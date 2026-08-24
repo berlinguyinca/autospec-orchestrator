@@ -1,0 +1,48 @@
+# Example execution request submitted by AutoSpec to POST /api/v1/executions.
+apiVersion: autospec.dev/v1alpha1
+role: implementation
+
+task:
+  project_id: inferweave
+  issue_id: "417"
+
+repository:
+  repo: InferWeave/inferweave-node
+  baseRef: main
+  branch: autospec/417
+
+agent:
+  harness: pi
+  modelPolicy:
+    provider: inferweave
+    preferred:
+      - qwen3.8-27b
+    fallbackClass: coding-high
+
+runtime:
+  type: docker
+  os: linux
+  cpu: 8
+  memoryMib: 16384
+  capabilities:
+    - docker
+    - playwright
+
+services:
+  - name: postgres
+    image: postgres:17
+  - name: redis
+    image: redis:8
+
+persistence: resumable
+
+task_packet:
+  goal: Implement reservation cancellation.
+  acceptanceCriteria:
+    - Cancelling a reservation releases its held capacity.
+    - Cancelling twice is idempotent.
+  nonGoals:
+    - Changing the reservation creation API.
+  requiredTests:
+    - Integration test against PostgreSQL.
+  roleSkill: implement-issue

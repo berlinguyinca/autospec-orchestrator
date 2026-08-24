@@ -1,0 +1,26 @@
+[package]
+name = "autospec-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AutoSpec execution worker daemon: provisions isolated runtimes and agent harnesses on a host."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "autospec-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+orchestrator-core.workspace = true
+orchestrator-worker.workspace = true
+runtime-docker.workspace = true
+harness-pi.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

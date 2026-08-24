@@ -1,0 +1,24 @@
+[package]
+name = "autospec-orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Execution-plane controller for AutoSpec: schedules isolated agent execution environments across workers."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "autospec-orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+orchestrator-api.workspace = true
+orchestrator-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

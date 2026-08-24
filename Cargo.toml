@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/orchestrator-core",
+    "crates/orchestrator-api",
+    "crates/orchestrator-scheduler",
+    "crates/orchestrator-worker",
+    "crates/runtime-traits",
+    "crates/runtime-docker",
+    "crates/harness-traits",
+    "crates/harness-pi",
+    "crates/git-worktree",
+    "crates/autospec-orchestrator",
+    "crates/autospec-worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/InferWeave/autospec-orchestrator"
+authors = ["InferWeave"]
+
+[workspace.dependencies]
+orchestrator-core = { path = "crates/orchestrator-core" }
+orchestrator-api = { path = "crates/orchestrator-api" }
+orchestrator-scheduler = { path = "crates/orchestrator-scheduler" }
+orchestrator-worker = { path = "crates/orchestrator-worker" }
+runtime-traits = { path = "crates/runtime-traits" }
+runtime-docker = { path = "crates/runtime-docker" }
+harness-traits = { path = "crates/harness-traits" }
+harness-pi = { path = "crates/harness-pi" }
+git-worktree = { path = "crates/git-worktree" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

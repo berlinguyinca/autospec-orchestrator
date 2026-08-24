@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+.env
+.omc/
+.turbo/
+.autospec/state/

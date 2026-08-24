@@ -1,0 +1,25 @@
+# Example `.autospec/environment.yaml` placed in a *source* repository.
+# The orchestrator reads it to learn which services that repository supports,
+# and provisions only what a given task actually requires.
+
+runtime:
+  type: docker
+  image: ghcr.io/inferweave/autospec-rust:latest
+  cpu: 8
+  memoryMib: 16384
+  diskGib: 50
+  capabilities:
+    - docker
+    - playwright
+
+services:
+  postgres:
+    image: postgres:17
+    env:
+      POSTGRES_PASSWORD: autospec
+
+  redis:
+    image: redis:8
+
+  localstack:
+    image: localstack/localstack
