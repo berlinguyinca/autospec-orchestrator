@@ -15,6 +15,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +106,55 @@ pub trait DockerBindVerifier: Debug + Send + Sync {
     fn verify(&self, source: &Path) -> Result<DockerBindProof, StorageError>;
 }
 
+/// Revalidates a durable ready allocation immediately before a consumer writes
+/// into its mounted filesystem.
+pub trait VerifiedExecutionStorage: Debug + Send + Sync {
+    fn repository_path(&self) -> &Path;
+    fn verify(&self) -> Result<(), StorageError>;
+}
+
+pub trait ReadyAllocationVerifier: Debug + Send + Sync {
+    fn verify_ready(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError>;
+}
+
+#[derive(Debug)]
+struct LiveVerifiedExecutionStorage {
+    root: PinnedDirectory,
+    repository: PinnedDirectory,
+}
+
+impl VerifiedExecutionStorage for LiveVerifiedExecutionStorage {
+    fn repository_path(&self) -> &Path {
+        &self.repository.path
+    }
+
+    fn verify(&self) -> Result<(), StorageError> {
+        self.root.verify("execution mountpoint")?;
+        self.repository.verify("execution repository")?;
+        if self.repository.path.parent() != Some(self.root.path.as_path()) {
+            return Err(StorageError::IdentityMismatch(
+                "execution repository is not a direct child of the mounted allocation".to_owned(),
+            ));
+        }
+        #[cfg(unix)]
+        if fs::symlink_metadata(&self.root.path)
+            .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?
+            .dev()
+            != fs::symlink_metadata(&self.repository.path)
+                .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?
+                .dev()
+        {
+            return Err(StorageError::IdentityMismatch(
+                "execution repository is not on the mounted allocation filesystem".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub trait ExecutionStorageManager: Send + Sync {
     fn probe(&self, disk_gib: u64) -> Result<StorageCapability, StorageError>;
     fn allocate(&self, request: &AllocationRequest) -> Result<AllocationReceipt, StorageError>;
@@ -147,6 +199,45 @@ impl ExecutionStorage {
 
     pub fn state_root(&self) -> &Path {
         &self.state_root
+    }
+
+    fn verify_ready_allocation(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+        let layout = ExecutionLayout::new(&self.state_root, &receipt.labels.execution_id)?;
+        receipt.validate(&receipt.labels, &layout)?;
+        let journal = self.journals.read(&layout)?;
+        if journal.phase != AllocationPhase::Ready || journal.receipt.as_ref() != Some(receipt) {
+            return Err(StorageError::IdentityMismatch(
+                "allocation receipt does not exactly match a durable Ready journal".to_owned(),
+            ));
+        }
+        self.validate_backend_config(&journal)?;
+        if self
+            .backend
+            .state(&layout, &receipt.backend, receipt.reserved_bytes)?
+            != BackendState::Mounted
+        {
+            return Err(StorageError::IdentityMismatch(
+                "ready backend is not mounted".to_owned(),
+            ));
+        }
+        let current_bind = self.docker.verify(&layout.root)?;
+        if current_bind != receipt.docker_bind {
+            return Err(StorageError::IdentityMismatch(
+                "Docker bind proof changed since allocation".to_owned(),
+            ));
+        }
+        self.executions_directory.verify("executions directory")?;
+        require_real_directory(&layout.root, "execution mountpoint")?;
+        require_real_directory(&layout.repository, "execution repository")?;
+        let verified = LiveVerifiedExecutionStorage {
+            root: PinnedDirectory::capture(&layout.root, "execution mountpoint")?,
+            repository: PinnedDirectory::capture(&layout.repository, "execution repository")?,
+        };
+        verified.verify()?;
+        Ok(Box::new(verified))
     }
 
     fn create_mountpoint(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
@@ -355,6 +446,15 @@ impl ExecutionStorage {
                 "allocation failed: {cause}; rollback failed: {cleanup}"
             )),
         }
+    }
+}
+
+impl ReadyAllocationVerifier for ExecutionStorage {
+    fn verify_ready(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+        self.verify_ready_allocation(receipt)
     }
 }
 

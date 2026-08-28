@@ -41,6 +41,10 @@ impl WorktreeFilesystem for SystemWorktreeFilesystem {
             .output()?;
         if output.status.success() {
             Ok(())
+        } else if output.status.code() == Some(28)
+            || String::from_utf8_lossy(&output.stderr).contains("No space left on device")
+        {
+            Err(io::Error::from_raw_os_error(28))
         } else {
             Err(io::Error::other(
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),

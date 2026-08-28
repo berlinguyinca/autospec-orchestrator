@@ -1,7 +1,8 @@
 use crate::lock::FileLock;
 use crate::manager::{
-    atomic_write_new, git_stdout, hex_component, normalized_repository_name, read_owner_record,
-    verify_repository_storage, GitWorktreeManager, OwnerRecord,
+    git_stdout, hex_component, metadata_directory, metadata_name, normalized_repository_name,
+    read_owner_record, verify_git_storage_preflight, verify_repository_storage, GitWorktreeManager,
+    OwnerRecord,
 };
 use crate::{Worktree, WorktreeError};
 use orchestrator_core::labels::{EXECUTION_ID, MANAGED, REPOSITORY};
@@ -22,7 +23,7 @@ pub(crate) fn destroy(
     worktree: &Worktree,
 ) -> Result<(), WorktreeError> {
     let journal_path = cleanup_journal_path(manager, &worktree.execution_id);
-    let existing_journal = read_cleanup_journal(&journal_path)?;
+    let existing_journal = read_cleanup_journal(manager, &journal_path)?;
     let (journal, needs_write) = match existing_journal {
         Some(journal) => {
             verify_journal(manager, worktree, &journal)?;
@@ -30,6 +31,7 @@ pub(crate) fn destroy(
         }
         None => {
             let path = verified_path(manager, worktree)?;
+            verify_repository_storage(&path)?;
             let owner = verified_owner(&path, worktree)?;
             let current = current_branch(&path)?;
             if current != owner.branch {
@@ -62,7 +64,9 @@ pub(crate) fn destroy(
 
     let path = Path::new(&journal.worktree_path);
     remove_repository_if_present(manager, path, &journal.owner.branch)?;
-    fs::remove_file(&journal_path).map_err(|error| WorktreeError::Cleanup(error.to_string()))
+    metadata_directory(manager, WorktreeError::Cleanup)?
+        .remove(metadata_name(&journal_path)?)
+        .map_err(|error| WorktreeError::Cleanup(error.to_string()))
 }
 
 fn cleanup_journal_path(manager: &GitWorktreeManager, execution_id: &ExecutionId) -> PathBuf {
@@ -71,22 +75,19 @@ fn cleanup_journal_path(manager: &GitWorktreeManager, execution_id: &ExecutionId
         .join(format!(".cleanup-{execution_id}.json"))
 }
 
-fn read_cleanup_journal(path: &Path) -> Result<Option<CleanupJournal>, WorktreeError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WorktreeError::Cleanup(error.to_string())),
-    };
-    if !metadata.file_type().is_file() {
-        return Err(WorktreeError::Ownership(format!(
-            "cleanup journal is not a regular file: {}",
-            path.display()
-        )));
-    }
-    let bytes = fs::read(path).map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| WorktreeError::Cleanup(error.to_string()))
+fn read_cleanup_journal(
+    manager: &GitWorktreeManager,
+    path: &Path,
+) -> Result<Option<CleanupJournal>, WorktreeError> {
+    let bytes = metadata_directory(manager, WorktreeError::Cleanup)?
+        .read(metadata_name(path)?)
+        .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
+    bytes
+        .map(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|error| WorktreeError::Cleanup(error.to_string()))
+        })
+        .transpose()
 }
 
 fn write_cleanup_journal(
@@ -94,18 +95,11 @@ fn write_cleanup_journal(
     final_path: &Path,
     journal: &CleanupJournal,
 ) -> Result<(), WorktreeError> {
-    fs::create_dir_all(manager.worktrees_root())
-        .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
-    let temporary_path = final_path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(journal)
         .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
-    atomic_write_new(
-        &manager.worktrees_root(),
-        final_path,
-        &temporary_path,
-        &bytes,
-        WorktreeError::Cleanup,
-    )
+    metadata_directory(manager, WorktreeError::Cleanup)?
+        .create(metadata_name(final_path)?, &bytes)
+        .map_err(|error| WorktreeError::Cleanup(error.to_string()))
 }
 
 fn verify_journal(
@@ -149,6 +143,7 @@ fn remove_repository_if_present(
             path.display()
         )));
     }
+    verify_repository_storage(path)?;
     let current = current_branch(path)?;
     if current != branch {
         return Err(WorktreeError::Ownership(format!(
@@ -156,7 +151,6 @@ fn remove_repository_if_present(
             path.display()
         )));
     }
-    verify_repository_storage(path)?;
     manager
         .filesystem
         .remove_repository(path)
@@ -216,6 +210,7 @@ pub(crate) fn find_stale(
         if live.contains(&execution_id) {
             continue;
         }
+        verify_repository_storage(&path)?;
         let branch = current_branch(&path)?;
         if branch != record.branch {
             return Err(WorktreeError::Ownership(format!(
@@ -277,6 +272,7 @@ fn required_label<'a>(record: &'a OwnerRecord, key: &str) -> Result<&'a str, Wor
 }
 
 fn current_branch(path: &Path) -> Result<String, WorktreeError> {
+    verify_git_storage_preflight(path)?;
     git_stdout(
         [
             OsStr::new("-C"),

@@ -30,6 +30,8 @@ pub enum WorktreeError {
     Mirror(String),
     #[error("worktree creation failed: {0}")]
     Create(String),
+    #[error("execution storage is full: {0}")]
+    StorageFull(String),
     #[error("worktree is locked by {0}")]
     Locked(ExecutionId),
     #[error("cleanup failed: {0}")]

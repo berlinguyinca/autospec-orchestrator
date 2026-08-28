@@ -2,7 +2,8 @@ use execution_storage::{
     disk_gib_to_bytes, AllocationPhase, AllocationReceipt, AllocationRequest, BackendCapability,
     BackendIdentity, BackendState, DockerBindCapability, DockerBindProof, DockerBindVerifier,
     ExecutionLayout, ExecutionStorage, ExecutionStorageManager, JournalStore, PhaseJournal,
-    ReleasePhase, StorageBackend, StorageError, ALLOCATION_API_VERSION,
+    ReadyAllocationVerifier, ReleasePhase, SecureMetadataDirectory, StorageBackend, StorageError,
+    ALLOCATION_API_VERSION,
 };
 use orchestrator_core::{ExecutionId, OwnershipLabels, WorkerId};
 use std::{
@@ -27,6 +28,29 @@ fn storage_directories(root: &Path) {
         mode(&root.join("execution-storage"), 0o700);
         mode(&root.join("executions"), 0o700);
     }
+}
+
+#[test]
+fn secure_metadata_directory_recovers_synced_temporary_files() {
+    let root = tempfile::tempdir().expect("temporary metadata root");
+    #[cfg(unix)]
+    mode(root.path(), 0o700);
+    let metadata = SecureMetadataDirectory::new(root.path()).expect("secure metadata directory");
+
+    metadata
+        .create("intent.json", b"first")
+        .expect("create intent");
+    fs::rename(
+        root.path().join("intent.json"),
+        root.path().join("intent.json.tmp"),
+    )
+    .expect("simulate crash after durable temporary write");
+
+    assert_eq!(
+        metadata.read("intent.json").expect("reconcile intent"),
+        Some(b"first".to_vec())
+    );
+    assert!(!root.path().join("intent.json.tmp").exists());
 }
 
 fn labels() -> OwnershipLabels {
@@ -755,6 +779,34 @@ fn manager_trait_is_object_safe_and_lifecycle_is_journaled() {
     assert!(calls.iter().any(|call| call.starts_with("prepare:")));
     assert!(calls.iter().any(|call| call.starts_with("mount:")));
     assert!(calls.iter().any(|call| call.starts_with("remove:")));
+}
+
+#[test]
+fn live_ready_verification_requires_exact_ready_journal_and_mounted_identity() {
+    let (_root, manager, _calls) = manager_fixture();
+    let request = AllocationRequest {
+        labels: labels(),
+        disk_gib: 3,
+    };
+    let receipt = manager.allocate(&request).expect("allocate storage");
+
+    manager
+        .verify_ready(&receipt)
+        .expect("verify exact durable Ready allocation");
+    let layout = ExecutionLayout::new(manager.state_root(), &request.labels.execution_id)
+        .expect("execution layout");
+    JournalStore::new(manager.state_root())
+        .expect("journal store")
+        .write(
+            &layout,
+            &PhaseJournal::releasing(receipt.clone(), ReleasePhase::Mounted),
+        )
+        .expect("transition journal away from Ready");
+
+    assert!(matches!(
+        manager.verify_ready(&receipt),
+        Err(StorageError::IdentityMismatch(_))
+    ));
 }
 
 #[test]

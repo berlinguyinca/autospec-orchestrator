@@ -58,6 +58,30 @@ consume a verified allocation receipt.
   owner-record temporary write, fsync, and rename; successful rollback removes
   the create intent, while rollback failure retains it for exact restart
   recovery.
+- Replaced receipt-only path trust with `ReadyAllocationVerifier` and a pinned
+  `VerifiedExecutionStorage` capability. The real execution-storage verifier
+  exact-matches the durable Ready journal, labels, backend configuration,
+  ownership token, mounted backend state, filesystem identity, and Docker bind
+  proof immediately before clone materialization; legacy constructors reject
+  structurally valid receipts when no live verifier is configured.
+- Routed Git create and cleanup journals through execution-storage's reusable
+  owner-only `SecureMetadataDirectory`. It uses no-follow opens, opened inode
+  checks, file and directory fsync, and reconciles durable write/removal
+  temporaries after restart.
+- Made create rollback idempotent when an earlier attempt removed the exact
+  repository directory, recreated it empty, or failed between those phases.
+  Recovery remains limited to the deterministic direct child selected by the
+  exact journal labels and path.
+- Moved interrupted-create recovery before mirror refresh and retained the
+  journaled `base_sha`; an upstream ref advance during downtime cannot silently
+  retarget the restarted execution.
+- Added filesystem-only Git storage and alternate-object preflight immediately
+  before repository Git invocations used by owner scans, stale discovery,
+  evidence, and destruction.
+- Added PATH-wrapper regressions that make real Git leave partial object-pack
+  and index state and exit with ENOSPC during clone and checkout. ENOSPC is now
+  a distinct `WorktreeError::StorageFull`, and restart removes only the exact
+  partial repository before retrying.
 
 ## Public Contract
 
@@ -178,12 +202,12 @@ polling loops, or `du`/`df` accounting.
 
 ## Verification
 
-- `cargo test -p git-worktree` — 39 real temporary Git repository tests passed,
+- `cargo test -p git-worktree` — 43 real temporary Git repository tests passed,
   including hostile Git environments, independent Git-path containment, mirror
   immutability/substitution rejection, receipt binding, create-intent recovery,
   phase-specific ENOSPC rollback, exact cleanup, foreign-resource survival, and
   stale discovery.
-- `cargo test -p execution-storage -- --nocapture` — 32 passed. The real Docker
+- `cargo test -p execution-storage -- --nocapture` — 34 passed. The real Docker
   bind verifier contract ran. The destructive aggregate quota lifecycle printed
   an explicit skip because no operator pool is configured on this host; when
   configured it performs create, identity proof, substantial successful writes,
@@ -191,11 +215,11 @@ polling loops, or `du`/`df` accounting.
   unmount, and exact release, and configuration failures are test failures.
 - `cargo clippy -p execution-storage --all-targets -- -D warnings` — passed.
 - Current toolchain `cargo fmt --all -- --check`, `cargo build --workspace`,
-  `cargo test --workspace -- --nocapture`, and
+  `cargo test --workspace`, and
   `cargo clippy --workspace --all-targets -- -D warnings` — passed, including
   all real-Docker runtime tests.
 - Rust 1.85 ran the same full fmt/build/test/clippy workspace matrix — passed,
-  including all 39 Git tests and all 13 real-Docker runtime tests.
+  including all 43 Git tests and all 13 real-Docker runtime tests.
 
 ## Remaining Integration Work
 

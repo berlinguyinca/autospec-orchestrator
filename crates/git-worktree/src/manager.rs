@@ -2,14 +2,16 @@ use crate::command::git_command;
 use crate::filesystem::{SystemWorktreeFilesystem, WorktreeFilesystem, WorktreeFilesystemPoint};
 use crate::lock::FileLock;
 use crate::{DiffCapture, Worktree, WorktreeError, WorktreeManager};
-use execution_storage::{AllocationReceipt, ExecutionLayout};
+use execution_storage::{
+    AllocationReceipt, ExecutionLayout, ReadyAllocationVerifier, SecureMetadataDirectory,
+    StorageError, VerifiedExecutionStorage,
+};
 use orchestrator_core::labels::{EXECUTION_ID, REPOSITORY};
 use orchestrator_core::{ExecutionId, OwnershipLabels};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::Arc;
@@ -22,6 +24,21 @@ pub struct GitWorktreeManager {
     pub(crate) cache_root: PathBuf,
     clone_base: String,
     pub(crate) filesystem: Arc<dyn WorktreeFilesystem>,
+    storage_verifier: Arc<dyn ReadyAllocationVerifier>,
+}
+
+#[derive(Debug)]
+struct RejectUnverifiedStorage;
+
+impl ReadyAllocationVerifier for RejectUnverifiedStorage {
+    fn verify_ready(
+        &self,
+        _receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+        Err(StorageError::IdentityMismatch(
+            "no live execution-storage verifier is configured".to_owned(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,56 +76,6 @@ struct MirrorRoot {
     inode: u64,
     #[cfg(unix)]
     owner: u32,
-}
-
-struct BoundedStorage {
-    root: PathBuf,
-    repository: PathBuf,
-    root_handle: File,
-    repository_handle: File,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    root_inode: u64,
-    #[cfg(unix)]
-    repository_inode: u64,
-}
-
-impl BoundedStorage {
-    fn verify(&self) -> Result<(), WorktreeError> {
-        let root = fs::symlink_metadata(&self.root)
-            .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-        let repository = fs::symlink_metadata(&self.repository)
-            .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-        if !root.file_type().is_dir() || !repository.file_type().is_dir() {
-            return Err(WorktreeError::Ownership(
-                "execution storage ancestry is no longer real directories".to_owned(),
-            ));
-        }
-        let opened_root = self
-            .root_handle
-            .metadata()
-            .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-        let opened_repository = self
-            .repository_handle
-            .metadata()
-            .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-        #[cfg(unix)]
-        if root.dev() != self.device
-            || repository.dev() != self.device
-            || root.ino() != self.root_inode
-            || repository.ino() != self.repository_inode
-            || opened_root.dev() != self.device
-            || opened_repository.dev() != self.device
-            || opened_root.ino() != self.root_inode
-            || opened_repository.ino() != self.repository_inode
-        {
-            return Err(WorktreeError::Ownership(
-                "execution storage filesystem or inode identity changed".to_owned(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl MirrorRoot {
@@ -154,15 +121,43 @@ impl GitWorktreeManager {
         )
     }
 
+    pub fn with_clone_base_and_verifier(
+        cache_root: impl Into<PathBuf>,
+        clone_base: impl Into<String>,
+        storage_verifier: Arc<dyn ReadyAllocationVerifier>,
+    ) -> Self {
+        Self::with_clone_base_filesystem_and_verifier(
+            cache_root,
+            clone_base,
+            Arc::new(SystemWorktreeFilesystem),
+            storage_verifier,
+        )
+    }
+
     pub fn with_clone_base_and_filesystem(
         cache_root: impl Into<PathBuf>,
         clone_base: impl Into<String>,
         filesystem: Arc<dyn WorktreeFilesystem>,
     ) -> Self {
+        Self::with_clone_base_filesystem_and_verifier(
+            cache_root,
+            clone_base,
+            filesystem,
+            Arc::new(RejectUnverifiedStorage),
+        )
+    }
+
+    pub fn with_clone_base_filesystem_and_verifier(
+        cache_root: impl Into<PathBuf>,
+        clone_base: impl Into<String>,
+        filesystem: Arc<dyn WorktreeFilesystem>,
+        storage_verifier: Arc<dyn ReadyAllocationVerifier>,
+    ) -> Self {
         Self {
             cache_root: cache_root.into(),
             clone_base: clone_base.into().trim_end_matches('/').to_owned(),
             filesystem,
+            storage_verifier,
         }
     }
 
@@ -274,7 +269,23 @@ impl WorktreeManager for GitWorktreeManager {
             ));
         }
         let repository_root = &layout.repository;
-        verify_bounded_repository_root(self, &layout, repository_root)?;
+        verify_repository_selector(self, &layout, repository_root)?;
+
+        let intent_path = create_intent_path(self, &labels.execution_id);
+        let recovered_base_sha = if let Some(existing) = read_create_intent(self, &intent_path)? {
+            verify_create_intent(&existing, labels, repo, base_ref, branch, repository_root)?;
+            rollback_independent_repository(self.filesystem.as_ref(), repository_root)
+                .map_err(WorktreeError::Create)?;
+            remove_create_intent(self, &intent_path)?;
+            Some(existing.base_sha)
+        } else {
+            None
+        };
+        let initial_storage = self
+            .storage_verifier
+            .verify_ready(storage)
+            .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
+        verify_live_storage(initial_storage.as_ref(), repository_root)?;
 
         let mirror = PathBuf::from(self.ensure_mirror(repo)?);
         let mirror_lock = mirror.with_extension("git.lock");
@@ -296,24 +307,31 @@ impl WorktreeManager for GitWorktreeManager {
         if let Some(owner) = self.branch_owner(repo, branch)? {
             return Err(WorktreeError::Locked(owner));
         }
-        let base_sha = git_stdout(
-            [
-                OsStr::new("--git-dir"),
-                mirror.as_os_str(),
-                OsStr::new("rev-parse"),
-                OsStr::new("--verify"),
-                OsStr::new(base_ref),
-            ],
-            WorktreeError::Create,
-        )?;
-        let intent_path = create_intent_path(self, &labels.execution_id);
-        if let Some(existing) = read_create_intent(&intent_path)? {
-            verify_create_intent(&existing, labels, repo, base_ref, branch, repository_root)?;
-            rollback_independent_repository(self.filesystem.as_ref(), repository_root)
-                .map_err(WorktreeError::Create)?;
-            remove_create_intent(self, &intent_path)?;
-        }
-        let bounded_storage = verify_bounded_repository_root(self, &layout, repository_root)?;
+        let base_sha = match recovered_base_sha {
+            Some(base_sha) => {
+                run_git(
+                    [
+                        OsStr::new("--git-dir"),
+                        mirror.as_os_str(),
+                        OsStr::new("cat-file"),
+                        OsStr::new("-e"),
+                        OsStr::new(&format!("{base_sha}^{{commit}}")),
+                    ],
+                    WorktreeError::Create,
+                )?;
+                base_sha
+            }
+            None => git_stdout(
+                [
+                    OsStr::new("--git-dir"),
+                    mirror.as_os_str(),
+                    OsStr::new("rev-parse"),
+                    OsStr::new("--verify"),
+                    OsStr::new(base_ref),
+                ],
+                WorktreeError::Create,
+            )?,
+        };
         if fs::read_dir(repository_root)
             .map_err(|error| WorktreeError::Create(error.to_string()))?
             .next()
@@ -335,23 +353,29 @@ impl WorktreeManager for GitWorktreeManager {
         };
         write_create_intent(self, &intent_path, &intent, false)?;
         let setup_result = (|| {
-            bounded_storage.verify()?;
             mirror_root
                 .verify()
                 .map_err(|error| WorktreeError::Create(error.to_string()))?;
             verify_mirror_repository(&mirror_root, &mirror, &clone_locator)
                 .map_err(|error| WorktreeError::Create(error.to_string()))?;
+            let verified_storage = self
+                .storage_verifier
+                .verify_ready(storage)
+                .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
+            verify_live_storage(verified_storage.as_ref(), repository_root)?;
             self.filesystem
                 .clone_repository(&mirror, repository_root)
-                .map_err(|error| WorktreeError::Create(error.to_string()))?;
+                .map_err(create_io_error)?;
             self.filesystem
                 .checkpoint(
                     WorktreeFilesystemPoint::CloneObjectPack,
                     &repository_root.join(".git/objects/pack"),
                 )
-                .map_err(|error| WorktreeError::Create(error.to_string()))?;
+                .map_err(create_io_error)?;
             verify_repository_storage(repository_root)?;
-            bounded_storage.verify()?;
+            verified_storage
+                .verify()
+                .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
             intent.phase = CreatePhase::Cloned;
             write_create_intent(self, &intent_path, &intent, true)?;
             run_git(
@@ -381,11 +405,13 @@ impl WorktreeManager for GitWorktreeManager {
                     WorktreeFilesystemPoint::CheckoutIndex,
                     &repository_root.join(".git/index"),
                 )
-                .map_err(|error| WorktreeError::Create(error.to_string()))?;
+                .map_err(create_io_error)?;
             intent.phase = CreatePhase::CheckedOut;
             write_create_intent(self, &intent_path, &intent, true)?;
             verify_repository_storage(repository_root)?;
-            bounded_storage.verify()?;
+            verified_storage
+                .verify()
+                .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
             write_owner_record(
                 self.filesystem.as_ref(),
                 repository_root,
@@ -475,6 +501,7 @@ impl GitWorktreeManager {
             if record.branch != branch {
                 continue;
             }
+            verify_git_storage_preflight(&path)?;
             let current = git_stdout(
                 [
                     OsStr::new("-C"),
@@ -683,36 +710,15 @@ fn write_owner_record(
         .map_err(|error| WorktreeError::Create(error.to_string()))?;
     filesystem
         .write_owner_record(path, &bytes)
-        .map_err(|error| WorktreeError::Create(error.to_string()))
+        .map_err(create_io_error)
 }
 
-pub(crate) fn atomic_write_new(
-    directory: &Path,
-    final_path: &Path,
-    temporary_path: &Path,
-    bytes: &[u8],
-    error: fn(String) -> WorktreeError,
-) -> Result<(), WorktreeError> {
-    reject_existing_path(final_path, error)?;
-    reject_existing_path(temporary_path, error)?;
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(temporary_path)
-            .map_err(|cause| error(cause.to_string()))?;
-        file.write_all(bytes)
-            .map_err(|cause| error(cause.to_string()))?;
-        file.sync_all().map_err(|cause| error(cause.to_string()))?;
-        fs::rename(temporary_path, final_path).map_err(|cause| error(cause.to_string()))?;
-        File::open(directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|cause| error(cause.to_string()))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary_path);
+fn create_io_error(error: std::io::Error) -> WorktreeError {
+    if error.raw_os_error() == Some(28) {
+        WorktreeError::StorageFull(error.to_string())
+    } else {
+        WorktreeError::Create(error.to_string())
     }
-    result
 }
 
 fn create_intent_path(manager: &GitWorktreeManager, execution_id: &ExecutionId) -> PathBuf {
@@ -721,22 +727,18 @@ fn create_intent_path(manager: &GitWorktreeManager, execution_id: &ExecutionId) 
         .join(format!(".create-{execution_id}.json"))
 }
 
-fn read_create_intent(path: &Path) -> Result<Option<CreateIntent>, WorktreeError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WorktreeError::Create(error.to_string())),
-    };
-    if !metadata.file_type().is_file() {
-        return Err(WorktreeError::Ownership(format!(
-            "create intent is not a regular file: {}",
-            path.display()
-        )));
-    }
-    let bytes = fs::read(path).map_err(|error| WorktreeError::Create(error.to_string()))?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| WorktreeError::Create(error.to_string()))
+fn read_create_intent(
+    manager: &GitWorktreeManager,
+    path: &Path,
+) -> Result<Option<CreateIntent>, WorktreeError> {
+    let bytes = metadata_directory(manager, WorktreeError::Create)?
+        .read(metadata_name(path)?)
+        .map_err(|error| WorktreeError::Create(error.to_string()))?;
+    bytes
+        .map(|bytes| {
+            serde_json::from_slice(&bytes).map_err(|error| WorktreeError::Create(error.to_string()))
+        })
+        .transpose()
 }
 
 fn write_create_intent(
@@ -745,49 +747,57 @@ fn write_create_intent(
     intent: &CreateIntent,
     replace: bool,
 ) -> Result<(), WorktreeError> {
-    fs::create_dir_all(manager.worktrees_root())
-        .map_err(|error| WorktreeError::Create(error.to_string()))?;
-    let temporary = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(intent)
         .map_err(|error| WorktreeError::Create(error.to_string()))?;
+    let directory = metadata_directory(manager, WorktreeError::Create)?;
     if replace {
-        reject_existing_path(&temporary, WorktreeError::Create)?;
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(|error| WorktreeError::Create(error.to_string()))?;
-            file.write_all(&bytes)
-                .map_err(|error| WorktreeError::Create(error.to_string()))?;
-            file.sync_all()
-                .map_err(|error| WorktreeError::Create(error.to_string()))?;
-            fs::rename(&temporary, path)
-                .map_err(|error| WorktreeError::Create(error.to_string()))?;
-            File::open(manager.worktrees_root())
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| WorktreeError::Create(error.to_string()))
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        directory
+            .replace(metadata_name(path)?, &bytes)
+            .map_err(|error| WorktreeError::Create(error.to_string()))
     } else {
-        atomic_write_new(
-            &manager.worktrees_root(),
-            path,
-            &temporary,
-            &bytes,
-            WorktreeError::Create,
-        )
+        directory
+            .create(metadata_name(path)?, &bytes)
+            .map_err(|error| WorktreeError::Create(error.to_string()))
     }
 }
 
 fn remove_create_intent(manager: &GitWorktreeManager, path: &Path) -> Result<(), WorktreeError> {
-    fs::remove_file(path).map_err(|error| WorktreeError::Create(error.to_string()))?;
-    File::open(manager.worktrees_root())
-        .and_then(|directory| directory.sync_all())
+    metadata_directory(manager, WorktreeError::Create)?
+        .remove(metadata_name(path)?)
         .map_err(|error| WorktreeError::Create(error.to_string()))
+}
+
+pub(crate) fn metadata_directory(
+    manager: &GitWorktreeManager,
+    error: fn(String) -> WorktreeError,
+) -> Result<SecureMetadataDirectory, WorktreeError> {
+    let path = manager.worktrees_root();
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+                    .create(&path)
+                    .map_err(|cause| error(cause.to_string()))?;
+            }
+            #[cfg(not(unix))]
+            fs::create_dir(&path).map_err(|cause| error(cause.to_string()))?;
+        }
+        Err(cause) => return Err(error(cause.to_string())),
+    }
+    SecureMetadataDirectory::new(&path).map_err(|cause| error(cause.to_string()))
+}
+
+pub(crate) fn metadata_name(path: &Path) -> Result<&str, WorktreeError> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            WorktreeError::Ownership(format!("metadata name is invalid: {}", path.display()))
+        })
 }
 
 fn verify_create_intent(
@@ -812,58 +822,43 @@ fn verify_create_intent(
     }
 }
 
-fn reject_existing_path(
-    path: &Path,
-    error: fn(String) -> WorktreeError,
-) -> Result<(), WorktreeError> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(error(format!(
-            "ownership metadata path already exists: {}",
-            path.display()
-        ))),
-        Err(cause) => Err(error(cause.to_string())),
-    }
-}
-
 fn rollback_independent_repository(
     filesystem: &dyn WorktreeFilesystem,
     path: &Path,
 ) -> Result<(), String> {
-    filesystem
-        .remove_repository(path)
-        .map_err(|error| error.to_string())?;
-    filesystem
-        .create_repository_root(path)
-        .map_err(|error| error.to_string())
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => filesystem
+            .create_repository_root(path)
+            .map_err(|error| error.to_string()),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            if fs::read_dir(path)
+                .map_err(|error| error.to_string())?
+                .next()
+                .is_none()
+            {
+                Ok(())
+            } else {
+                filesystem
+                    .remove_repository(path)
+                    .map_err(|error| error.to_string())?;
+                filesystem
+                    .create_repository_root(path)
+                    .map_err(|error| error.to_string())
+            }
+        }
+        Ok(_) => Err(format!(
+            "repository rollback target is not a real directory: {}",
+            path.display()
+        )),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
-fn verify_bounded_repository_root(
+fn verify_repository_selector(
     manager: &GitWorktreeManager,
     layout: &ExecutionLayout,
     repository_root: &Path,
-) -> Result<BoundedStorage, WorktreeError> {
-    for (description, path) in [
-        ("executions root", manager.executions_root()),
-        (
-            "execution root",
-            manager
-                .executions_root()
-                .join(layout.root.file_name().ok_or_else(|| {
-                    WorktreeError::Ownership("execution root has no name".to_owned())
-                })?),
-        ),
-        ("repository root", repository_root.to_path_buf()),
-    ] {
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| WorktreeError::Create(error.to_string()))?;
-        if !metadata.file_type().is_dir() {
-            return Err(WorktreeError::Ownership(format!(
-                "{description} is not a real directory: {}",
-                path.display()
-            )));
-        }
-    }
+) -> Result<(), WorktreeError> {
     if layout.root
         != manager.executions_root().join(
             layout
@@ -877,56 +872,35 @@ fn verify_bounded_repository_root(
             "execution storage layout is not deterministic".to_owned(),
         ));
     }
-    let root = layout
-        .root
-        .canonicalize()
+    let root = fs::symlink_metadata(&layout.root)
         .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-    let repository = repository_root
-        .canonicalize()
-        .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-    if repository.parent() != Some(root.as_path()) {
-        return Err(WorktreeError::Ownership(
-            "repository is not a direct child of the execution mount".to_owned(),
-        ));
+    if !root.file_type().is_dir() {
+        return Err(WorktreeError::Ownership(format!(
+            "execution root is not a real directory: {}",
+            layout.root.display()
+        )));
     }
-    let root_handle =
-        File::open(&root).map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-    let repository_handle =
-        File::open(&repository).map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-    let root_metadata = root_handle
-        .metadata()
-        .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-    let repository_metadata = repository_handle
-        .metadata()
-        .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-    #[cfg(unix)]
-    if root_metadata.dev() != repository_metadata.dev() {
-        return Err(WorktreeError::Ownership(
-            "repository is not on the execution mount filesystem".to_owned(),
-        ));
+    Ok(())
+}
+
+fn verify_live_storage(
+    storage: &dyn VerifiedExecutionStorage,
+    repository_root: &Path,
+) -> Result<(), WorktreeError> {
+    if storage.repository_path() != repository_root {
+        return Err(WorktreeError::Ownership(format!(
+            "verified repository {} is not {}",
+            storage.repository_path().display(),
+            repository_root.display()
+        )));
     }
-    #[cfg(unix)]
-    let storage = BoundedStorage {
-        root,
-        repository,
-        root_handle,
-        repository_handle,
-        device: root_metadata.dev(),
-        root_inode: root_metadata.ino(),
-        repository_inode: repository_metadata.ino(),
-    };
-    #[cfg(not(unix))]
-    let storage = BoundedStorage {
-        root,
-        repository,
-        root_handle,
-        repository_handle,
-    };
-    storage.verify()?;
-    Ok(storage)
+    storage
+        .verify()
+        .map_err(|error| WorktreeError::Ownership(error.to_string()))
 }
 
 pub(crate) fn verify_repository_storage(path: &Path) -> Result<(), WorktreeError> {
+    verify_git_storage_preflight(path)?;
     let canonical_root = path
         .canonicalize()
         .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
@@ -937,6 +911,7 @@ pub(crate) fn verify_repository_storage(path: &Path) -> Result<(), WorktreeError
         &["rev-parse", "--git-path", "refs"][..],
         &["rev-parse", "--git-path", "index"][..],
     ] {
+        verify_git_storage_preflight(path)?;
         let reported = git_stdout(
             std::iter::once(OsStr::new("-C"))
                 .chain(std::iter::once(path.as_os_str()))
@@ -977,6 +952,7 @@ pub(crate) fn verify_repository_storage(path: &Path) -> Result<(), WorktreeError
             )));
         }
     }
+    verify_git_storage_preflight(path)?;
     let alternates = PathBuf::from(git_stdout(
         [
             OsStr::new("-C"),
@@ -992,6 +968,47 @@ pub(crate) fn verify_repository_storage(path: &Path) -> Result<(), WorktreeError
     } else {
         path.join(alternates)
     };
+    match fs::symlink_metadata(&alternates) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(WorktreeError::Ownership(format!(
+            "alternate object database is forbidden: {}",
+            alternates.display()
+        ))),
+        Err(error) => Err(WorktreeError::Ownership(error.to_string())),
+    }
+}
+
+pub(crate) fn verify_git_storage_preflight(path: &Path) -> Result<(), WorktreeError> {
+    for (purpose, candidate, expected_directory) in [
+        ("repository", path.to_path_buf(), true),
+        ("Git directory", path.join(".git"), true),
+        ("object database", path.join(".git/objects"), true),
+        ("refs directory", path.join(".git/refs"), true),
+    ] {
+        let metadata = fs::symlink_metadata(&candidate)
+            .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
+        if metadata.file_type().is_symlink()
+            || (expected_directory && !metadata.file_type().is_dir())
+        {
+            return Err(WorktreeError::Ownership(format!(
+                "{purpose} is not a real directory: {}",
+                candidate.display()
+            )));
+        }
+    }
+    let index = path.join(".git/index");
+    match fs::symlink_metadata(&index) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(WorktreeError::Ownership(format!(
+                "Git index is not a real file: {}",
+                index.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(WorktreeError::Ownership(error.to_string())),
+    }
+    let alternates = path.join(".git/objects/info/alternates");
     match fs::symlink_metadata(&alternates) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Ok(_) => Err(WorktreeError::Ownership(format!(
@@ -1026,12 +1043,21 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = git_command()
-        .args(args)
-        .output()
-        .map_err(|cause| error(cause.to_string()))?;
+    let output = git_command().args(args).output().map_err(|cause| {
+        if cause.raw_os_error() == Some(28) {
+            WorktreeError::StorageFull(cause.to_string())
+        } else {
+            error(cause.to_string())
+        }
+    })?;
     if output.status.success() {
         Ok(output)
+    } else if output.status.code() == Some(28)
+        || String::from_utf8_lossy(&output.stderr).contains("No space left on device")
+    {
+        Err(WorktreeError::StorageFull(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
     } else {
         Err(error(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),

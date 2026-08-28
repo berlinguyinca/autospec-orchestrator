@@ -1,7 +1,8 @@
 use crate::cleanup::verified_path;
 use crate::command::git_command;
 use crate::manager::{
-    git_stdout, read_owner_record, verify_repository_storage, GitWorktreeManager,
+    git_stdout, read_owner_record, verify_git_storage_preflight, verify_repository_storage,
+    GitWorktreeManager,
 };
 use crate::{DiffCapture, Worktree, WorktreeError};
 use orchestrator_core::labels::{EXECUTION_ID, MANAGED, REPOSITORY};
@@ -27,6 +28,7 @@ pub(crate) fn capture(
     {
         return Err(WorktreeError::Ownership(worktree.path.clone()));
     }
+    verify_git_storage_preflight(path)?;
     let current_branch = git_stdout(
         [
             OsStr::new("-C"),
@@ -78,6 +80,7 @@ pub(crate) fn capture(
 
     let mut changed_files = parse_paths(&tracked)?;
     for file in parse_paths(&untracked)? {
+        verify_git_storage_preflight(path)?;
         let output = git_command()
             .current_dir(path)
             .args([
@@ -110,6 +113,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    verify_git_storage_preflight(path)?;
     let output = git_command()
         .current_dir(path)
         .args(args)

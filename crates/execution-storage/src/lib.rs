@@ -9,11 +9,12 @@ mod model;
 
 pub use apfs::ApfsBackend;
 pub use command::{CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner};
-pub use journal::JournalStore;
+pub use journal::{JournalStore, SecureMetadataDirectory};
 pub use lvm::LvmBackend;
 pub use manager::{
     AllocationRequest, BackendCapability, DockerBindCapability, DockerBindVerifier,
-    ExecutionStorage, ExecutionStorageManager, StorageBackend, StorageCapability,
+    ExecutionStorage, ExecutionStorageManager, ReadyAllocationVerifier, StorageBackend,
+    StorageCapability, VerifiedExecutionStorage,
 };
 pub use model::{
     disk_gib_to_bytes, AllocationPhase, AllocationReceipt, BackendIdentity, BackendState,

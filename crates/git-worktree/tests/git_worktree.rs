@@ -1,5 +1,6 @@
 use execution_storage::{
-    AllocationReceipt, BackendIdentity, DockerBindProof, ALLOCATION_API_VERSION,
+    AllocationReceipt, BackendIdentity, DockerBindProof, ReadyAllocationVerifier, StorageError,
+    VerifiedExecutionStorage, ALLOCATION_API_VERSION,
 };
 use git_worktree::{
     GitWorktreeManager, SystemWorktreeFilesystem, WorktreeError, WorktreeFilesystem,
@@ -14,6 +15,35 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
+#[derive(Debug)]
+struct FakeReadyAllocationVerifier;
+
+#[derive(Debug)]
+struct FakeVerifiedExecutionStorage {
+    repository: PathBuf,
+}
+
+impl VerifiedExecutionStorage for FakeVerifiedExecutionStorage {
+    fn repository_path(&self) -> &Path {
+        &self.repository
+    }
+
+    fn verify(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+impl ReadyAllocationVerifier for FakeReadyAllocationVerifier {
+    fn verify_ready(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+        Ok(Box::new(FakeVerifiedExecutionStorage {
+            repository: receipt.mount_path.join("repository"),
+        }))
+    }
+}
+
 struct TestRepository {
     _temp: TempDir,
     path: PathBuf,
@@ -24,6 +54,7 @@ struct TestRepository {
 enum InjectedFailure {
     AlternateAfterClone,
     CloneAfterCopy,
+    CloneAndRollbackCreate,
     CloneAndRollbackRemove,
     FaultPoint(WorktreeFilesystemPoint),
     OwnerRecord,
@@ -71,6 +102,7 @@ impl WorktreeFilesystem for InjectedFilesystem {
             )?;
         }
         if self.take(InjectedFailure::CloneAfterCopy)
+            || self.is(InjectedFailure::CloneAndRollbackCreate)
             || self.is(InjectedFailure::CloneAndRollbackRemove)
         {
             Err(io::Error::from_raw_os_error(28))
@@ -100,7 +132,11 @@ impl WorktreeFilesystem for InjectedFilesystem {
     }
 
     fn create_repository_root(&self, path: &Path) -> io::Result<()> {
-        self.system.create_repository_root(path)
+        if self.take(InjectedFailure::CloneAndRollbackCreate) {
+            Err(io::Error::from_raw_os_error(28))
+        } else {
+            self.system.create_repository_root(path)
+        }
     }
 }
 
@@ -177,6 +213,16 @@ fn git_succeeds(current_dir: &Path, args: &[&str]) -> bool {
         .expect("run git command")
         .status
         .success()
+}
+
+#[cfg(unix)]
+fn real_git_program() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("Git executable on PATH")
+        .canonicalize()
+        .expect("canonical Git executable")
 }
 
 fn bounded_repository_root(state: &TempDir, execution_id: &str) -> PathBuf {
@@ -278,9 +324,10 @@ impl Deref for TestManager {
 
 fn manager(state: &TempDir, repository: &TestRepository) -> TestManager {
     TestManager {
-        inner: GitWorktreeManager::with_clone_base(
+        inner: GitWorktreeManager::with_clone_base_and_verifier(
             state.path(),
             repository.clone_base.to_str().expect("utf-8 clone base"),
+            Arc::new(FakeReadyAllocationVerifier),
         ),
         state_root: state.path().to_path_buf(),
     }
@@ -291,10 +338,11 @@ fn manager_with_filesystem(
     repository: &TestRepository,
     filesystem: Arc<dyn WorktreeFilesystem>,
 ) -> GitWorktreeManager {
-    GitWorktreeManager::with_clone_base_and_filesystem(
+    GitWorktreeManager::with_clone_base_filesystem_and_verifier(
         state.path(),
         repository.clone_base.to_str().expect("utf-8 clone base"),
         filesystem,
+        Arc::new(FakeReadyAllocationVerifier),
     )
 }
 
@@ -621,6 +669,34 @@ fn create_in_materializes_all_git_state_inside_the_bounded_repository_root() {
 }
 
 #[test]
+fn create_in_rejects_receipt_without_live_ready_verification() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = GitWorktreeManager::with_clone_base(
+        state.path(),
+        repository.clone_base.to_str().expect("utf-8 clone base"),
+    );
+    let execution_id = "project-11-unverified-01";
+    let labels = labels(execution_id, repository.canonical());
+    bounded_repository_root(&state, execution_id);
+    let receipt = allocation_receipt(state.path(), &labels);
+
+    let error = manager
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-unverified-01",
+            &receipt,
+        )
+        .expect_err("reject a structurally valid but unverified receipt");
+
+    assert!(matches!(error, WorktreeError::Ownership(_)));
+    assert_empty_repository_root(&state, execution_id);
+    assert!(!state.path().join("mirrors").exists());
+}
+
+#[test]
 fn create_in_rejects_storage_receipt_filesystem_identity_mismatch() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
@@ -817,9 +893,7 @@ fn clone_enospc_rolls_back_partial_repository_without_mutating_mirror() {
         )
         .expect_err("surface clone ENOSPC");
 
-    assert!(
-        matches!(error, WorktreeError::Create(message) if message.contains("28") || message.contains("space"))
-    );
+    assert!(matches!(error, WorktreeError::StorageFull(_)));
     assert!(root.is_dir());
     assert_eq!(
         std::fs::read_dir(&root)
@@ -837,6 +911,171 @@ fn clone_enospc_rolls_back_partial_repository_without_mutating_mirror() {
             &["for-each-ref", "--format=%(refname):%(objectname)"],
         ),
         refs_before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_git_clone_enospc_is_distinct_and_restart_recovers_partial_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const CHILD: &str = "AUTOSPEC_REAL_GIT_ENOSPC_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "real_git_clone_enospc_is_distinct_and_restart_recovers_partial_state",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated ENOSPC test");
+        assert!(
+            output.status.success(),
+            "ENOSPC child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    manager
+        .ensure_mirror(repository.canonical())
+        .expect("seed mirror before hostile PATH");
+    let execution_id = "project-11-real-enospc-01";
+    let labels = labels(execution_id, repository.canonical());
+    bounded_repository_root(&state, execution_id);
+    let receipt = allocation_receipt(state.path(), &labels);
+    let bin = tempfile::tempdir().expect("fake Git bin");
+    let wrapper = bin.path().join("git");
+    let real_git = real_git_program();
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = clone ]; then\n  for arg do destination=$arg; done\n  mkdir -p \"$destination/.git/objects/pack\"\n  echo 'fatal: write error: No space left on device' >&2\n  exit 28\nfi\nexec '{}' \"$@\"\n",
+            real_git.display()
+        ),
+    )
+    .expect("write Git wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+        .expect("make Git wrapper executable");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&original_path)),
+    )
+    .expect("wrapper PATH");
+    std::env::set_var("PATH", &path);
+
+    let error = manager
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-real-enospc-01",
+            &receipt,
+        )
+        .expect_err("surface real Git ENOSPC");
+    assert!(
+        matches!(error, WorktreeError::StorageFull(_)),
+        "unexpected error: {error:?}"
+    );
+    std::env::set_var("PATH", original_path);
+
+    let worktree = manager
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-real-enospc-01",
+            &receipt,
+        )
+        .expect("restart after exact rollback");
+    assert!(Path::new(&worktree.path).join(".git/objects").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_git_checkout_enospc_is_distinct_and_restart_recovers_partial_index() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const CHILD: &str = "AUTOSPEC_REAL_GIT_CHECKOUT_ENOSPC_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "real_git_checkout_enospc_is_distinct_and_restart_recovers_partial_index",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated checkout ENOSPC test");
+        assert!(
+            output.status.success(),
+            "checkout ENOSPC child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    manager
+        .ensure_mirror(repository.canonical())
+        .expect("seed mirror before hostile PATH");
+    let execution_id = "project-11-checkout-enospc";
+    let labels = labels(execution_id, repository.canonical());
+    let root = bounded_repository_root(&state, execution_id);
+    let receipt = allocation_receipt(state.path(), &labels);
+    let bin = tempfile::tempdir().expect("fake Git bin");
+    let wrapper = bin.path().join("git");
+    let real_git = real_git_program();
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncheckout=0\nfor arg do [ \"$arg\" = checkout ] && checkout=1; done\nif [ \"$checkout\" = 1 ]; then\n  printf partial > '{}/.git/index'\n  echo 'fatal: index write failed: No space left on device' >&2\n  exit 28\nfi\nexec '{}' \"$@\"\n",
+            root.display(),
+            real_git.display()
+        ),
+    )
+    .expect("write checkout Git wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+        .expect("make Git wrapper executable");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&original_path)),
+    )
+    .expect("wrapper PATH");
+    std::env::set_var("PATH", &path);
+
+    let error = manager
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-checkout-enospc",
+            &receipt,
+        )
+        .expect_err("surface real checkout ENOSPC");
+    assert!(matches!(error, WorktreeError::StorageFull(_)));
+    std::env::set_var("PATH", original_path);
+
+    let worktree = manager
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-checkout-enospc",
+            &receipt,
+        )
+        .expect("restart after partial index rollback");
+    assert_eq!(
+        git_output(Path::new(&worktree.path), &["branch", "--show-current"]),
+        "autospec/project-11-checkout-enospc"
     );
 }
 
@@ -861,9 +1100,7 @@ fn owner_record_enospc_rolls_back_cloned_repository() {
         )
         .expect_err("surface owner-record ENOSPC");
 
-    assert!(
-        matches!(error, WorktreeError::Create(message) if message.contains("28") || message.contains("space"))
-    );
+    assert!(matches!(error, WorktreeError::StorageFull(_)));
     assert!(root.is_dir());
     assert_eq!(
         std::fs::read_dir(&root)
@@ -883,6 +1120,7 @@ fn create_intent_recovers_partial_clone_after_restart() {
     let manager = manager_with_filesystem(&state, &repository, filesystem);
     let execution_id = "project-11-impl-09";
     let labels = labels(execution_id, repository.canonical());
+    let journaled_base = git_output(&repository.path, &["rev-parse", "HEAD"]);
     bounded_repository_root(&state, execution_id);
     let receipt = allocation_receipt(state.path(), &labels);
 
@@ -901,10 +1139,22 @@ fn create_intent_recovers_partial_clone_after_restart() {
     let value: Value = serde_json::from_slice(&std::fs::read(&intent).expect("read create intent"))
         .expect("parse create intent");
     assert_eq!(value["phase"], "cloning");
+    assert_eq!(value["base_sha"], journaled_base);
+    let temporary_intent = intent.with_file_name(format!(
+        "{}.tmp",
+        intent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("intent filename")
+    ));
+    std::fs::rename(&intent, &temporary_intent)
+        .expect("simulate crash after synced temporary intent");
+    repository.commit("upstream advanced after interrupted clone\n");
 
-    let restarted = GitWorktreeManager::with_clone_base(
+    let restarted = GitWorktreeManager::with_clone_base_and_verifier(
         state.path(),
         repository.clone_base.to_str().expect("utf-8 clone base"),
+        Arc::new(FakeReadyAllocationVerifier),
     );
     let worktree = restarted
         .create_in(
@@ -917,9 +1167,54 @@ fn create_intent_recovers_partial_clone_after_restart() {
         .expect("recover exact intent and recreate repository");
 
     assert!(!intent.exists());
+    assert!(!temporary_intent.exists());
+    assert_eq!(worktree.base_sha, journaled_base);
     assert!(Path::new(&worktree.path)
         .join(".autospec-owner.json")
         .is_file());
+}
+
+#[test]
+fn create_intent_recovers_when_prior_rollback_left_repository_absent() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let filesystem = Arc::new(InjectedFilesystem::new(
+        InjectedFailure::CloneAndRollbackCreate,
+    ));
+    let manager = manager_with_filesystem(&state, &repository, filesystem);
+    let execution_id = "project-11-impl-rollback-absent";
+    let labels = labels(execution_id, repository.canonical());
+    let root = bounded_repository_root(&state, execution_id);
+    let receipt = allocation_receipt(state.path(), &labels);
+
+    manager
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-impl-rollback-absent",
+            &receipt,
+        )
+        .expect_err("leave durable intent after recreate failure");
+    assert!(!root.exists());
+
+    let restarted = GitWorktreeManager::with_clone_base_and_verifier(
+        state.path(),
+        repository.clone_base.to_str().expect("utf-8 clone base"),
+        Arc::new(FakeReadyAllocationVerifier),
+    );
+    let worktree = restarted
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-impl-rollback-absent",
+            &receipt,
+        )
+        .expect("recover absent exact repository root");
+
+    assert_eq!(Path::new(&worktree.path), root);
+    assert!(root.join(".autospec-owner.json").is_file());
 }
 
 #[test]
@@ -955,7 +1250,7 @@ fn enospc_at_git_and_owner_commit_phases_rolls_back_exact_repository() {
 
         assert!(matches!(
             error,
-            WorktreeError::Create(_) | WorktreeError::Ownership(_)
+            WorktreeError::StorageFull(_) | WorktreeError::Ownership(_)
         ));
         assert_empty_repository_root(&state, &execution_id);
         assert!(!state

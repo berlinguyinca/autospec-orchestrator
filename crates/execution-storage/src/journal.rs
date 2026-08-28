@@ -2,7 +2,7 @@ use crate::{ExecutionLayout, PhaseJournal, StorageError};
 use orchestrator_core::ExecutionId;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufReader, BufWriter, Write},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -22,6 +22,99 @@ pub struct JournalStore {
     directory: PathBuf,
     state_root: PinnedDirectory,
     journal_directory: PinnedDirectory,
+}
+
+/// Owner-only, descriptor-pinned directory for small durable metadata records.
+#[derive(Debug, Clone)]
+pub struct SecureMetadataDirectory {
+    directory: PinnedDirectory,
+}
+
+impl SecureMetadataDirectory {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Ok(Self {
+            directory: PinnedDirectory::capture(path.as_ref(), "metadata directory")?,
+        })
+    }
+
+    pub fn create(&self, name: &str, bytes: &[u8]) -> Result<(), StorageError> {
+        self.reconcile(name)?;
+        if self.directory.child_metadata(name)?.is_some() {
+            return Err(StorageError::Journal(format!(
+                "metadata record already exists: {name}"
+            )));
+        }
+        let temporary = metadata_temporary_name(name)?;
+        let file = self.directory.create_file(&temporary)?;
+        write_bytes_and_sync(file, bytes, &self.directory.child_path(&temporary)?)?;
+        self.directory.rename(&temporary, name)?;
+        self.directory.sync()
+    }
+
+    pub fn replace(&self, name: &str, bytes: &[u8]) -> Result<(), StorageError> {
+        self.reconcile(name)?;
+        let current = self.directory.open_file(name)?;
+        let expected = current
+            .metadata()
+            .map_err(|error| journal_error("inspect", &self.directory.path, error))?;
+        let temporary = metadata_temporary_name(name)?;
+        let file = self.directory.create_file(&temporary)?;
+        write_bytes_and_sync(file, bytes, &self.directory.child_path(&temporary)?)?;
+        self.directory.verify_child(name, &expected)?;
+        self.directory.rename(&temporary, name)?;
+        self.directory.sync()
+    }
+
+    pub fn read(&self, name: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.reconcile(name)?;
+        if self.directory.child_metadata(name)?.is_none() {
+            return Ok(None);
+        }
+        let mut file = self.directory.open_file(name)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| journal_error("read", &self.directory.path, error))?;
+        self.directory.verify("metadata directory")?;
+        Ok(Some(bytes))
+    }
+
+    pub fn remove(&self, name: &str) -> Result<(), StorageError> {
+        self.reconcile(name)?;
+        let Some(_) = self.directory.child_metadata(name)? else {
+            return Ok(());
+        };
+        let file = self.directory.open_file(name)?;
+        let expected = file
+            .metadata()
+            .map_err(|error| journal_error("inspect", &self.directory.path, error))?;
+        let tombstone = metadata_removal_name(name)?;
+        self.directory.rename(name, &tombstone)?;
+        self.directory.verify_child(&tombstone, &expected)?;
+        self.directory.remove_file(&tombstone)?;
+        self.directory.sync()
+    }
+
+    fn reconcile(&self, name: &str) -> Result<(), StorageError> {
+        self.directory.verify("metadata directory")?;
+        let temporary = metadata_temporary_name(name)?;
+        let tombstone = metadata_removal_name(name)?;
+        if self.directory.child_metadata(&tombstone)?.is_some() {
+            self.directory.open_file(&tombstone)?;
+            self.directory.remove_file(&tombstone)?;
+            self.directory.sync()?;
+        }
+        if self.directory.child_metadata(&temporary)?.is_some() {
+            self.directory.open_file(&temporary)?;
+            if self.directory.child_metadata(name)?.is_some() {
+                self.directory.open_file(name)?;
+                self.directory.remove_file(&temporary)?;
+            } else {
+                self.directory.rename(&temporary, name)?;
+            }
+            self.directory.sync()?;
+        }
+        self.directory.verify("metadata directory")
+    }
 }
 
 impl JournalStore {
@@ -424,6 +517,33 @@ fn write_and_sync(file: File, journal: &PhaseJournal, path: &Path) -> Result<(),
         .get_ref()
         .sync_all()
         .map_err(|error| journal_error("fsync", path, error))
+}
+
+fn write_bytes_and_sync(mut file: File, bytes: &[u8], path: &Path) -> Result<(), StorageError> {
+    file.write_all(bytes)
+        .map_err(|error| journal_error("write", path, error))?;
+    file.sync_all()
+        .map_err(|error| journal_error("fsync", path, error))
+}
+
+fn metadata_temporary_name(name: &str) -> Result<String, StorageError> {
+    validate_metadata_name(name)?;
+    Ok(format!("{name}.tmp"))
+}
+
+fn metadata_removal_name(name: &str) -> Result<String, StorageError> {
+    validate_metadata_name(name)?;
+    Ok(format!("remove-{name}.tmp"))
+}
+
+fn validate_metadata_name(name: &str) -> Result<(), StorageError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        Err(StorageError::InvalidRequest(
+            "metadata record name is unsafe".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn require_real_directory(path: &Path, purpose: &str) -> Result<(), StorageError> {
