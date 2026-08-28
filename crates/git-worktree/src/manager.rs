@@ -53,6 +53,7 @@ impl WorktreeManager for GitWorktreeManager {
     fn ensure_mirror(&self, repo: &str) -> Result<String, WorktreeError> {
         fs::create_dir_all(self.mirrors_root())
             .map_err(|error| WorktreeError::Mirror(error.to_string()))?;
+        let clone_locator = self.clone_locator(repo)?;
         let mirror = self
             .mirrors_root()
             .join(format!("{}.git", normalized_repository_name(repo)?));
@@ -60,6 +61,21 @@ impl WorktreeManager for GitWorktreeManager {
         let _lock = FileLock::acquire(&lock_path)?;
 
         if mirror.exists() {
+            let actual_origin = git_stdout(
+                [
+                    OsStr::new("--git-dir"),
+                    mirror.as_os_str(),
+                    OsStr::new("remote"),
+                    OsStr::new("get-url"),
+                    OsStr::new("origin"),
+                ],
+                WorktreeError::Mirror,
+            )?;
+            if actual_origin != clone_locator {
+                return Err(WorktreeError::Mirror(format!(
+                    "mirror origin mismatch: expected {clone_locator}, found {actual_origin}"
+                )));
+            }
             run_git(
                 [
                     OsStr::new("--git-dir"),
@@ -71,7 +87,6 @@ impl WorktreeManager for GitWorktreeManager {
                 WorktreeError::Mirror,
             )?;
         } else {
-            let clone_locator = self.clone_locator(repo)?;
             run_git(
                 [
                     OsStr::new("clone"),
@@ -164,6 +179,7 @@ impl WorktreeManager for GitWorktreeManager {
             path: path.to_string_lossy().into_owned(),
             branch: branch.to_owned(),
             base_sha,
+            repository: repo.to_owned(),
         })
     }
 
@@ -374,6 +390,7 @@ fn is_safe_component(component: &str) -> bool {
     !component.is_empty()
         && component != "."
         && component != ".."
+        && !component.contains("__")
         && component
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))

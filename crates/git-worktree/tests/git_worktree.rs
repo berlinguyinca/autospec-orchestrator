@@ -130,6 +130,83 @@ fn mirror_uses_safe_owner_repo_name_and_refreshes() {
 }
 
 #[test]
+fn mirror_refuses_mismatched_existing_origin_without_fetching() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let mirror = manager
+        .ensure_mirror(repository.canonical())
+        .expect("create mirror");
+    let original_head = git_output(Path::new(&mirror), &["rev-parse", "HEAD"]);
+    let original_refs = git_output(
+        Path::new(&mirror),
+        &["for-each-ref", "--format=%(refname):%(objectname)"],
+    );
+
+    let impostor = repository.clone_base.join("impostor.git");
+    git(
+        repository.clone_base.as_path(),
+        &["init", impostor.to_str().expect("utf-8 impostor path")],
+    );
+    git(&impostor, &["config", "user.email", "tests@example.com"]);
+    git(&impostor, &["config", "user.name", "Autospec Tests"]);
+    std::fs::write(impostor.join("IMPOSTOR.md"), "wrong source\n").expect("write impostor file");
+    git(&impostor, &["add", "IMPOSTOR.md"]);
+    git(&impostor, &["commit", "-m", "impostor"]);
+    git(
+        Path::new(&mirror),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            impostor.to_str().expect("utf-8 impostor path"),
+        ],
+    );
+
+    let error = manager
+        .ensure_mirror(repository.canonical())
+        .expect_err("reject substituted mirror origin");
+
+    assert!(matches!(error, WorktreeError::Mirror(_)));
+    assert_eq!(
+        git_output(Path::new(&mirror), &["rev-parse", "HEAD"]),
+        original_head
+    );
+    assert_eq!(
+        git_output(
+            Path::new(&mirror),
+            &["for-each-ref", "--format=%(refname):%(objectname)"],
+        ),
+        original_refs
+    );
+}
+
+#[test]
+fn mirror_allows_single_underscores_in_canonical_components() {
+    let mut repository = TestRepository::new();
+    let underscored = repository
+        .clone_base
+        .join("single_owner/single_project.git");
+    std::fs::create_dir_all(underscored.parent().expect("underscored repository parent"))
+        .expect("create underscored repository parent");
+    std::fs::rename(&repository.path, &underscored).expect("move repository");
+    repository.path = underscored;
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+
+    let mirror = manager
+        .ensure_mirror("single_owner/single_project")
+        .expect("mirror canonical identity with single underscores");
+
+    assert_eq!(
+        Path::new(&mirror)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("single_owner__single_project.git")
+    );
+}
+
+#[test]
 fn create_places_owned_worktree_under_execution_id() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
@@ -151,6 +228,7 @@ fn create_places_owned_worktree_under_execution_id() {
         state.path().join("worktrees/project-11-impl-01")
     );
     assert_eq!(worktree.base_sha, base_sha);
+    assert_eq!(worktree.repository, repository.canonical());
     assert_eq!(
         git_output(Path::new(&worktree.path), &["branch", "--show-current"]),
         "autospec/project-11-impl-01"
@@ -331,6 +409,8 @@ fn mirror_rejects_noncanonical_repository_identity() {
         "/owner/project",
         "owner/project/extra",
         "owner/../project",
+        "owner__/project",
+        "owner/project__fork",
     ] {
         let error = manager
             .ensure_mirror(invalid)
@@ -421,6 +501,64 @@ fn capture_diff_refuses_owner_record_outside_execution_path() {
     let error = manager
         .capture_diff(&forged)
         .expect_err("reject owner record outside state root");
+
+    assert!(matches!(error, WorktreeError::Ownership(_)));
+}
+
+#[test]
+fn capture_diff_refuses_checked_out_branch_switch() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-impl-03", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-impl-03",
+        )
+        .expect("create worktree");
+    git(
+        Path::new(&worktree.path),
+        &["branch", "-m", "autospec/diff-switched-branch"],
+    );
+
+    let error = manager
+        .capture_diff(&worktree)
+        .expect_err("reject switched checkout branch");
+
+    assert!(matches!(error, WorktreeError::Ownership(_)));
+}
+
+#[test]
+fn capture_diff_refuses_tampered_owner_repository() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-impl-04", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-impl-04",
+        )
+        .expect("create worktree");
+    let owner_path = Path::new(&worktree.path).join(".autospec-owner.json");
+    let mut owner: Value =
+        serde_json::from_slice(&std::fs::read(&owner_path).expect("read owner record"))
+            .expect("parse owner record");
+    owner["labels"]["autospec.repository"] = Value::String("different/repository".to_owned());
+    std::fs::write(
+        owner_path,
+        serde_json::to_vec_pretty(&owner).expect("serialize owner record"),
+    )
+    .expect("tamper owner repository");
+
+    let error = manager
+        .capture_diff(&worktree)
+        .expect_err("reject tampered owner repository");
 
     assert!(matches!(error, WorktreeError::Ownership(_)));
 }
@@ -623,6 +761,39 @@ fn destroy_refuses_tampered_recorded_branch() {
 }
 
 #[test]
+fn destroy_refuses_tampered_owner_repository() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-14-impl-07", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-14-impl-07",
+        )
+        .expect("create worktree");
+    let owner_path = Path::new(&worktree.path).join(".autospec-owner.json");
+    let mut owner: Value =
+        serde_json::from_slice(&std::fs::read(&owner_path).expect("read owner record"))
+            .expect("parse owner record");
+    owner["labels"]["autospec.repository"] = Value::String("different/repository".to_owned());
+    std::fs::write(
+        owner_path,
+        serde_json::to_vec_pretty(&owner).expect("serialize owner record"),
+    )
+    .expect("tamper owner repository");
+
+    let error = manager
+        .destroy(&worktree)
+        .expect_err("refuse tampered owner repository");
+
+    assert!(matches!(error, WorktreeError::Ownership(_)));
+    assert!(Path::new(&worktree.path).is_dir());
+}
+
+#[test]
 fn find_stale_returns_owned_worktrees_not_in_live_set() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
@@ -656,6 +827,7 @@ fn find_stale_returns_owned_worktrees_not_in_live_set() {
     assert_eq!(stale[0].path, stale_worktree.path);
     assert_eq!(stale[0].branch, stale_worktree.branch);
     assert_eq!(stale[0].base_sha, stale_worktree.base_sha);
+    assert_eq!(stale[0].repository, repository.canonical());
 }
 
 #[test]

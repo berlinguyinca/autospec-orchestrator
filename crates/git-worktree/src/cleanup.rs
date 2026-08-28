@@ -157,6 +157,8 @@ fn verify_journal(
             == Some(worktree.execution_id.as_str())
         && journal.owner.base_sha == worktree.base_sha
         && journal.owner.branch == worktree.branch
+        && journal.owner.labels.get(REPOSITORY).map(String::as_str)
+            == Some(worktree.repository.as_str())
     {
         Ok(())
     } else {
@@ -275,11 +277,14 @@ pub(crate) fn find_stale(
                 path.display()
             )));
         }
+        let repository = required_label(&record, REPOSITORY)?.to_owned();
+        normalized_repository_name(&repository)?;
         stale.push(Worktree {
             execution_id,
             path: path.to_string_lossy().into_owned(),
             branch: record.branch,
             base_sha: record.base_sha,
+            repository,
         });
     }
     stale.sort_by(|left, right| left.execution_id.cmp(&right.execution_id));
@@ -310,6 +315,7 @@ fn verified_owner(path: &Path, worktree: &Worktree) -> Result<OwnerRecord, Workt
             == Some(worktree.execution_id.as_str())
         && record.base_sha == worktree.base_sha
         && record.branch == worktree.branch
+        && record.labels.get(REPOSITORY).map(String::as_str) == Some(worktree.repository.as_str())
     {
         Ok(record)
     } else {

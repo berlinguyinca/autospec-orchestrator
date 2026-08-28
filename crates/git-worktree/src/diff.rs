@@ -1,8 +1,7 @@
 use crate::cleanup::verified_path;
-use crate::manager::read_owner_record;
-use crate::manager::GitWorktreeManager;
+use crate::manager::{git_stdout, read_owner_record, GitWorktreeManager};
 use crate::{DiffCapture, Worktree, WorktreeError};
-use orchestrator_core::labels::{EXECUTION_ID, MANAGED};
+use orchestrator_core::labels::{EXECUTION_ID, MANAGED, REPOSITORY};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -20,8 +19,25 @@ pub(crate) fn capture(
             != Some(worktree.execution_id.as_str())
         || owner.base_sha != worktree.base_sha
         || owner.branch != worktree.branch
+        || owner.labels.get(REPOSITORY).map(String::as_str) != Some(worktree.repository.as_str())
     {
         return Err(WorktreeError::Ownership(worktree.path.clone()));
+    }
+    let current_branch = git_stdout(
+        [
+            OsStr::new("-C"),
+            path.as_os_str(),
+            OsStr::new("branch"),
+            OsStr::new("--show-current"),
+        ],
+        WorktreeError::Diff,
+    )?;
+    if current_branch != owner.branch {
+        return Err(WorktreeError::Ownership(format!(
+            "recorded branch {} does not match checkout {current_branch} at {}",
+            owner.branch,
+            path.display()
+        )));
     }
 
     let mut patch = git_success(

@@ -44,6 +44,7 @@ pub struct Worktree {
     pub path: String,
     pub branch: String,
     pub base_sha: String,
+    pub repository: String,
 }
 
 /// Manages the per-worker repository mirror cache and the worktrees carved from
