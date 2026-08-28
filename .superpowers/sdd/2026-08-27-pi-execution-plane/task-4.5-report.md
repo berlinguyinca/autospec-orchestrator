@@ -334,6 +334,59 @@ polling loops, or `du`/`df` accounting.
   subsequent full current and Rust 1.85 workspace runs both passed. The current
   integration now passes all 26 Pi harness tests on both toolchains.
 
+## Pi/runtime capability fix round 1
+
+- Added the neutral `VerifiedAgentContainer` runtime capability. Docker runtime
+  issues it only after inspecting the immutable created container ID, live
+  running state, exact ownership-label map, daemon identity, and exact
+  daemon-reported bind set. The proof includes canonical host sources,
+  container targets, and writability.
+- `PiHarnessConfig::for_ready_allocation` now requires that capability rather
+  than accepting an arbitrary container name. Before packet, owner, cursor, or
+  process mutation, the harness re-inspects Docker by immutable ID and requires
+  the same daemon, running container, labels, and mounts. It rejects any bind
+  outside the allocation root, any private session path other than
+  `conversation/`, and the Docker socket. It repeats the live proof immediately
+  before opening event/stderr output and launching Pi.
+- Added a real-Docker foreign-container regression. A running, identically
+  mounted but unlabeled replacement ID is rejected specifically by the live
+  ownership check; packet, owner, cursor, resume counter, and Pi body markers
+  remain absent.
+- Cleanup liveness now treats only the supervisor's explicit exit 0 as a
+  runnable group and exit 1 as zombie-only/absent. Wrapper, daemon, timeout, and
+  other control failures are uncertain rather than accidental proof of reap.
+- Uncertain startup or `ProcessRegistry::drop` cleanup transfers the Docker
+  client, trusted PGID/token authority, and `ReadyLease` to a fallible,
+  nonblocking quarantine reaper. A host-private journal is written before the
+  handoff; retries retain the lease until both the client and zombie-aware
+  process-group checks confirm death. If the retry thread cannot start or
+  receive, the authority is deliberately retained rather than releasing
+  storage.
+- Added startup and drop fault-injection tests whose Docker control commands
+  fail after Pi launch. Both prove release remains blocked while cleanup is
+  uncertain, then succeeds only after control recovers and no runnable Pi or
+  descendant remains.
+- Cursor initialization now writes the normalized absolute per-session live
+  event path only for an empty default. Every nonempty stored path must be byte-
+  for-byte equal to that exact path; legacy, relative, external, or alternate
+  normalized spellings fail before the referenced file is opened.
+- Implementation commit: `84e05c1`.
+
+### Fix-round verification
+
+- `cargo test -p harness-pi --test pi_harness -- --test-threads=1` — 30/30
+  production-shaped real-Docker tests passed without `--init`.
+- `cargo test -p runtime-docker --test docker_runtime
+  agent_mounts_only_writable_worktree_and_durable_conversation -- --nocapture`
+  — passed with immutable ID, daemon, label, and exact mount assertions.
+- Current toolchain: `cargo fmt --all -- --check`, `cargo build --workspace`,
+  `cargo test --workspace`, and
+  `cargo clippy --workspace --all-targets -- -D warnings` — passed, including
+  30 Pi, 18 runtime-Docker, 58 real-Git, and 4 Postgres tests.
+- Rust 1.85.0: full workspace build/test and warning-denied Clippy — passed with
+  the same Docker, Git, and Postgres integration suites.
+- `git diff --check` — passed.
+
 ## Remaining Integration Work
 
 - Round-2 filesystem finding 3 is not fully closed on macOS. The exact missing
