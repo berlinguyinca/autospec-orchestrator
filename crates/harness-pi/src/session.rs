@@ -24,9 +24,12 @@ pub(crate) const CONVERSATION_DIR: &str = "conversation";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
-const STARTUP_STABILITY_WINDOW: Duration = Duration::from_secs(5);
-const STARTUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(12);
-const SUPERVISOR: &str = r#"printf '{"type":"autospec_control","pgid":%s}\n' "$$"; exec "$@""#;
+const SUPERVISOR: &str = r#"token=$1
+shift
+printf '{"type":"autospec_control","token":"%s","pgid":%s}\n' "$token" "$$"
+IFS= read -r ack || exit 125
+[ "$ack" = "ACK $token" ] || exit 125
+exec "$@""#;
 const GROUP_HAS_RUNNABLE: &str = r#"target=$1
 for stat_file in /proc/[0-9]*/stat; do
   stat=$(cat "$stat_file" 2>/dev/null) || continue
@@ -198,7 +201,7 @@ pub(crate) fn spawn(
     );
     let mut command = Command::new(&harness.config.docker_binary);
     command
-        .args(["exec", "--env"])
+        .args(["exec", "--interactive", "--env"])
         .arg(format!("AUTOSPEC_SUPERVISOR_TOKEN={supervisor_token}"))
         .args(["--workdir", CONTAINER_WORKTREE])
         .arg(&harness.config.agent_container)
@@ -209,9 +212,10 @@ pub(crate) fn spawn(
             SUPERVISOR,
             "autospec-pi-supervisor",
         ])
+        .arg(&supervisor_token)
         .arg(&harness.config.pi_executable)
         .args(pi_args)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(stderr);
     let mut child = command.spawn().map_err(|error| {
@@ -225,16 +229,15 @@ pub(crate) fn spawn(
         .stdout
         .take()
         .ok_or_else(|| HarnessError::Start("docker exec stdout was not piped".to_owned()))?;
+    let mut supervisor_input = child
+        .stdin
+        .take()
+        .ok_or_else(|| HarnessError::Start("docker exec stdin was not piped".to_owned()))?;
     let (control_tx, control_rx) = mpsc::sync_channel(1);
     let pump_docker = harness.config.docker_binary.clone();
     let pump_container = harness.config.agent_container.clone();
-    let mut event_thread = thread::Builder::new().name(format!("pi-events-{}", session.id));
-    if let Some(stack_size) = harness.config.event_thread_stack_size {
-        event_thread = event_thread.stack_size(stack_size);
-    }
-    if !harness.config.event_thread_spawn_delay.is_zero() {
-        thread::sleep(harness.config.event_thread_spawn_delay);
-    }
+    let expected_supervisor_token = supervisor_token.clone();
+    let event_thread = thread::Builder::new().name(format!("pi-events-{}", session.id));
     if let Err(error) = event_thread.spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut header = String::new();
@@ -245,7 +248,7 @@ pub(crate) fn spawn(
                 if length == 0 {
                     Err("supervisor exited before its control record".to_owned())
                 } else {
-                    parse_supervisor_header(&header)
+                    parse_supervisor_header(&header, &expected_supervisor_token)
                 }
             });
         let valid = control.is_ok();
@@ -266,28 +269,42 @@ pub(crate) fn spawn(
             let _ = events.flush();
         }
     }) {
+        drop(supervisor_input);
         cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
         return Err(HarnessError::Start(error.to_string()));
     }
     let pgid = match control_rx.recv_timeout(SUPERVISOR_HEADER_TIMEOUT) {
         Ok(Ok(pgid)) => pgid,
         Ok(Err(error)) => {
+            drop(supervisor_input);
             cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
             return Err(HarnessError::Start(error));
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
+            drop(supervisor_input);
             cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
             return Err(HarnessError::Start(
                 "timed out waiting for trusted Pi supervisor control record".to_owned(),
             ));
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
+            drop(supervisor_input);
             cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
             return Err(HarnessError::Start(
                 "Pi supervisor control channel disconnected".to_owned(),
             ));
         }
     };
+    if let Err(error) =
+        writeln!(supervisor_input, "ACK {supervisor_token}").and_then(|()| supervisor_input.flush())
+    {
+        drop(supervisor_input);
+        cleanup_failed_start(harness, &supervisor_token, Some(pgid), &mut child)?;
+        return Err(HarnessError::Start(format!(
+            "failed to acknowledge Pi supervisor: {error}"
+        )));
+    }
+    drop(supervisor_input);
     children.insert(
         session.id.to_string(),
         Arc::new(ManagedProcess {
@@ -528,32 +545,12 @@ fn cleanup_container_authority(
     if let Some(pgid) = pgid {
         return cleanup_process_groups(docker_binary, container, &[pgid]);
     }
-    cleanup_token_authority_stable(docker_binary, container, token)
-}
-
-fn cleanup_token_authority_stable(
-    docker_binary: &Path,
-    container: &str,
-    token: &str,
-) -> Result<(), HarnessError> {
-    let deadline = Instant::now() + STARTUP_CLEANUP_TIMEOUT;
-    let mut stable_since = None;
-    while Instant::now() < deadline {
-        let pgids = derive_token_pgids(docker_binary, container, token)?;
-        if pgids.is_empty() {
-            let since = stable_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= STARTUP_STABILITY_WINDOW {
-                return Ok(());
-            }
-        } else {
-            stable_since = None;
-            cleanup_process_groups(docker_binary, container, &pgids)?;
-        }
-        thread::sleep(Duration::from_millis(20));
+    let pgids = derive_token_pgids(docker_binary, container, token)?;
+    if pgids.is_empty() {
+        Ok(())
+    } else {
+        cleanup_process_groups(docker_binary, container, &pgids)
     }
-    Err(HarnessError::Crashed(
-        "startup cleanup did not reach a stable token-free window".to_owned(),
-    ))
 }
 
 fn cleanup_process_groups(
@@ -751,13 +748,17 @@ fn terminate_host_child(
 struct SupervisorControl {
     #[serde(rename = "type")]
     record_type: String,
+    token: String,
     pgid: u32,
 }
 
-fn parse_supervisor_header(header: &str) -> Result<u32, String> {
+fn parse_supervisor_header(header: &str, expected_token: &str) -> Result<u32, String> {
     let control: SupervisorControl = serde_json::from_str(header)
         .map_err(|error| format!("invalid supervisor header: {error}"))?;
-    if control.record_type != "autospec_control" || control.pgid == 0 {
+    if control.record_type != "autospec_control"
+        || control.token != expected_token
+        || control.pgid == 0
+    {
         return Err("invalid supervisor control record".to_owned());
     }
     Ok(control.pgid)

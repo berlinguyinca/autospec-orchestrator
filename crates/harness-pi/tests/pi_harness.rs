@@ -146,8 +146,6 @@ impl DockerPi {
             tools: vec!["read".to_owned(), "bash".to_owned(), "edit".to_owned()],
             skills: vec![],
             stop_timeout: Duration::from_millis(250),
-            event_thread_stack_size: None,
-            event_thread_spawn_delay: Duration::ZERO,
         })
     }
 
@@ -189,10 +187,10 @@ impl DockerPi {
             format!(
                 r#"#!/bin/sh
 real_docker={docker:?}
-case "$1 $2 $3" in
-  "exec --env AUTOSPEC_SUPERVISOR_TOKEN="*)
-    (trap '' HUP TERM; sleep 0.4; command=$1; shift; exec "$real_docker" "$command" --detach "$@") </dev/null >/dev/null 2>&1 &
-    wait $!
+case "$1 $2 $3 $4" in
+  "exec --interactive --env AUTOSPEC_SUPERVISOR_TOKEN="*)
+    sleep 0.4
+    exec "$real_docker" "$@"
     ;;
   *) exec "$real_docker" "$@" ;;
 esac
@@ -526,22 +524,33 @@ async fn supervisor_header_timeout_reaps_started_pi_and_descendant() {
 }
 
 #[tokio::test]
-async fn reader_thread_spawn_failure_reaps_a_delayed_in_container_process_group() {
+async fn delayed_reader_failure_cannot_release_a_pi_body() {
     let Some(fixture) = DockerPi::create() else {
         return;
     };
     fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
+    fs::write(
+        fixture.root.path().join("worktree/handshake-read-error"),
+        "",
+    )
+    .unwrap();
     let mut config = fixture.harness().config().clone();
     config.docker_binary = fixture.delayed_docker_wrapper();
-    config.event_thread_stack_size = Some(1usize << 50);
-    config.event_thread_spawn_delay = Duration::from_millis(100);
     let harness = PiHarness::new(config);
     let started = Instant::now();
     let result = harness.start(&packet()).await;
-    let pgid = wait_for_pi_pgid(&fixture).await;
     assert!(matches!(result.unwrap_err(), HarnessError::Start(_)));
     assert!(started.elapsed() >= Duration::from_millis(400));
     assert!(started.elapsed() < Duration::from_secs(20));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("worktree/pi-body-started")
+            .exists(),
+        "Pi body executed after host startup failure"
+    );
     assert!(
         !pi_is_alive(&fixture),
         "delayed Pi survived cleanup: {}",
@@ -553,7 +562,6 @@ async fn reader_thread_spawn_failure_reaps_a_delayed_in_container_process_group(
                 .stdout
         )
     );
-    assert_zombie_only_group(&fixture, pgid);
 }
 
 async fn startup_handshake_failure_reaps(failure: &str) {
@@ -794,6 +802,7 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
+printf 'started\n' > /workspace/pi-body-started
 stat=$(cat /proc/$$/stat)
 rest=${stat##*) }
 set -- $rest
@@ -832,16 +841,33 @@ while :; do sleep 0.05; done
 
 const STUB_SETSID: &str = r#"#!/bin/sh
 if [ -f /workspace/handshake-invalid ]; then
-  shift 4
-  exec /usr/bin/setsid /bin/sh -c 'printf "not-json\n"; exec "$@"' injected "$@"
+  shift 5
+  exec /usr/bin/setsid /bin/sh -c '
+    stat=$(cat /proc/$$/stat); rest=${stat##*) }; set -- $rest; printf "%s\n" "$3" > /session/test-pgid
+    (trap "" TERM; while :; do sleep 0.05; done) &
+    printf "not-json\n"
+    IFS= read -r ignored || exit 125
+    exit 125
+  ' injected "$@"
 fi
 if [ -f /workspace/handshake-read-error ]; then
-  shift 4
-  exec /usr/bin/setsid /bin/sh -c 'printf "\377\n"; exec "$@"' injected "$@"
+  shift 5
+  exec /usr/bin/setsid /bin/sh -c '
+    stat=$(cat /proc/$$/stat); rest=${stat##*) }; set -- $rest; printf "%s\n" "$3" > /session/test-pgid
+    (trap "" TERM; while :; do sleep 0.05; done) &
+    printf "\377\n"
+    IFS= read -r ignored || exit 125
+    exit 125
+  ' injected "$@"
 fi
 if [ -f /workspace/handshake-timeout ]; then
-  shift 4
-  exec /usr/bin/setsid /bin/sh -c 'exec "$@" >/dev/null' injected "$@"
+  shift 5
+  exec /usr/bin/setsid /bin/sh -c '
+    stat=$(cat /proc/$$/stat); rest=${stat##*) }; set -- $rest; printf "%s\n" "$3" > /session/test-pgid
+    (trap "" TERM; while :; do sleep 0.05; done) &
+    IFS= read -r ignored || exit 125
+    exit 125
+  ' injected "$@"
 fi
 exec /usr/bin/setsid "$@"
 "#;
