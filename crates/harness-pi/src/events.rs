@@ -68,8 +68,9 @@ pub(crate) fn poll_events(
             HarnessError::InvalidSession(format!("invalid complete Pi JSONL record: {error}"))
         })?;
         match normalize(session, &record) {
-            Some(event) => events.push(event),
-            None => {
+            Normalized::Event(event) => events.push(event),
+            Normalized::KnownIgnored => {}
+            Normalized::Unknown => {
                 unknown += 1;
                 tracing::debug!(
                     execution_id = %session.execution_id,
@@ -87,10 +88,18 @@ pub(crate) fn poll_events(
     Ok(events)
 }
 
-fn normalize(session: &SessionRef, record: &Value) -> Option<ExecutionEvent> {
-    let record_type = record.get("type")?.as_str()?;
+enum Normalized {
+    Event(ExecutionEvent),
+    KnownIgnored,
+    Unknown,
+}
+
+fn normalize(session: &SessionRef, record: &Value) -> Normalized {
+    let Some(record_type) = record.get("type").and_then(Value::as_str) else {
+        return Normalized::Unknown;
+    };
     let (state, kind) = match record_type {
-        "session" | "turn_start" | "agent_start" => (
+        "agent_start" => (
             ExecutionState::Running,
             ExecutionEventKind::AgentStarted {
                 session_id: SessionId::new(session.id.to_string()),
@@ -105,7 +114,7 @@ fn normalize(session: &SessionRef, record: &Value) -> Option<ExecutionEvent> {
                 failure: FailureClass::ModelFailed,
             },
         ),
-        "message" if is_model_error(record) => (
+        "message_end" | "message" if is_model_error(record) => (
             ExecutionState::Failed,
             ExecutionEventKind::ExecutionFailed {
                 failure: FailureClass::ModelFailed,
@@ -114,9 +123,31 @@ fn normalize(session: &SessionRef, record: &Value) -> Option<ExecutionEvent> {
         "tool_execution_start" if is_test_tool(record) => {
             (ExecutionState::Running, ExecutionEventKind::TestsStarted)
         }
-        _ => return None,
+        "session"
+        | "turn_start"
+        | "turn_end"
+        | "agent_end"
+        | "message_start"
+        | "message_update"
+        | "message_end"
+        | "tool_execution_start"
+        | "tool_execution_update"
+        | "tool_execution_end"
+        | "queue_update"
+        | "compaction_start"
+        | "compaction_end"
+        | "entry_appended"
+        | "session_info_changed"
+        | "thinking_level_changed"
+        | "auto_retry_start"
+        | "auto_retry_end"
+        | "summarization_retry_scheduled"
+        | "summarization_retry_attempt_start"
+        | "summarization_retry_finished"
+        | "bash_execution_update" => return Normalized::KnownIgnored,
+        _ => return Normalized::Unknown,
     };
-    Some(ExecutionEvent {
+    Normalized::Event(ExecutionEvent {
         execution_id: session.execution_id.clone(),
         attempt_id: None,
         sequence: 0,

@@ -64,9 +64,16 @@ impl PiHarnessConfig {
 
 #[derive(Debug)]
 struct ProcessRegistry {
-    children: Mutex<HashMap<String, Arc<Mutex<Child>>>>,
+    children: Mutex<HashMap<String, Arc<ManagedProcess>>>,
     docker_binary: PathBuf,
     agent_container: String,
+    stop_timeout: Duration,
+}
+
+#[derive(Debug)]
+struct ManagedProcess {
+    child: Mutex<Child>,
+    pgid: u32,
 }
 
 impl Drop for ProcessRegistry {
@@ -74,16 +81,13 @@ impl Drop for ProcessRegistry {
         let Ok(children) = self.children.get_mut() else {
             return;
         };
-        for (session_id, child) in children.iter() {
-            let _ = session::signal_container_group(
+        for process in children.values() {
+            session::terminate_on_drop(
                 &self.docker_binary,
                 &self.agent_container,
-                session_id,
-                "KILL",
+                process,
+                self.stop_timeout,
             );
-            if let Ok(mut child) = child.lock() {
-                let _ = child.wait();
-            }
         }
     }
 }
@@ -99,12 +103,14 @@ impl PiHarness {
     pub fn new(config: PiHarnessConfig) -> Self {
         let docker_binary = config.docker_binary.clone();
         let agent_container = config.agent_container.clone();
+        let stop_timeout = config.stop_timeout;
         Self {
             config,
             processes: Arc::new(ProcessRegistry {
                 children: Mutex::new(HashMap::new()),
                 docker_binary,
                 agent_container,
+                stop_timeout,
             }),
             unknown_events: Arc::new(AtomicU64::new(0)),
         }

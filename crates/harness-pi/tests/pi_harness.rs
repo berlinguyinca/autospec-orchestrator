@@ -63,6 +63,11 @@ impl DockerPi {
         fs::create_dir_all(&session).unwrap();
         fs::write(worktree.join("AGENTS.md"), "Stay scoped.\n").unwrap();
         fs::write(worktree.join("role.md"), "Implement.\n").unwrap();
+        fs::write(
+            worktree.join("pi-json-events.jsonl"),
+            include_str!("fixtures/pi-0.84.3-json-mode.jsonl"),
+        )
+        .unwrap();
         let stub = root.path().join("pi");
         fs::write(&stub, STUB_PI).unwrap();
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
@@ -179,17 +184,27 @@ async fn wait_for_content(path: &Path, needle: &str) -> String {
     panic!("timed out waiting for {needle:?} in {}", path.display());
 }
 
-fn group_is_alive(fixture: &DockerPi) -> bool {
+async fn wait_for_length_greater_than(path: &Path, previous: u64) {
+    for _ in 0..200 {
+        if fs::metadata(path).is_ok_and(|metadata| metadata.len() > previous) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "timed out waiting for {} to grow past {previous} bytes",
+        path.display()
+    );
+}
+
+fn pi_is_alive(fixture: &DockerPi) -> bool {
     Command::new("docker")
-        .args([
-            "exec",
-            &fixture.container,
-            "/session/.pi-control",
-            "CHECK",
-            &format!("/session/pi-process-{}", fixture.execution_id),
-        ])
-        .status()
-        .is_ok_and(|status| status.success())
+        .args(["top", &fixture.container, "-eo", "pid,pgid,args"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("/usr/local/bin/pi")
+        })
 }
 
 #[tokio::test]
@@ -230,13 +245,28 @@ async fn live_event_stdout_is_incremental_and_distinct_from_durable_conversation
         .join(format!("pi.events-{}.jsonl", fixture.execution_id));
     wait_for_content(&events_path, "future_pi_record").await;
     let first = harness.poll_events(&session).await.unwrap();
-    assert_eq!(first.len(), 2);
+    assert_eq!(first.len(), 4);
     assert!(matches!(
         first[0].kind,
         ExecutionEventKind::AgentStarted { .. }
     ));
-    assert!(matches!(first[1].kind, ExecutionEventKind::TestsStarted));
+    assert!(matches!(first[1].kind, ExecutionEventKind::ReviewReady));
+    assert!(matches!(
+        first[2].kind,
+        ExecutionEventKind::ExecutionFailed {
+            failure: FailureClass::ModelFailed
+        }
+    ));
+    assert!(matches!(
+        first[3].kind,
+        ExecutionEventKind::ExecutionFailed {
+            failure: FailureClass::ModelFailed
+        }
+    ));
     assert_eq!(harness.unknown_event_count(), 1);
+    let live_jsonl = fs::read_to_string(&events_path).unwrap();
+    assert!(live_jsonl.starts_with("{\"type\":\"session\""));
+    assert!(!live_jsonl.contains("autospec_control"));
     assert!(harness.poll_events(&session).await.unwrap().is_empty());
     write!(
         fs::OpenOptions::new()
@@ -303,8 +333,8 @@ async fn empty_session_resumes_via_fresh_packet_without_resetting_event_cursor()
     let events_path = fixture
         .session_dir()
         .join(format!("pi.events-{}.jsonl", fixture.execution_id));
-    wait_for_content(&events_path, "turn_start").await;
-    assert_eq!(harness.poll_events(&session).await.unwrap().len(), 2);
+    wait_for_content(&events_path, "future_pi_record").await;
+    assert_eq!(harness.poll_events(&session).await.unwrap().len(), 4);
     harness.stop(&session).await.unwrap();
     fs::write(
         fixture
@@ -313,6 +343,7 @@ async fn empty_session_resumes_via_fresh_packet_without_resetting_event_cursor()
         "",
     )
     .unwrap();
+    let delivered_length = fs::metadata(&events_path).unwrap().len();
     harness.resume(&session).await.unwrap();
     let args = wait_for_content(
         &fixture.session_dir().join("arguments"),
@@ -321,7 +352,8 @@ async fn empty_session_resumes_via_fresh_packet_without_resetting_event_cursor()
     .await;
     assert!(args.contains(&format!("--session-id {}", fixture.execution_id)));
     assert!(!args.contains("Continue from the persisted session"));
-    assert_eq!(harness.poll_events(&session).await.unwrap().len(), 2);
+    wait_for_length_greater_than(&events_path, delivered_length).await;
+    assert_eq!(harness.poll_events(&session).await.unwrap().len(), 4);
     assert!(harness.poll_events(&session).await.unwrap().is_empty());
     harness.stop(&session).await.unwrap();
 }
@@ -369,37 +401,80 @@ async fn stop_duplicate_and_drop_terminate_the_in_container_process_group() {
     };
     let harness = fixture.harness();
     let session = harness.start(&packet()).await.unwrap();
-    wait_for_content(
-        &fixture
-            .session_dir()
-            .join(format!("pi-process-{}", fixture.execution_id)),
-        "pgid",
-    )
-    .await;
-    assert!(group_is_alive(&fixture));
+    wait_for_content(&fixture.session_dir().join("arguments"), "--mode json").await;
+    assert!(pi_is_alive(&fixture));
     assert!(matches!(
         harness.start(&packet()).await.unwrap_err(),
         HarnessError::Start(_)
     ));
-    assert!(group_is_alive(&fixture));
+    assert!(pi_is_alive(&fixture));
     fs::write(fixture.session_dir().join("ignore-term"), "").unwrap();
     let started = Instant::now();
     harness.stop(&session).await.unwrap();
-    assert!(started.elapsed() <= Duration::from_secs(2));
-    assert!(!group_is_alive(&fixture));
+    assert!(started.elapsed() <= Duration::from_secs(5));
+    assert!(!pi_is_alive(&fixture));
 
     fs::remove_file(fixture.session_dir().join("ignore-term")).unwrap();
     harness.resume(&session).await.unwrap();
-    wait_for_content(
-        &fixture
-            .session_dir()
-            .join(format!("pi-process-{}", fixture.execution_id)),
-        "pgid",
-    )
-    .await;
-    assert!(group_is_alive(&fixture));
+    wait_for_content(&fixture.session_dir().join("arguments"), "--mode json").await;
+    assert!(pi_is_alive(&fixture));
     drop(harness);
-    assert!(!group_is_alive(&fixture));
+    assert!(!pi_is_alive(&fixture));
+}
+
+#[tokio::test]
+async fn pi_cannot_replace_supervisor_control_state() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.root.path().join("worktree/forge-control"), "").unwrap();
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    wait_for_content(&fixture.session_dir().join("pi-process-forged"), "999999").await;
+    harness.stop(&session).await.unwrap();
+    assert!(!pi_is_alive(&fixture));
+    assert!(!fixture.session_dir().join(".pi-launch").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.session_dir().join(".pi-control")).unwrap(),
+        "#!/bin/sh\nexit 0\n"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            fixture
+                .session_dir()
+                .join(format!("pi-process-{}", fixture.execution_id))
+        )
+        .unwrap(),
+        "{\"pgid\":999999}\n"
+    );
+}
+
+#[tokio::test]
+async fn drop_is_bounded_when_a_descendant_ignores_term_and_pi_forges_control_files() {
+    let Some(mut fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.root.path().join("worktree/forge-control"), "").unwrap();
+    fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
+    let harness = fixture.harness();
+    harness.start(&packet()).await.unwrap();
+    wait_for_content(&fixture.session_dir().join("pi-process-forged"), "999999").await;
+
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let drop_thread = std::thread::spawn(move || {
+        drop(harness);
+        let _ = finished_tx.send(());
+    });
+    let bounded = finished_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    if !bounded {
+        fixture.remove_container();
+    }
+    drop_thread.join().unwrap();
+    assert!(
+        bounded,
+        "ProcessRegistry::drop exceeded its five-second bound"
+    );
+    assert!(!pi_is_alive(&fixture));
 }
 
 #[tokio::test]
@@ -449,9 +524,16 @@ session_file="$session_dir/session_${session_id}.jsonl"
 if [ ! -s "$session_file" ]; then
   printf '{"type":"session","version":3,"id":"%s","timestamp":"2026-08-28T00:00:00Z","cwd":"/workspace"}\n' "$session_id" > "$session_file"
 fi
-printf '{"type":"turn_start"}\n'
-printf '{"type":"test_run"}\n'
-printf '{"type":"future_pi_record","prompt":"never-log-this"}\n'
+cat /workspace/pi-json-events.jsonl
+if [ -f /workspace/forge-control ]; then
+  printf '#!/bin/sh\nexit 0\n' > "$session_dir/.pi-control"
+  chmod 755 "$session_dir/.pi-control"
+  printf '{"pgid":999999}\n' > "$session_dir/pi-process-${session_id}"
+  printf '999999\n' > "$session_dir/pi-process-forged"
+fi
+if [ -f /workspace/hung-descendant ]; then
+  (trap '' TERM; while :; do sleep 0.05; done) &
+fi
 trap 'if [ -f "$session_dir/ignore-term" ]; then :; else exit 0; fi' TERM
 while :; do sleep 0.05; done
 "#;

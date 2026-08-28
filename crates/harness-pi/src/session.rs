@@ -1,13 +1,14 @@
-use crate::PiHarness;
+use crate::{ManagedProcess, PiHarness};
 use harness_traits::{HarnessError, SessionRef};
 use orchestrator_core::{ModelPolicy, SessionId, TaskPacket};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    process::{Command, ExitStatus, Stdio},
+    sync::{mpsc, Arc},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -16,8 +17,10 @@ pub(crate) const CURSOR_FILE: &str = ".cursor";
 pub(crate) const RESUME_COUNT_FILE: &str = "resume-count";
 pub(crate) const CONTAINER_WORKTREE: &str = "/workspace";
 pub(crate) const CONTAINER_SESSION: &str = "/session";
-const LAUNCHER_FILE: &str = ".pi-launch";
-const CONTROL_FILE: &str = ".pi-control";
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+const SUPERVISOR_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
+const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const SUPERVISOR: &str = r#"printf '{"type":"autospec_control","pgid":%s}\n' "$$"; exec "$@""#;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionOwner {
@@ -52,8 +55,6 @@ pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionR
     )?;
     write_once(&session_dir.join(CURSOR_FILE), b"{}\n")?;
     write_once(&session_dir.join(RESUME_COUNT_FILE), b"0\n")?;
-    materialize_process_scripts(&session_dir)?;
-
     let session = SessionRef {
         id: session_id,
         path: session_dir.display().to_string(),
@@ -158,58 +159,114 @@ pub(crate) fn spawn(
         .append(true)
         .open(session_dir.join(format!("pi.stderr-{}.log", session.id)))
         .map_err(io_error)?;
-    let record = container_process_record(session.id.as_str());
-    let host_record = host_process_record(session);
-    if host_record.exists() {
-        fs::remove_file(&host_record).map_err(io_error)?;
-    }
     let mut command = Command::new(&harness.config.docker_binary);
     command
         .args(["exec", "--workdir", CONTAINER_WORKTREE])
         .arg(&harness.config.agent_container)
-        .args([format!("{CONTAINER_SESSION}/{LAUNCHER_FILE}"), record])
+        .args([
+            "setsid",
+            "/bin/sh",
+            "-c",
+            SUPERVISOR,
+            "autospec-pi-supervisor",
+        ])
         .arg(&harness.config.pi_executable)
         .args(pi_args)
         .stdin(Stdio::null())
-        .stdout(events)
+        .stdout(Stdio::piped())
         .stderr(stderr);
-    let child = command.spawn().map_err(|error| {
+    let mut child = command.spawn().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             HarnessError::NotInstalled(harness.config.docker_binary.display().to_string())
         } else {
             HarnessError::Start(error.to_string())
         }
     })?;
-    children.insert(session.id.to_string(), Arc::new(Mutex::new(child)));
-    drop(children);
-    wait_for_process_record(harness, session)
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HarnessError::Start("docker exec stdout was not piped".to_owned()))?;
+    let (control_tx, control_rx) = mpsc::sync_channel(1);
+    if let Err(error) = thread::Builder::new()
+        .name(format!("pi-events-{}", session.id))
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut header = String::new();
+            let control = reader
+                .read_line(&mut header)
+                .map_err(|error| error.to_string())
+                .and_then(|length| {
+                    if length == 0 {
+                        Err("supervisor exited before its control record".to_owned())
+                    } else {
+                        parse_supervisor_header(&header)
+                    }
+                });
+            let valid = control.is_ok();
+            if control_tx.send(control).is_ok() && valid {
+                let mut events = events;
+                let _ = io::copy(&mut reader, &mut events);
+                let _ = events.flush();
+            }
+        })
+    {
+        terminate_host_child(&mut child, CONTROL_TIMEOUT);
+        return Err(HarnessError::Start(error.to_string()));
+    }
+    let pgid = match control_rx.recv_timeout(SUPERVISOR_HEADER_TIMEOUT) {
+        Ok(Ok(pgid)) => pgid,
+        Ok(Err(error)) => {
+            terminate_host_child(&mut child, CONTROL_TIMEOUT);
+            return Err(HarnessError::Start(error));
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            terminate_host_child(&mut child, CONTROL_TIMEOUT);
+            return Err(HarnessError::Start(
+                "timed out waiting for trusted Pi supervisor control record".to_owned(),
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            terminate_host_child(&mut child, CONTROL_TIMEOUT);
+            return Err(HarnessError::Start(
+                "Pi supervisor control channel disconnected".to_owned(),
+            ));
+        }
+    };
+    children.insert(
+        session.id.to_string(),
+        Arc::new(ManagedProcess {
+            child: std::sync::Mutex::new(child),
+            pgid,
+        }),
+    );
+    Ok(())
 }
 
 pub(crate) async fn stop(harness: &PiHarness, session: &SessionRef) -> Result<(), HarnessError> {
-    let child = harness
+    let process = harness
         .processes
         .children
         .lock()
         .map_err(|_| HarnessError::Crashed("process registry lock poisoned".to_owned()))?
         .get(session.id.as_str())
         .cloned();
-    let Some(child) = child else {
+    let Some(process) = process else {
         return Ok(());
     };
-    if process_reaped(harness, session, &child)? {
-        remove_registered_child(harness, session, &child)?;
+    if process_reaped(harness, &process)? {
+        remove_registered_child(harness, session, &process)?;
         return Ok(());
     }
     signal_container_group(
         &harness.config.docker_binary,
         &harness.config.agent_container,
-        session.id.as_str(),
+        process.pgid,
         "TERM",
     )?;
     let deadline = Instant::now() + harness.config.stop_timeout;
     while Instant::now() < deadline {
-        if process_reaped(harness, session, &child)? {
-            remove_registered_child(harness, session, &child)?;
+        if process_reaped(harness, &process)? {
+            remove_registered_child(harness, session, &process)?;
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -217,13 +274,13 @@ pub(crate) async fn stop(harness: &PiHarness, session: &SessionRef) -> Result<()
     signal_container_group(
         &harness.config.docker_binary,
         &harness.config.agent_container,
-        session.id.as_str(),
+        process.pgid,
         "KILL",
     )?;
-    let kill_deadline = Instant::now() + Duration::from_secs(1);
+    let kill_deadline = Instant::now() + KILL_REAP_TIMEOUT;
     while Instant::now() < kill_deadline {
-        if process_reaped(harness, session, &child)? {
-            remove_registered_child(harness, session, &child)?;
+        if process_reaped(harness, &process)? {
+            remove_registered_child(harness, session, &process)?;
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -234,24 +291,21 @@ pub(crate) async fn stop(harness: &PiHarness, session: &SessionRef) -> Result<()
     )))
 }
 
-fn process_reaped(
-    harness: &PiHarness,
-    session: &SessionRef,
-    child: &Arc<Mutex<std::process::Child>>,
-) -> Result<bool, HarnessError> {
-    let child_exited = child
+fn process_reaped(harness: &PiHarness, process: &ManagedProcess) -> Result<bool, HarnessError> {
+    let child_exited = process
+        .child
         .lock()
         .map_err(|_| HarnessError::Crashed("Pi child lock poisoned".to_owned()))?
         .try_wait()
         .map_err(io_error)?
         .is_some();
-    Ok(child_exited && !container_group_alive(harness, session.id.as_str())?)
+    Ok(child_exited && !container_group_alive(harness, process.pgid)?)
 }
 
 fn remove_registered_child(
     harness: &PiHarness,
     session: &SessionRef,
-    expected: &Arc<Mutex<std::process::Child>>,
+    expected: &Arc<ManagedProcess>,
 ) -> Result<(), HarnessError> {
     let mut children = harness
         .processes
@@ -263,45 +317,8 @@ fn remove_registered_child(
         .is_some_and(|registered| Arc::ptr_eq(registered, expected))
     {
         children.remove(session.id.as_str());
-        let record = host_process_record(session);
-        if record.exists() {
-            fs::remove_file(record).map_err(io_error)?;
-        }
     }
     Ok(())
-}
-
-fn wait_for_process_record(harness: &PiHarness, session: &SessionRef) -> Result<(), HarnessError> {
-    let record = host_process_record(session);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if record.is_file() {
-            return Ok(());
-        }
-        let child = harness
-            .processes
-            .children
-            .lock()
-            .map_err(|_| HarnessError::Start("process registry lock poisoned".to_owned()))?
-            .get(session.id.as_str())
-            .cloned();
-        if let Some(child) = child {
-            if let Some(status) = child
-                .lock()
-                .map_err(|_| HarnessError::Start("Pi child lock poisoned".to_owned()))?
-                .try_wait()
-                .map_err(io_error)?
-            {
-                return Err(HarnessError::Start(format!(
-                    "docker exec exited before Pi recorded its process group: {status}"
-                )));
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    Err(HarnessError::Start(
-        "timed out waiting for in-container Pi process record".to_owned(),
-    ))
 }
 
 fn ensure_docker_and_pi(harness: &PiHarness) -> Result<(), HarnessError> {
@@ -350,55 +367,152 @@ fn ensure_docker_and_pi(harness: &PiHarness) -> Result<(), HarnessError> {
 pub(crate) fn signal_container_group(
     docker_binary: &Path,
     container: &str,
-    session_id: &str,
+    pgid: u32,
     signal: &str,
 ) -> Result<(), HarnessError> {
-    let status = Command::new(docker_binary)
-        .args([
-            "exec",
-            container,
-            &format!("{CONTAINER_SESSION}/{CONTROL_FILE}"),
-            signal,
-            &container_process_record(session_id),
-        ])
-        .status()
-        .map_err(io_error)?;
-    if status.success() || signal == "CHECK" {
+    let status = run_control_command(docker_binary, container, pgid, signal)?;
+    if status.success() {
         Ok(())
-    } else if !container_recorded_group_alive(docker_binary, container, session_id)? {
+    } else if !container_group_alive_with(docker_binary, container, pgid)? {
         // The group exited between the caller's check and signal delivery.
         Ok(())
     } else {
         Err(HarnessError::Crashed(format!(
-            "failed to signal Pi process group {signal} for {session_id}"
+            "failed to signal Pi process group {pgid} with {signal}"
         )))
     }
 }
 
-fn container_recorded_group_alive(
+fn container_group_alive_with(
     docker_binary: &Path,
     container: &str,
-    session_id: &str,
+    pgid: u32,
 ) -> Result<bool, HarnessError> {
-    let status = Command::new(docker_binary)
-        .args([
-            "exec",
-            container,
-            &format!("{CONTAINER_SESSION}/{CONTROL_FILE}"),
-            "CHECK",
-            &container_process_record(session_id),
-        ])
-        .status()
-        .map_err(io_error)?;
-    Ok(status.success())
+    Ok(run_control_command(docker_binary, container, pgid, "0")?.success())
 }
 
-fn container_group_alive(harness: &PiHarness, session_id: &str) -> Result<bool, HarnessError> {
-    container_recorded_group_alive(
+fn run_control_command(
+    docker_binary: &Path,
+    container: &str,
+    pgid: u32,
+    signal: &str,
+) -> Result<ExitStatus, HarnessError> {
+    let mut command = Command::new(docker_binary);
+    command
+        .args([
+            "exec",
+            "--user",
+            "root",
+            container,
+            "/bin/sh",
+            "-c",
+            r#"kill "$1" "-$2""#,
+            "autospec-pi-kill",
+        ])
+        .arg(format!("-{signal}"))
+        .arg(pgid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    run_command_bounded(&mut command, CONTROL_TIMEOUT)
+}
+
+fn container_group_alive(harness: &PiHarness, pgid: u32) -> Result<bool, HarnessError> {
+    container_group_alive_with(
         &harness.config.docker_binary,
         &harness.config.agent_container,
-        session_id,
+        pgid,
     )
+}
+
+pub(crate) fn terminate_on_drop(
+    docker_binary: &Path,
+    container: &str,
+    process: &ManagedProcess,
+    stop_timeout: Duration,
+) {
+    let _ = signal_container_group(docker_binary, container, process.pgid, "TERM");
+    if wait_for_reap_bounded(docker_binary, container, process, stop_timeout) {
+        return;
+    }
+    let _ = signal_container_group(docker_binary, container, process.pgid, "KILL");
+    if wait_for_reap_bounded(docker_binary, container, process, KILL_REAP_TIMEOUT) {
+        return;
+    }
+    if let Ok(mut child) = process.child.try_lock() {
+        let _ = child.kill();
+        let _ = child.try_wait();
+    }
+}
+
+fn wait_for_reap_bounded(
+    docker_binary: &Path,
+    container: &str,
+    process: &ManagedProcess,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let child_exited = process
+            .child
+            .try_lock()
+            .ok()
+            .and_then(|mut child| child.try_wait().ok().flatten())
+            .is_some();
+        let group_alive =
+            container_group_alive_with(docker_binary, container, process.pgid).unwrap_or(true);
+        if child_exited && !group_alive {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+fn run_command_bounded(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<ExitStatus, HarnessError> {
+    let mut child = command.spawn().map_err(io_error)?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().map_err(io_error)? {
+            return Ok(status);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.try_wait();
+    Err(HarnessError::Crashed(
+        "timed out running Docker process-group control command".to_owned(),
+    ))
+}
+
+fn terminate_host_child(child: &mut std::process::Child, timeout: Duration) {
+    let _ = child.kill();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[derive(Deserialize)]
+struct SupervisorControl {
+    #[serde(rename = "type")]
+    record_type: String,
+    pgid: u32,
+}
+
+fn parse_supervisor_header(header: &str) -> Result<u32, String> {
+    let control: SupervisorControl = serde_json::from_str(header)
+        .map_err(|error| format!("invalid supervisor header: {error}"))?;
+    if control.record_type != "autospec_control" || control.pgid == 0 {
+        return Err("invalid supervisor control record".to_owned());
+    }
+    Ok(control.pgid)
 }
 
 fn live_events_path(session: &SessionRef) -> PathBuf {
@@ -407,34 +521,6 @@ fn live_events_path(session: &SessionRef) -> PathBuf {
 
 pub(crate) fn events_path(session: &SessionRef) -> PathBuf {
     live_events_path(session)
-}
-
-fn host_process_record(session: &SessionRef) -> PathBuf {
-    Path::new(&session.path).join(format!("pi-process-{}", session.id))
-}
-
-fn container_process_record(session_id: &str) -> String {
-    format!("{CONTAINER_SESSION}/pi-process-{session_id}")
-}
-
-fn materialize_process_scripts(session_dir: &Path) -> Result<(), HarnessError> {
-    write_once(&session_dir.join(LAUNCHER_FILE), LAUNCHER.as_bytes())?;
-    write_once(&session_dir.join(CONTROL_FILE), CONTROL.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(
-            session_dir.join(LAUNCHER_FILE),
-            fs::Permissions::from_mode(0o755),
-        )
-        .map_err(io_error)?;
-        fs::set_permissions(
-            session_dir.join(CONTROL_FILE),
-            fs::Permissions::from_mode(0o755),
-        )
-        .map_err(io_error)?;
-    }
-    Ok(())
 }
 
 fn write_packet_once(path: &Path, packet: &TaskPacket) -> Result<(), HarnessError> {
@@ -489,27 +575,3 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), HarnessError
 pub(crate) fn io_error(error: io::Error) -> HarnessError {
     HarnessError::Io(error.to_string())
 }
-
-const LAUNCHER: &str = r#"#!/bin/sh
-record=$1
-shift
-setsid "$@" &
-pid=$!
-printf '{"pid":%s,"pgid":%s}\n' "$pid" "$pid" > "${record}.tmp"
-mv "${record}.tmp" "$record"
-wait "$pid"
-"#;
-
-const CONTROL: &str = r#"#!/bin/sh
-action=$1
-record=$2
-[ -f "$record" ] || exit 1
-pgid=$(sed -n 's/.*"pgid":\([0-9][0-9]*\).*/\1/p' "$record")
-[ -n "$pgid" ] || exit 1
-case "$action" in
-  CHECK) kill -0 "-$pgid" 2>/dev/null ;;
-  TERM) kill -TERM "-$pgid" ;;
-  KILL) kill -KILL "-$pgid" ;;
-  *) exit 2 ;;
-esac
-"#;
