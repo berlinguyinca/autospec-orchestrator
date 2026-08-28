@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete after review fix round 3. The Pi 0.84.3 harness now launches only
+Complete after review fix round 4. The Pi 0.84.3 harness now launches only
 inside its provisioned agent container through argument-separated `docker exec`,
 using `/workspace` and `/session` container paths and one compact materialized
 `TaskPacket`. The authoritative live JSON event stream is captured durably on
@@ -26,7 +26,8 @@ polls and harness restarts. Assistant errors remain pending through
 allows `agent_settled` to emit `ReviewReady`, while an exhausted retry emits one
 `ModelFailed` and suppresses the finally-block `agent_settled`. Other declared
 protocol records are deliberately ignored without inflating the unknown-event
-counter.
+counter. The undeclared top-level `message` shape is no longer treated as known
+and increments unknown-event accounting.
 
 Process-group authority no longer crosses into the Pi-writable session mount.
 An immutable inline supervisor runs through argument-separated `docker exec`,
@@ -34,9 +35,14 @@ creates the process group, and emits one trusted control record before executing
 Pi. The host removes that record from the event stream and retains the PGID only
 in memory. Root `docker exec` control commands signal that trusted PGID, while
 bounded drop cleanup uses `try_wait`, TERM, and KILL without an indefinite wait.
-If the supervisor header is invalid, unreadable, or times out, the host recovers
-trusted group identity from a per-launch environment token, reaps the process
-group and descendants, then terminates the Docker exec client. The durable live
+If the supervisor header is invalid, unreadable, or times out, the host first
+terminates and reaps the Docker exec client, then recovers trusted group identity
+from a per-launch environment token and reaps the process group and descendants.
+Token cleanup polls through a stable absence window, so an accepted exec with
+delayed `/proc` visibility cannot escape. Group reap uses Linux `/proc` PGID and
+non-zombie membership rather than `kill -0`; zombie-only groups no longer block
+stop, drop, or startup cleanup, and the harness does not depend on a PID 1 reaper.
+The durable live
 event file, reducer/cursor, owner, and resume count all stay in the host-private
 session root; only `session_root/conversation/` is mounted at `/session`.
 
@@ -47,11 +53,13 @@ session root; only `session_root/conversation/` is mounted at `/session`.
 - `a274938` — review fix round 2 protocol normalization and trusted supervisor.
 - `54d9164` — review fix round 3 retry reducer, private state boundary, and
   startup-failure cleanup.
+- `fb59162` — review fix round 4 zombie-aware reap, delayed-start cleanup, and
+  exact message normalization.
 - Report commit — this report.
 
 ## Tests
 
-- `cargo test -p harness-pi --test pi_harness` — 16 passed against a real Docker
+- `cargo test -p harness-pi --test pi_harness` — 17 passed against a real Docker
   daemon and isolated labelled Debian containers with a mounted stub Pi. Coverage
   includes container-only paths, absent model-selection flags, distinct live and
   conversation JSONL, incremental partial-line delivery, persistence after
@@ -64,7 +72,11 @@ session root; only `session_root/conversation/` is mounted at `/session`.
   in authoritative Pi order across incremental polls and harness restart,
   malicious conversation writes against all host-private metadata, and cleanup
   after invalid JSON, invalid UTF-8 reader failure, and a silent supervisor
-  header timeout.
+  header timeout. Round-4 coverage removes `--init`, proves zombie-only groups
+  are accepted only after every runnable descendant is gone across stop, drop,
+  and startup failure, deterministically delays `/proc` visibility after an
+  event-thread spawn failure, and verifies undeclared `message` records increase
+  the unknown counter.
 - `cargo test -p orchestrator-worker --test health` — 3 passed; half-window
   inactivity warning/reset, inactivity and wall-clock failures, and sustained
   CPU saturation.
@@ -73,7 +85,7 @@ session root; only `session_root/conversation/` is mounted at `/session`.
   `cargo fmt --all -- --check` — passed, including real Docker, PostgreSQL, and
   Git suites.
 - Rust 1.85: the same complete build/test/clippy/fmt gate — passed, including
-  the sixteen real-Docker Pi harness tests.
+  the seventeen real-Docker Pi harness tests.
 
 ## Concerns
 
