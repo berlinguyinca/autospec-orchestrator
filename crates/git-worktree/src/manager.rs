@@ -78,6 +78,19 @@ struct MirrorRoot {
     owner: u32,
 }
 
+pub(crate) struct LockedMirror {
+    root: MirrorRoot,
+    path: PathBuf,
+    handle: File,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    owner: u32,
+    _lock: FileLock,
+}
+
 impl MirrorRoot {
     fn verify(&self) -> Result<(), WorktreeError> {
         let metadata = fs::symlink_metadata(&self.path)
@@ -182,6 +195,79 @@ impl GitWorktreeManager {
     fn clone_locator(&self, repo: &str) -> Result<String, WorktreeError> {
         let (owner, name) = canonical_repository(repo)?;
         Ok(format!("{}/{owner}/{name}.git", self.clone_base))
+    }
+
+    pub(crate) fn lock_mirror_for_capture(
+        &self,
+        repo: &str,
+    ) -> Result<LockedMirror, WorktreeError> {
+        let path = PathBuf::from(self.ensure_mirror(repo)?);
+        let lock_path = path.with_extension("git.lock");
+        let lock = FileLock::acquire_with(&lock_path, WorktreeError::Diff)?;
+        let root = secure_mirror_root(&self.cache_root)?;
+        let clone_locator = self.clone_locator(repo)?;
+        verify_mirror_repository(&root, &path, &clone_locator)?;
+        verify_mirror_storage_preflight(&root, &path)?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| WorktreeError::Mirror(error.to_string()))?;
+        let handle = File::open(&path).map_err(|error| WorktreeError::Mirror(error.to_string()))?;
+        let opened = handle
+            .metadata()
+            .map_err(|error| WorktreeError::Mirror(error.to_string()))?;
+        #[cfg(unix)]
+        if metadata.dev() != opened.dev()
+            || metadata.ino() != opened.ino()
+            || metadata.uid() != opened.uid()
+        {
+            return Err(WorktreeError::Mirror(
+                "mirror identity changed while pinning".to_owned(),
+            ));
+        }
+        Ok(LockedMirror {
+            root,
+            path,
+            handle,
+            #[cfg(unix)]
+            device: opened.dev(),
+            #[cfg(unix)]
+            inode: opened.ino(),
+            #[cfg(unix)]
+            owner: opened.uid(),
+            _lock: lock,
+        })
+    }
+}
+
+impl LockedMirror {
+    pub(crate) fn objects_path(&self) -> PathBuf {
+        self.path.join("objects")
+    }
+
+    pub(crate) fn verify(&self) -> Result<(), WorktreeError> {
+        self.root.verify()?;
+        let metadata = fs::symlink_metadata(&self.path)
+            .map_err(|error| WorktreeError::Mirror(error.to_string()))?;
+        let opened = self
+            .handle
+            .metadata()
+            .map_err(|error| WorktreeError::Mirror(error.to_string()))?;
+        if !metadata.file_type().is_dir() {
+            return Err(WorktreeError::Mirror(
+                "locked mirror is no longer a real directory".to_owned(),
+            ));
+        }
+        #[cfg(unix)]
+        if metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || metadata.uid() != self.owner
+            || opened.dev() != self.device
+            || opened.ino() != self.inode
+        {
+            return Err(WorktreeError::Mirror(
+                "locked mirror identity changed".to_owned(),
+            ));
+        }
+        verify_mirror_storage_preflight(&self.root, &self.path)
     }
 }
 
@@ -636,6 +722,51 @@ fn verify_mirror_repository(
         return Err(WorktreeError::Mirror(format!(
             "mirror origin mismatch: expected {clone_locator}, found {actual_origin}"
         )));
+    }
+    Ok(())
+}
+
+fn verify_mirror_storage_preflight(root: &MirrorRoot, mirror: &Path) -> Result<(), WorktreeError> {
+    root.verify()?;
+    let canonical_mirror = mirror
+        .canonicalize()
+        .map_err(|error| WorktreeError::Mirror(error.to_string()))?;
+    if canonical_mirror.parent() != Some(root.path.as_path()) {
+        return Err(WorktreeError::Mirror(format!(
+            "mirror escaped pinned root: {}",
+            canonical_mirror.display()
+        )));
+    }
+    let objects = mirror.join("objects");
+    let metadata =
+        fs::symlink_metadata(&objects).map_err(|error| WorktreeError::Mirror(error.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(WorktreeError::Mirror(format!(
+            "mirror object database is not a real directory: {}",
+            objects.display()
+        )));
+    }
+    let canonical_objects = objects
+        .canonicalize()
+        .map_err(|error| WorktreeError::Mirror(error.to_string()))?;
+    if canonical_objects.parent() != Some(canonical_mirror.as_path()) {
+        return Err(WorktreeError::Mirror(format!(
+            "mirror object database escaped its repository: {}",
+            canonical_objects.display()
+        )));
+    }
+    for name in ["alternates", "http-alternates"] {
+        let alternate = objects.join("info").join(name);
+        match fs::symlink_metadata(&alternate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(WorktreeError::Mirror(format!(
+                    "mirror alternate object database is forbidden: {}",
+                    alternate.display()
+                )))
+            }
+            Err(error) => return Err(WorktreeError::Mirror(error.to_string())),
+        }
     }
     Ok(())
 }

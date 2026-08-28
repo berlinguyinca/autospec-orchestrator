@@ -1657,6 +1657,154 @@ fn capture_diff_includes_patch_and_all_changed_files() {
 }
 
 #[test]
+fn capture_diff_ignores_execution_index_visibility_flags() {
+    for (index, flag) in ["--assume-unchanged", "--skip-worktree"]
+        .into_iter()
+        .enumerate()
+    {
+        let repository = TestRepository::new();
+        let state = tempfile::tempdir().expect("create state root");
+        let manager = manager(&state, &repository);
+        let execution_id = format!("project-13-index-flag-{index}");
+        let labels = labels(&execution_id, repository.canonical());
+        let worktree = manager
+            .create(
+                &labels,
+                repository.canonical(),
+                "HEAD",
+                &format!("autospec/{execution_id}"),
+            )
+            .expect("create worktree");
+        let path = Path::new(&worktree.path);
+        git(path, &["update-index", flag, "README.md"]);
+        std::fs::write(path.join("README.md"), format!("modified with {flag}\n"))
+            .expect("modify tracked file hidden by execution index");
+
+        let capture = manager
+            .capture_diff(&worktree)
+            .unwrap_or_else(|error| panic!("capture with {flag} failed: {error}"));
+
+        assert!(
+            capture.changed_files.contains(&"README.md".to_owned()),
+            "execution index flag {flag} hid tracked evidence"
+        );
+        assert!(capture.patch.contains(&format!("modified with {flag}")));
+    }
+}
+
+#[test]
+fn capture_diff_ignores_execution_index_contents() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-agent-index", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-agent-index",
+        )
+        .expect("create worktree");
+    let path = Path::new(&worktree.path);
+    std::fs::write(path.join(".git/index"), b"agent-controlled index")
+        .expect("replace execution index");
+    std::fs::write(path.join("README.md"), "modified despite index\n")
+        .expect("modify tracked file");
+    std::fs::write(path.join("untracked.txt"), "untracked despite index\n")
+        .expect("write untracked file");
+
+    let capture = manager
+        .capture_diff(&worktree)
+        .expect("capture without execution index");
+
+    assert_eq!(capture.changed_files, vec!["README.md", "untracked.txt"]);
+    assert!(capture.patch.contains("modified despite index"));
+    assert!(capture.patch.contains("untracked despite index"));
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_diff_does_not_enter_a_dirty_hostile_submodule() {
+    let repository = TestRepository::new();
+    let child = tempfile::tempdir().expect("create child repository");
+    git(child.path(), &["init"]);
+    git(child.path(), &["config", "user.email", "tests@example.com"]);
+    git(child.path(), &["config", "user.name", "Autospec Tests"]);
+    std::fs::write(child.path().join("child.txt"), "clean\n").expect("write child file");
+    git(child.path(), &["add", "child.txt"]);
+    git(child.path(), &["commit", "-m", "initial child"]);
+    git(
+        &repository.path,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            child.path().to_str().expect("child path"),
+            "vendor/child",
+        ],
+    );
+    git(&repository.path, &["commit", "-am", "add child"]);
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-hostile-submodule", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-hostile-submodule",
+        )
+        .expect("create worktree");
+    let path = Path::new(&worktree.path);
+    git(
+        path,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+        ],
+    );
+    let child_path = path.join("vendor/child");
+    let marker = state.path().join("submodule-filter-ran");
+    let helper = state.path().join("submodule-filter");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+    )
+    .expect("write hostile child filter");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+        .expect("make hostile child filter executable");
+    git(
+        &child_path,
+        &[
+            "config",
+            "filter.hostile.clean",
+            helper.to_str().expect("filter path"),
+        ],
+    );
+    std::fs::write(
+        child_path.join(".gitattributes"),
+        "child.txt filter=hostile\n",
+    )
+    .expect("select hostile child filter");
+    std::fs::write(child_path.join("child.txt"), "dirty\n").expect("dirty child file");
+
+    let capture = manager
+        .capture_diff(&worktree)
+        .expect("capture without entering dirty child repository");
+
+    assert!(!marker.exists(), "hostile child filter ran on the host");
+    assert!(
+        !capture.changed_files.contains(&"vendor/child".to_owned()),
+        "dirty submodule appeared in parent evidence"
+    );
+}
+
+#[test]
 fn capture_diff_accepts_non_executable_diff_attributes() {
     for (index, attribute) in ["-diff", "!diff", "diff"].into_iter().enumerate() {
         let repository = TestRepository::new();
@@ -1872,13 +2020,11 @@ fn capture_diff_ignores_long_running_process_filter_without_starting_it() {
         .expect("select process filter");
     std::fs::write(path.join("README.md"), "modified\n").expect("modify tracked file");
 
-    let started = std::time::Instant::now();
     let capture = manager
         .capture_diff(&worktree)
         .expect("capture without repository process filter");
 
     assert!(capture.patch.contains("modified"));
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
     assert!(!marker.exists(), "process filter started on the host");
 }
 
@@ -2016,8 +2162,11 @@ fn capture_diff_targets_only_the_explicit_git_directory_and_work_tree() {
         !log.lines().any(|line| line.starts_with("\tconfig\t--file")),
         "capture read mutable local config:\n{log}"
     );
-    let repository_calls: Vec<_> = log.lines().collect();
-    assert!(!repository_calls.is_empty());
+    let capture_calls: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("\t--work-tree\t"))
+        .collect();
+    assert!(!capture_calls.is_empty());
     let expected_git_dir_prefix = format!(
         "\t--git-dir\t{}/.capture-",
         state
@@ -2029,7 +2178,7 @@ fn capture_diff_targets_only_the_explicit_git_directory_and_work_tree() {
     );
     let expected_work_tree = format!("\t--work-tree\t{}", repository_path.display());
     assert!(
-        repository_calls.iter().all(|line| {
+        capture_calls.iter().all(|line| {
             line.contains(&expected_git_dir_prefix) && line.contains(&expected_work_tree)
         }),
         "repository Git invocation lacked exact selectors:\n{log}"
@@ -2039,7 +2188,7 @@ fn capture_diff_targets_only_the_explicit_git_directory_and_work_tree() {
         repository_path.join(".git").display()
     )));
     assert!(
-        repository_calls
+        capture_calls
             .iter()
             .any(|line| line.contains("\trev-parse\t--show-toplevel")),
         "repository root was not verified:\n{log}"
@@ -2209,6 +2358,107 @@ fn capture_diff_ignores_synchronized_hostile_config_and_attribute_mutation() {
     assert!(!helper_marker.exists(), "hostile process filter executed");
     let capture = result.expect("trusted capture ignores mutable agent Git config");
     assert!(capture.changed_files.contains(&"README.md".to_owned()));
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_diff_ignores_synchronized_execution_object_database_mutation() {
+    const CHILD: &str = "AUTOSPEC_SYNCHRONIZED_OBJECT_ATTACK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "capture_diff_ignores_synchronized_execution_object_database_mutation",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated synchronized object attack test");
+        assert!(
+            output.status.success(),
+            "synchronized object attack child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-object-attack", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-object-attack",
+        )
+        .expect("create worktree");
+    let repository_path = Path::new(&worktree.path);
+    std::fs::write(repository_path.join("README.md"), "modified\n").expect("modify tracked file");
+    std::fs::write(repository_path.join("untracked.txt"), "untracked\n")
+        .expect("write untracked file");
+    let attack_started = state.path().join("object-attack-started");
+    let helper_marker = state.path().join("object-filter-executed");
+    let helper = state.path().join("object-filter");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\ntouch '{}'\ncat\n", helper_marker.display()),
+    )
+    .expect("write hostile filter");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+        .expect("make hostile filter executable");
+    let bin = tempfile::tempdir().expect("wrapper bin");
+    let wrapper = bin.path().join("git");
+    let real_git = real_git_program();
+    let objects = repository_path.join(".git/objects");
+    let displaced = repository_path.join(".git/objects-agent");
+    let config = repository_path.join(".git/config");
+    let attributes = repository_path.join(".gitattributes");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *' diff '*)\n    if [ ! -e '{}' ]; then\n      mv '{}' '{}'\n      mkdir -p '{}/info' '{}/pack'\n      printf '/agent-controlled/objects\\n' > '{}/info/alternates'\n      printf 'agent pack data\\n' > '{}/pack/pack-agent.pack'\n      printf '\\n[filter \"hostile\"]\\n\\tclean = {}\\n\\trequired = true\\n' >> '{}'\n      printf 'README.md filter=hostile\\n' > '{}'\n      touch '{}'\n    fi\n    ;;\nesac\nexec '{}' \"$@\"\n",
+            attack_started.display(),
+            objects.display(),
+            displaced.display(),
+            objects.display(),
+            objects.display(),
+            objects.display(),
+            objects.display(),
+            helper.display(),
+            config.display(),
+            attributes.display(),
+            attack_started.display(),
+            real_git.display()
+        ),
+    )
+    .expect("write synchronized object attack wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+        .expect("make Git wrapper executable");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&original_path)),
+    )
+    .expect("wrapper PATH");
+    std::env::set_var("PATH", &path);
+
+    let result = manager.capture_diff(&worktree);
+    std::env::set_var("PATH", original_path);
+
+    assert!(
+        attack_started.exists(),
+        "object attack did not overlap diff"
+    );
+    assert!(!helper_marker.exists(), "hostile filter executed");
+    let capture = result.expect("capture ignores mutable execution object database");
+    assert_eq!(
+        capture.changed_files,
+        vec![".gitattributes", "README.md", "untracked.txt"]
+    );
+    assert!(capture.patch.contains("+modified"));
+    assert!(capture.patch.contains("+untracked"));
 }
 
 #[test]

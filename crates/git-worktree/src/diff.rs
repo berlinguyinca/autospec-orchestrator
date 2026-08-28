@@ -2,6 +2,7 @@ use crate::cleanup::verified_path;
 use crate::command::git_command;
 use crate::manager::{
     metadata_directory, read_owner_record, verify_git_storage_preflight, GitWorktreeManager,
+    LockedMirror,
 };
 use crate::{DiffCapture, Worktree, WorktreeError};
 use execution_storage::SecureMetadataDirectory;
@@ -25,7 +26,9 @@ struct TrustedCaptureContext {
     name: String,
     git_dir: PathBuf,
     work_tree: PathBuf,
+    mirror: LockedMirror,
     object_database: VerifiedObjectDirectory,
+    has_index: bool,
     temp_objects: Option<SecureMetadataDirectory>,
     temp_refs: Option<SecureMetadataDirectory>,
     has_config: bool,
@@ -105,6 +108,7 @@ fn capture_with_context(
             OsStr::new("diff"),
             OsStr::new("--no-ext-diff"),
             OsStr::new("--no-textconv"),
+            OsStr::new("--ignore-submodules=dirty"),
             OsStr::new("--binary"),
             OsStr::new(&worktree.base_sha),
             OsStr::new("--"),
@@ -117,6 +121,7 @@ fn capture_with_context(
             OsStr::new("diff"),
             OsStr::new("--no-ext-diff"),
             OsStr::new("--no-textconv"),
+            OsStr::new("--ignore-submodules=dirty"),
             OsStr::new("--name-only"),
             OsStr::new("-z"),
             OsStr::new(&worktree.base_sha),
@@ -175,8 +180,9 @@ impl TrustedCaptureContext {
         worktree: &Worktree,
     ) -> Result<Self, WorktreeError> {
         verify_git_storage_preflight(work_tree)?;
-        let index = read_stable_file(&work_tree.join(".git/index"), "Git index")?;
-        let object_database = VerifiedObjectDirectory::capture(work_tree)?;
+        let mirror = manager.lock_mirror_for_capture(&worktree.repository)?;
+        mirror.verify()?;
+        let object_database = VerifiedObjectDirectory::capture(&mirror.objects_path())?;
         let config = match worktree.base_sha.len() {
             40 => None,
             64 => Some(
@@ -205,7 +211,9 @@ impl TrustedCaptureContext {
             parent,
             directory,
             name,
+            mirror,
             object_database,
+            has_index: false,
             temp_objects: None,
             temp_refs: None,
             has_config: config.is_some(),
@@ -225,10 +233,6 @@ impl TrustedCaptureContext {
             );
             context
                 .directory
-                .create("index", &index)
-                .map_err(|error| WorktreeError::Diff(error.to_string()))?;
-            context
-                .directory
                 .create("HEAD", format!("{}\n", worktree.base_sha).as_bytes())
                 .map_err(|error| WorktreeError::Diff(error.to_string()))?;
             if let Some(config) = config {
@@ -237,6 +241,16 @@ impl TrustedCaptureContext {
                     .create("config", config)
                     .map_err(|error| WorktreeError::Diff(error.to_string()))?;
             }
+            context.verify()?;
+            git_success(
+                &context,
+                [OsStr::new("read-tree"), OsStr::new(&worktree.base_sha)],
+            )?;
+            context.has_index = true;
+            context
+                .directory
+                .restrict_file_to_owner("index")
+                .map_err(|error| WorktreeError::Diff(error.to_string()))?;
             context.verify()
         })();
         match setup {
@@ -251,7 +265,6 @@ impl TrustedCaptureContext {
     }
 
     fn command(&self) -> Result<Command, WorktreeError> {
-        verify_git_storage_preflight(&self.work_tree)?;
         self.verify()?;
         let mut command = git_command();
         command
@@ -273,6 +286,7 @@ impl TrustedCaptureContext {
     }
 
     fn verify(&self) -> Result<(), WorktreeError> {
+        self.mirror.verify()?;
         self.object_database.verify()?;
         if self.directory.path() != self.git_dir {
             return Err(WorktreeError::Ownership(
@@ -284,6 +298,11 @@ impl TrustedCaptureContext {
 
     fn cleanup(&self) -> Result<(), String> {
         let mut errors = Vec::new();
+        if self.has_index {
+            if let Err(error) = self.directory.restrict_file_to_owner("index") {
+                errors.push(format!("restrict index: {error}"));
+            }
+        }
         for name in ["config", "HEAD", "index"] {
             if name == "config" && !self.has_config {
                 continue;
@@ -314,28 +333,18 @@ impl TrustedCaptureContext {
 }
 
 impl VerifiedObjectDirectory {
-    fn capture(work_tree: &Path) -> Result<Self, WorktreeError> {
-        let canonical_work_tree = work_tree
-            .canonicalize()
-            .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-        let supplied = work_tree.join(".git/objects");
-        let metadata = fs::symlink_metadata(&supplied)
-            .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
+    fn capture(supplied: &Path) -> Result<Self, WorktreeError> {
+        let metadata = fs::symlink_metadata(supplied)
+            .map_err(|error| WorktreeError::Mirror(error.to_string()))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(WorktreeError::Ownership(format!(
+            return Err(WorktreeError::Mirror(format!(
                 "object database is not a real directory: {}",
                 supplied.display()
             )));
         }
         let path = supplied
             .canonicalize()
-            .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-        if !path.starts_with(&canonical_work_tree) {
-            return Err(WorktreeError::Ownership(format!(
-                "object database escapes work tree: {}",
-                path.display()
-            )));
-        }
+            .map_err(|error| WorktreeError::Mirror(error.to_string()))?;
         let handle = File::open(&path).map_err(|error| WorktreeError::Diff(error.to_string()))?;
         let opened = handle
             .metadata()

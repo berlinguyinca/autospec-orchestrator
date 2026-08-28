@@ -99,9 +99,55 @@ impl SecureMetadataDirectory {
         &self.directory.path
     }
 
+    /// Restricts an existing real direct-child file to owner-only access and fsyncs it.
+    #[cfg(unix)]
+    pub fn restrict_file_to_owner(&self, name: &str) -> Result<(), StorageError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        validate_metadata_name(name)?;
+        self.directory.verify("metadata directory")?;
+        let path = self.directory.child_path(name)?;
+        let expected = self.directory.child_metadata(name)?.ok_or_else(|| {
+            StorageError::IdentityMismatch("metadata file disappeared".to_owned())
+        })?;
+        if expected.file_type().is_symlink() || !expected.is_file() {
+            return Err(StorageError::IdentityMismatch(format!(
+                "metadata child is not a real file: {}",
+                path.display()
+            )));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| journal_error("open", &path, error))?;
+        verify_opened_identity(&expected, &file, &path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| journal_error("restrict", &path, error))?;
+        file.sync_all()
+            .map_err(|error| journal_error("fsync", &path, error))?;
+        self.directory.verify_child(name, &expected)?;
+        self.directory.sync()
+    }
+
     /// Creates and pins one owner-only direct child beneath this directory.
     #[cfg(unix)]
     pub fn create_subdirectory(&self, name: &str) -> Result<Self, StorageError> {
+        self.create_subdirectory_with(name, PinnedDirectory::sync, |path| Self::new(path))
+    }
+
+    #[cfg(unix)]
+    fn create_subdirectory_with<Sync, Pin>(
+        &self,
+        name: &str,
+        sync_parent: Sync,
+        pin_child: Pin,
+    ) -> Result<Self, StorageError>
+    where
+        Sync: FnOnce(&PinnedDirectory) -> Result<(), StorageError>,
+        Pin: FnOnce(&Path) -> Result<Self, StorageError>,
+    {
         validate_metadata_name(name)?;
         self.directory.verify("metadata directory")?;
         if self.directory.child_metadata(name)?.is_some() {
@@ -109,26 +155,60 @@ impl SecureMetadataDirectory {
                 "metadata subdirectory already exists: {name}"
             )));
         }
-        self.directory.create_directory(name)?;
+        self.directory.create_directory_unsynced(name)?;
         let expected = self.directory.child_metadata(name)?.ok_or_else(|| {
             StorageError::IdentityMismatch("metadata subdirectory disappeared".to_owned())
         })?;
-        let child = Self::new(self.directory.path.join(name))?;
-        let opened = child
-            .directory
-            .handle
-            .metadata()
-            .map_err(|error| journal_error("inspect", &child.directory.path, error))?;
-        if expected.dev() != opened.dev()
-            || expected.ino() != opened.ino()
-            || expected.uid() != opened.uid()
+        let result = (|| {
+            sync_parent(&self.directory)?;
+            let child = pin_child(&self.directory.path.join(name))?;
+            let opened = child
+                .directory
+                .handle
+                .metadata()
+                .map_err(|error| journal_error("inspect", &child.directory.path, error))?;
+            if expected.dev() != opened.dev()
+                || expected.ino() != opened.ino()
+                || expected.uid() != opened.uid()
+            {
+                return Err(StorageError::IdentityMismatch(
+                    "metadata subdirectory changed while pinning".to_owned(),
+                ));
+            }
+            self.directory.verify("metadata directory")?;
+            Ok(child)
+        })();
+        match result {
+            Ok(child) => Ok(child),
+            Err(error) => match self.rollback_created_subdirectory(name, &expected) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(StorageError::Journal(format!(
+                    "{error}; rollback metadata subdirectory failed: {rollback}"
+                ))),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn rollback_created_subdirectory(
+        &self,
+        name: &str,
+        expected: &fs::Metadata,
+    ) -> Result<(), StorageError> {
+        let current = self.directory.child_metadata(name)?.ok_or_else(|| {
+            StorageError::IdentityMismatch("metadata subdirectory disappeared".to_owned())
+        })?;
+        if current.file_type().is_symlink()
+            || !current.is_dir()
+            || current.dev() != expected.dev()
+            || current.ino() != expected.ino()
+            || current.uid() != expected.uid()
         {
             return Err(StorageError::IdentityMismatch(
-                "metadata subdirectory changed while pinning".to_owned(),
+                "created metadata subdirectory identity changed".to_owned(),
             ));
         }
-        self.directory.verify("metadata directory")?;
-        Ok(child)
+        self.directory.remove_directory(name)
     }
 
     /// Removes an empty direct child only when its retained pinned identity matches.
@@ -502,14 +582,19 @@ impl PinnedDirectory {
 
     #[cfg(unix)]
     pub(crate) fn create_directory(&self, name: &str) -> Result<(), StorageError> {
+        self.create_directory_unsynced(name)?;
+        self.sync()
+    }
+
+    #[cfg(unix)]
+    fn create_directory_unsynced(&self, name: &str) -> Result<(), StorageError> {
         use std::os::unix::fs::DirBuilderExt;
         let path = self.child_path(name)?;
         let mut builder = fs::DirBuilder::new();
         builder
             .mode(0o700)
             .create(&path)
-            .map_err(|error| journal_error("create directory", &path, error))?;
-        self.sync()
+            .map_err(|error| journal_error("create directory", &path, error))
     }
 
     #[cfg(unix)]
@@ -649,6 +734,28 @@ fn verify_opened_file(
     Ok(())
 }
 
+#[cfg(unix)]
+fn verify_opened_identity(
+    expected: &fs::Metadata,
+    file: &File,
+    path: &Path,
+) -> Result<(), StorageError> {
+    let opened = file
+        .metadata()
+        .map_err(|error| journal_error("inspect opened file", path, error))?;
+    if expected.dev() != opened.dev()
+        || expected.ino() != opened.ino()
+        || expected.uid() != opened.uid()
+        || !opened.is_file()
+    {
+        return Err(StorageError::IdentityMismatch(format!(
+            "metadata file identity changed while opening {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn journal_name(layout: &ExecutionLayout) -> Result<String, StorageError> {
     layout
         .journal
@@ -692,4 +799,56 @@ fn is_journal_temporary_name(name: &str) -> bool {
 
 fn journal_error(action: &str, path: &Path, error: std::io::Error) -> StorageError {
     StorageError::Journal(format!("{action} {}: {error}", path.display()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn metadata_directory() -> (tempfile::TempDir, SecureMetadataDirectory) {
+        let root = tempfile::tempdir().expect("temporary metadata root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure metadata root");
+        let metadata = SecureMetadataDirectory::new(root.path()).expect("pin metadata root");
+        (root, metadata)
+    }
+
+    #[test]
+    fn subdirectory_creation_removes_exact_child_when_parent_fsync_fails() {
+        let (root, metadata) = metadata_directory();
+
+        let error = metadata
+            .create_subdirectory_with(
+                "capture-fsync-failure",
+                |_| {
+                    Err(StorageError::Journal(
+                        "injected parent fsync failure".to_owned(),
+                    ))
+                },
+                |path| SecureMetadataDirectory::new(path),
+            )
+            .expect_err("surface injected parent fsync failure");
+
+        assert!(matches!(error, StorageError::Journal(message) if message.contains("injected")));
+        assert!(!root.path().join("capture-fsync-failure").exists());
+    }
+
+    #[test]
+    fn subdirectory_creation_removes_exact_child_when_pinning_fails() {
+        let (root, metadata) = metadata_directory();
+
+        let error = metadata
+            .create_subdirectory_with("capture-pin-failure", PinnedDirectory::sync, |_| {
+                Err::<SecureMetadataDirectory, _>(StorageError::IdentityMismatch(
+                    "injected child pin failure".to_owned(),
+                ))
+            })
+            .expect_err("surface injected child pin failure");
+
+        assert!(
+            matches!(error, StorageError::IdentityMismatch(message) if message.contains("injected"))
+        );
+        assert!(!root.path().join("capture-pin-failure").exists());
+    }
 }

@@ -109,21 +109,30 @@ consume a verified allocation receipt.
   validation. Partial JSON is never promoted into authoritative state.
 - Evidence capture no longer performs the prior O(N*U) config-and-attribute
   rescans around each Git invocation. The trusted Git context is established
-  once after the execution-stop boundary, its index is copied and fsynced, its
-  metadata directory and source object database remain inode-pinned, and its
-  exact files and directories are removed through the pinned metadata boundary
-  after capture. Safe boolean, unset, and unspecified `diff` attributes remain
-  supported because repository filter and diff commands are unavailable in the
-  trusted context.
+  once after the execution-stop boundary. Capture never copies the mutable
+  execution index or reads the execution object database: it refreshes and
+  exact-verifies the owned bare mirror, holds that mirror's repository lock for
+  the full capture, pins its alternate-free object database, and runs
+  `read-tree` for the exact journaled base SHA into the host-private index. The
+  index and metadata directory are fsynced and removed through the pinned
+  metadata boundary after capture. Safe boolean, unset, and unspecified `diff`
+  attributes remain supported because repository filter and diff commands are
+  unavailable in the trusted context.
 - Added hostile `filter.clean`, long-running `filter.process`, repository helper,
   and synchronized config/attribute mutation regressions. Even when a Git PATH
   wrapper changes the execution config and attributes immediately before the
   first diff, no marker program starts and tracked/untracked evidence remains
   complete.
-- Every non-bare repository Git command now receives the exact trusted
-  `--git-dir executions/{execution_id}/repository/.git` and `--work-tree
-  executions/{execution_id}/repository` selectors. Repository verification also
-  requires `rev-parse --show-toplevel` to canonicalize to that exact root.
+- Assume-unchanged and skip-worktree bits, a malformed execution index, and
+  synchronized replacement of execution objects, alternates, and pack data no
+  longer affect evidence. Dirty submodules are ignored explicitly so capture
+  never enters a mutable child Git repository or starts its configured filter.
+- Every capture Git command receives the exact host-private trusted `--git-dir`
+  and execution `--work-tree` selectors. Repository verification also requires
+  `rev-parse --show-toplevel` to canonicalize to that exact root.
+- Metadata-subdirectory creation is transactional after the direct child is
+  created. Injected parent-fsync and child-pinning failures remove only the
+  exact inode just created before returning the original failure.
 - The storage manager's full `verify_ready(receipt)` transition check runs a
   second time immediately before the first clone write. A stateful verifier
   regression proves a receipt that leaves Ready after preparation cannot write
@@ -248,24 +257,25 @@ polling loops, or `du`/`df` accounting.
 
 ## Verification
 
-- `cargo test -p git-worktree` — 53 real temporary Git repository tests passed,
+- `cargo test -p git-worktree` — 57 real temporary Git repository tests passed,
   including hostile Git environments, independent Git-path containment, mirror
   immutability/substitution rejection, receipt binding, create-intent recovery,
   phase-specific ENOSPC rollback, safe diff capture, pre-Git commondir rejection,
   exact cleanup, foreign-resource survival, and stale discovery.
-- `cargo test -p execution-storage -- --nocapture` — 36 passed. The real Docker
+- `cargo test -p execution-storage -- --nocapture` — 38 passed. The real Docker
   bind verifier contract ran. The destructive aggregate quota lifecycle printed
   an explicit skip because no operator pool is configured on this host; when
   configured it performs create, identity proof, substantial successful writes,
   aggregate over-limit writes accepted only as ENOSPC/StorageFull,
   unmount, and exact release, and configuration failures are test failures.
-- `cargo clippy -p execution-storage --all-targets -- -D warnings` — passed.
+- `cargo clippy -p execution-storage -p git-worktree --all-targets -- -D warnings`
+  — passed.
 - Current toolchain `cargo fmt --all -- --check`, `cargo build --workspace`,
   `cargo test --workspace`, and
   `cargo clippy --workspace --all-targets -- -D warnings` — passed, including
   all real-Docker runtime tests.
 - Rust 1.85 ran the same full fmt/build/test/clippy workspace matrix — passed,
-  including all 53 Git tests and all 13 real-Docker runtime tests.
+  including all 57 Git tests and all 13 real-Docker runtime tests.
 - The first current-toolchain workspace test attempt saw the existing
   five-second `harness-pi` drop-bound test exceed its timing threshold under
   concurrent Docker load. The isolated retry passed in 4.76 seconds, and the
