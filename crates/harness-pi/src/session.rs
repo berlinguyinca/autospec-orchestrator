@@ -4,10 +4,13 @@ use orchestrator_core::{ModelPolicy, SessionId, TaskPacket};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -17,10 +20,34 @@ pub(crate) const CURSOR_FILE: &str = ".cursor";
 pub(crate) const RESUME_COUNT_FILE: &str = "resume-count";
 pub(crate) const CONTAINER_WORKTREE: &str = "/workspace";
 pub(crate) const CONTAINER_SESSION: &str = "/session";
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const CONVERSATION_DIR: &str = "conversation";
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const SUPERVISOR: &str = r#"printf '{"type":"autospec_control","pgid":%s}\n' "$$"; exec "$@""#;
+const TOKEN_CONTROL: &str = r#"token=$1
+action=$2
+found=0
+for environment in /proc/[0-9]*/environ; do
+  [ -r "$environment" ] || continue
+  if tr '\000' '\n' < "$environment" 2>/dev/null | grep -Fqx "AUTOSPEC_SUPERVISOR_TOKEN=$token"; then
+    pid=${environment#/proc/}
+    pid=${pid%/environ}
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || continue
+    rest=${stat##*) }
+    set -- $rest
+    pgid=$3
+    case "$action" in
+      CHECK) kill -0 "-$pgid" 2>/dev/null && found=1 ;;
+      DERIVE) printf '%s\n' "$pgid" ;;
+      TERM) kill -TERM "-$pgid" 2>/dev/null || : ;;
+      KILL) kill -KILL "-$pgid" 2>/dev/null || : ;;
+      *) exit 2 ;;
+    esac
+  fi
+done
+[ "$action" != CHECK ] || [ "$found" -eq 1 ]"#;
+static SUPERVISOR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionOwner {
@@ -41,6 +68,7 @@ pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionR
         .join("sessions")
         .join(execution_id.as_str());
     fs::create_dir_all(&session_dir).map_err(io_error)?;
+    fs::create_dir_all(session_dir.join(CONVERSATION_DIR)).map_err(io_error)?;
     let packet_path = harness.config.worktree.join(".autospec/task-packet.json");
     write_packet_once(&packet_path, packet)?;
     write_json_once(
@@ -159,9 +187,16 @@ pub(crate) fn spawn(
         .append(true)
         .open(session_dir.join(format!("pi.stderr-{}.log", session.id)))
         .map_err(io_error)?;
+    let supervisor_token = format!(
+        "{}-{}",
+        std::process::id(),
+        SUPERVISOR_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
     let mut command = Command::new(&harness.config.docker_binary);
     command
-        .args(["exec", "--workdir", CONTAINER_WORKTREE])
+        .args(["exec", "--env"])
+        .arg(format!("AUTOSPEC_SUPERVISOR_TOKEN={supervisor_token}"))
+        .args(["--workdir", CONTAINER_WORKTREE])
         .arg(&harness.config.agent_container)
         .args([
             "setsid",
@@ -187,6 +222,8 @@ pub(crate) fn spawn(
         .take()
         .ok_or_else(|| HarnessError::Start("docker exec stdout was not piped".to_owned()))?;
     let (control_tx, control_rx) = mpsc::sync_channel(1);
+    let pump_docker = harness.config.docker_binary.clone();
+    let pump_container = harness.config.agent_container.clone();
     if let Err(error) = thread::Builder::new()
         .name(format!("pi-events-{}", session.id))
         .spawn(move || {
@@ -203,30 +240,45 @@ pub(crate) fn spawn(
                     }
                 });
             let valid = control.is_ok();
+            let pgid = control.as_ref().ok().copied();
             if control_tx.send(control).is_ok() && valid {
                 let mut events = events;
-                let _ = io::copy(&mut reader, &mut events);
+                if let Err(error) = io::copy(&mut reader, &mut events) {
+                    if let Some(pgid) = pgid {
+                        let cleanup = cleanup_container_authority(
+                            &pump_docker,
+                            &pump_container,
+                            Some(pgid),
+                            "",
+                        );
+                        tracing::error!(
+                            error = %error,
+                            cleanup_error = cleanup.err().map(|failure| failure.to_string()),
+                            "Pi event reader failed; terminated its process group"
+                        );
+                    }
+                }
                 let _ = events.flush();
             }
         })
     {
-        terminate_host_child(&mut child, CONTROL_TIMEOUT);
+        cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
         return Err(HarnessError::Start(error.to_string()));
     }
     let pgid = match control_rx.recv_timeout(SUPERVISOR_HEADER_TIMEOUT) {
         Ok(Ok(pgid)) => pgid,
         Ok(Err(error)) => {
-            terminate_host_child(&mut child, CONTROL_TIMEOUT);
+            cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
             return Err(HarnessError::Start(error));
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            terminate_host_child(&mut child, CONTROL_TIMEOUT);
+            cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
             return Err(HarnessError::Start(
                 "timed out waiting for trusted Pi supervisor control record".to_owned(),
             ));
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            terminate_host_child(&mut child, CONTROL_TIMEOUT);
+            cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
             return Err(HarnessError::Start(
                 "Pi supervisor control channel disconnected".to_owned(),
             ));
@@ -417,6 +469,208 @@ fn run_control_command(
     run_command_bounded(&mut command, CONTROL_TIMEOUT)
 }
 
+fn run_token_control_command(
+    docker_binary: &Path,
+    container: &str,
+    token: &str,
+    action: &str,
+) -> Result<ExitStatus, HarnessError> {
+    let mut command = Command::new(docker_binary);
+    command
+        .args([
+            "exec",
+            "--user",
+            "root",
+            container,
+            "/bin/sh",
+            "-c",
+            TOKEN_CONTROL,
+            "autospec-pi-token-control",
+            token,
+            action,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    run_command_bounded(&mut command, CONTROL_TIMEOUT)
+}
+
+fn cleanup_failed_start(
+    harness: &PiHarness,
+    token: &str,
+    pgid: Option<u32>,
+    child: &mut std::process::Child,
+) -> Result<(), HarnessError> {
+    let cleanup = cleanup_container_authority(
+        &harness.config.docker_binary,
+        &harness.config.agent_container,
+        pgid,
+        token,
+    );
+    terminate_host_child(child, CONTROL_TIMEOUT);
+    cleanup.map_err(|error| {
+        HarnessError::Start(format!(
+            "failed to reap Pi after supervisor handshake failure: {error}"
+        ))
+    })
+}
+
+fn cleanup_container_authority(
+    docker_binary: &Path,
+    container: &str,
+    pgid: Option<u32>,
+    token: &str,
+) -> Result<(), HarnessError> {
+    if pgid.is_none() {
+        let pgids = derive_token_pgids(docker_binary, container, token)?;
+        if !pgids.is_empty() {
+            return cleanup_process_groups(docker_binary, container, &pgids);
+        }
+    }
+    signal_authority(docker_binary, container, pgid, token, "TERM")?;
+    if wait_for_authority_reap(
+        docker_binary,
+        container,
+        pgid,
+        token,
+        Duration::from_millis(250),
+    )? {
+        return Ok(());
+    }
+    signal_authority(docker_binary, container, pgid, token, "KILL")?;
+    if wait_for_authority_reap(docker_binary, container, pgid, token, KILL_REAP_TIMEOUT)? {
+        Ok(())
+    } else {
+        Err(HarnessError::Crashed(
+            "startup-failed Pi process group was not reaped".to_owned(),
+        ))
+    }
+}
+
+fn cleanup_process_groups(
+    docker_binary: &Path,
+    container: &str,
+    pgids: &[u32],
+) -> Result<(), HarnessError> {
+    for pgid in pgids {
+        signal_container_group(docker_binary, container, *pgid, "TERM")?;
+    }
+    if wait_for_process_groups_reap(docker_binary, container, pgids, Duration::from_millis(250))? {
+        return Ok(());
+    }
+    for pgid in pgids {
+        signal_container_group(docker_binary, container, *pgid, "KILL")?;
+    }
+    if wait_for_process_groups_reap(docker_binary, container, pgids, KILL_REAP_TIMEOUT)? {
+        Ok(())
+    } else {
+        Err(HarnessError::Crashed(
+            "startup-failed Pi process groups were not reaped".to_owned(),
+        ))
+    }
+}
+
+fn wait_for_process_groups_reap(
+    docker_binary: &Path,
+    container: &str,
+    pgids: &[u32],
+    timeout: Duration,
+) -> Result<bool, HarnessError> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut any_alive = false;
+        for pgid in pgids {
+            any_alive |= container_group_alive_with(docker_binary, container, *pgid)?;
+        }
+        if !any_alive {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(false)
+}
+
+fn derive_token_pgids(
+    docker_binary: &Path,
+    container: &str,
+    token: &str,
+) -> Result<Vec<u32>, HarnessError> {
+    let mut command = Command::new(docker_binary);
+    command
+        .args([
+            "exec",
+            "--user",
+            "root",
+            container,
+            "/bin/sh",
+            "-c",
+            TOKEN_CONTROL,
+            "autospec-pi-token-control",
+            token,
+            "DERIVE",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let (status, stdout) = run_command_capture_bounded(&mut command, CONTROL_TIMEOUT)?;
+    if !status.success() {
+        return Err(HarnessError::Crashed(
+            "failed to derive startup process groups from trusted token".to_owned(),
+        ));
+    }
+    let mut pgids = stdout
+        .lines()
+        .filter_map(|line| line.parse::<u32>().ok())
+        .filter(|pgid| *pgid > 1)
+        .collect::<Vec<_>>();
+    pgids.sort_unstable();
+    pgids.dedup();
+    Ok(pgids)
+}
+
+fn signal_authority(
+    docker_binary: &Path,
+    container: &str,
+    pgid: Option<u32>,
+    token: &str,
+    signal: &str,
+) -> Result<(), HarnessError> {
+    if let Some(pgid) = pgid {
+        signal_container_group(docker_binary, container, pgid, signal)
+    } else {
+        let status = run_token_control_command(docker_binary, container, token, signal)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(HarnessError::Crashed(format!(
+                "failed to signal startup process identified by token with {signal}"
+            )))
+        }
+    }
+}
+
+fn wait_for_authority_reap(
+    docker_binary: &Path,
+    container: &str,
+    pgid: Option<u32>,
+    token: &str,
+    timeout: Duration,
+) -> Result<bool, HarnessError> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let alive = if let Some(pgid) = pgid {
+            container_group_alive_with(docker_binary, container, pgid)?
+        } else {
+            run_token_control_command(docker_binary, container, token, "CHECK")?.success()
+        };
+        if !alive {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(false)
+}
+
 fn container_group_alive(harness: &PiHarness, pgid: u32) -> Result<bool, HarnessError> {
     container_group_alive_with(
         &harness.config.docker_binary,
@@ -485,6 +739,29 @@ fn run_command_bounded(
     let _ = child.try_wait();
     Err(HarnessError::Crashed(
         "timed out running Docker process-group control command".to_owned(),
+    ))
+}
+
+fn run_command_capture_bounded(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<(ExitStatus, String), HarnessError> {
+    let mut child = command.spawn().map_err(io_error)?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().map_err(io_error)? {
+            let mut stdout = String::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                pipe.read_to_string(&mut stdout).map_err(io_error)?;
+            }
+            return Ok((status, stdout));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.try_wait();
+    Err(HarnessError::Crashed(
+        "timed out deriving Docker process-group control state".to_owned(),
     ))
 }
 

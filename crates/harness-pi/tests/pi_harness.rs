@@ -59,8 +59,9 @@ impl DockerPi {
         let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let execution_id = format!("pi-test-{}-{sequence}", std::process::id());
         let session = root.path().join("state/sessions").join(&execution_id);
+        let conversation = session.join("conversation");
         fs::create_dir_all(worktree.join(".autospec")).unwrap();
-        fs::create_dir_all(&session).unwrap();
+        fs::create_dir_all(&conversation).unwrap();
         fs::write(worktree.join("AGENTS.md"), "Stay scoped.\n").unwrap();
         fs::write(worktree.join("role.md"), "Implement.\n").unwrap();
         fs::write(
@@ -71,6 +72,9 @@ impl DockerPi {
         let stub = root.path().join("pi");
         fs::write(&stub, STUB_PI).unwrap();
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let setsid = root.path().join("setsid");
+        fs::write(&setsid, STUB_SETSID).unwrap();
+        fs::set_permissions(&setsid, fs::Permissions::from_mode(0o755)).unwrap();
 
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -92,13 +96,20 @@ impl DockerPi {
             ])
             .args([
                 "--mount",
-                &format!("type=bind,src={},dst=/session", session.display()),
+                &format!("type=bind,src={},dst=/session", conversation.display()),
             ])
             .args([
                 "--mount",
                 &format!(
                     "type=bind,src={},dst=/usr/local/bin/pi,readonly",
                     stub.display()
+                ),
+            ])
+            .args([
+                "--mount",
+                &format!(
+                    "type=bind,src={},dst=/usr/local/bin/setsid,readonly",
+                    setsid.display()
                 ),
             ])
             .args([IMAGE, "sleep", "infinity"])
@@ -143,6 +154,24 @@ impl DockerPi {
             .path()
             .join("state/sessions")
             .join(&self.execution_id)
+    }
+
+    fn conversation_dir(&self) -> PathBuf {
+        self.session_dir().join("conversation")
+    }
+
+    fn set_event_phases(&self, first: &str, second: &str) {
+        fs::write(
+            self.root.path().join("worktree/pi-json-events.jsonl"),
+            first,
+        )
+        .unwrap();
+        let second_path = self.root.path().join("worktree/pi-json-events-2.jsonl");
+        if second.is_empty() {
+            let _ = fs::remove_file(second_path);
+        } else {
+            fs::write(second_path, second).unwrap();
+        }
     }
 
     fn remove_container(&mut self) {
@@ -215,7 +244,7 @@ async fn docker_exec_uses_only_container_paths_and_carries_no_model_selection_fl
     let harness = fixture.harness();
     let session = harness.start(&packet()).await.unwrap();
     let args = wait_for_content(
-        &fixture.session_dir().join("arguments"),
+        &fixture.conversation_dir().join("arguments"),
         &format!("--session-id {}", fixture.execution_id),
     )
     .await;
@@ -245,24 +274,12 @@ async fn live_event_stdout_is_incremental_and_distinct_from_durable_conversation
         .join(format!("pi.events-{}.jsonl", fixture.execution_id));
     wait_for_content(&events_path, "future_pi_record").await;
     let first = harness.poll_events(&session).await.unwrap();
-    assert_eq!(first.len(), 4);
+    assert_eq!(first.len(), 2);
     assert!(matches!(
         first[0].kind,
         ExecutionEventKind::AgentStarted { .. }
     ));
     assert!(matches!(first[1].kind, ExecutionEventKind::ReviewReady));
-    assert!(matches!(
-        first[2].kind,
-        ExecutionEventKind::ExecutionFailed {
-            failure: FailureClass::ModelFailed
-        }
-    ));
-    assert!(matches!(
-        first[3].kind,
-        ExecutionEventKind::ExecutionFailed {
-            failure: FailureClass::ModelFailed
-        }
-    ));
     assert_eq!(harness.unknown_event_count(), 1);
     let live_jsonl = fs::read_to_string(&events_path).unwrap();
     assert!(live_jsonl.starts_with("{\"type\":\"session\""));
@@ -291,13 +308,154 @@ async fn live_event_stdout_is_incremental_and_distinct_from_durable_conversation
     ));
     let durable = fs::read_to_string(
         fixture
-            .session_dir()
+            .conversation_dir()
             .join(format!("session_{}.jsonl", fixture.execution_id)),
     )
     .unwrap();
     assert!(durable.contains("\"type\":\"session\""));
     assert!(!durable.contains("turn_start"));
     harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
+async fn retrying_backend_error_emits_only_start_then_review_ready_across_restart() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fixture.set_event_phases(
+        include_str!("fixtures/retry-success-1.jsonl"),
+        include_str!("fixtures/retry-success-2.jsonl"),
+    );
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    let events_path = fixture
+        .session_dir()
+        .join(format!("pi.events-{}.jsonl", fixture.execution_id));
+    wait_for_content(&events_path, "auto_retry_start").await;
+    let first = harness.poll_events(&session).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(matches!(
+        first[0].kind,
+        ExecutionEventKind::AgentStarted { .. }
+    ));
+
+    let restarted = PiHarness::new(harness.config().clone());
+    fs::write(fixture.root.path().join("worktree/continue-events"), "").unwrap();
+    wait_for_content(&events_path, "recovered").await;
+    let terminal = restarted.poll_events(&session).await.unwrap();
+    assert_eq!(terminal.len(), 1);
+    assert!(matches!(terminal[0].kind, ExecutionEventKind::ReviewReady));
+    assert_eq!(restarted.unknown_event_count(), 0);
+    harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
+async fn exhausted_retry_emits_one_model_failure_and_never_review_ready() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fixture.set_event_phases(
+        include_str!("fixtures/retry-failure-1.jsonl"),
+        include_str!("fixtures/retry-failure-2.jsonl"),
+    );
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    let events_path = fixture
+        .session_dir()
+        .join(format!("pi.events-{}.jsonl", fixture.execution_id));
+    wait_for_content(&events_path, "auto_retry_start").await;
+    let first = harness.poll_events(&session).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(matches!(
+        first[0].kind,
+        ExecutionEventKind::AgentStarted { .. }
+    ));
+
+    let restarted = PiHarness::new(harness.config().clone());
+    fs::write(fixture.root.path().join("worktree/continue-events"), "").unwrap();
+    wait_for_content(&events_path, "finalError").await;
+    let terminal = restarted.poll_events(&session).await.unwrap();
+    assert_eq!(terminal.len(), 1);
+    assert!(matches!(
+        terminal[0].kind,
+        ExecutionEventKind::ExecutionFailed {
+            failure: FailureClass::ModelFailed
+        }
+    ));
+    assert!(!terminal
+        .iter()
+        .any(|event| matches!(event.kind, ExecutionEventKind::ReviewReady)));
+    harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
+async fn pi_writable_conversation_cannot_forge_host_private_harness_state() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.root.path().join("worktree/forge-metadata"), "").unwrap();
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    let events_path = fixture
+        .session_dir()
+        .join(format!("pi.events-{}.jsonl", fixture.execution_id));
+    wait_for_content(&events_path, "future_pi_record").await;
+    wait_for_content(&fixture.conversation_dir().join("owner.json"), "forged").await;
+    wait_for_content(&fixture.conversation_dir().join("resume-count"), "999").await;
+    let events = harness.poll_events(&session).await.unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event.kind, ExecutionEventKind::ExecutionFailed { .. })));
+    let owner: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.session_dir().join("owner.json")).unwrap())
+            .unwrap();
+    assert_eq!(owner["execution_id"], fixture.execution_id);
+    assert_eq!(
+        fs::read_to_string(fixture.session_dir().join("resume-count")).unwrap(),
+        "0\n"
+    );
+    let cursor: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.session_dir().join(".cursor")).unwrap()).unwrap();
+    assert!(cursor["sessions"][&fixture.execution_id]["offset"]
+        .as_u64()
+        .is_some_and(|offset| offset > 0));
+    assert_eq!(
+        fs::read_to_string(fixture.conversation_dir().join("resume-count")).unwrap(),
+        "999\n"
+    );
+    harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_supervisor_header_reaps_started_pi_and_descendant() {
+    startup_handshake_failure_reaps("handshake-invalid").await;
+}
+
+#[tokio::test]
+async fn supervisor_header_reader_failure_reaps_started_pi_and_descendant() {
+    startup_handshake_failure_reaps("handshake-read-error").await;
+}
+
+#[tokio::test]
+async fn supervisor_header_timeout_reaps_started_pi_and_descendant() {
+    startup_handshake_failure_reaps("handshake-timeout").await;
+}
+
+async fn startup_handshake_failure_reaps(failure: &str) {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.root.path().join("worktree").join(failure), "").unwrap();
+    fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
+    let harness = fixture.harness();
+    let started = Instant::now();
+    assert!(matches!(
+        harness.start(&packet()).await.unwrap_err(),
+        HarnessError::Start(_)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(!pi_is_alive(&fixture));
 }
 
 #[tokio::test]
@@ -309,7 +467,7 @@ async fn durable_session_survives_agent_container_removal() {
     let session = harness.start(&packet()).await.unwrap();
     wait_for_content(
         &fixture
-            .session_dir()
+            .conversation_dir()
             .join(format!("session_{}.jsonl", fixture.execution_id)),
         "\"type\":\"session\"",
     )
@@ -317,7 +475,7 @@ async fn durable_session_survives_agent_container_removal() {
     harness.stop(&session).await.unwrap();
     fixture.remove_container();
     assert!(fixture
-        .session_dir()
+        .conversation_dir()
         .join(format!("session_{}.jsonl", fixture.execution_id))
         .is_file());
     assert!(fixture.session_dir().join("owner.json").is_file());
@@ -334,11 +492,11 @@ async fn empty_session_resumes_via_fresh_packet_without_resetting_event_cursor()
         .session_dir()
         .join(format!("pi.events-{}.jsonl", fixture.execution_id));
     wait_for_content(&events_path, "future_pi_record").await;
-    assert_eq!(harness.poll_events(&session).await.unwrap().len(), 4);
+    assert_eq!(harness.poll_events(&session).await.unwrap().len(), 2);
     harness.stop(&session).await.unwrap();
     fs::write(
         fixture
-            .session_dir()
+            .conversation_dir()
             .join(format!("session_{}.jsonl", fixture.execution_id)),
         "",
     )
@@ -346,14 +504,14 @@ async fn empty_session_resumes_via_fresh_packet_without_resetting_event_cursor()
     let delivered_length = fs::metadata(&events_path).unwrap().len();
     harness.resume(&session).await.unwrap();
     let args = wait_for_content(
-        &fixture.session_dir().join("arguments"),
+        &fixture.conversation_dir().join("arguments"),
         "@/workspace/.autospec/task-packet.json",
     )
     .await;
     assert!(args.contains(&format!("--session-id {}", fixture.execution_id)));
     assert!(!args.contains("Continue from the persisted session"));
     wait_for_length_greater_than(&events_path, delivered_length).await;
-    assert_eq!(harness.poll_events(&session).await.unwrap().len(), 4);
+    assert_eq!(harness.poll_events(&session).await.unwrap().len(), 2);
     assert!(harness.poll_events(&session).await.unwrap().is_empty());
     harness.stop(&session).await.unwrap();
 }
@@ -366,7 +524,7 @@ async fn resume_rejects_malformed_complete_record_but_truncates_only_a_torn_tail
     let harness = fixture.harness();
     let session = harness.start(&packet()).await.unwrap();
     let durable = fixture
-        .session_dir()
+        .conversation_dir()
         .join(format!("session_{}.jsonl", fixture.execution_id));
     wait_for_content(&durable, "\"type\":\"session\"").await;
     harness.stop(&session).await.unwrap();
@@ -401,22 +559,22 @@ async fn stop_duplicate_and_drop_terminate_the_in_container_process_group() {
     };
     let harness = fixture.harness();
     let session = harness.start(&packet()).await.unwrap();
-    wait_for_content(&fixture.session_dir().join("arguments"), "--mode json").await;
+    wait_for_content(&fixture.conversation_dir().join("arguments"), "--mode json").await;
     assert!(pi_is_alive(&fixture));
     assert!(matches!(
         harness.start(&packet()).await.unwrap_err(),
         HarnessError::Start(_)
     ));
     assert!(pi_is_alive(&fixture));
-    fs::write(fixture.session_dir().join("ignore-term"), "").unwrap();
+    fs::write(fixture.conversation_dir().join("ignore-term"), "").unwrap();
     let started = Instant::now();
     harness.stop(&session).await.unwrap();
     assert!(started.elapsed() <= Duration::from_secs(5));
     assert!(!pi_is_alive(&fixture));
 
-    fs::remove_file(fixture.session_dir().join("ignore-term")).unwrap();
+    fs::remove_file(fixture.conversation_dir().join("ignore-term")).unwrap();
     harness.resume(&session).await.unwrap();
-    wait_for_content(&fixture.session_dir().join("arguments"), "--mode json").await;
+    wait_for_content(&fixture.conversation_dir().join("arguments"), "--mode json").await;
     assert!(pi_is_alive(&fixture));
     drop(harness);
     assert!(!pi_is_alive(&fixture));
@@ -430,18 +588,22 @@ async fn pi_cannot_replace_supervisor_control_state() {
     fs::write(fixture.root.path().join("worktree/forge-control"), "").unwrap();
     let harness = fixture.harness();
     let session = harness.start(&packet()).await.unwrap();
-    wait_for_content(&fixture.session_dir().join("pi-process-forged"), "999999").await;
+    wait_for_content(
+        &fixture.conversation_dir().join("pi-process-forged"),
+        "999999",
+    )
+    .await;
     harness.stop(&session).await.unwrap();
     assert!(!pi_is_alive(&fixture));
     assert!(!fixture.session_dir().join(".pi-launch").exists());
     assert_eq!(
-        fs::read_to_string(fixture.session_dir().join(".pi-control")).unwrap(),
+        fs::read_to_string(fixture.conversation_dir().join(".pi-control")).unwrap(),
         "#!/bin/sh\nexit 0\n"
     );
     assert_eq!(
         fs::read_to_string(
             fixture
-                .session_dir()
+                .conversation_dir()
                 .join(format!("pi-process-{}", fixture.execution_id))
         )
         .unwrap(),
@@ -458,7 +620,11 @@ async fn drop_is_bounded_when_a_descendant_ignores_term_and_pi_forges_control_fi
     fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
     let harness = fixture.harness();
     harness.start(&packet()).await.unwrap();
-    wait_for_content(&fixture.session_dir().join("pi-process-forged"), "999999").await;
+    wait_for_content(
+        &fixture.conversation_dir().join("pi-process-forged"),
+        "999999",
+    )
+    .await;
 
     let (finished_tx, finished_rx) = std::sync::mpsc::channel();
     let drop_thread = std::thread::spawn(move || {
@@ -525,6 +691,16 @@ if [ ! -s "$session_file" ]; then
   printf '{"type":"session","version":3,"id":"%s","timestamp":"2026-08-28T00:00:00Z","cwd":"/workspace"}\n' "$session_id" > "$session_file"
 fi
 cat /workspace/pi-json-events.jsonl
+if [ -f /workspace/pi-json-events-2.jsonl ]; then
+  while [ ! -f /workspace/continue-events ]; do sleep 0.01; done
+  cat /workspace/pi-json-events-2.jsonl
+fi
+if [ -f /workspace/forge-metadata ]; then
+  printf '{"execution_id":"forged"}\n' > "$session_dir/owner.json"
+  printf '{"sessions":{"forged":{"path":"/session/forged.jsonl","offset":0}}}\n' > "$session_dir/.cursor"
+  printf '999\n' > "$session_dir/resume-count"
+  printf '{"type":"model_error"}\n' > "$session_dir/pi.events-${session_id}.jsonl"
+fi
 if [ -f /workspace/forge-control ]; then
   printf '#!/bin/sh\nexit 0\n' > "$session_dir/.pi-control"
   chmod 755 "$session_dir/.pi-control"
@@ -536,4 +712,20 @@ if [ -f /workspace/hung-descendant ]; then
 fi
 trap 'if [ -f "$session_dir/ignore-term" ]; then :; else exit 0; fi' TERM
 while :; do sleep 0.05; done
+"#;
+
+const STUB_SETSID: &str = r#"#!/bin/sh
+if [ -f /workspace/handshake-invalid ]; then
+  shift 4
+  exec /usr/bin/setsid /bin/sh -c 'printf "not-json\n"; exec "$@"' injected "$@"
+fi
+if [ -f /workspace/handshake-read-error ]; then
+  shift 4
+  exec /usr/bin/setsid /bin/sh -c 'printf "\377\n"; exec "$@"' injected "$@"
+fi
+if [ -f /workspace/handshake-timeout ]; then
+  shift 4
+  exec /usr/bin/setsid /bin/sh -c 'exec "$@" >/dev/null' injected "$@"
+fi
+exec /usr/bin/setsid "$@"
 "#;

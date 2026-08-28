@@ -26,6 +26,24 @@ struct CursorFile {
 struct JsonlCursor {
     path: PathBuf,
     offset: u64,
+    #[serde(default)]
+    reducer: ReducerState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ReducerState {
+    pending_model_error: bool,
+    retrying: bool,
+    terminal: TerminalState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalState {
+    #[default]
+    Active,
+    ReviewReady,
+    ModelFailed,
 }
 
 pub(crate) fn poll_events(
@@ -67,7 +85,7 @@ pub(crate) fn poll_events(
         let record: Value = serde_json::from_slice(line).map_err(|error| {
             HarnessError::InvalidSession(format!("invalid complete Pi JSONL record: {error}"))
         })?;
-        match normalize(session, &record) {
+        match normalize(session, &record, &mut cursor.reducer) {
             Normalized::Event(event) => events.push(event),
             Normalized::KnownIgnored => {}
             Normalized::Unknown => {
@@ -94,42 +112,63 @@ enum Normalized {
     Unknown,
 }
 
-fn normalize(session: &SessionRef, record: &Value) -> Normalized {
+fn normalize(session: &SessionRef, record: &Value, reducer: &mut ReducerState) -> Normalized {
     let Some(record_type) = record.get("type").and_then(Value::as_str) else {
         return Normalized::Unknown;
     };
     let (state, kind) = match record_type {
-        "agent_start" => (
-            ExecutionState::Running,
-            ExecutionEventKind::AgentStarted {
-                session_id: SessionId::new(session.id.to_string()),
-            },
-        ),
+        "agent_start" => {
+            *reducer = ReducerState::default();
+            (
+                ExecutionState::Running,
+                ExecutionEventKind::AgentStarted {
+                    session_id: SessionId::new(session.id.to_string()),
+                },
+            )
+        }
         "test_run" => (ExecutionState::Running, ExecutionEventKind::TestsStarted),
         "test_failed" => (ExecutionState::Running, ExecutionEventKind::TestsFailed),
-        "done" | "agent_settled" => (ExecutionState::ReviewReady, ExecutionEventKind::ReviewReady),
-        "model_error" => (
-            ExecutionState::Failed,
-            ExecutionEventKind::ExecutionFailed {
-                failure: FailureClass::ModelFailed,
-            },
-        ),
-        "message_end" | "message" if is_model_error(record) => (
-            ExecutionState::Failed,
-            ExecutionEventKind::ExecutionFailed {
-                failure: FailureClass::ModelFailed,
-            },
-        ),
+        "done" => return settle(session, reducer),
+        "agent_settled" => return settle(session, reducer),
+        "model_error" => return model_failed(session, reducer),
+        "message_end" | "message" => {
+            if is_assistant_message(record) {
+                reducer.pending_model_error = is_model_error(record);
+            }
+            return Normalized::KnownIgnored;
+        }
+        "agent_end" => {
+            let will_retry = record
+                .get("willRetry")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            reducer.retrying = will_retry;
+            if !will_retry && reducer.pending_model_error {
+                return model_failed(session, reducer);
+            }
+            return Normalized::KnownIgnored;
+        }
+        "auto_retry_start" => {
+            reducer.retrying = true;
+            return Normalized::KnownIgnored;
+        }
+        "auto_retry_end" => {
+            reducer.retrying = false;
+            let succeeded = record
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            reducer.pending_model_error = !succeeded;
+            return Normalized::KnownIgnored;
+        }
         "tool_execution_start" if is_test_tool(record) => {
             (ExecutionState::Running, ExecutionEventKind::TestsStarted)
         }
         "session"
         | "turn_start"
         | "turn_end"
-        | "agent_end"
         | "message_start"
         | "message_update"
-        | "message_end"
         | "tool_execution_start"
         | "tool_execution_update"
         | "tool_execution_end"
@@ -139,8 +178,6 @@ fn normalize(session: &SessionRef, record: &Value) -> Normalized {
         | "entry_appended"
         | "session_info_changed"
         | "thinking_level_changed"
-        | "auto_retry_start"
-        | "auto_retry_end"
         | "summarization_retry_scheduled"
         | "summarization_retry_attempt_start"
         | "summarization_retry_finished"
@@ -157,11 +194,65 @@ fn normalize(session: &SessionRef, record: &Value) -> Normalized {
     })
 }
 
+fn settle(session: &SessionRef, reducer: &mut ReducerState) -> Normalized {
+    if reducer.terminal == TerminalState::ModelFailed {
+        return Normalized::KnownIgnored;
+    }
+    if reducer.pending_model_error || reducer.retrying {
+        return model_failed(session, reducer);
+    }
+    if reducer.terminal == TerminalState::ReviewReady {
+        return Normalized::KnownIgnored;
+    }
+    reducer.terminal = TerminalState::ReviewReady;
+    Normalized::Event(event(
+        session,
+        ExecutionState::ReviewReady,
+        ExecutionEventKind::ReviewReady,
+    ))
+}
+
+fn model_failed(session: &SessionRef, reducer: &mut ReducerState) -> Normalized {
+    if reducer.terminal == TerminalState::ModelFailed {
+        return Normalized::KnownIgnored;
+    }
+    reducer.pending_model_error = false;
+    reducer.retrying = false;
+    reducer.terminal = TerminalState::ModelFailed;
+    Normalized::Event(event(
+        session,
+        ExecutionState::Failed,
+        ExecutionEventKind::ExecutionFailed {
+            failure: FailureClass::ModelFailed,
+        },
+    ))
+}
+
+fn event(session: &SessionRef, state: ExecutionState, kind: ExecutionEventKind) -> ExecutionEvent {
+    ExecutionEvent {
+        execution_id: session.execution_id.clone(),
+        attempt_id: None,
+        sequence: 0,
+        at: chrono::Utc::now(),
+        state,
+        kind,
+    }
+}
+
 fn is_model_error(record: &Value) -> bool {
     let message = record.get("message").unwrap_or(record);
     message.get("role").and_then(Value::as_str) == Some("assistant")
         && (message.get("stopReason").and_then(Value::as_str) == Some("error")
             || message.get("errorMessage").is_some())
+}
+
+fn is_assistant_message(record: &Value) -> bool {
+    record
+        .get("message")
+        .unwrap_or(record)
+        .get("role")
+        .and_then(Value::as_str)
+        == Some("assistant")
 }
 
 fn is_test_tool(record: &Value) -> bool {

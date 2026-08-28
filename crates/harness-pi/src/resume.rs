@@ -1,7 +1,8 @@
 use crate::{
     events::find_session_file,
     session::{
-        atomic_write, base_args, io_error, spawn, CONTAINER_SESSION, OWNER_FILE, RESUME_COUNT_FILE,
+        atomic_write, base_args, io_error, spawn, CONTAINER_SESSION, CONVERSATION_DIR, OWNER_FILE,
+        RESUME_COUNT_FILE,
     },
     PiHarness,
 };
@@ -20,6 +21,7 @@ enum DurableSession {
 pub(crate) fn resume(harness: &PiHarness, session: &SessionRef) -> Result<(), HarnessError> {
     validate_owner(harness, session)?;
     let session_dir = Path::new(&session.path);
+    let conversation_dir = session_dir.join(CONVERSATION_DIR);
     let count_path = session_dir.join(RESUME_COUNT_FILE);
     let current = fs::read_to_string(&count_path)
         .map_err(io_error)?
@@ -31,7 +33,7 @@ pub(crate) fn resume(harness: &PiHarness, session: &SessionRef) -> Result<(), Ha
             "resume limit {MAX_RESUMES} exceeded"
         )));
     }
-    let source = match find_session_file(session_dir, session.id.as_str())? {
+    let source = match find_session_file(&conversation_dir, session.id.as_str())? {
         Some(path) => validate_and_repair(&path)?,
         None => DurableSession::Empty,
     };
@@ -69,7 +71,8 @@ pub(crate) fn fork_conversation(
 ) -> Result<SessionRef, HarnessError> {
     validate_owner(harness, session)?;
     let session_dir = Path::new(&session.path);
-    let source = find_session_file(session_dir, session.id.as_str())?
+    let conversation_dir = session_dir.join(CONVERSATION_DIR);
+    let source = find_session_file(&conversation_dir, session.id.as_str())?
         .ok_or_else(|| HarnessError::NotResumable("source session JSONL is missing".to_owned()))?;
     if !matches!(validate_and_repair(&source)?, DurableSession::Ready(_)) {
         return Err(HarnessError::NotResumable(

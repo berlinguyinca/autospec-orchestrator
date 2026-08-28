@@ -8,6 +8,4 @@
 {"type":"agent_end","messages":[],"willRetry":false}
 {"type":"agent_settled"}
 {"type":"queue_update","steering":[],"followUp":[]}
-{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error"}}
-{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"stop","errorMessage":"backend unavailable"}}
 {"type":"future_pi_record","prompt":"never-log-this"}
