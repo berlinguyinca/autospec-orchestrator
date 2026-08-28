@@ -1,5 +1,5 @@
 use crate::{
-    session::{atomic_write, io_error, CURSOR_FILE},
+    session::{atomic_write, events_path, io_error, CURSOR_FILE},
     PiHarness,
 };
 use harness_traits::{HarnessError, SessionRef};
@@ -37,10 +37,10 @@ pub(crate) fn poll_events(
     let mut cursors = read_cursors(&cursor_path)?;
     let cursor = cursors.sessions.entry(session.id.to_string()).or_default();
     if cursor.path.as_os_str().is_empty() {
-        let Some(path) = find_session_file(session_dir, session.id.as_str())? else {
-            return Ok(Vec::new());
-        };
-        cursor.path = path;
+        cursor.path = events_path(session);
+    }
+    if !cursor.path.exists() {
+        return Ok(Vec::new());
     }
     let mut file = File::open(&cursor.path).map_err(io_error)?;
     let length = file.metadata().map_err(io_error)?.len();
@@ -163,7 +163,14 @@ pub(crate) fn find_session_file(
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-        .filter(|path| path.file_name().and_then(|name| name.to_str()) != Some("pi.stdout.jsonl"))
+        .filter(|path| {
+            !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("pi.events-") || name.starts_with("pi.stderr-")
+                })
+        })
         .collect::<Vec<_>>();
     candidates.sort();
     for path in candidates {

@@ -2,19 +2,22 @@ use crate::PiHarness;
 use harness_traits::{HarnessError, SessionRef};
 use orchestrator_core::{ModelPolicy, SessionId, TaskPacket};
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::{
     fs::{self, File},
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 pub(crate) const OWNER_FILE: &str = "owner.json";
 pub(crate) const CURSOR_FILE: &str = ".cursor";
 pub(crate) const RESUME_COUNT_FILE: &str = "resume-count";
+pub(crate) const CONTAINER_WORKTREE: &str = "/workspace";
+pub(crate) const CONTAINER_SESSION: &str = "/session";
+const LAUNCHER_FILE: &str = ".pi-launch";
+const CONTROL_FILE: &str = ".pi-control";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionOwner {
@@ -26,7 +29,7 @@ pub(crate) struct SessionOwner {
 }
 
 pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionRef, HarnessError> {
-    ensure_executable(&harness.config.executable)?;
+    ensure_docker_and_pi(harness)?;
     let execution_id = harness.config.labels.execution_id.clone();
     let session_id = SessionId::new(execution_id.to_string());
     let session_dir = harness
@@ -49,6 +52,7 @@ pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionR
     )?;
     write_once(&session_dir.join(CURSOR_FILE), b"{}\n")?;
     write_once(&session_dir.join(RESUME_COUNT_FILE), b"0\n")?;
+    materialize_process_scripts(&session_dir)?;
 
     let session = SessionRef {
         id: session_id,
@@ -56,22 +60,19 @@ pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionR
         execution_id,
         worktree_path: harness.config.worktree.display().to_string(),
     };
-    let mut args = base_args(harness, &session_dir)?;
+    let mut args = base_args(harness)?;
     args.extend(["--session-id".into(), session.id.to_string()]);
-    args.push(format!("@{}", packet_path.display()));
+    args.push("@/workspace/.autospec/task-packet.json".into());
     spawn(harness, &session, args)?;
     Ok(session)
 }
 
-pub(crate) fn base_args(
-    harness: &PiHarness,
-    session_dir: &Path,
-) -> Result<Vec<String>, HarnessError> {
+pub(crate) fn base_args(harness: &PiHarness) -> Result<Vec<String>, HarnessError> {
     let mut args = vec![
         "--mode".into(),
         "json".into(),
         "--session-dir".into(),
-        session_dir.display().to_string(),
+        CONTAINER_SESSION.into(),
         "--no-extensions".into(),
         "--no-prompt-templates".into(),
         "--no-themes".into(),
@@ -86,22 +87,12 @@ pub(crate) fn base_args(
     if let Some(role_skill) = packet_role_skill(&harness.config.worktree) {
         skills.push(resolve_role_skill(&harness.config.worktree, &role_skill)?);
     }
-    // Disable ambient discovery even when explicit skills are loaded.
     args.push("--no-skills".into());
     for skill in skills {
-        args.extend(["--skill".into(), skill.display().to_string()]);
-    }
-    if let Some(policy) = harness.config.model_policy.as_ref() {
-        args.extend(["--provider".into(), policy.provider.clone()]);
-        let models = policy
-            .preferred
-            .iter()
-            .chain(&policy.alternatives)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !models.is_empty() {
-            args.extend(["--models".into(), models.join(",")]);
-        }
+        args.extend([
+            "--skill".into(),
+            container_worktree_path(&harness.config.worktree, &skill)?,
+        ]);
     }
     Ok(args)
 }
@@ -113,10 +104,7 @@ fn packet_role_skill(worktree: &Path) -> Option<String> {
         .role_skill
 }
 
-fn resolve_role_skill(
-    worktree: &Path,
-    role_skill: &str,
-) -> Result<std::path::PathBuf, HarnessError> {
+fn resolve_role_skill(worktree: &Path, role_skill: &str) -> Result<PathBuf, HarnessError> {
     let worktree = fs::canonicalize(worktree).map_err(io_error)?;
     let skill = fs::canonicalize(worktree.join(role_skill)).map_err(io_error)?;
     if !skill.starts_with(&worktree) || !skill.is_file() {
@@ -127,106 +115,326 @@ fn resolve_role_skill(
     Ok(skill)
 }
 
+fn container_worktree_path(worktree: &Path, host_path: &Path) -> Result<String, HarnessError> {
+    let worktree = fs::canonicalize(worktree).map_err(io_error)?;
+    let host_path = fs::canonicalize(host_path).map_err(io_error)?;
+    let relative = host_path.strip_prefix(&worktree).map_err(|_| {
+        HarnessError::Start(format!(
+            "skill path is outside the mounted worktree: {}",
+            host_path.display()
+        ))
+    })?;
+    Ok(Path::new(CONTAINER_WORKTREE)
+        .join(relative)
+        .display()
+        .to_string())
+}
+
 pub(crate) fn spawn(
     harness: &PiHarness,
     session: &SessionRef,
-    args: Vec<String>,
+    pi_args: Vec<String>,
 ) -> Result<(), HarnessError> {
-    let session_dir = Path::new(&session.path);
-    let stdout = File::options()
-        .create(true)
-        .append(true)
-        .open(session_dir.join("pi.stdout.jsonl"))
-        .map_err(io_error)?;
-    let stderr = File::options()
-        .create(true)
-        .append(true)
-        .open(session_dir.join("pi.stderr.log"))
-        .map_err(io_error)?;
-    let mut command = Command::new(&harness.config.executable);
-    command
-        .args(args)
-        .current_dir(&harness.config.worktree)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr);
-    #[cfg(unix)]
-    command.process_group(0);
-    let child = command.spawn().map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            HarnessError::NotInstalled(harness.config.executable.display().to_string())
-        } else {
-            HarnessError::Start(error.to_string())
-        }
-    })?;
-    let mut processes = harness
+    ensure_docker_and_pi(harness)?;
+    let mut children = harness
         .processes
-        .0
+        .children
         .lock()
         .map_err(|_| HarnessError::Start("process registry lock poisoned".to_owned()))?;
-    if processes.contains_key(session.id.as_str()) {
-        let mut child = child;
-        let _ = child.kill();
-        let _ = child.wait();
+    if children.contains_key(session.id.as_str()) {
         return Err(HarnessError::Start(format!(
             "Pi session {} is already running",
             session.id
         )));
     }
-    processes.insert(session.id.to_string(), child);
-    Ok(())
+    let session_dir = Path::new(&session.path);
+    let events = File::options()
+        .create(true)
+        .append(true)
+        .open(live_events_path(session))
+        .map_err(io_error)?;
+    let stderr = File::options()
+        .create(true)
+        .append(true)
+        .open(session_dir.join(format!("pi.stderr-{}.log", session.id)))
+        .map_err(io_error)?;
+    let record = container_process_record(session.id.as_str());
+    let host_record = host_process_record(session);
+    if host_record.exists() {
+        fs::remove_file(&host_record).map_err(io_error)?;
+    }
+    let mut command = Command::new(&harness.config.docker_binary);
+    command
+        .args(["exec", "--workdir", CONTAINER_WORKTREE])
+        .arg(&harness.config.agent_container)
+        .args([format!("{CONTAINER_SESSION}/{LAUNCHER_FILE}"), record])
+        .arg(&harness.config.pi_executable)
+        .args(pi_args)
+        .stdin(Stdio::null())
+        .stdout(events)
+        .stderr(stderr);
+    let child = command.spawn().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            HarnessError::NotInstalled(harness.config.docker_binary.display().to_string())
+        } else {
+            HarnessError::Start(error.to_string())
+        }
+    })?;
+    children.insert(session.id.to_string(), Arc::new(Mutex::new(child)));
+    drop(children);
+    wait_for_process_record(harness, session)
 }
 
 pub(crate) async fn stop(harness: &PiHarness, session: &SessionRef) -> Result<(), HarnessError> {
     let child = harness
         .processes
-        .0
+        .children
         .lock()
         .map_err(|_| HarnessError::Crashed("process registry lock poisoned".to_owned()))?
-        .remove(session.id.as_str());
-    let Some(mut child) = child else {
+        .get(session.id.as_str())
+        .cloned();
+    let Some(child) = child else {
         return Ok(());
     };
-    if child.try_wait().map_err(io_error)?.is_some() {
+    if process_reaped(harness, session, &child)? {
+        remove_registered_child(harness, session, &child)?;
         return Ok(());
     }
-    send_term(child.id())?;
+    signal_container_group(
+        &harness.config.docker_binary,
+        &harness.config.agent_container,
+        session.id.as_str(),
+        "TERM",
+    )?;
     let deadline = Instant::now() + harness.config.stop_timeout;
     while Instant::now() < deadline {
-        if child.try_wait().map_err(io_error)?.is_some() {
+        if process_reaped(harness, session, &child)? {
+            remove_registered_child(harness, session, &child)?;
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    send_signal(child.id(), "-KILL")?;
-    child.wait().map_err(io_error)?;
+    signal_container_group(
+        &harness.config.docker_binary,
+        &harness.config.agent_container,
+        session.id.as_str(),
+        "KILL",
+    )?;
+    let kill_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < kill_deadline {
+        if process_reaped(harness, session, &child)? {
+            remove_registered_child(harness, session, &child)?;
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err(HarnessError::Crashed(format!(
+        "Pi process group for session {} was not reaped",
+        session.id
+    )))
+}
+
+fn process_reaped(
+    harness: &PiHarness,
+    session: &SessionRef,
+    child: &Arc<Mutex<std::process::Child>>,
+) -> Result<bool, HarnessError> {
+    let child_exited = child
+        .lock()
+        .map_err(|_| HarnessError::Crashed("Pi child lock poisoned".to_owned()))?
+        .try_wait()
+        .map_err(io_error)?
+        .is_some();
+    Ok(child_exited && !container_group_alive(harness, session.id.as_str())?)
+}
+
+fn remove_registered_child(
+    harness: &PiHarness,
+    session: &SessionRef,
+    expected: &Arc<Mutex<std::process::Child>>,
+) -> Result<(), HarnessError> {
+    let mut children = harness
+        .processes
+        .children
+        .lock()
+        .map_err(|_| HarnessError::Crashed("process registry lock poisoned".to_owned()))?;
+    if children
+        .get(session.id.as_str())
+        .is_some_and(|registered| Arc::ptr_eq(registered, expected))
+    {
+        children.remove(session.id.as_str());
+        let record = host_process_record(session);
+        if record.exists() {
+            fs::remove_file(record).map_err(io_error)?;
+        }
+    }
     Ok(())
 }
 
-fn send_term(pid: u32) -> Result<(), HarnessError> {
-    send_signal(pid, "-TERM")
+fn wait_for_process_record(harness: &PiHarness, session: &SessionRef) -> Result<(), HarnessError> {
+    let record = host_process_record(session);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if record.is_file() {
+            return Ok(());
+        }
+        let child = harness
+            .processes
+            .children
+            .lock()
+            .map_err(|_| HarnessError::Start("process registry lock poisoned".to_owned()))?
+            .get(session.id.as_str())
+            .cloned();
+        if let Some(child) = child {
+            if let Some(status) = child
+                .lock()
+                .map_err(|_| HarnessError::Start("Pi child lock poisoned".to_owned()))?
+                .try_wait()
+                .map_err(io_error)?
+            {
+                return Err(HarnessError::Start(format!(
+                    "docker exec exited before Pi recorded its process group: {status}"
+                )));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(HarnessError::Start(
+        "timed out waiting for in-container Pi process record".to_owned(),
+    ))
 }
 
-fn send_signal(pid: u32, signal: &str) -> Result<(), HarnessError> {
-    #[cfg(unix)]
-    let target = format!("-{pid}");
-    #[cfg(not(unix))]
-    let target = pid.to_string();
-    let status = Command::new("kill")
-        .args([signal, "--", &target])
+fn ensure_docker_and_pi(harness: &PiHarness) -> Result<(), HarnessError> {
+    let inspect = Command::new(&harness.config.docker_binary)
+        .args([
+            "inspect",
+            "--type",
+            "container",
+            &harness.config.agent_container,
+        ])
+        .output()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(harness.config.docker_binary.display().to_string())
+            } else {
+                HarnessError::Start(error.to_string())
+            }
+        })?;
+    if !inspect.status.success() {
+        return Err(HarnessError::Start(format!(
+            "agent container is unavailable: {}",
+            harness.config.agent_container
+        )));
+    }
+    let output = Command::new(&harness.config.docker_binary)
+        .args(["exec", &harness.config.agent_container, "test", "-x"])
+        .arg(&harness.config.pi_executable)
+        .output()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(harness.config.docker_binary.display().to_string())
+            } else {
+                HarnessError::Start(error.to_string())
+            }
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(HarnessError::NotInstalled(format!(
+            "{} in container {}",
+            harness.config.pi_executable, harness.config.agent_container
+        )))
+    }
+}
+
+pub(crate) fn signal_container_group(
+    docker_binary: &Path,
+    container: &str,
+    session_id: &str,
+    signal: &str,
+) -> Result<(), HarnessError> {
+    let status = Command::new(docker_binary)
+        .args([
+            "exec",
+            container,
+            &format!("{CONTAINER_SESSION}/{CONTROL_FILE}"),
+            signal,
+            &container_process_record(session_id),
+        ])
         .status()
         .map_err(io_error)?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| HarnessError::Crashed(format!("failed to terminate Pi process {pid}")))
+    if status.success() || signal == "CHECK" {
+        Ok(())
+    } else if !container_recorded_group_alive(docker_binary, container, session_id)? {
+        // The group exited between the caller's check and signal delivery.
+        Ok(())
+    } else {
+        Err(HarnessError::Crashed(format!(
+            "failed to signal Pi process group {signal} for {session_id}"
+        )))
+    }
 }
 
-fn ensure_executable(path: &Path) -> Result<(), HarnessError> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(()),
-        _ => Err(HarnessError::NotInstalled(path.display().to_string())),
+fn container_recorded_group_alive(
+    docker_binary: &Path,
+    container: &str,
+    session_id: &str,
+) -> Result<bool, HarnessError> {
+    let status = Command::new(docker_binary)
+        .args([
+            "exec",
+            container,
+            &format!("{CONTAINER_SESSION}/{CONTROL_FILE}"),
+            "CHECK",
+            &container_process_record(session_id),
+        ])
+        .status()
+        .map_err(io_error)?;
+    Ok(status.success())
+}
+
+fn container_group_alive(harness: &PiHarness, session_id: &str) -> Result<bool, HarnessError> {
+    container_recorded_group_alive(
+        &harness.config.docker_binary,
+        &harness.config.agent_container,
+        session_id,
+    )
+}
+
+fn live_events_path(session: &SessionRef) -> PathBuf {
+    Path::new(&session.path).join(format!("pi.events-{}.jsonl", session.id))
+}
+
+pub(crate) fn events_path(session: &SessionRef) -> PathBuf {
+    live_events_path(session)
+}
+
+fn host_process_record(session: &SessionRef) -> PathBuf {
+    Path::new(&session.path).join(format!("pi-process-{}", session.id))
+}
+
+fn container_process_record(session_id: &str) -> String {
+    format!("{CONTAINER_SESSION}/pi-process-{session_id}")
+}
+
+fn materialize_process_scripts(session_dir: &Path) -> Result<(), HarnessError> {
+    write_once(&session_dir.join(LAUNCHER_FILE), LAUNCHER.as_bytes())?;
+    write_once(&session_dir.join(CONTROL_FILE), CONTROL.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            session_dir.join(LAUNCHER_FILE),
+            fs::Permissions::from_mode(0o755),
+        )
+        .map_err(io_error)?;
+        fs::set_permissions(
+            session_dir.join(CONTROL_FILE),
+            fs::Permissions::from_mode(0o755),
+        )
+        .map_err(io_error)?;
     }
+    Ok(())
 }
 
 fn write_packet_once(path: &Path, packet: &TaskPacket) -> Result<(), HarnessError> {
@@ -282,6 +490,26 @@ pub(crate) fn io_error(error: io::Error) -> HarnessError {
     HarnessError::Io(error.to_string())
 }
 
-pub(crate) fn kill_process_group(pid: u32) -> Result<(), HarnessError> {
-    send_signal(pid, "-KILL")
-}
+const LAUNCHER: &str = r#"#!/bin/sh
+record=$1
+shift
+setsid "$@" &
+pid=$!
+printf '{"pid":%s,"pgid":%s}\n' "$pid" "$pid" > "${record}.tmp"
+mv "${record}.tmp" "$record"
+wait "$pid"
+"#;
+
+const CONTROL: &str = r#"#!/bin/sh
+action=$1
+record=$2
+[ -f "$record" ] || exit 1
+pgid=$(sed -n 's/.*"pgid":\([0-9][0-9]*\).*/\1/p' "$record")
+[ -n "$pgid" ] || exit 1
+case "$action" in
+  CHECK) kill -0 "-$pgid" 2>/dev/null ;;
+  TERM) kill -TERM "-$pgid" ;;
+  KILL) kill -KILL "-$pgid" ;;
+  *) exit 2 ;;
+esac
+"#;

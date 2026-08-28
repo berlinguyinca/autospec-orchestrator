@@ -22,7 +22,9 @@ use std::{
 pub struct PiHarnessConfig {
     pub state_root: PathBuf,
     pub worktree: PathBuf,
-    pub executable: PathBuf,
+    pub docker_binary: PathBuf,
+    pub agent_container: String,
+    pub pi_executable: String,
     pub labels: OwnershipLabels,
     /// AutoSpec's model policy, carried into Pi without choosing an alternative.
     pub model_policy: Option<ModelPolicy>,
@@ -37,13 +39,15 @@ impl PiHarnessConfig {
     pub fn for_execution(
         state_root: PathBuf,
         worktree: PathBuf,
-        executable: PathBuf,
+        agent_container: String,
         labels: OwnershipLabels,
     ) -> Self {
         Self {
             state_root,
             worktree,
-            executable,
+            docker_binary: PathBuf::from("docker"),
+            agent_container,
+            pi_executable: "pi".to_owned(),
             labels,
             model_policy: None,
             tools: vec![
@@ -59,16 +63,27 @@ impl PiHarnessConfig {
 }
 
 #[derive(Debug)]
-struct ProcessRegistry(Mutex<HashMap<String, Child>>);
+struct ProcessRegistry {
+    children: Mutex<HashMap<String, Arc<Mutex<Child>>>>,
+    docker_binary: PathBuf,
+    agent_container: String,
+}
 
 impl Drop for ProcessRegistry {
     fn drop(&mut self) {
-        let Ok(children) = self.0.get_mut() else {
+        let Ok(children) = self.children.get_mut() else {
             return;
         };
-        for child in children.values_mut() {
-            let _ = session::kill_process_group(child.id());
-            let _ = child.wait();
+        for (session_id, child) in children.iter() {
+            let _ = session::signal_container_group(
+                &self.docker_binary,
+                &self.agent_container,
+                session_id,
+                "KILL",
+            );
+            if let Ok(mut child) = child.lock() {
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -82,9 +97,15 @@ pub struct PiHarness {
 
 impl PiHarness {
     pub fn new(config: PiHarnessConfig) -> Self {
+        let docker_binary = config.docker_binary.clone();
+        let agent_container = config.agent_container.clone();
         Self {
             config,
-            processes: Arc::new(ProcessRegistry(Mutex::new(HashMap::new()))),
+            processes: Arc::new(ProcessRegistry {
+                children: Mutex::new(HashMap::new()),
+                docker_binary,
+                agent_container,
+            }),
             unknown_events: Arc::new(AtomicU64::new(0)),
         }
     }
