@@ -43,8 +43,12 @@ orphans without deleting them.
 - Hardened real-Docker test isolation for concurrent workspace sessions. Test
   execution IDs combine process ID, wall-clock nanoseconds, and a process-local
   atomic sequence; an unwind-safe scope removes managed resources only through
-  that execution's ownership selector and removes test-support resources only
-  through a separate per-test ownership label.
+  valid `OwnershipLabels` selectors. Control resources use a distinct control
+  `execution_id` and exactly the five shared `autospec.*` ownership keys.
+- Normal test cleanup attempts both the control and execution selectors,
+  aggregates every error, fails the test on any cleanup error, and marks its
+  guard clean only after complete success. Unwind cleanup is non-panicking and
+  emits the same aggregate diagnostics.
 - Pinned compatible transitive lockfile releases so the workspace still checks
   with its declared Rust 1.85 toolchain after adding Bollard.
 
@@ -81,21 +85,27 @@ tests then exposed a second issue: global volume-set equality observed another
 test's labelled volumes. Assertions now inspect execution-specific resources and
 only treat newly-created 64-hex Docker volume names as anonymous leaks. Two
 runtime-docker test binaries subsequently passed concurrently without collisions.
+The follow-up label test then failed on the invented
+`autospec.test_execution_id` key. After replacing it with distinct contract
+ownership, a real-Docker failure-injection test held one execution volume and one
+control volume under independently owned containers. The first cleanup returned
+both selector failures and kept the guard armed; after cleaning the blocker
+selectors, the retry succeeded.
 
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo build --workspace` — passed.
 - `cargo test --workspace -- --nocapture` — passed with normal test concurrency;
-  real Docker tests: 8 passed, 0 skipped. PostgreSQL tests printed their existing explicit
+  real Docker tests: 10 passed, 0 skipped. PostgreSQL tests printed their existing explicit
   skips because `AUTOSPEC_DATABASE_URL` was unset.
 - Two simultaneous `cargo test -p runtime-docker --test docker_runtime --
-  --nocapture` processes — both passed 8/8 with no name collisions.
+  --nocapture` processes — both passed 10/10 with no name collisions.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed.
 - `cargo +1.85.0 check --workspace` — passed.
 - `git diff --check` — passed.
 - Post-test Docker inventory for the new process/time/sequence execution IDs and
-  `autospec.test_execution_id` support labels — empty. Old wall-clock-only
+  their valid control execution IDs — empty. Old wall-clock-only
   resources from a foreign failed session remained untouched, as required by the
   no-foreign-cleanup rule.
 
