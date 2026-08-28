@@ -4,8 +4,21 @@
 //! gates. This crate owns only the physical side: mirrors, fetch, worktrees,
 //! locking, diff capture, and ownership-aware cleanup.
 
+mod cleanup;
+mod diff;
+mod lock;
+mod manager;
+
 use orchestrator_core::{ExecutionId, OwnershipLabels};
 use thiserror::Error;
+
+pub use manager::GitWorktreeManager;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffCapture {
+    pub patch: String,
+    pub changed_files: Vec<String>,
+}
 
 #[derive(Debug, Error)]
 pub enum WorktreeError {
@@ -17,6 +30,12 @@ pub enum WorktreeError {
     Locked(ExecutionId),
     #[error("cleanup failed: {0}")]
     Cleanup(String),
+    #[error("invalid repository reference: {0}")]
+    InvalidRepository(String),
+    #[error("diff capture failed: {0}")]
+    Diff(String),
+    #[error("worktree ownership verification failed: {0}")]
+    Ownership(String),
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +63,7 @@ pub trait WorktreeManager: Send + Sync {
     ) -> Result<Worktree, WorktreeError>;
 
     /// Capture the diff produced by an execution as an artifact payload.
-    fn capture_diff(&self, worktree: &Worktree) -> Result<String, WorktreeError>;
+    fn capture_diff(&self, worktree: &Worktree) -> Result<DiffCapture, WorktreeError>;
 
     /// Remove exactly the worktree and branch this execution owns.
     fn destroy(&self, worktree: &Worktree) -> Result<(), WorktreeError>;
