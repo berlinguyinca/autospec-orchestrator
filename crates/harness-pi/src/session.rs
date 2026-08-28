@@ -1,13 +1,16 @@
 use crate::{verify_storage_paths, ManagedProcess, PiHarness, ReadyPiStorage};
+use execution_storage::ReadyLease;
 use harness_traits::{HarnessError, SessionRef};
 use orchestrator_core::{ModelPolicy, SessionId, TaskPacket};
+use runtime_traits::VerifiedBindMount;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -52,6 +55,23 @@ for environment in /proc/[0-9]*/environ; do
     [ "$state" = Z ] || printf '%s\n' "$pgid"
   fi
 done"#;
+
+enum QuarantinedProcess {
+    Registered {
+        docker_binary: PathBuf,
+        container: String,
+        process: Arc<ManagedProcess>,
+    },
+    Startup {
+        docker_binary: PathBuf,
+        container: String,
+        child: Mutex<std::process::Child>,
+        pgid: Option<u32>,
+        token: String,
+        journal: PathBuf,
+        _storage_lease: Box<dyn ReadyLease>,
+    },
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionOwner {
     pub(crate) execution_id: String,
@@ -63,6 +83,7 @@ pub(crate) struct SessionOwner {
 
 pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionRef, HarnessError> {
     let storage = harness.acquire_ready_storage()?;
+    verify_live_agent_container(harness, &storage.layout)?;
     ensure_docker_and_pi(harness)?;
     let execution_id = harness.config.labels.execution_id.clone();
     let session_id = SessionId::new(execution_id.to_string());
@@ -171,6 +192,7 @@ pub(crate) fn spawn(
 ) -> Result<(), HarnessError> {
     harness.validate_session(session)?;
     verify_storage_paths(storage.lease.verified(), &storage.layout)?;
+    verify_live_agent_container(harness, &storage.layout)?;
     ensure_docker_and_pi(harness)?;
     let mut children = harness
         .processes
@@ -186,6 +208,7 @@ pub(crate) fn spawn(
     let session_dir = Path::new(&session.path);
     let events = open_private_append(&live_events_path(session))?;
     let stderr = open_private_append(&session_dir.join(format!("pi.stderr-{}.log", session.id)))?;
+    let quarantine_journal = session_dir.join(format!("quarantine-{}.json", session.id));
     let supervisor_token = supervisor_token()?;
     let mut command = Command::new(&harness.config.docker_binary);
     command
@@ -274,26 +297,54 @@ pub(crate) fn spawn(
         }
     }) {
         drop(supervisor_input);
-        cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
+        cleanup_failed_start(
+            harness,
+            &supervisor_token,
+            None,
+            child,
+            storage.lease,
+            quarantine_journal,
+        );
         return Err(HarnessError::Start(error.to_string()));
     }
     let pgid = match control_rx.recv_timeout(SUPERVISOR_HEADER_TIMEOUT) {
         Ok(Ok(pgid)) => pgid,
         Ok(Err(error)) => {
             drop(supervisor_input);
-            cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
+            cleanup_failed_start(
+                harness,
+                &supervisor_token,
+                None,
+                child,
+                storage.lease,
+                quarantine_journal,
+            );
             return Err(HarnessError::Start(error));
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             drop(supervisor_input);
-            cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
+            cleanup_failed_start(
+                harness,
+                &supervisor_token,
+                None,
+                child,
+                storage.lease,
+                quarantine_journal,
+            );
             return Err(HarnessError::Start(
                 "timed out waiting for trusted Pi supervisor control record".to_owned(),
             ));
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             drop(supervisor_input);
-            cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
+            cleanup_failed_start(
+                harness,
+                &supervisor_token,
+                None,
+                child,
+                storage.lease,
+                quarantine_journal,
+            );
             return Err(HarnessError::Start(
                 "Pi supervisor control channel disconnected".to_owned(),
             ));
@@ -303,7 +354,14 @@ pub(crate) fn spawn(
         writeln!(supervisor_input, "ACK {supervisor_token}").and_then(|()| supervisor_input.flush())
     {
         drop(supervisor_input);
-        cleanup_failed_start(harness, &supervisor_token, Some(pgid), &mut child)?;
+        cleanup_failed_start(
+            harness,
+            &supervisor_token,
+            Some(pgid),
+            child,
+            storage.lease,
+            quarantine_journal,
+        );
         return Err(HarnessError::Start(format!(
             "failed to acknowledge Pi supervisor: {error}"
         )));
@@ -312,17 +370,38 @@ pub(crate) fn spawn(
     match ready_rx.recv_timeout(SUPERVISOR_HEADER_TIMEOUT) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            cleanup_failed_start(harness, &supervisor_token, Some(pgid), &mut child)?;
+            cleanup_failed_start(
+                harness,
+                &supervisor_token,
+                Some(pgid),
+                child,
+                storage.lease,
+                quarantine_journal,
+            );
             return Err(HarnessError::Start(error));
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            cleanup_failed_start(harness, &supervisor_token, Some(pgid), &mut child)?;
+            cleanup_failed_start(
+                harness,
+                &supervisor_token,
+                Some(pgid),
+                child,
+                storage.lease,
+                quarantine_journal,
+            );
             return Err(HarnessError::Start(
                 "timed out waiting for trusted Pi supervisor READY confirmation".to_owned(),
             ));
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            cleanup_failed_start(harness, &supervisor_token, Some(pgid), &mut child)?;
+            cleanup_failed_start(
+                harness,
+                &supervisor_token,
+                Some(pgid),
+                child,
+                storage.lease,
+                quarantine_journal,
+            );
             return Err(HarnessError::Start(
                 "Pi supervisor READY channel disconnected".to_owned(),
             ));
@@ -333,6 +412,8 @@ pub(crate) fn spawn(
         Arc::new(ManagedProcess {
             child: std::sync::Mutex::new(child),
             pgid,
+            supervisor_token,
+            quarantine_journal,
             _storage_lease: storage.lease,
         }),
     );
@@ -461,6 +542,127 @@ fn ensure_docker_and_pi(harness: &PiHarness) -> Result<(), HarnessError> {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveContainerInspect {
+    id: String,
+    state: LiveContainerState,
+    config: LiveContainerConfig,
+    mounts: Vec<LiveContainerMount>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveContainerState {
+    running: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveContainerConfig {
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveContainerMount {
+    #[serde(rename = "Type")]
+    mount_type: String,
+    source: PathBuf,
+    destination: String,
+    #[serde(rename = "RW")]
+    writable: bool,
+}
+
+fn verify_live_agent_container(
+    harness: &PiHarness,
+    layout: &execution_storage::ExecutionLayout,
+) -> Result<(), HarnessError> {
+    let capability = harness.container_capability()?;
+    let daemon = Command::new(&harness.config.docker_binary)
+        .args(["info", "--format={{.ID}}"])
+        .output()
+        .map_err(docker_start_error)?;
+    if !daemon.status.success()
+        || String::from_utf8_lossy(&daemon.stdout).trim() != capability.daemon_id
+    {
+        return Err(HarnessError::Start(
+            "live Docker daemon differs from the runtime-issued container capability".to_owned(),
+        ));
+    }
+    let output = Command::new(&harness.config.docker_binary)
+        .args(["inspect", "--type", "container"])
+        .arg(&capability.container_id)
+        .output()
+        .map_err(docker_start_error)?;
+    if !output.status.success() {
+        return Err(HarnessError::Start(
+            "runtime-issued agent container is unavailable".to_owned(),
+        ));
+    }
+    let mut inspected: Vec<LiveContainerInspect> = serde_json::from_slice(&output.stdout)
+        .map_err(|error| HarnessError::Start(format!("decode live agent container: {error}")))?;
+    if inspected.len() != 1 {
+        return Err(HarnessError::Start(
+            "Docker inspect did not return exactly one agent container".to_owned(),
+        ));
+    }
+    let inspect = inspected.pop().expect("length checked");
+    if inspect.id != capability.container_id || !inspect.state.running {
+        return Err(HarnessError::Start(
+            "runtime-issued agent container identity is stale or not running".to_owned(),
+        ));
+    }
+    if inspect.config.labels != capability.labels.to_map() {
+        return Err(HarnessError::Start(
+            "live container ownership labels differ from its runtime capability".to_owned(),
+        ));
+    }
+    let mut mounts = Vec::with_capacity(inspect.mounts.len());
+    for mount in inspect.mounts {
+        if mount.mount_type != "bind" {
+            return Err(HarnessError::Start(
+                "live agent container has a non-bind mount".to_owned(),
+            ));
+        }
+        let source = fs::canonicalize(&mount.source).map_err(|error| {
+            HarnessError::Start(format!("canonicalize live agent bind mount: {error}"))
+        })?;
+        mounts.push(VerifiedBindMount {
+            source,
+            target: mount.destination,
+            writable: mount.writable,
+        });
+    }
+    mounts.sort();
+    if mounts != capability.mounts {
+        return Err(HarnessError::Start(
+            "live agent container mounts differ from its runtime capability".to_owned(),
+        ));
+    }
+    let private_session = fs::canonicalize(&layout.session).map_err(io_error)?;
+    let conversation = fs::canonicalize(&layout.conversation).map_err(io_error)?;
+    if mounts.iter().any(|mount| {
+        (mount.source.starts_with(&private_session) && mount.source != conversation)
+            || mount.target == "/var/run/docker.sock"
+            || mount.source == Path::new("/var/run/docker.sock")
+    }) {
+        return Err(HarnessError::Start(
+            "live agent container exposes private harness state or Docker authority".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn docker_start_error(error: io::Error) -> HarnessError {
+    if error.kind() == io::ErrorKind::NotFound {
+        HarnessError::NotInstalled("docker".to_owned())
+    } else {
+        HarnessError::Start(error.to_string())
+    }
+}
+
 pub(crate) fn signal_container_group(
     docker_binary: &Path,
     container: &str,
@@ -501,7 +703,14 @@ fn container_group_alive_with(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    Ok(run_command_bounded(&mut command, CONTROL_TIMEOUT)?.success())
+    let status = run_command_bounded(&mut command, CONTROL_TIMEOUT)?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(HarnessError::Crashed(
+            "Docker process-group liveness probe failed without a trusted result".to_owned(),
+        )),
+    }
 }
 
 fn run_control_command(
@@ -534,30 +743,174 @@ fn cleanup_failed_start(
     harness: &PiHarness,
     token: &str,
     pgid: Option<u32>,
-    child: &mut std::process::Child,
-) -> Result<(), HarnessError> {
-    let client = terminate_host_child(child, CONTROL_TIMEOUT);
+    mut child: std::process::Child,
+    storage_lease: Box<dyn ReadyLease>,
+    journal: PathBuf,
+) {
+    let client = terminate_host_child(&mut child, CONTROL_TIMEOUT);
     let cleanup = cleanup_container_authority(
         &harness.config.docker_binary,
         &harness.config.agent_container,
         pgid,
         token,
     );
-    match (client, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (client, cleanup) => Err(HarnessError::Start(format!(
-            "failed startup cleanup: docker client={}; Pi authority={}",
-            cleanup_result(client),
-            cleanup_result(cleanup)
-        ))),
+    if client.is_ok() && cleanup.is_ok() {
+        let _ = fs::remove_file(journal);
+        return;
     }
+    tracing::error!(
+        docker_client = %cleanup_result(client),
+        pi_authority = %cleanup_result(cleanup),
+        "startup cleanup was uncertain; quarantining its storage lease and process authority"
+    );
+    write_quarantine_journal(&journal, &harness.config.agent_container, pgid, token);
+    quarantine(QuarantinedProcess::Startup {
+        docker_binary: harness.config.docker_binary.clone(),
+        container: harness.config.agent_container.clone(),
+        child: Mutex::new(child),
+        pgid,
+        token: token.to_owned(),
+        journal,
+        _storage_lease: storage_lease,
+    });
 }
 
 fn cleanup_result(result: Result<(), HarnessError>) -> String {
-    match result {
-        Ok(()) => "reaped".to_owned(),
-        Err(error) => error.to_string(),
+    result.map_or_else(|error| error.to_string(), |()| "reaped".to_owned())
+}
+
+fn quarantine(process: QuarantinedProcess) {
+    static SENDER: OnceLock<Option<mpsc::Sender<QuarantinedProcess>>> = OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name("pi-quarantine-reaper".to_owned())
+            .spawn(move || quarantine_reaper(receiver))
+        {
+            Ok(_) => Some(sender),
+            Err(error) => {
+                tracing::error!(%error, "failed to spawn Pi quarantine reaper; authority will remain quarantined for journal recovery");
+                None
+            }
+        }
+    });
+    let Some(sender) = sender else {
+        Box::leak(Box::new(process));
+        return;
+    };
+    if let Err(error) = sender.send(process) {
+        tracing::error!(
+            "Pi quarantine reaper stopped; authority will remain quarantined for journal recovery"
+        );
+        Box::leak(Box::new(error.0));
     }
+}
+
+fn quarantine_reaper(receiver: mpsc::Receiver<QuarantinedProcess>) {
+    let mut pending = Vec::new();
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(process) => pending.push(process),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) if pending.is_empty() => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        pending.retain(|process| !quarantine_reaped(process));
+    }
+}
+
+fn quarantine_reaped(process: &QuarantinedProcess) -> bool {
+    let (docker_binary, container, child, pgid, token, journal) = match process {
+        QuarantinedProcess::Registered {
+            docker_binary,
+            container,
+            process,
+        } => (
+            docker_binary,
+            container,
+            &process.child,
+            Some(process.pgid),
+            process.supervisor_token.as_str(),
+            &process.quarantine_journal,
+        ),
+        QuarantinedProcess::Startup {
+            docker_binary,
+            container,
+            child,
+            pgid,
+            token,
+            journal,
+            ..
+        } => (
+            docker_binary,
+            container,
+            child,
+            *pgid,
+            token.as_str(),
+            journal,
+        ),
+    };
+    let client_reaped = child.try_lock().ok().is_some_and(|mut child| {
+        if child.try_wait().ok().flatten().is_some() {
+            true
+        } else {
+            let _ = child.kill();
+            child.try_wait().ok().flatten().is_some()
+        }
+    });
+    let pgids = match pgid {
+        Some(pgid) => vec![pgid],
+        None => match derive_token_pgids(docker_binary, container, token) {
+            Ok(pgids) => pgids,
+            Err(_) => return false,
+        },
+    };
+    let mut groups_reaped = true;
+    for pgid in pgids {
+        let _ = run_control_command(docker_binary, container, pgid, "KILL");
+        match container_group_alive_with(docker_binary, container, pgid) {
+            Ok(false) => {}
+            Ok(true) | Err(_) => groups_reaped = false,
+        }
+    }
+    if client_reaped && groups_reaped {
+        let _ = fs::remove_file(journal);
+        true
+    } else {
+        false
+    }
+}
+
+fn write_quarantine_journal(journal: &Path, container: &str, pgid: Option<u32>, token: &str) {
+    let record = serde_json::json!({
+        "version": 1,
+        "container_id": container,
+        "pgid": pgid,
+        "supervisor_token": token,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&record) {
+        if let Err(error) = atomic_write(journal, &bytes) {
+            tracing::error!(error = %error, path = %journal.display(), "failed to persist Pi quarantine journal");
+        }
+    }
+}
+
+pub(crate) fn quarantine_registered(
+    docker_binary: PathBuf,
+    container: String,
+    process: Arc<ManagedProcess>,
+) {
+    write_quarantine_journal(
+        &process.quarantine_journal,
+        &container,
+        Some(process.pgid),
+        &process.supervisor_token,
+    );
+    quarantine(QuarantinedProcess::Registered {
+        docker_binary,
+        container,
+        process,
+    });
 }
 
 fn cleanup_container_authority(
@@ -670,19 +1023,20 @@ pub(crate) fn terminate_on_drop(
     container: &str,
     process: &ManagedProcess,
     stop_timeout: Duration,
-) {
+) -> bool {
     let _ = signal_container_group(docker_binary, container, process.pgid, "TERM");
     if wait_for_reap_bounded(docker_binary, container, process, stop_timeout) {
-        return;
+        return true;
     }
     let _ = signal_container_group(docker_binary, container, process.pgid, "KILL");
     if wait_for_reap_bounded(docker_binary, container, process, KILL_REAP_TIMEOUT) {
-        return;
+        return true;
     }
     if let Ok(mut child) = process.child.try_lock() {
         let _ = child.kill();
         let _ = child.try_wait();
     }
+    wait_for_reap_bounded(docker_binary, container, process, Duration::from_millis(50))
 }
 
 fn wait_for_reap_bounded(

@@ -21,12 +21,30 @@ pub enum RuntimeError {
     Cleanup(String),
 }
 
+/// One exact daemon-verified bind attached to the agent container.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VerifiedBindMount {
+    pub source: PathBuf,
+    pub target: String,
+    pub writable: bool,
+}
+
+/// Immutable runtime authority required to execute an agent workload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAgentContainer {
+    pub container_id: String,
+    pub daemon_id: String,
+    pub labels: OwnershipLabels,
+    pub mounts: Vec<VerifiedBindMount>,
+}
+
 /// Handle to a provisioned, isolated execution environment.
 #[derive(Debug, Clone)]
 pub struct EnvironmentHandle {
     pub execution_id: ExecutionId,
     pub network: String,
     pub agent_container: String,
+    pub verified_agent_container: VerifiedAgentContainer,
     pub service_containers: Vec<String>,
     pub volumes: Vec<String>,
     pub credentials_path: Option<PathBuf>,

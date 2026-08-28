@@ -11,9 +11,9 @@ use bollard::{
 use execution_storage::{disk_gib_to_bytes, ExecutionLayout, ReadyLease, VerifiedExecutionStorage};
 use futures_util::StreamExt;
 use orchestrator_core::{OwnershipLabels, RuntimeRequirement, ServiceRequirement};
-use runtime_traits::{EnvironmentHandle, RuntimeError};
+use runtime_traits::{EnvironmentHandle, RuntimeError, VerifiedAgentContainer, VerifiedBindMount};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs, io,
     path::Path,
 };
@@ -366,7 +366,7 @@ async fn provision_inner(
     mounts.extend(execution_mounts);
     limits.mounts = Some(mounts.clone());
     storage.verify(&all_mounts).await?;
-    runtime
+    let created_agent = runtime
         .client
         .create_container(
             Some(CreateContainerOptions {
@@ -394,8 +394,9 @@ async fn provision_inner(
                 true,
             )
         })?;
+    let agent_container_id = created_agent.id;
     storage.verify(&all_mounts).await?;
-    verify_container_mount_sources(runtime, &agent_container, &layout.root, &mounts).await?;
+    verify_container_mount_sources(runtime, &agent_container_id, &layout.root, &mounts).await?;
 
     verify_with_trusted_container(
         runtime,
@@ -410,19 +411,125 @@ async fn provision_inner(
     storage.verify(&all_mounts).await?;
     runtime
         .client
-        .start_container::<String>(&agent_container, None)
+        .start_container::<String>(&agent_container_id, None)
         .await
         .map_err(|error| {
             RuntimeError::Provisioning(format!("start agent container {agent_container}: {error}"))
         })?;
+    let verified_agent_container =
+        issue_agent_container_capability(runtime, &agent_container_id, labels, layout, &mounts)
+            .await?;
 
     Ok(EnvironmentHandle {
         execution_id: labels.execution_id.clone(),
         network,
         agent_container,
+        verified_agent_container,
         service_containers,
         volumes: Vec::new(),
         credentials_path: None,
+    })
+}
+
+async fn issue_agent_container_capability(
+    runtime: &DockerRuntime,
+    container_id: &str,
+    labels: &OwnershipLabels,
+    layout: &ExecutionLayout,
+    requested_mounts: &[Mount],
+) -> Result<VerifiedAgentContainer, RuntimeError> {
+    let inspect = runtime
+        .client
+        .inspect_container(container_id, None)
+        .await
+        .map_err(|error| {
+            RuntimeError::Provisioning(format!(
+                "inspect started agent container {container_id}: {error}"
+            ))
+        })?;
+    if inspect.id.as_deref() != Some(container_id)
+        || inspect.state.as_ref().and_then(|state| state.running) != Some(true)
+    {
+        return Err(RuntimeError::ResourceLimit(
+            "agent container identity or running state changed before capability issue".to_owned(),
+        ));
+    }
+    let actual_labels = inspect
+        .config
+        .and_then(|config| config.labels)
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    if actual_labels != labels.to_map() {
+        return Err(RuntimeError::ResourceLimit(
+            "agent container ownership labels differ from the exact execution".to_owned(),
+        ));
+    }
+    let actual_mounts = inspect.mounts.unwrap_or_default();
+    validate_actual_mounts(requested_mounts, &actual_mounts)?;
+    let session_root = fs::canonicalize(&layout.session).map_err(|error| {
+        RuntimeError::ResourceLimit(format!("canonicalize private session root: {error}"))
+    })?;
+    let conversation = fs::canonicalize(&layout.conversation).map_err(|error| {
+        RuntimeError::ResourceLimit(format!("canonicalize conversation root: {error}"))
+    })?;
+    let mut mounts = Vec::with_capacity(actual_mounts.len());
+    for mount in actual_mounts {
+        if mount.typ != Some(MountPointTypeEnum::BIND) || mount.name.is_some() || mount.rw.is_none()
+        {
+            return Err(RuntimeError::ResourceLimit(
+                "agent capability contains a non-bind or ambiguous mount".to_owned(),
+            ));
+        }
+        let source =
+            fs::canonicalize(mount.source.as_deref().ok_or_else(|| {
+                RuntimeError::ResourceLimit("agent bind lacks source".to_owned())
+            })?)
+            .map_err(|error| {
+                RuntimeError::ResourceLimit(format!("canonicalize agent bind: {error}"))
+            })?;
+        let target = mount.destination.ok_or_else(|| {
+            RuntimeError::ResourceLimit("agent bind lacks destination".to_owned())
+        })?;
+        if (source.starts_with(&session_root) && source != conversation)
+            || target == "/var/run/docker.sock"
+            || source == Path::new("/var/run/docker.sock")
+        {
+            return Err(RuntimeError::ResourceLimit(
+                "agent capability exposes private session state or the Docker socket".to_owned(),
+            ));
+        }
+        mounts.push(VerifiedBindMount {
+            source,
+            target,
+            writable: mount.rw == Some(true),
+        });
+    }
+    mounts.sort();
+    let daemon_id = runtime
+        .client
+        .info()
+        .await
+        .map_err(|error| RuntimeError::Unavailable(format!("inspect Docker daemon: {error}")))?
+        .id
+        .ok_or_else(|| RuntimeError::ResourceLimit("Docker daemon lacks identity".to_owned()))?;
+    if daemon_id
+        != runtime
+            .allocation
+            .as_ref()
+            .ok_or_else(|| RuntimeError::ResourceLimit("allocation receipt is missing".to_owned()))?
+            .docker_bind
+            .daemon_id
+    {
+        return Err(RuntimeError::ResourceLimit(
+            "agent capability daemon differs from the storage proof".to_owned(),
+        ));
+    }
+    Ok(VerifiedAgentContainer {
+        container_id: container_id.to_owned(),
+        daemon_id,
+        labels: labels.clone(),
+        mounts,
     })
 }
 

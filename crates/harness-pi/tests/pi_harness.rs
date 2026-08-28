@@ -9,6 +9,7 @@ use orchestrator_core::{
     event::ExecutionEventKind, ExecutionId, FailureClass, ModelPolicy, OwnershipLabels, TaskPacket,
     WorkerId,
 };
+use runtime_traits::{VerifiedAgentContainer, VerifiedBindMount};
 use std::{
     fs,
     io::Write,
@@ -43,6 +44,7 @@ struct DockerPi {
     execution_id: String,
     receipt: AllocationReceipt,
     verifier: Arc<TestReadyVerifier>,
+    capability: VerifiedAgentContainer,
     removed: bool,
 }
 
@@ -218,10 +220,10 @@ impl DockerPi {
             include_str!("fixtures/pi-0.84.3-json-mode.jsonl"),
         )
         .unwrap();
-        let stub = root.path().join("pi");
+        let stub = layout.runtime.join("pi");
         fs::write(&stub, STUB_PI).unwrap();
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
-        let setsid = root.path().join("setsid");
+        let setsid = layout.runtime.join("setsid");
         fs::write(&setsid, STUB_SETSID).unwrap();
         fs::set_permissions(&setsid, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -231,7 +233,7 @@ impl DockerPi {
             .as_nanos();
         let container = format!("autospec-pi-test-{}-{nonce}-{sequence}", std::process::id());
         let labels = labels(&execution_id);
-        let status = Command::new("docker")
+        let created = Command::new("docker")
             .args(["create", "--name", &container])
             .args(
                 labels
@@ -262,14 +264,25 @@ impl DockerPi {
                 ),
             ])
             .args([IMAGE, "sleep", "infinity"])
-            .status()
+            .output()
             .expect("create stub Pi container");
-        assert!(status.success(), "create stub Pi container");
+        assert!(created.status.success(), "create stub Pi container");
+        let container_id = String::from_utf8(created.stdout).unwrap().trim().to_owned();
         assert!(Command::new("docker")
             .args(["start", &container])
             .status()
             .unwrap()
             .success());
+        let daemon_id = String::from_utf8(
+            Command::new("docker")
+                .args(["info", "--format", "{{.ID}}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
         let receipt = AllocationReceipt {
             api_version: ALLOCATION_API_VERSION.to_owned(),
             labels: labels.clone(),
@@ -287,7 +300,7 @@ impl DockerPi {
                 ownership_token: "test-owner-token".to_owned(),
             },
             docker_bind: DockerBindProof {
-                daemon_id: "test-daemon".to_owned(),
+                daemon_id: daemon_id.clone(),
                 verifier: "test-verifier".to_owned(),
                 method_version: "test-method-v1".to_owned(),
                 source_path: layout.root.clone(),
@@ -301,12 +314,42 @@ impl DockerPi {
             lease_state: Arc::new(LeaseState::default()),
             verified_directories: Arc::new(Mutex::new(Vec::new())),
         });
+        let mut mounts = vec![
+            VerifiedBindMount {
+                source: fs::canonicalize(&worktree).unwrap(),
+                target: "/workspace".to_owned(),
+                writable: true,
+            },
+            VerifiedBindMount {
+                source: fs::canonicalize(&conversation).unwrap(),
+                target: "/session".to_owned(),
+                writable: true,
+            },
+            VerifiedBindMount {
+                source: fs::canonicalize(&stub).unwrap(),
+                target: "/usr/local/bin/pi".to_owned(),
+                writable: false,
+            },
+            VerifiedBindMount {
+                source: fs::canonicalize(&setsid).unwrap(),
+                target: "/usr/local/bin/setsid".to_owned(),
+                writable: false,
+            },
+        ];
+        mounts.sort();
+        let capability = VerifiedAgentContainer {
+            container_id,
+            daemon_id,
+            labels: labels.clone(),
+            mounts,
+        };
         Some(Self {
             root,
             container,
             execution_id,
             receipt,
             verifier,
+            capability,
             removed: false,
         })
     }
@@ -315,7 +358,7 @@ impl DockerPi {
         let mut config = PiHarnessConfig::for_ready_allocation(
             self.verifier.clone(),
             self.receipt.clone(),
-            self.container.clone(),
+            self.capability.clone(),
         )
         .unwrap();
         config.docker_binary = PathBuf::from("docker");
@@ -408,6 +451,34 @@ case "$1 $2 $3 $4" in
 esac
 "#,
                 docker = docker.trim()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        wrapper
+    }
+
+    fn controllable_cleanup_docker_proxy(&self, blocked: &Path) -> PathBuf {
+        let docker = Command::new("sh")
+            .args(["-c", "command -v docker"])
+            .output()
+            .unwrap();
+        assert!(docker.status.success());
+        let docker = String::from_utf8(docker.stdout).unwrap();
+        let wrapper = self.root.path().join("cleanup-controlled-docker");
+        fs::write(
+            &wrapper,
+            format!(
+                r#"#!/bin/sh
+real_docker={docker:?}
+blocked={blocked:?}
+if [ "$1 $2" = "exec --user" ] && [ -f "$blocked" ]; then
+  exit 86
+fi
+exec "$real_docker" "$@"
+"#,
+                docker = docker.trim(),
+                blocked = blocked.display().to_string()
             ),
         )
         .unwrap();
@@ -539,7 +610,7 @@ async fn stale_or_forged_receipt_is_rejected_before_harness_writes() {
     let config = PiHarnessConfig::for_ready_allocation(
         fixture.verifier.clone(),
         forged,
-        fixture.container.clone(),
+        fixture.capability.clone(),
     )
     .unwrap();
     let result = PiHarness::new(config).start(&packet()).await;
@@ -556,6 +627,79 @@ async fn stale_or_forged_receipt_is_rejected_before_harness_writes() {
         .mount_path
         .join("repository/pi-body-started")
         .exists());
+}
+
+#[tokio::test]
+async fn foreign_container_id_is_rejected_before_harness_writes_or_pi_execution() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let foreign_name = format!("{}-foreign", fixture.container);
+    let created = Command::new("docker")
+        .args(["create", "--name", &foreign_name])
+        .args([
+            "--mount",
+            &format!(
+                "type=bind,src={},dst=/workspace",
+                fixture.worktree_dir().display()
+            ),
+        ])
+        .args([
+            "--mount",
+            &format!(
+                "type=bind,src={},dst=/session",
+                fixture.conversation_dir().display()
+            ),
+        ])
+        .args([
+            "--mount",
+            &format!(
+                "type=bind,src={},dst=/usr/local/bin/pi,readonly",
+                fixture.receipt.mount_path.join("runtime/pi").display()
+            ),
+        ])
+        .args([
+            "--mount",
+            &format!(
+                "type=bind,src={},dst=/usr/local/bin/setsid,readonly",
+                fixture.receipt.mount_path.join("runtime/setsid").display()
+            ),
+        ])
+        .args([IMAGE, "sleep", "infinity"])
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+    let foreign_id = String::from_utf8(created.stdout).unwrap().trim().to_owned();
+    assert!(Command::new("docker")
+        .args(["start", &foreign_id])
+        .status()
+        .unwrap()
+        .success());
+    let mut capability = fixture.capability.clone();
+    capability.container_id = foreign_id.clone();
+    let config = PiHarnessConfig::for_ready_allocation(
+        fixture.verifier.clone(),
+        fixture.receipt.clone(),
+        capability,
+    )
+    .unwrap();
+    let result = PiHarness::new(config).start(&packet()).await;
+    let _ = Command::new("docker")
+        .args(["rm", "-f", &foreign_id])
+        .status();
+    let error = result.expect_err("foreign container must fail closed");
+    assert!(
+        matches!(&error, HarnessError::Start(message) if message.contains("live container ownership")),
+        "unexpected foreign-container result: {error:?}"
+    );
+    assert!(!fixture
+        .worktree_dir()
+        .join(".autospec/task-packet.json")
+        .exists());
+    assert!(!fixture.session_dir().join("owner.json").exists());
+    assert!(!fixture.session_dir().join(".cursor").exists());
+    assert!(!fixture.session_dir().join("resume-count").exists());
+    assert!(!fixture.worktree_dir().join("pi-body-started").exists());
 }
 
 #[tokio::test]
@@ -597,6 +741,82 @@ async fn ready_lease_blocks_release_until_the_live_pi_session_stops() {
     released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     release.join().unwrap();
     assert_eq!(fixture.verifier.active_leases(), 0);
+}
+
+#[tokio::test]
+async fn failed_drop_quarantines_cleanup_authority_and_lease_until_confirmed_reap() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.worktree_dir().join("hung-descendant"), "").unwrap();
+    let blocked = fixture.root.path().join("block-cleanup");
+    let mut config = fixture.harness().config().clone();
+    config.docker_binary = fixture.controllable_cleanup_docker_proxy(&blocked);
+    let harness = PiHarness::new(config);
+    harness.start(&packet()).await.unwrap();
+    wait_for_content(&fixture.worktree_dir().join("pi-body-started"), "started").await;
+    let _ = wait_for_pi_pgid(&fixture).await;
+    fs::write(&blocked, "").unwrap();
+    assert_eq!(fixture.verifier.active_leases(), 1);
+    assert!(!Command::new(harness.config().docker_binary.clone())
+        .args([
+            "exec",
+            "--user",
+            "root",
+            &fixture.capability.container_id,
+            "true"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    drop(harness);
+    assert_eq!(fixture.verifier.active_leases(), 1);
+    assert!(fixture
+        .session_dir()
+        .read_dir()
+        .unwrap()
+        .flatten()
+        .any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("quarantine-")));
+    fs::remove_file(blocked).unwrap();
+    let verifier = Arc::clone(&fixture.verifier);
+    let (released_tx, released_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        verifier.wait_for_release();
+        let _ = released_tx.send(());
+    });
+    released_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(!pi_is_alive(&fixture));
+}
+
+#[tokio::test]
+async fn failed_start_quarantines_cleanup_authority_and_lease_until_confirmed_reap() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.worktree_dir().join("handshake-invalid"), "").unwrap();
+    fs::write(fixture.worktree_dir().join("hung-descendant"), "").unwrap();
+    let blocked = fixture.root.path().join("block-startup-cleanup");
+    fs::write(&blocked, "").unwrap();
+    let mut config = fixture.harness().config().clone();
+    config.docker_binary = fixture.controllable_cleanup_docker_proxy(&blocked);
+    let harness = PiHarness::new(config);
+    assert!(matches!(
+        harness.start(&packet()).await,
+        Err(HarnessError::Start(_))
+    ));
+    assert_eq!(fixture.verifier.active_leases(), 1);
+    fs::remove_file(blocked).unwrap();
+    let verifier = Arc::clone(&fixture.verifier);
+    let (released_tx, released_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        verifier.wait_for_release();
+        let _ = released_tx.send(());
+    });
+    released_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(!pi_is_alive(&fixture));
 }
 
 #[tokio::test]
@@ -774,6 +994,35 @@ async fn live_event_stdout_is_incremental_and_distinct_from_durable_conversation
     assert!(durable.contains("\"type\":\"session\""));
     assert!(!durable.contains("turn_start"));
     harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
+async fn cursor_rejects_any_nonempty_path_other_than_the_exact_live_event_file() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    harness.stop(&session).await.unwrap();
+    let external = fixture.root.path().join("external-events.jsonl");
+    fs::write(&external, "{\"type\":\"agent_start\"}\n").unwrap();
+    fs::write(
+        fixture.session_dir().join(".cursor"),
+        serde_json::to_vec(&serde_json::json!({
+            "sessions": {
+                fixture.execution_id.clone(): {
+                    "path": external,
+                    "offset": 0
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        harness.poll_events(&session).await,
+        Err(HarnessError::InvalidSession(_))
+    ));
 }
 
 #[tokio::test]

@@ -712,6 +712,7 @@ dependencies = [
  "execution-storage",
  "harness-traits",
  "orchestrator-core",
+ "runtime-traits",
  "serde",
  "serde_json",
  "tempfile",

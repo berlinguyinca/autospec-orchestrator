@@ -1506,6 +1506,24 @@ async fn agent_mounts_only_writable_worktree_and_durable_conversation() {
         .inspect_container(&handle.agent_container, None)
         .await
         .expect("inspect mounted agent");
+    let capability = &handle.verified_agent_container;
+    assert_eq!(capability.container_id, inspect.id.clone().unwrap());
+    assert_eq!(capability.labels, execution_labels);
+    assert_eq!(
+        capability.daemon_id,
+        docker.info().await.unwrap().id.unwrap()
+    );
+    assert!(capability.mounts.iter().any(|mount| {
+        mount.target == "/workspace"
+            && mount.source == fs::canonicalize(state.worktree(&execution_labels)).unwrap()
+            && mount.writable
+    }));
+    assert!(capability.mounts.iter().any(|mount| {
+        mount.target == "/session"
+            && mount.source
+                == fs::canonicalize(state.session(&execution_labels).join("conversation")).unwrap()
+            && mount.writable
+    }));
     let mounts = inspect
         .host_config
         .expect("agent host config")

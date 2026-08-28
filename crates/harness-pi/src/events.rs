@@ -58,8 +58,13 @@ pub(crate) fn poll_events(
     let cursor_path = session_dir.join(CURSOR_FILE);
     let mut cursors = read_cursors(&cursor_path)?;
     let cursor = cursors.sessions.entry(session.id.to_string()).or_default();
+    let expected_events = normalized_absolute(&events_path(session))?;
     if cursor.path.as_os_str().is_empty() {
-        cursor.path = events_path(session);
+        cursor.path = expected_events.clone();
+    } else if cursor.path != expected_events {
+        return Err(HarnessError::InvalidSession(
+            "cursor path does not exactly match the session live-event file".to_owned(),
+        ));
     }
     if !cursor.path.exists() {
         return Ok(Vec::new());
@@ -108,6 +113,22 @@ pub(crate) fn poll_events(
     atomic_write(&cursor_path, &serialized)?;
     harness.unknown_events.fetch_add(unknown, Ordering::Relaxed);
     Ok(events)
+}
+
+fn normalized_absolute(path: &Path) -> Result<PathBuf, HarnessError> {
+    if !path.is_absolute() {
+        return Err(HarnessError::InvalidSession(format!(
+            "harness path is not absolute: {}",
+            path.display()
+        )));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        HarnessError::InvalidSession(format!("harness path has no parent: {}", path.display()))
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        HarnessError::InvalidSession(format!("harness path has no filename: {}", path.display()))
+    })?;
+    Ok(fs::canonicalize(parent).map_err(io_error)?.join(name))
 }
 
 enum Normalized {

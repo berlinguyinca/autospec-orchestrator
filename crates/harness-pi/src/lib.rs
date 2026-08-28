@@ -11,6 +11,7 @@ use execution_storage::{
 };
 use harness_traits::{AgentHarness, HarnessError, SessionRef};
 use orchestrator_core::{ExecutionEvent, ModelPolicy, OwnershipLabels, TaskPacket};
+use runtime_traits::VerifiedAgentContainer;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -45,6 +46,7 @@ struct VerifiedAllocationConfig {
     verifier: Arc<dyn ReadyAllocationVerifier>,
     receipt: AllocationReceipt,
     layout: ExecutionLayout,
+    container: VerifiedAgentContainer,
 }
 
 impl PiHarnessConfig {
@@ -82,7 +84,7 @@ impl PiHarnessConfig {
     pub fn for_ready_allocation(
         verifier: Arc<dyn ReadyAllocationVerifier>,
         receipt: AllocationReceipt,
-        agent_container: String,
+        container: VerifiedAgentContainer,
     ) -> Result<Self, HarnessError> {
         let state_root = receipt
             .mount_path
@@ -101,6 +103,7 @@ impl PiHarnessConfig {
             .map_err(storage_error)?;
         let labels = receipt.labels.clone();
         let worktree = layout.repository.clone();
+        let agent_container = container.container_id.clone();
         Ok(Self {
             state_root,
             worktree,
@@ -121,6 +124,7 @@ impl PiHarnessConfig {
                 verifier,
                 receipt,
                 layout,
+                container,
             }),
         })
     }
@@ -138,6 +142,8 @@ struct ProcessRegistry {
 struct ManagedProcess {
     child: Mutex<Child>,
     pgid: u32,
+    supervisor_token: String,
+    quarantine_journal: PathBuf,
     _storage_lease: Box<dyn ReadyLease>,
 }
 
@@ -152,12 +158,18 @@ impl Drop for ProcessRegistry {
             return;
         };
         for process in children.values() {
-            session::terminate_on_drop(
+            if !session::terminate_on_drop(
                 &self.docker_binary,
                 &self.agent_container,
                 process,
                 self.stop_timeout,
-            );
+            ) {
+                session::quarantine_registered(
+                    self.docker_binary.clone(),
+                    self.agent_container.clone(),
+                    Arc::clone(process),
+                );
+            }
         }
     }
 }
@@ -210,11 +222,13 @@ impl PiHarness {
         if storage.layout != expected
             || storage.receipt.labels != self.config.labels
             || self.config.worktree != expected.repository
+            || self.config.agent_container != storage.container.container_id
         {
             return Err(HarnessError::Start(
                 "Pi configuration does not exactly match its execution allocation".to_owned(),
             ));
         }
+        validate_container_capability(&storage.container, &storage.receipt, &expected)?;
 
         let verified = storage
             .verifier
@@ -230,6 +244,19 @@ impl PiHarness {
             layout: expected,
             lease,
         })
+    }
+
+    pub(crate) fn container_capability(&self) -> Result<&VerifiedAgentContainer, HarnessError> {
+        self.config
+            .storage
+            .as_ref()
+            .map(|storage| &storage.container)
+            .ok_or_else(|| {
+                HarnessError::Start(
+                    "Pi execution requires an exact runtime-issued agent container capability"
+                        .to_owned(),
+                )
+            })
     }
 
     pub(crate) fn validate_session(&self, session: &SessionRef) -> Result<(), HarnessError> {
@@ -248,6 +275,66 @@ impl PiHarness {
         }
         Ok(())
     }
+}
+
+fn validate_container_capability(
+    container: &VerifiedAgentContainer,
+    receipt: &AllocationReceipt,
+    layout: &ExecutionLayout,
+) -> Result<(), HarnessError> {
+    if container.container_id.is_empty()
+        || container.daemon_id != receipt.docker_bind.daemon_id
+        || container.labels != receipt.labels
+    {
+        return Err(HarnessError::Start(
+            "agent container capability does not match allocation identity".to_owned(),
+        ));
+    }
+    let root = std::fs::canonicalize(&layout.root).map_err(|error| {
+        HarnessError::Start(format!(
+            "canonicalize execution root for container proof: {error}"
+        ))
+    })?;
+    let repository = std::fs::canonicalize(&layout.repository).map_err(|error| {
+        HarnessError::Start(format!(
+            "canonicalize worktree for container proof: {error}"
+        ))
+    })?;
+    let session_root = std::fs::canonicalize(&layout.session).map_err(|error| {
+        HarnessError::Start(format!(
+            "canonicalize private session root for container proof: {error}"
+        ))
+    })?;
+    let conversation = std::fs::canonicalize(&layout.conversation).map_err(|error| {
+        HarnessError::Start(format!(
+            "canonicalize conversation for container proof: {error}"
+        ))
+    })?;
+    let workspace = container.mounts.iter().filter(|mount| {
+        mount.target == session::CONTAINER_WORKTREE && mount.source == repository && mount.writable
+    });
+    let session = container.mounts.iter().filter(|mount| {
+        mount.target == session::CONTAINER_SESSION && mount.source == conversation && mount.writable
+    });
+    if workspace.count() != 1 || session.count() != 1 {
+        return Err(HarnessError::Start(
+            "agent container capability lacks exact writable execution binds".to_owned(),
+        ));
+    }
+    let mut targets = std::collections::BTreeSet::new();
+    for mount in &container.mounts {
+        if !mount.source.starts_with(&root)
+            || !targets.insert(&mount.target)
+            || (mount.source.starts_with(&session_root) && mount.source != conversation)
+            || mount.target == "/var/run/docker.sock"
+            || mount.source == std::path::Path::new("/var/run/docker.sock")
+        {
+            return Err(HarnessError::Start(
+                "agent container capability exposes an unverified host path".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_storage_paths(
