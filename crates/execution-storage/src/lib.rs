@@ -9,7 +9,9 @@ mod model;
 
 pub use apfs::ApfsBackend;
 pub use command::{CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner};
-pub use journal::{JournalStore, SecureMetadataDirectory};
+pub use journal::{
+    ExecutionLifecycleHold, ExecutionLifecycleHoldStore, JournalStore, SecureMetadataDirectory,
+};
 pub use lvm::LvmBackend;
 pub use manager::{
     AllocationRequest, BackendCapability, DockerBindCapability, DockerBindVerifier,

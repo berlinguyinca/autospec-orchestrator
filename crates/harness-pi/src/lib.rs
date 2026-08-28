@@ -6,8 +6,8 @@ mod session;
 
 use async_trait::async_trait;
 use execution_storage::{
-    AllocationReceipt, ExecutionLayout, ReadyAllocationVerifier, ReadyLease,
-    VerifiedExecutionStorage,
+    AllocationReceipt, ExecutionLayout, ExecutionLifecycleHoldStore, ReadyAllocationVerifier,
+    ReadyLease, VerifiedExecutionStorage,
 };
 use harness_traits::{AgentHarness, HarnessError, SessionRef};
 use orchestrator_core::{ExecutionEvent, ModelPolicy, OwnershipLabels, TaskPacket};
@@ -143,7 +143,9 @@ struct ManagedProcess {
     child: Mutex<Child>,
     pgid: u32,
     supervisor_token: String,
-    quarantine_journal: PathBuf,
+    lifecycle_holds: ExecutionLifecycleHoldStore,
+    hold_id: String,
+    hold_execution_id: orchestrator_core::ExecutionId,
     _storage_lease: Box<dyn ReadyLease>,
 }
 

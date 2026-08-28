@@ -1,8 +1,8 @@
 use crate::{
     events::find_session_file,
     session::{
-        atomic_write, base_args, read_real_file, spawn, CONTAINER_SESSION, CONVERSATION_DIR,
-        OWNER_FILE, RESUME_COUNT_FILE,
+        atomic_write, base_args, read_real_file, spawn, verify_live_agent_container,
+        CONTAINER_SESSION, CONVERSATION_DIR, OWNER_FILE, RESUME_COUNT_FILE,
     },
     PiHarness,
 };
@@ -21,6 +21,7 @@ enum DurableSession {
 pub(crate) fn resume(harness: &PiHarness, session: &SessionRef) -> Result<(), HarnessError> {
     harness.validate_session(session)?;
     let storage = harness.acquire_ready_storage()?;
+    verify_live_agent_container(harness, &storage.layout)?;
     validate_owner(harness, session)?;
     let session_dir = Path::new(&session.path);
     let conversation_dir = session_dir.join(CONVERSATION_DIR);
@@ -73,6 +74,7 @@ pub(crate) fn fork_conversation(
 ) -> Result<SessionRef, HarnessError> {
     harness.validate_session(session)?;
     let storage = harness.acquire_ready_storage()?;
+    verify_live_agent_container(harness, &storage.layout)?;
     validate_owner(harness, session)?;
     let session_dir = Path::new(&session.path);
     let conversation_dir = session_dir.join(CONVERSATION_DIR);

@@ -1,5 +1,7 @@
 use crate::{ExecutionLayout, PhaseJournal, StorageError};
 use orchestrator_core::ExecutionId;
+use orchestrator_core::OwnershipLabels;
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
@@ -97,6 +99,25 @@ impl SecureMetadataDirectory {
     /// Returns the canonical path of this descriptor-pinned metadata directory.
     pub fn path(&self) -> &Path {
         &self.directory.path
+    }
+
+    pub fn names(&self) -> Result<Vec<String>, StorageError> {
+        self.directory.verify("metadata directory")?;
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.directory.path)
+            .map_err(|error| journal_error("list", &self.directory.path, error))?
+        {
+            let entry =
+                entry.map_err(|error| journal_error("list", &self.directory.path, error))?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                StorageError::IdentityMismatch("metadata child name is not UTF-8".to_owned())
+            })?;
+            validate_metadata_name(&name)?;
+            names.push(name);
+        }
+        names.sort();
+        self.directory.verify("metadata directory")?;
+        Ok(names)
     }
 
     /// Restricts an existing real direct-child file to owner-only access and fsyncs it.
@@ -281,6 +302,102 @@ impl SecureMetadataDirectory {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionLifecycleHold {
+    pub labels: OwnershipLabels,
+    pub hold_id: String,
+    pub container_id: String,
+    pub session_id: String,
+    pub supervisor_token: String,
+    pub pgid: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionLifecycleHoldStore {
+    directory: SecureMetadataDirectory,
+}
+
+impl ExecutionLifecycleHoldStore {
+    pub fn new(state_root: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let parent = SecureMetadataDirectory::new(state_root.as_ref().join("execution-storage"))?;
+        let path = parent.path().join("holds");
+        let directory = if path.exists() {
+            SecureMetadataDirectory::new(&path)?
+        } else {
+            parent.create_subdirectory("holds")?
+        };
+        Ok(Self { directory })
+    }
+
+    pub fn create(&self, hold: &ExecutionLifecycleHold) -> Result<(), StorageError> {
+        validate_hold(hold)?;
+        self.directory.create(
+            &hold_name(&hold.labels.execution_id, &hold.hold_id)?,
+            &serde_json::to_vec(hold).map_err(|error| StorageError::Journal(error.to_string()))?,
+        )
+    }
+
+    pub fn replace(&self, hold: &ExecutionLifecycleHold) -> Result<(), StorageError> {
+        validate_hold(hold)?;
+        self.directory.replace(
+            &hold_name(&hold.labels.execution_id, &hold.hold_id)?,
+            &serde_json::to_vec(hold).map_err(|error| StorageError::Journal(error.to_string()))?,
+        )
+    }
+
+    pub fn remove(&self, execution_id: &ExecutionId, hold_id: &str) -> Result<(), StorageError> {
+        self.directory.remove(&hold_name(execution_id, hold_id)?)
+    }
+
+    pub fn list(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Vec<ExecutionLifecycleHold>, StorageError> {
+        let prefix = format!("{}--", execution_id.as_str());
+        let mut holds = Vec::new();
+        for name in self
+            .directory
+            .names()?
+            .into_iter()
+            .filter(|name| name.starts_with(&prefix))
+        {
+            let bytes = self
+                .directory
+                .read(&name)?
+                .ok_or_else(|| StorageError::Journal("lifecycle hold disappeared".to_owned()))?;
+            let hold: ExecutionLifecycleHold = serde_json::from_slice(&bytes)
+                .map_err(|error| StorageError::Journal(error.to_string()))?;
+            validate_hold(&hold)?;
+            if &hold.labels.execution_id != execution_id {
+                return Err(StorageError::IdentityMismatch(
+                    "lifecycle hold execution changed".to_owned(),
+                ));
+            }
+            holds.push(hold);
+        }
+        Ok(holds)
+    }
+}
+
+fn hold_name(execution_id: &ExecutionId, hold_id: &str) -> Result<String, StorageError> {
+    let name = format!("{}--{hold_id}.json", execution_id.as_str());
+    validate_metadata_name(&name)?;
+    Ok(name)
+}
+
+fn validate_hold(hold: &ExecutionLifecycleHold) -> Result<(), StorageError> {
+    if hold.hold_id.is_empty()
+        || hold.container_id.is_empty()
+        || hold.session_id.is_empty()
+        || hold.supervisor_token.is_empty()
+    {
+        return Err(StorageError::IdentityMismatch(
+            "lifecycle hold identity is incomplete".to_owned(),
+        ));
+    }
+    hold_name(&hold.labels.execution_id, &hold.hold_id).map(|_| ())
+}
+
 impl JournalStore {
     pub fn new(state_root: impl AsRef<Path>) -> Result<Self, StorageError> {
         let state_root = PinnedDirectory::capture(state_root.as_ref(), "state root")?;
@@ -418,6 +535,10 @@ impl JournalStore {
             let file_type = entry
                 .file_type()
                 .map_err(|error| journal_error("inspect entry", &entry.path(), error))?;
+            if entry.file_name() == "holds" && file_type.is_dir() {
+                SecureMetadataDirectory::new(entry.path())?;
+                continue;
+            }
             if file_type.is_symlink() || !file_type.is_file() {
                 return Err(StorageError::Journal(format!(
                     "unexpected journal entry type: {}",

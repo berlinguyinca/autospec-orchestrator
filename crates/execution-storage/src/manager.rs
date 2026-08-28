@@ -304,6 +304,7 @@ pub struct ExecutionStorage {
     backend: Box<dyn StorageBackend>,
     docker: Box<dyn DockerBindVerifier>,
     executions_directory: PinnedDirectory,
+    lifecycle_holds: crate::ExecutionLifecycleHoldStore,
 }
 
 impl ExecutionStorage {
@@ -322,6 +323,7 @@ impl ExecutionStorage {
         let executions_directory =
             PinnedDirectory::capture(&state_root.join("executions"), "executions directory")?;
         let journals = JournalStore::new(&state_root)?;
+        let lifecycle_holds = crate::ExecutionLifecycleHoldStore::new(&state_root)?;
         state_identity.verify("state root")?;
         Ok(Self {
             state_root,
@@ -329,6 +331,7 @@ impl ExecutionStorage {
             backend,
             docker,
             executions_directory,
+            lifecycle_holds,
         })
     }
 
@@ -844,6 +847,15 @@ impl ExecutionStorageManager for ExecutionStorage {
 
     fn release(&self, receipt: &AllocationReceipt) -> Result<(), StorageError> {
         let layout = ExecutionLayout::new(&self.state_root, &receipt.labels.execution_id)?;
+        if !self
+            .lifecycle_holds
+            .list(&receipt.labels.execution_id)?
+            .is_empty()
+        {
+            return Err(StorageError::Unavailable(
+                "execution has an unresolved durable lifecycle hold".to_owned(),
+            ));
+        }
         let release_lock = self.journals.open_ready_lease(&layout)?;
         FileExt::try_lock_exclusive(&release_lock).map_err(|error| {
             StorageError::Unavailable(format!(

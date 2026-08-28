@@ -207,6 +207,12 @@ impl DockerPi {
         let state_root = root.path().join("state");
         let execution = ExecutionId::new(&execution_id);
         let layout = ExecutionLayout::new(&state_root, &execution).unwrap();
+        fs::create_dir_all(state_root.join("execution-storage")).unwrap();
+        fs::set_permissions(
+            state_root.join("execution-storage"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         let worktree = layout.repository.clone();
         let conversation = layout.conversation.clone();
         fs::create_dir_all(worktree.join(".autospec")).unwrap();
@@ -472,8 +478,8 @@ esac
                 r#"#!/bin/sh
 real_docker={docker:?}
 blocked={blocked:?}
-if [ "$1 $2" = "exec --user" ] && [ -f "$blocked" ]; then
-  exit 86
+if {{ [ "$1 $2" = "exec --user" ] || [ "$1" = "top" ]; }} && [ -f "$blocked" ]; then
+  exit "$(cat "$blocked")"
 fi
 exec "$real_docker" "$@"
 "#,
@@ -756,7 +762,7 @@ async fn failed_drop_quarantines_cleanup_authority_and_lease_until_confirmed_rea
     harness.start(&packet()).await.unwrap();
     wait_for_content(&fixture.worktree_dir().join("pi-body-started"), "started").await;
     let _ = wait_for_pi_pgid(&fixture).await;
-    fs::write(&blocked, "").unwrap();
+    fs::write(&blocked, "1").unwrap();
     assert_eq!(fixture.verifier.active_leases(), 1);
     assert!(!Command::new(harness.config().docker_binary.clone())
         .args([
@@ -772,14 +778,17 @@ async fn failed_drop_quarantines_cleanup_authority_and_lease_until_confirmed_rea
     drop(harness);
     assert_eq!(fixture.verifier.active_leases(), 1);
     assert!(fixture
-        .session_dir()
+        .receipt
+        .mount_path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("execution-storage/holds")
         .read_dir()
         .unwrap()
         .flatten()
-        .any(|entry| entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("quarantine-")));
+        .any(|entry| entry.file_name().to_string_lossy().contains("--pi-")));
     fs::remove_file(blocked).unwrap();
     let verifier = Arc::clone(&fixture.verifier);
     let (released_tx, released_rx) = std::sync::mpsc::channel();
@@ -799,7 +808,7 @@ async fn failed_start_quarantines_cleanup_authority_and_lease_until_confirmed_re
     fs::write(fixture.worktree_dir().join("handshake-invalid"), "").unwrap();
     fs::write(fixture.worktree_dir().join("hung-descendant"), "").unwrap();
     let blocked = fixture.root.path().join("block-startup-cleanup");
-    fs::write(&blocked, "").unwrap();
+    fs::write(&blocked, "1").unwrap();
     let mut config = fixture.harness().config().clone();
     config.docker_binary = fixture.controllable_cleanup_docker_proxy(&blocked);
     let harness = PiHarness::new(config);
@@ -1340,6 +1349,54 @@ async fn resume_rejects_malformed_complete_record_but_truncates_only_a_torn_tail
         )
     );
     harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_container_resume_fails_before_count_or_conversation_mutation() {
+    let Some(mut fixture) = DockerPi::create() else {
+        return;
+    };
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    let durable = fixture
+        .conversation_dir()
+        .join(format!("session_{}.jsonl", fixture.execution_id));
+    wait_for_content(&durable, "\"type\":\"session\"").await;
+    harness.stop(&session).await.unwrap();
+    let before = fs::read(&durable).unwrap();
+    fixture.remove_container();
+    assert!(matches!(
+        harness.resume(&session).await,
+        Err(HarnessError::Start(_))
+    ));
+    assert_eq!(fs::read(&durable).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(fixture.session_dir().join("resume-count")).unwrap(),
+        "0\n"
+    );
+}
+
+#[tokio::test]
+async fn stale_container_fork_fails_before_torn_conversation_repair() {
+    let Some(mut fixture) = DockerPi::create() else {
+        return;
+    };
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    let durable = fixture
+        .conversation_dir()
+        .join(format!("session_{}.jsonl", fixture.execution_id));
+    wait_for_content(&durable, "\"type\":\"session\"").await;
+    harness.stop(&session).await.unwrap();
+    let mut before = fs::read(&durable).unwrap();
+    before.extend_from_slice(b"{\"type\":\"message\"");
+    fs::write(&durable, &before).unwrap();
+    fixture.remove_container();
+    assert!(matches!(
+        harness.fork_conversation(&session).await,
+        Err(HarnessError::Start(_))
+    ));
+    assert_eq!(fs::read(&durable).unwrap(), before);
 }
 
 #[tokio::test]

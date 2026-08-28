@@ -1,5 +1,5 @@
 use crate::{verify_storage_paths, ManagedProcess, PiHarness, ReadyPiStorage};
-use execution_storage::ReadyLease;
+use execution_storage::{ExecutionLifecycleHold, ExecutionLifecycleHoldStore, ReadyLease};
 use harness_traits::{HarnessError, SessionRef};
 use orchestrator_core::{ModelPolicy, SessionId, TaskPacket};
 use runtime_traits::VerifiedBindMount;
@@ -22,8 +22,20 @@ pub(crate) const CONTAINER_WORKTREE: &str = "/workspace";
 pub(crate) const CONTAINER_SESSION: &str = "/session";
 pub(crate) const CONVERSATION_DIR: &str = "conversation";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
-const SUPERVISOR_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
+const SUPERVISOR_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const GROUP_PROBE: &str = r#"target=$1
+token=$2
+printf 'AUTOSPEC_GROUP_PROBE %s\n' "$token"
+for stat_file in /proc/[0-9]*/stat; do
+  stat=$(cat "$stat_file" 2>/dev/null) || continue
+  rest=${stat##*) }
+  set -- $rest
+  state=$1
+  pgid=$3
+  [ "$pgid" = "$target" ] && printf 'MEMBER %s\n' "$state"
+done
+exit 0"#;
 const SUPERVISOR: &str = r#"token=$1
 shift
 printf '{"type":"autospec_control","token":"%s","pgid":%s}\n' "$token" "$$"
@@ -31,16 +43,6 @@ IFS= read -r ack || exit 125
 [ "$ack" = "ACK $token" ] || exit 125
 printf '{"type":"autospec_ready","token":"%s"}\n' "$token"
 exec "$@""#;
-const GROUP_HAS_RUNNABLE: &str = r#"target=$1
-for stat_file in /proc/[0-9]*/stat; do
-  stat=$(cat "$stat_file" 2>/dev/null) || continue
-  rest=${stat##*) }
-  set -- $rest
-  state=$1
-  pgid=$3
-  [ "$pgid" = "$target" ] && [ "$state" != Z ] && exit 0
-done
-exit 1"#;
 const TOKEN_PGIDS: &str = r#"token=$1
 for environment in /proc/[0-9]*/environ; do
   [ -r "$environment" ] || continue
@@ -68,7 +70,9 @@ enum QuarantinedProcess {
         child: Mutex<std::process::Child>,
         pgid: Option<u32>,
         token: String,
-        journal: PathBuf,
+        lifecycle_holds: ExecutionLifecycleHoldStore,
+        hold_execution_id: orchestrator_core::ExecutionId,
+        hold_id: String,
         _storage_lease: Box<dyn ReadyLease>,
     },
 }
@@ -84,6 +88,7 @@ pub(crate) struct SessionOwner {
 pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionRef, HarnessError> {
     let storage = harness.acquire_ready_storage()?;
     verify_live_agent_container(harness, &storage.layout)?;
+    recover_lifecycle_holds(harness)?;
     ensure_docker_and_pi(harness)?;
     let execution_id = harness.config.labels.execution_id.clone();
     let session_id = SessionId::new(execution_id.to_string());
@@ -119,6 +124,42 @@ pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionR
     args.push("@/workspace/.autospec/task-packet.json".into());
     spawn(harness, &session, args, storage)?;
     Ok(session)
+}
+
+fn recover_lifecycle_holds(harness: &PiHarness) -> Result<(), HarnessError> {
+    let store = ExecutionLifecycleHoldStore::new(&harness.config.state_root)
+        .map_err(crate::storage_error)?;
+    for hold in store
+        .list(&harness.config.labels.execution_id)
+        .map_err(crate::storage_error)?
+    {
+        if harness
+            .processes
+            .children
+            .lock()
+            .map_err(|_| HarnessError::Start("process registry lock poisoned".to_owned()))?
+            .contains_key(&hold.session_id)
+        {
+            continue;
+        }
+        if hold.labels != harness.config.labels
+            || hold.container_id != harness.config.agent_container
+        {
+            return Err(HarnessError::Start(
+                "durable Pi lifecycle hold does not match the live container capability".to_owned(),
+            ));
+        }
+        cleanup_container_authority(
+            &harness.config.docker_binary,
+            &hold.container_id,
+            hold.pgid,
+            &hold.supervisor_token,
+        )?;
+        store
+            .remove(&hold.labels.execution_id, &hold.hold_id)
+            .map_err(crate::storage_error)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn base_args(harness: &PiHarness) -> Result<Vec<String>, HarnessError> {
@@ -208,8 +249,21 @@ pub(crate) fn spawn(
     let session_dir = Path::new(&session.path);
     let events = open_private_append(&live_events_path(session))?;
     let stderr = open_private_append(&session_dir.join(format!("pi.stderr-{}.log", session.id)))?;
-    let quarantine_journal = session_dir.join(format!("quarantine-{}.json", session.id));
     let supervisor_token = supervisor_token()?;
+    let lifecycle_holds = ExecutionLifecycleHoldStore::new(&harness.config.state_root)
+        .map_err(crate::storage_error)?;
+    let hold_id = format!("pi-{}", session.id);
+    let mut lifecycle_hold = ExecutionLifecycleHold {
+        labels: harness.config.labels.clone(),
+        hold_id: hold_id.clone(),
+        container_id: harness.config.agent_container.clone(),
+        session_id: session.id.to_string(),
+        supervisor_token: supervisor_token.clone(),
+        pgid: None,
+    };
+    lifecycle_holds
+        .create(&lifecycle_hold)
+        .map_err(crate::storage_error)?;
     let mut command = Command::new(&harness.config.docker_binary);
     command
         .args(["exec", "--interactive", "--env"])
@@ -230,6 +284,7 @@ pub(crate) fn spawn(
         .stdout(Stdio::piped())
         .stderr(stderr);
     let mut child = command.spawn().map_err(|error| {
+        let _ = lifecycle_holds.remove(&harness.config.labels.execution_id, &hold_id);
         if error.kind() == io::ErrorKind::NotFound {
             HarnessError::NotInstalled(harness.config.docker_binary.display().to_string())
         } else {
@@ -303,7 +358,8 @@ pub(crate) fn spawn(
             None,
             child,
             storage.lease,
-            quarantine_journal,
+            lifecycle_holds,
+            hold_id,
         );
         return Err(HarnessError::Start(error.to_string()));
     }
@@ -317,7 +373,8 @@ pub(crate) fn spawn(
                 None,
                 child,
                 storage.lease,
-                quarantine_journal,
+                lifecycle_holds,
+                hold_id,
             );
             return Err(HarnessError::Start(error));
         }
@@ -329,7 +386,8 @@ pub(crate) fn spawn(
                 None,
                 child,
                 storage.lease,
-                quarantine_journal,
+                lifecycle_holds,
+                hold_id,
             );
             return Err(HarnessError::Start(
                 "timed out waiting for trusted Pi supervisor control record".to_owned(),
@@ -343,7 +401,8 @@ pub(crate) fn spawn(
                 None,
                 child,
                 storage.lease,
-                quarantine_journal,
+                lifecycle_holds,
+                hold_id,
             );
             return Err(HarnessError::Start(
                 "Pi supervisor control channel disconnected".to_owned(),
@@ -360,7 +419,8 @@ pub(crate) fn spawn(
             Some(pgid),
             child,
             storage.lease,
-            quarantine_journal,
+            lifecycle_holds,
+            hold_id,
         );
         return Err(HarnessError::Start(format!(
             "failed to acknowledge Pi supervisor: {error}"
@@ -376,7 +436,8 @@ pub(crate) fn spawn(
                 Some(pgid),
                 child,
                 storage.lease,
-                quarantine_journal,
+                lifecycle_holds,
+                hold_id,
             );
             return Err(HarnessError::Start(error));
         }
@@ -387,7 +448,8 @@ pub(crate) fn spawn(
                 Some(pgid),
                 child,
                 storage.lease,
-                quarantine_journal,
+                lifecycle_holds,
+                hold_id,
             );
             return Err(HarnessError::Start(
                 "timed out waiting for trusted Pi supervisor READY confirmation".to_owned(),
@@ -400,12 +462,26 @@ pub(crate) fn spawn(
                 Some(pgid),
                 child,
                 storage.lease,
-                quarantine_journal,
+                lifecycle_holds,
+                hold_id,
             );
             return Err(HarnessError::Start(
                 "Pi supervisor READY channel disconnected".to_owned(),
             ));
         }
+    }
+    lifecycle_hold.pgid = Some(pgid);
+    if let Err(error) = lifecycle_holds.replace(&lifecycle_hold) {
+        cleanup_failed_start(
+            harness,
+            &supervisor_token,
+            Some(pgid),
+            child,
+            storage.lease,
+            lifecycle_holds,
+            hold_id,
+        );
+        return Err(crate::storage_error(error));
     }
     children.insert(
         session.id.to_string(),
@@ -413,7 +489,9 @@ pub(crate) fn spawn(
             child: std::sync::Mutex::new(child),
             pgid,
             supervisor_token,
-            quarantine_journal,
+            lifecycle_holds,
+            hold_id,
+            hold_execution_id: harness.config.labels.execution_id.clone(),
             _storage_lease: storage.lease,
         }),
     );
@@ -485,6 +563,10 @@ fn remove_registered_child(
     session: &SessionRef,
     expected: &Arc<ManagedProcess>,
 ) -> Result<(), HarnessError> {
+    expected
+        .lifecycle_holds
+        .remove(&expected.hold_execution_id, &expected.hold_id)
+        .map_err(crate::storage_error)?;
     let mut children = harness
         .processes
         .children
@@ -575,7 +657,7 @@ struct LiveContainerMount {
     writable: bool,
 }
 
-fn verify_live_agent_container(
+pub(crate) fn verify_live_agent_container(
     harness: &PiHarness,
     layout: &execution_storage::ExecutionLayout,
 ) -> Result<(), HarnessError> {
@@ -687,6 +769,7 @@ fn container_group_alive_with(
     container: &str,
     pgid: u32,
 ) -> Result<bool, HarnessError> {
+    let token = supervisor_token()?;
     let mut command = Command::new(docker_binary);
     command
         .args([
@@ -696,21 +779,41 @@ fn container_group_alive_with(
             container,
             "/bin/sh",
             "-c",
-            GROUP_HAS_RUNNABLE,
-            "autospec-pi-group-liveness",
+            GROUP_PROBE,
+            "autospec-pi-group-probe",
         ])
         .arg(pgid.to_string())
+        .arg(&token)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let status = run_command_bounded(&mut command, CONTROL_TIMEOUT)?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(HarnessError::Crashed(
-            "Docker process-group liveness probe failed without a trusted result".to_owned(),
-        )),
+    let (status, output) = run_command_capture_bounded(&mut command, CONTROL_TIMEOUT)?;
+    if !status.success() {
+        return Err(HarnessError::Crashed(
+            "trusted Docker process-group probe failed without a result".to_owned(),
+        ));
     }
+    let mut lines = output.lines();
+    let header = lines.next().ok_or_else(|| {
+        HarnessError::Crashed("trusted process-group probe omitted its token".to_owned())
+    })?;
+    if header != format!("AUTOSPEC_GROUP_PROBE {token}") {
+        return Err(HarnessError::Crashed(
+            "trusted process-group probe returned the wrong token".to_owned(),
+        ));
+    }
+    for line in lines {
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        if columns.len() != 2 || columns[0] != "MEMBER" || columns[1].is_empty() {
+            return Err(HarnessError::Crashed(
+                "trusted process-group probe returned a malformed row".to_owned(),
+            ));
+        }
+        if !columns[1].starts_with('Z') {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn run_control_command(
@@ -745,7 +848,8 @@ fn cleanup_failed_start(
     pgid: Option<u32>,
     mut child: std::process::Child,
     storage_lease: Box<dyn ReadyLease>,
-    journal: PathBuf,
+    lifecycle_holds: ExecutionLifecycleHoldStore,
+    hold_id: String,
 ) {
     let client = terminate_host_child(&mut child, CONTROL_TIMEOUT);
     let cleanup = cleanup_container_authority(
@@ -754,8 +858,12 @@ fn cleanup_failed_start(
         pgid,
         token,
     );
-    if client.is_ok() && cleanup.is_ok() {
-        let _ = fs::remove_file(journal);
+    if client.is_ok()
+        && cleanup.is_ok()
+        && lifecycle_holds
+            .remove(&harness.config.labels.execution_id, &hold_id)
+            .is_ok()
+    {
         return;
     }
     tracing::error!(
@@ -763,14 +871,15 @@ fn cleanup_failed_start(
         pi_authority = %cleanup_result(cleanup),
         "startup cleanup was uncertain; quarantining its storage lease and process authority"
     );
-    write_quarantine_journal(&journal, &harness.config.agent_container, pgid, token);
     quarantine(QuarantinedProcess::Startup {
         docker_binary: harness.config.docker_binary.clone(),
         container: harness.config.agent_container.clone(),
         child: Mutex::new(child),
         pgid,
         token: token.to_owned(),
-        journal,
+        lifecycle_holds,
+        hold_execution_id: harness.config.labels.execution_id.clone(),
+        hold_id,
         _storage_lease: storage_lease,
     });
 }
@@ -820,36 +929,43 @@ fn quarantine_reaper(receiver: mpsc::Receiver<QuarantinedProcess>) {
 }
 
 fn quarantine_reaped(process: &QuarantinedProcess) -> bool {
-    let (docker_binary, container, child, pgid, token, journal) = match process {
-        QuarantinedProcess::Registered {
-            docker_binary,
-            container,
-            process,
-        } => (
-            docker_binary,
-            container,
-            &process.child,
-            Some(process.pgid),
-            process.supervisor_token.as_str(),
-            &process.quarantine_journal,
-        ),
-        QuarantinedProcess::Startup {
-            docker_binary,
-            container,
-            child,
-            pgid,
-            token,
-            journal,
-            ..
-        } => (
-            docker_binary,
-            container,
-            child,
-            *pgid,
-            token.as_str(),
-            journal,
-        ),
-    };
+    let (docker_binary, container, child, pgid, token, lifecycle_holds, hold_execution_id, hold_id) =
+        match process {
+            QuarantinedProcess::Registered {
+                docker_binary,
+                container,
+                process,
+            } => (
+                docker_binary,
+                container,
+                &process.child,
+                Some(process.pgid),
+                process.supervisor_token.as_str(),
+                &process.lifecycle_holds,
+                &process.hold_execution_id,
+                process.hold_id.as_str(),
+            ),
+            QuarantinedProcess::Startup {
+                docker_binary,
+                container,
+                child,
+                pgid,
+                token,
+                lifecycle_holds,
+                hold_execution_id,
+                hold_id,
+                ..
+            } => (
+                docker_binary,
+                container,
+                child,
+                *pgid,
+                token.as_str(),
+                lifecycle_holds,
+                hold_execution_id,
+                hold_id.as_str(),
+            ),
+        };
     let client_reaped = child.try_lock().ok().is_some_and(|mut child| {
         if child.try_wait().ok().flatten().is_some() {
             true
@@ -874,24 +990,9 @@ fn quarantine_reaped(process: &QuarantinedProcess) -> bool {
         }
     }
     if client_reaped && groups_reaped {
-        let _ = fs::remove_file(journal);
-        true
+        lifecycle_holds.remove(hold_execution_id, hold_id).is_ok()
     } else {
         false
-    }
-}
-
-fn write_quarantine_journal(journal: &Path, container: &str, pgid: Option<u32>, token: &str) {
-    let record = serde_json::json!({
-        "version": 1,
-        "container_id": container,
-        "pgid": pgid,
-        "supervisor_token": token,
-    });
-    if let Ok(bytes) = serde_json::to_vec(&record) {
-        if let Err(error) = atomic_write(journal, &bytes) {
-            tracing::error!(error = %error, path = %journal.display(), "failed to persist Pi quarantine journal");
-        }
     }
 }
 
@@ -900,12 +1001,6 @@ pub(crate) fn quarantine_registered(
     container: String,
     process: Arc<ManagedProcess>,
 ) {
-    write_quarantine_journal(
-        &process.quarantine_journal,
-        &container,
-        Some(process.pgid),
-        &process.supervisor_token,
-    );
     quarantine(QuarantinedProcess::Registered {
         docker_binary,
         container,

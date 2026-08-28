@@ -1,9 +1,9 @@
 use execution_storage::{
     disk_gib_to_bytes, AllocationPhase, AllocationReceipt, AllocationRequest, BackendCapability,
     BackendIdentity, BackendState, DockerBindCapability, DockerBindProof, DockerBindVerifier,
-    ExecutionLayout, ExecutionStorage, ExecutionStorageManager, JournalStore, PhaseJournal,
-    ReadyAllocationVerifier, ReadyLease, ReleasePhase, SecureMetadataDirectory, StorageBackend,
-    StorageError, ALLOCATION_API_VERSION,
+    ExecutionLayout, ExecutionLifecycleHold, ExecutionLifecycleHoldStore, ExecutionStorage,
+    ExecutionStorageManager, JournalStore, PhaseJournal, ReadyAllocationVerifier, ReadyLease,
+    ReleasePhase, SecureMetadataDirectory, StorageBackend, StorageError, ALLOCATION_API_VERSION,
 };
 use orchestrator_core::{ExecutionId, OwnershipLabels, WorkerId};
 use std::{
@@ -877,6 +877,40 @@ fn ready_lease_prevents_concurrent_release_until_the_consumer_drops_it() {
     manager
         .release(&receipt)
         .expect("release succeeds after the Ready lease is dropped");
+}
+
+#[test]
+fn durable_execution_hold_blocks_release_across_manager_instances() {
+    let (_root, manager, _calls) = manager_fixture();
+    let receipt = manager
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 3,
+        })
+        .expect("allocate storage");
+    let holds = ExecutionLifecycleHoldStore::new(manager.state_root()).expect("hold store");
+    holds
+        .create(&ExecutionLifecycleHold {
+            labels: receipt.labels.clone(),
+            hold_id: "pi-session".to_owned(),
+            container_id: "container-id".to_owned(),
+            session_id: "session-id".to_owned(),
+            supervisor_token: "token".to_owned(),
+            pgid: Some(42),
+        })
+        .expect("durable hold");
+    assert!(matches!(
+        manager.release(&receipt),
+        Err(StorageError::Unavailable(_))
+    ));
+    drop(holds);
+    ExecutionLifecycleHoldStore::new(manager.state_root())
+        .expect("reopen hold store")
+        .remove(&receipt.labels.execution_id, "pi-session")
+        .expect("remove hold");
+    manager
+        .release(&receipt)
+        .expect("release after durable hold recovery");
 }
 
 #[test]
