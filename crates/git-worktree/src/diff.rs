@@ -1,11 +1,14 @@
 use crate::cleanup::verified_path;
-use crate::manager::{git_stdout, read_owner_record, GitWorktreeManager};
+use crate::command::git_command;
+use crate::manager::{
+    git_stdout, read_owner_record, verify_repository_storage, GitWorktreeManager,
+};
 use crate::{DiffCapture, Worktree, WorktreeError};
 use orchestrator_core::labels::{EXECUTION_ID, MANAGED, REPOSITORY};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 pub(crate) fn capture(
     manager: &GitWorktreeManager,
@@ -13,6 +16,7 @@ pub(crate) fn capture(
 ) -> Result<DiffCapture, WorktreeError> {
     let owned_path = verified_path(manager, worktree)?;
     let path = Path::new(&owned_path);
+    verify_repository_storage(path)?;
     let owner = read_owner_record(path).map_err(|error| WorktreeError::Diff(error.to_string()))?;
     if owner.labels.get(MANAGED).map(String::as_str) != Some("true")
         || owner.labels.get(EXECUTION_ID).map(String::as_str)
@@ -74,7 +78,7 @@ pub(crate) fn capture(
 
     let mut changed_files = parse_paths(&tracked)?;
     for file in parse_paths(&untracked)? {
-        let output = Command::new("git")
+        let output = git_command()
             .current_dir(path)
             .args([
                 OsString::from("diff"),
@@ -106,7 +110,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("git")
+    let output = git_command()
         .current_dir(path)
         .args(args)
         .output()

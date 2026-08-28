@@ -692,6 +692,7 @@ dependencies = [
 name = "git-worktree"
 version = "0.1.0"
 dependencies = [
+ "execution-storage",
  "fs2",
  "orchestrator-core",
  "serde",

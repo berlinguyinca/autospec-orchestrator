@@ -1,7 +1,7 @@
 use crate::lock::FileLock;
 use crate::manager::{
     atomic_write_new, git_stdout, hex_component, normalized_repository_name, read_owner_record,
-    GitWorktreeManager, OwnerRecord,
+    verify_repository_storage, GitWorktreeManager, OwnerRecord,
 };
 use crate::{Worktree, WorktreeError};
 use orchestrator_core::labels::{EXECUTION_ID, MANAGED, REPOSITORY};
@@ -156,7 +156,7 @@ fn remove_repository_if_present(
             path.display()
         )));
     }
-    verify_git_storage_is_bounded(path)?;
+    verify_repository_storage(path)?;
     manager
         .filesystem
         .remove_repository(path)
@@ -286,36 +286,4 @@ fn current_branch(path: &Path) -> Result<String, WorktreeError> {
         ],
         WorktreeError::Cleanup,
     )
-}
-
-fn verify_git_storage_is_bounded(path: &Path) -> Result<(), WorktreeError> {
-    let canonical_root = path
-        .canonicalize()
-        .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
-    for argument in ["--git-dir", "--git-common-dir"] {
-        let reported = git_stdout(
-            [
-                OsStr::new("-C"),
-                path.as_os_str(),
-                OsStr::new("rev-parse"),
-                OsStr::new(argument),
-            ],
-            WorktreeError::Cleanup,
-        )?;
-        let reported = PathBuf::from(reported);
-        let resolved = if reported.is_absolute() {
-            reported
-        } else {
-            path.join(reported)
-        }
-        .canonicalize()
-        .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
-        if !resolved.starts_with(&canonical_root) {
-            return Err(WorktreeError::Ownership(format!(
-                "{argument} escapes repository root {}",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
 }

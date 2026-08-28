@@ -5,16 +5,17 @@
 //! repositories, locking, diff capture, and ownership-aware cleanup.
 
 mod cleanup;
+mod command;
 mod diff;
 mod filesystem;
 mod lock;
 mod manager;
 
+use execution_storage::AllocationReceipt;
 use orchestrator_core::{ExecutionId, OwnershipLabels};
-use std::path::Path;
 use thiserror::Error;
 
-pub use filesystem::{SystemWorktreeFilesystem, WorktreeFilesystem};
+pub use filesystem::{SystemWorktreeFilesystem, WorktreeFilesystem, WorktreeFilesystemPoint};
 pub use manager::GitWorktreeManager;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +76,7 @@ pub trait WorktreeManager: Send + Sync {
         repo: &str,
         base_ref: &str,
         branch: &str,
-        repository_root: &Path,
+        storage: &AllocationReceipt,
     ) -> Result<Worktree, WorktreeError>;
 
     /// Capture the diff produced by an execution as an artifact payload.

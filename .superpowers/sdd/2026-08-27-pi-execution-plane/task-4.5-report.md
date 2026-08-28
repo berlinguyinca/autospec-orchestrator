@@ -35,6 +35,29 @@ consume a verified allocation receipt.
   ENOSPC after a partial clone and during owner-record commit, prove exact
   rollback to an empty bounded repository directory, and prove cleanup retries
   from durable exact ownership without touching foreign resources.
+- Centralized every production Git subprocess behind an environment-clearing
+  command builder. Hostile repository, object, index, worktree, namespace,
+  alternate-object, and config routing variables cannot redirect mirror,
+  creation, evidence, or cleanup commands.
+- `create_in` now consumes an `execution-storage` allocation receipt rather than
+  a bare path. It validates exact labels/layout/backend/bind identities, derives
+  the deterministic repository path, pins the execution root and repository
+  directory, and requires same-filesystem direct ancestry throughout creation.
+- Pinned the canonical private mirror root and revalidated exact non-symlinked
+  ownership, bare identity, canonical parent, and origin under lock immediately
+  before every update and execution clone.
+- Added a durable fsynced create-intent journal outside the bounded filesystem
+  with exact labels, repository, base, branch, path, and creation phase. Restart
+  recovery rolls back only the exact matching partial repository; mismatched or
+  malformed intents fail closed.
+- Expanded repository storage verification after clone and checkout and during
+  evidence and cleanup: Git directory, common directory, objects, refs, index,
+  and derived locks must stay beneath the execution repository, with no
+  alternate-object file or symlink escape.
+- Added phase-specific ENOSPC seams for cloned object packs, checkout index, and
+  owner-record temporary write, fsync, and rename; successful rollback removes
+  the create intent, while rollback failure retains it for exact restart
+  recovery.
 
 ## Public Contract
 
@@ -155,9 +178,11 @@ polling loops, or `du`/`df` accounting.
 
 ## Verification
 
-- `cargo test -p git-worktree` — 31 real temporary Git repository tests passed,
-  including independent Git-path containment, mirror immutability, ENOSPC
-  rollback, exact cleanup, foreign-resource survival, and stale discovery.
+- `cargo test -p git-worktree` — 39 real temporary Git repository tests passed,
+  including hostile Git environments, independent Git-path containment, mirror
+  immutability/substitution rejection, receipt binding, create-intent recovery,
+  phase-specific ENOSPC rollback, exact cleanup, foreign-resource survival, and
+  stale discovery.
 - `cargo test -p execution-storage -- --nocapture` — 32 passed. The real Docker
   bind verifier contract ran. The destructive aggregate quota lifecycle printed
   an explicit skip because no operator pool is configured on this host; when
@@ -170,7 +195,7 @@ polling loops, or `du`/`df` accounting.
   `cargo clippy --workspace --all-targets -- -D warnings` — passed, including
   all real-Docker runtime tests.
 - Rust 1.85 ran the same full fmt/build/test/clippy workspace matrix — passed,
-  including all 31 Git tests and all 13 real-Docker runtime tests.
+  including all 39 Git tests and all 13 real-Docker runtime tests.
 
 ## Remaining Integration Work
 
