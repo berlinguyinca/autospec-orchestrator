@@ -85,12 +85,12 @@
 - Produces durable Pi start/stop/resume/fork and normalized incremental events.
 - Consumes a compact `TaskPacket`; never rebuilds prompts from repository-wide context.
 
-- [ ] Add tests around a stub `pi` executable and representative JSONL records.
-- [ ] Serialize the task packet once and launch Pi against mounted worktree/session paths.
-- [ ] Persist `owner.json`, `.cursor`, and `resume-count` outside containers.
-- [ ] Poll only JSONL bytes after `.cursor`; normalize known events and skip unknown records with counters.
-- [ ] Resume the same session after container loss and fork conversations without copying worktrees.
-- [ ] Add inactivity, wall-clock, and CPU-saturation health classification.
+- [x] Add tests around a stub `pi` executable and representative JSONL records.
+- [x] Serialize the task packet once and launch Pi against mounted worktree/session paths.
+- [x] Persist `owner.json`, `.cursor`, and `resume-count` outside containers.
+- [x] Poll only JSONL bytes after `.cursor`; normalize known events and skip unknown records with counters.
+- [x] Resume the same session after container loss and fork conversations without copying worktrees.
+- [x] Add inactivity, wall-clock, and CPU-saturation health classification.
 
 ### Task 5: Worker scheduling, lifecycle, and recovery (#19–#22)
 
