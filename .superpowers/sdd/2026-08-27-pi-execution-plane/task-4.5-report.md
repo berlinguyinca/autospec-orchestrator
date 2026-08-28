@@ -403,8 +403,14 @@ polling loops, or `du`/`df` accounting.
   lease acquisition and before owner reads, JSONL repair, count updates, or
   writes. Stopped-container tests prove count and torn JSONL remain unchanged.
 - Verification: current and Rust 1.85 full workspace build/test and warning-
-  denied Clippy passed; current Pi 32/32, storage 30/30, runtime-Docker 18/18,
+  denied Clippy passed; current Pi 35/35, storage 30/30, runtime-Docker 18/18,
   Git 58/58, and Postgres 4/4 passed. Formatting and diff checks passed.
+- A separate invocation of the integration-test executable now starts Pi and
+  exits with `process::exit`, bypassing every Rust destructor. The parent sees
+  the surviving process and fsynced hold, then a fresh harness recovers the
+  exact group, removes the hold, and leaves no runnable Pi. A second child is
+  killed after hold creation but before PGID binding; token-derived recovery
+  closes that crash window as well.
 
 ## Remaining Integration Work
 
