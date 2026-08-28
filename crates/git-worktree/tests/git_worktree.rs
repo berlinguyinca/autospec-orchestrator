@@ -207,6 +207,36 @@ fn mirror_allows_single_underscores_in_canonical_components() {
 }
 
 #[test]
+fn mirror_rejects_separator_boundary_collisions_without_blocking_valid_identity() {
+    let mut repository = TestRepository::new();
+    let valid = repository.clone_base.join("a/b.git");
+    std::fs::create_dir_all(valid.parent().expect("valid repository parent"))
+        .expect("create valid repository parent");
+    std::fs::rename(&repository.path, &valid).expect("move repository");
+    repository.path = valid;
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+
+    for colliding in ["a_/b", "a/_b"] {
+        let error = manager
+            .ensure_mirror(colliding)
+            .expect_err("reject separator boundary collision");
+        assert!(matches!(error, WorktreeError::InvalidRepository(_)));
+    }
+    assert!(!state.path().join("mirrors/a___b.git").exists());
+
+    let mirror = manager
+        .ensure_mirror("a/b")
+        .expect("create valid identity after rejected collisions");
+    assert_eq!(
+        Path::new(&mirror)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("a__b.git")
+    );
+}
+
+#[test]
 fn create_places_owned_worktree_under_execution_id() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");

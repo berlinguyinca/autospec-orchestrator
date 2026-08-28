@@ -6,7 +6,7 @@ Status: complete.
 
 - Added `GitWorktreeManager` with fs2-locked bare mirror creation and refresh.
 - Kept repository identity canonical as exact `owner/name`, resolved clone locators through GitHub HTTPS by default, and added an explicit clone-base constructor for local repositories.
-- Normalized mirror names to injective `{owner}__{repo}.git` paths by rejecting `__` inside canonical components while retaining single underscores, and rejected other noncanonical or unsafe repository references.
+- Normalized mirror names to injective `{owner}__{repo}.git` paths by rejecting `__` inside canonical components, owner components ending in `_`, and repository-name components starting with `_`, while retaining unambiguous single underscores elsewhere.
 - Verified every existing mirror's `origin` exactly matches the configured canonical clone locator before fetch; mismatches fail without mutating refs.
 - Created execution-scoped linked worktrees under `worktrees/{execution_id}` with branch locking, resolved `base_sha`, and atomic `.autospec-owner.json` records containing the canonical ownership label map.
 - Hardened owner-record creation against committed metadata and temp-path symlinks with pre-existing-path rejection, `create_new`, file sync, atomic rename, and directory sync.
@@ -22,9 +22,9 @@ Status: complete.
 
 ## Verification
 
-- `cargo test -p git-worktree` — 24 real temporary Git repository tests passed.
+- `cargo test -p git-worktree` — 25 real temporary Git repository tests passed, including the separator-boundary collision regression.
 - `cargo build --workspace` and `cargo +1.85.0 build --workspace` — passed.
-- `cargo test --workspace` and `cargo +1.85.0 test --workspace` — passed, including all ten real Docker integration tests.
+- `cargo test --workspace` and `cargo +1.85.0 test --workspace` — passed, including all eleven real Docker integration tests.
 - `cargo clippy --workspace --all-targets -- -D warnings` and the same command under Rust 1.85 — passed.
 - `cargo fmt --all -- --check` — passed.
 - `git diff --check` — passed.

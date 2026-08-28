@@ -248,7 +248,12 @@ pub(crate) fn normalized_repository_name(repo: &str) -> Result<String, WorktreeE
 fn canonical_repository(repo: &str) -> Result<(&str, &str), WorktreeError> {
     let mut components = repo.split('/');
     match (components.next(), components.next(), components.next()) {
-        (Some(owner), Some(name), None) if is_safe_component(owner) && is_safe_component(name) => {
+        (Some(owner), Some(name), None)
+            if is_safe_component(owner)
+                && !owner.ends_with('_')
+                && is_safe_component(name)
+                && !name.starts_with('_') =>
+        {
             Ok((owner, name))
         }
         _ => Err(WorktreeError::InvalidRepository(repo.to_owned())),
