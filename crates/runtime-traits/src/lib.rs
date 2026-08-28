@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use orchestrator_core::{ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement};
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -28,6 +29,7 @@ pub struct EnvironmentHandle {
     pub agent_container: String,
     pub service_containers: Vec<String>,
     pub volumes: Vec<String>,
+    pub credentials_path: Option<PathBuf>,
 }
 
 /// A runtime provisions one isolated environment per execution and can destroy

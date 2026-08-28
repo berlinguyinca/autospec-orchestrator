@@ -24,6 +24,7 @@ repository = "https://github.com/InferWeave/autospec-orchestrator"
 authors = ["InferWeave"]
 
 [workspace.dependencies]
+bollard = "0.18"
 orchestrator-core = { path = "crates/orchestrator-core" }
 orchestrator-api = { path = "crates/orchestrator-api" }
 orchestrator-scheduler = { path = "crates/orchestrator-scheduler" }
@@ -39,6 +40,7 @@ async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
