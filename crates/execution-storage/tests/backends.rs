@@ -1,6 +1,6 @@
 use execution_storage::{
-    ApfsBackend, BackendState, CommandOutput, CommandRunner, CommandSpec, ExecutionLayout,
-    LvmBackend, ProcessCommandRunner, StorageBackend, StorageError,
+    ApfsBackend, BackendIdentity, BackendState, CommandOutput, CommandRunner, CommandSpec,
+    ExecutionLayout, LvmBackend, ProcessCommandRunner, StorageBackend, StorageError,
 };
 use orchestrator_core::{ExecutionId, OwnershipLabels, WorkerId};
 use std::{
@@ -94,6 +94,11 @@ fn apfs_create_identity_is_proved_before_mount_and_cleanup_rechecks_uuid_and_tok
         mount.to_str().unwrap(),
     );
     let list = apfs_list("disk9s1", &name, bytes, bytes * 4);
+    let list_absent = format!(
+        "+-- Container disk3 POOL-UUID\nCapacity Not Allocated: {} B\n",
+        bytes * 4
+    )
+    .into_bytes();
     let root_info = apfs_info(
         &canonical_state,
         "disk3s5",
@@ -171,6 +176,10 @@ fn apfs_create_identity_is_proved_before_mount_and_cleanup_rechecks_uuid_and_tok
             Ok(success(Vec::new())),
         ),
         (
+            command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
+            Ok(success(list.clone())),
+        ),
+        (
             command("/usr/sbin/diskutil", &["info", "disk9s1"]),
             Ok(success(info_mounted.clone())),
         ),
@@ -193,6 +202,10 @@ fn apfs_create_identity_is_proved_before_mount_and_cleanup_rechecks_uuid_and_tok
         (
             command("/usr/sbin/diskutil", &["unmount", "disk9s1"]),
             Ok(success(Vec::new())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
+            Ok(success(list.clone())),
         ),
         (
             command("/usr/sbin/diskutil", &["info", "disk9s1"]),
@@ -219,8 +232,8 @@ fn apfs_create_identity_is_proved_before_mount_and_cleanup_rechecks_uuid_and_tok
             Ok(success(Vec::new())),
         ),
         (
-            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
-            Ok(failure("Could not find disk")),
+            command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
+            Ok(success(list_absent)),
         ),
     ];
     let runner = FakeRunner::new(std::mem::take(&mut expected));
@@ -383,15 +396,9 @@ fn lvm_create_is_tagged_and_identified_before_format_mount_and_exact_removal() {
         (
             command(
                 "/usr/bin/findmnt",
-                &[
-                    "--noheadings",
-                    "--output",
-                    "UUID,FSTYPE,TARGET",
-                    "--target",
-                    mount.to_str().unwrap(),
-                ],
+                &["--list", "--noheadings", "--output", "UUID,FSTYPE,TARGET"],
             ),
-            Ok(failure("not mounted")),
+            Ok(success(Vec::new())),
         ),
         (
             command(
@@ -437,13 +444,7 @@ fn lvm_create_is_tagged_and_identified_before_format_mount_and_exact_removal() {
         (
             command(
                 "/usr/bin/findmnt",
-                &[
-                    "--noheadings",
-                    "--output",
-                    "UUID,FSTYPE,TARGET",
-                    "--target",
-                    mount.to_str().unwrap(),
-                ],
+                &["--list", "--noheadings", "--output", "UUID,FSTYPE,TARGET"],
             ),
             Ok(success(format!("FS-UUID ext4 {}\n", mount.display()))),
         ),
@@ -499,15 +500,9 @@ fn lvm_create_is_tagged_and_identified_before_format_mount_and_exact_removal() {
         (
             command(
                 "/usr/bin/findmnt",
-                &[
-                    "--noheadings",
-                    "--output",
-                    "UUID,FSTYPE,TARGET",
-                    "--target",
-                    mount.to_str().unwrap(),
-                ],
+                &["--list", "--noheadings", "--output", "UUID,FSTYPE,TARGET"],
             ),
-            Ok(failure("not mounted")),
+            Ok(success(Vec::new())),
         ),
         (
             command(
@@ -549,7 +544,7 @@ fn lvm_create_is_tagged_and_identified_before_format_mount_and_exact_removal() {
                     &target,
                 ],
             ),
-            Ok(failure("Failed to find logical volume")),
+            Ok(success(Vec::new())),
         ),
     ]);
     let runner = FakeRunner::new(expected);
@@ -594,6 +589,46 @@ fn lvm_volume_group_validation_rejects_option_injection_and_reserved_names() {
         );
     }
     LvmBackend::new("vg.safe-01", runner).expect("full safe grammar");
+}
+
+#[test]
+fn lvm_inventory_errors_are_unknown_and_never_treated_as_absence() {
+    let state = tempfile::tempdir().expect("state");
+    let layout = ExecutionLayout::new(state.path(), &labels().execution_id).expect("layout");
+    let target = format!("vg-autospec/autospec-{TOKEN}");
+    let runner = FakeRunner::new(vec![(
+        command(
+            "/usr/sbin/lvm",
+            &[
+                "lvs",
+                "--noheadings",
+                "--units",
+                "b",
+                "--nosuffix",
+                "--separator",
+                ":",
+                "--options",
+                "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                "--",
+                &target,
+            ],
+        ),
+        Ok(failure("permission denied")),
+    )]);
+    let backend = LvmBackend::new("vg-autospec", runner.clone()).expect("backend");
+    let identity = BackendIdentity::Lvm {
+        volume_group: "vg-autospec".to_owned(),
+        volume_group_uuid: "VG-UUID".to_owned(),
+        logical_volume: format!("autospec-{TOKEN}"),
+        logical_volume_uuid: "LV-UUID".to_owned(),
+        filesystem_uuid: "FS-UUID".to_owned(),
+        ownership_token: TOKEN.to_owned(),
+    };
+    let error = backend
+        .state(&layout, &identity, 16 * 1024 * 1024)
+        .expect_err("inventory failure is unknown, not absent");
+    assert!(matches!(error, StorageError::Command(_)));
+    runner.assert_drained();
 }
 
 #[test]
@@ -669,28 +704,37 @@ fn configured_real_pool_runs_full_quota_lifecycle_or_explicitly_skips() {
         backend.remove(&prepared).expect("rollback prepared object");
         panic!("mount configured storage: {error}");
     }
-    let exercise = (|| -> std::io::Result<bool> {
-        fs::create_dir_all(&layout.repository)?;
-        let mut first = fs::File::create(layout.repository.join("aggregate-a"))?;
-        fs::create_dir_all(&layout.conversation)?;
-        let mut second = fs::File::create(layout.conversation.join("aggregate-b"))?;
+    let exercise = (|| -> Result<(u64, std::io::Error), String> {
+        fs::create_dir_all(&layout.repository).map_err(|error| error.to_string())?;
+        let mut first = fs::File::create(layout.repository.join("aggregate-a"))
+            .map_err(|error| error.to_string())?;
+        fs::create_dir_all(&layout.conversation).map_err(|error| error.to_string())?;
+        let mut second = fs::File::create(layout.conversation.join("aggregate-b"))
+            .map_err(|error| error.to_string())?;
         let block = vec![0x5a; 1024 * 1024];
+        let mut successful = 0_u64;
         for index in 0..=(bytes / block.len() as u64 + 2) {
             let result = if index % 2 == 0 {
                 first.write_all(&block)
             } else {
                 second.write_all(&block)
             };
-            if result.is_err() {
-                return Ok(true);
+            match result {
+                Ok(()) => successful += block.len() as u64,
+                Err(error) => return Ok((successful, error)),
             }
         }
-        Ok(false)
+        Err("writes beyond the configured hard bound unexpectedly succeeded".to_owned())
     })();
     backend.unmount(&layout, &prepared).expect("unmount");
     backend.remove(&prepared).expect("release");
+    let (successful, error) = exercise.expect("exercise aggregate quota");
     assert!(
-        exercise.expect("exercise aggregate quota"),
-        "writes beyond the configured hard bound unexpectedly succeeded"
+        successful >= bytes / 4,
+        "quota failed before substantial successful writes: {successful}"
+    );
+    assert!(
+        error.kind() == std::io::ErrorKind::StorageFull || error.raw_os_error() == Some(28),
+        "quota failure was not ENOSPC/StorageFull: {error:?}"
     );
 }

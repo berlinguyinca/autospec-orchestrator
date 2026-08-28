@@ -216,6 +216,9 @@ pub struct AllocationReceipt {
     pub labels: OwnershipLabels,
     pub reserved_bytes: u64,
     pub mount_path: PathBuf,
+    pub backend_kind: String,
+    pub backend_key: String,
+    pub pool_identity: String,
     pub backend: BackendIdentity,
     pub docker_bind: DockerBindProof,
 }
@@ -244,7 +247,11 @@ impl AllocationReceipt {
                 expected_layout.root.display()
             )));
         }
-        if self.reserved_bytes == 0 {
+        if self.reserved_bytes == 0
+            || self.backend_kind.is_empty()
+            || self.backend_key.is_empty()
+            || self.pool_identity.is_empty()
+        {
             return Err(StorageError::IdentityMismatch(
                 "reserved byte count is zero".to_owned(),
             ));
@@ -254,7 +261,7 @@ impl AllocationReceipt {
             || self.docker_bind.verifier.is_empty()
             || self.docker_bind.method_version.is_empty()
             || self.docker_bind.source_path != self.mount_path
-            || self.docker_bind.filesystem_id != self.backend.filesystem_id()
+            || self.docker_bind.filesystem_id.is_empty()
         {
             return Err(StorageError::IdentityMismatch(
                 "Docker bind proof does not match the allocation".to_owned(),
@@ -294,7 +301,9 @@ pub struct PhaseJournal {
     pub labels: OwnershipLabels,
     pub reserved_bytes: u64,
     pub mount_path: PathBuf,
+    pub backend_kind: String,
     pub backend_key: String,
+    pub pool_identity: String,
     pub ownership_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<BackendIdentity>,
@@ -309,7 +318,9 @@ impl PhaseJournal {
         labels: OwnershipLabels,
         reserved_bytes: u64,
         mount_path: PathBuf,
+        backend_kind: String,
         backend_key: String,
+        pool_identity: String,
         ownership_token: String,
     ) -> Self {
         Self {
@@ -318,7 +329,9 @@ impl PhaseJournal {
             labels,
             reserved_bytes,
             mount_path,
+            backend_kind,
             backend_key,
+            pool_identity,
             ownership_token,
             backend: None,
             receipt: None,
@@ -348,7 +361,9 @@ impl PhaseJournal {
             labels: receipt.labels.clone(),
             reserved_bytes: receipt.reserved_bytes,
             mount_path: receipt.mount_path.clone(),
-            backend_key: receipt.backend.filesystem_id().to_owned(),
+            backend_kind: receipt.backend_kind.clone(),
+            backend_key: receipt.backend_key.clone(),
+            pool_identity: receipt.pool_identity.clone(),
             ownership_token: receipt.backend.ownership_token().to_owned(),
             backend: Some(receipt.backend.clone()),
             receipt: Some(receipt),
@@ -366,7 +381,9 @@ impl PhaseJournal {
                     .unwrap_or_default()
             || self.mount_path != layout.root
             || self.reserved_bytes == 0
+            || self.backend_kind.is_empty()
             || self.backend_key.is_empty()
+            || self.pool_identity.is_empty()
             || self.ownership_token.is_empty()
         {
             return Err(StorageError::IdentityMismatch(

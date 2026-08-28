@@ -28,13 +28,22 @@ consume a verified allocation receipt.
   bind source proof.
 - `PhaseJournal` records `Allocating`, `Ready`, and `Releasing`. The allocating
   journal is created exclusively and fsynced with a unique ownership token
-  before physical creation. Exact token, pool UUID, and object UUID are then
+  before physical creation. It also records the probed backend kind, configured
+  backend key, and pool UUID; recovery re-probes and exact-matches all three
+  before discovery or cleanup. Exact token, pool UUID, and object UUID are then
   fsynced before format; the filesystem UUID is fsynced before mount. Releasing
   journals record mounted, unmounted, and object-absent cleanup subphases.
 - `JournalStore` creates the first journal with `create_new`, and later updates
   use a create-new temporary file, file fsync, atomic rename, and directory fsync.
   State paths are canonical, owner-only, and guarded by non-following metadata,
   opened-file inode checks, and pinned directory device/inode/owner/mode checks.
+  All child mutations route through the internal `PinnedDirectory` boundary.
+  Linux resolves relative children through `/proc/self/fd` with `O_NOFOLLOW`.
+  The direct `libc` dependency supplies only the portable `O_NOFOLLOW` constant;
+  it introduces no FFI calls or unsafe code.
+  macOS cannot traverse `/dev/fd/{dirfd}/child`, so true descriptor-relative
+  `openat`/`renameat`/`unlinkat` remains blocked by the workspace unsafe-code ban
+  and the prohibition on a new safe syscall-wrapper dependency.
 - `ExecutionStorageManager` is synchronous, `Send + Sync`, and object-safe. Its
   probe combines backend reservation capacity with an explicit Docker
   daemon/verifier capability. Allocation fails closed unless both prove usable;
@@ -52,6 +61,10 @@ consume a verified allocation receipt.
   separate mount operation.
 - Re-reads token-derived name, device, container UUID, volume UUID, mountpoint,
   read-only state, quota, and reserve before every unmount or deletion.
+- Treats absence only as a successful exact container inventory with no matching
+  token name. `diskutil` command errors remain unknown and propagate. Volume
+  headers and created devices are parsed exactly, including prefix-collision
+  regressions.
 
 ### Linux thick LVM
 
@@ -62,6 +75,8 @@ consume a verified allocation receipt.
   formats ext4, journals the filesystem UUID, and mounts with `nodev,nosuid`.
 - Re-verifies VG/LV UUIDs, exact LV size, device path, ext4 mount target, and
   filesystem UUID before returning or releasing an allocation.
+- Treats absence/unmounted state only as successful structured `lvs`/`findmnt`
+  inventory with no exact match; command errors never become absence.
 - VG input accepts the documented safe character grammar while rejecting a
   leading hyphen, dot names, and LVM-reserved names/prefixes; supported commands
   place `--` before operator-controlled names.
@@ -108,13 +123,20 @@ polling loops, or `du`/`df` accounting.
 - Security tests reject permissive state-root modes, symlink paths, and replaced
   directory inodes. Docker contract tests reject proof-method drift and exercise
   a concrete ownership-labelled real bind proof when Docker is available.
+- Review-round coverage proves pool/config drift is rejected before discovery,
+  APFS preparation is identity-preserving, and LVM preparation may change only
+  an empty filesystem UUID to one non-empty UUID.
+- The concrete Docker verifier no longer accepts a caller-supplied identity or
+  marker. It starts an ownership-labelled, networkless, read-only container and
+  constructs the proof from daemon-side `stat` device/inode identity.
 
 ## Verification
 
-- `cargo test -p execution-storage -- --nocapture` — 27 passed. The real Docker
+- `cargo test -p execution-storage -- --nocapture` — 32 passed. The real Docker
   bind verifier contract ran. The destructive aggregate quota lifecycle printed
   an explicit skip because no operator pool is configured on this host; when
-  configured it performs create, identity proof, aggregate over-limit writes,
+  configured it performs create, identity proof, substantial successful writes,
+  aggregate over-limit writes accepted only as ENOSPC/StorageFull,
   unmount, and exact release, and configuration failures are test failures.
 - `cargo clippy -p execution-storage --all-targets -- -D warnings` — passed.
 - Current toolchain `cargo fmt --all -- --check`, `cargo build --workspace`,
@@ -125,6 +147,14 @@ polling loops, or `du`/`df` accounting.
   including all real-Docker runtime tests.
 
 ## Remaining Integration Work
+
+- Round-2 filesystem finding 3 is not fully closed on macOS. The exact missing
+  safe surface is descriptor-relative `openat` with `O_NOFOLLOW|O_CREAT|O_EXCL`,
+  `renameat`, `unlinkat`, `mkdirat`, `fstatat(AT_SYMLINK_NOFOLLOW)`, and directory
+  `fsync`. Raw libc requires forbidden unsafe blocks; `/dev/fd` child traversal
+  returns ENOENT on this host. A direct safe `rustix` filesystem dependency
+  (already transitive in `Cargo.lock`) or a narrowly audited unsafe exception is
+  required. No unsafe or `rustix` dependency was added in this round.
 
 - Git, Pi, Docker, and worker lifecycle consumers remain on their old layouts by
   design; later Task 4.5 slices must switch them only after receiving a verified

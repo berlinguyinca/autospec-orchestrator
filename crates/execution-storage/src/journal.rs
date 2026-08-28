@@ -4,26 +4,31 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 static OWNER_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 
 #[derive(Debug, Clone)]
 pub struct JournalStore {
     directory: PathBuf,
-    state_root: DirectoryIdentity,
-    journal_directory: DirectoryIdentity,
+    state_root: PinnedDirectory,
+    journal_directory: PinnedDirectory,
 }
 
 impl JournalStore {
     pub fn new(state_root: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let state_root = DirectoryIdentity::capture(state_root.as_ref(), "state root")?;
+        let state_root = PinnedDirectory::capture(state_root.as_ref(), "state root")?;
         let directory = state_root.path.join("execution-storage");
-        let journal_directory = DirectoryIdentity::capture(&directory, "journal directory")?;
+        let journal_directory = PinnedDirectory::capture(&directory, "journal directory")?;
         Ok(Self {
             directory,
             state_root,
@@ -39,16 +44,20 @@ impl JournalStore {
         self.verify_directories()?;
         self.validate_path(layout)?;
         journal.validate(layout)?;
-        reject_any_existing_path(&layout.journal, "journal")?;
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .secure_file_mode()
-            .open(&layout.journal)
-            .map_err(|error| journal_error("create", &layout.journal, error))?;
+        let name = journal_name(layout)?;
+        let file = self.journal_directory.create_file(&name)?;
         write_and_sync(file, journal, &layout.journal)?;
-        sync_directory(&self.directory)?;
+        self.journal_directory.sync()?;
         self.verify_directories()
+    }
+
+    pub(crate) fn exists(&self, layout: &ExecutionLayout) -> Result<bool, StorageError> {
+        self.verify_directories()?;
+        self.validate_path(layout)?;
+        Ok(self
+            .journal_directory
+            .child_metadata(&journal_name(layout)?)?
+            .is_some())
     }
 
     pub fn write(
@@ -59,43 +68,28 @@ impl JournalStore {
         self.verify_directories()?;
         self.validate_path(layout)?;
         journal.validate(layout)?;
-        let metadata = fs::symlink_metadata(&layout.journal)
+        let name = journal_name(layout)?;
+        let current = self.journal_directory.open_file(&name)?;
+        let expected = current
+            .metadata()
             .map_err(|error| journal_error("inspect", &layout.journal, error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(StorageError::Journal(format!(
-                "journal is not a real file: {}",
-                layout.journal.display()
-            )));
-        }
-        let temporary = temporary_path(&layout.journal)?;
-        reject_any_existing_path(&temporary, "journal temporary file")?;
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .secure_file_mode()
-            .open(&temporary)
-            .map_err(|error| journal_error("create", &temporary, error))?;
-        write_and_sync(file, journal, &temporary)?;
-        fs::rename(&temporary, &layout.journal)
-            .map_err(|error| journal_error("rename", &layout.journal, error))?;
-        sync_directory(&self.directory)?;
+        let temporary = temporary_name(&name)?;
+        let file = self.journal_directory.create_file(&temporary)?;
+        write_and_sync(
+            file,
+            journal,
+            &self.journal_directory.child_path(&temporary)?,
+        )?;
+        self.journal_directory.verify_child(&name, &expected)?;
+        self.journal_directory.rename(&temporary, &name)?;
+        self.journal_directory.sync()?;
         self.verify_directories()
     }
 
     pub fn read(&self, layout: &ExecutionLayout) -> Result<PhaseJournal, StorageError> {
         self.verify_directories()?;
         self.validate_path(layout)?;
-        let metadata = fs::symlink_metadata(&layout.journal)
-            .map_err(|error| journal_error("inspect", &layout.journal, error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(StorageError::Journal(format!(
-                "journal is not a real file: {}",
-                layout.journal.display()
-            )));
-        }
-        let file = File::open(&layout.journal)
-            .map_err(|error| journal_error("open", &layout.journal, error))?;
-        verify_opened_file(&metadata, &file, &layout.journal)?;
+        let file = self.journal_directory.open_file(&journal_name(layout)?)?;
         let journal: PhaseJournal =
             serde_json::from_reader(BufReader::new(file)).map_err(|error| {
                 StorageError::Journal(format!("parse {}: {error}", layout.journal.display()))
@@ -107,21 +101,16 @@ impl JournalStore {
     pub fn remove(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
         self.verify_directories()?;
         self.validate_path(layout)?;
-        let metadata = fs::symlink_metadata(&layout.journal)
+        let name = journal_name(layout)?;
+        let file = self.journal_directory.open_file(&name)?;
+        let expected = file
+            .metadata()
             .map_err(|error| journal_error("inspect", &layout.journal, error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(StorageError::Journal(format!(
-                "refuse to remove non-file journal {}",
-                layout.journal.display()
-            )));
-        }
-        let file = File::open(&layout.journal)
-            .map_err(|error| journal_error("open", &layout.journal, error))?;
-        verify_opened_file(&metadata, &file, &layout.journal)?;
-        drop(file);
-        fs::remove_file(&layout.journal)
-            .map_err(|error| journal_error("remove", &layout.journal, error))?;
-        sync_directory(&self.directory)?;
+        let tombstone = temporary_name(&format!("remove-{name}"))?;
+        self.journal_directory.rename(&name, &tombstone)?;
+        self.journal_directory.verify_child(&tombstone, &expected)?;
+        self.journal_directory.remove_file(&tombstone)?;
+        self.journal_directory.sync()?;
         self.verify_directories()
     }
 
@@ -181,7 +170,12 @@ impl JournalStore {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DirectoryIdentity {
+/// Internal boundary for descriptor-pinned, no-follow directory operations.
+///
+/// Linux resolves children through `/proc/self/fd`; macOS currently retains the
+/// same inode/mode checks but needs a safe `openat`/`renameat`/`unlinkat` wrapper
+/// before it can avoid path re-resolution entirely.
+pub(crate) struct PinnedDirectory {
     pub(crate) path: PathBuf,
     #[cfg(unix)]
     device: u64,
@@ -189,9 +183,11 @@ pub(crate) struct DirectoryIdentity {
     inode: u64,
     #[cfg(unix)]
     uid: u32,
+    #[cfg(unix)]
+    handle: Arc<File>,
 }
 
-impl DirectoryIdentity {
+impl PinnedDirectory {
     pub(crate) fn capture(path: &Path, purpose: &str) -> Result<Self, StorageError> {
         let supplied =
             fs::symlink_metadata(path).map_err(|error| journal_error("inspect", path, error))?;
@@ -224,11 +220,21 @@ impl DirectoryIdentity {
                 )));
             }
             verify_current_owner(&path, metadata.uid(), purpose)?;
+            let handle = File::open(&path).map_err(|error| journal_error("open", &path, error))?;
+            let opened = handle
+                .metadata()
+                .map_err(|error| journal_error("inspect", &path, error))?;
+            if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+                return Err(StorageError::IdentityMismatch(format!(
+                    "{purpose} changed while opening"
+                )));
+            }
             Ok(Self {
                 path,
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 uid: metadata.uid(),
+                handle: Arc::new(handle),
             })
         }
         #[cfg(not(unix))]
@@ -259,6 +265,115 @@ impl DirectoryIdentity {
             )));
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn child_path(&self, name: &str) -> Result<PathBuf, StorageError> {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(StorageError::InvalidRequest(
+                "descriptor-relative name is unsafe".to_owned(),
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let parent = Path::new("/proc/self/fd").join(self.handle.as_raw_fd().to_string());
+        #[cfg(not(target_os = "linux"))]
+        let parent = self.path.clone();
+        Ok(parent.join(name))
+    }
+
+    #[cfg(unix)]
+    fn create_file(&self, name: &str) -> Result<File, StorageError> {
+        let path = self.child_path(name)?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| journal_error("create", &path, error))
+    }
+
+    #[cfg(unix)]
+    fn open_file(&self, name: &str) -> Result<File, StorageError> {
+        let path = self.child_path(name)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| journal_error("open", &path, error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| journal_error("inspect", &path, error))?;
+        if !metadata.is_file() || metadata.mode() & 0o077 != 0 {
+            return Err(StorageError::Journal(format!(
+                "journal is not a private real file: {}",
+                path.display()
+            )));
+        }
+        Ok(file)
+    }
+
+    #[cfg(unix)]
+    fn verify_child(&self, name: &str, expected: &fs::Metadata) -> Result<(), StorageError> {
+        let file = self.open_file(name)?;
+        verify_opened_file(expected, &file, &self.child_path(name)?)
+    }
+
+    #[cfg(unix)]
+    fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
+        let from_path = self.child_path(from)?;
+        let to_path = self.child_path(to)?;
+        fs::rename(&from_path, &to_path).map_err(|error| journal_error("rename", &to_path, error))
+    }
+
+    #[cfg(unix)]
+    fn remove_file(&self, name: &str) -> Result<(), StorageError> {
+        let path = self.child_path(name)?;
+        fs::remove_file(&path).map_err(|error| journal_error("remove", &path, error))
+    }
+
+    #[cfg(unix)]
+    fn sync(&self) -> Result<(), StorageError> {
+        self.handle
+            .sync_all()
+            .map_err(|error| journal_error("fsync directory", &self.path, error))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn create_directory(&self, name: &str) -> Result<(), StorageError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = self.child_path(name)?;
+        let mut builder = fs::DirBuilder::new();
+        builder
+            .mode(0o700)
+            .create(&path)
+            .map_err(|error| journal_error("create directory", &path, error))?;
+        self.sync()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn remove_directory(&self, name: &str) -> Result<(), StorageError> {
+        let path = self.child_path(name)?;
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| journal_error("inspect", &path, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StorageError::IdentityMismatch(format!(
+                "descriptor-relative mountpoint is not a real directory: {}",
+                path.display()
+            )));
+        }
+        fs::remove_dir(&path).map_err(|error| journal_error("remove directory", &path, error))?;
+        self.sync()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn child_metadata(&self, name: &str) -> Result<Option<fs::Metadata>, StorageError> {
+        let path = self.child_path(name)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(journal_error("inspect", &path, error)),
+        }
     }
 }
 
@@ -295,22 +410,6 @@ fn verify_current_owner(
     }
 }
 
-trait SecureOpenOptions {
-    fn secure_file_mode(&mut self) -> &mut Self;
-}
-impl SecureOpenOptions for OpenOptions {
-    fn secure_file_mode(&mut self) -> &mut Self {
-        #[cfg(unix)]
-        {
-            self.mode(0o600)
-        }
-        #[cfg(not(unix))]
-        {
-            self
-        }
-    }
-}
-
 fn write_and_sync(file: File, journal: &PhaseJournal, path: &Path) -> Result<(), StorageError> {
     let mut writer = BufWriter::new(file);
     serde_json::to_writer(&mut writer, journal)
@@ -340,17 +439,6 @@ pub(crate) fn require_real_directory(path: &Path, purpose: &str) -> Result<(), S
     Ok(())
 }
 
-fn reject_any_existing_path(path: &Path, purpose: &str) -> Result<(), StorageError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Err(StorageError::Journal(format!(
-            "{purpose} already exists: {}",
-            path.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(journal_error("inspect", path, error)),
-    }
-}
-
 fn verify_opened_file(
     expected: &fs::Metadata,
     file: &File,
@@ -373,20 +461,26 @@ fn verify_opened_file(
     Ok(())
 }
 
-fn temporary_path(journal: &Path) -> Result<PathBuf, StorageError> {
-    let name = journal
+fn journal_name(layout: &ExecutionLayout) -> Result<String, StorageError> {
+    layout
+        .journal
         .file_name()
         .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
         .ok_or_else(|| {
-            StorageError::Journal(format!("journal name is not UTF-8: {}", journal.display()))
-        })?;
-    Ok(journal.with_file_name(format!(".{name}.tmp")))
+            StorageError::Journal(format!(
+                "journal name is not UTF-8: {}",
+                layout.journal.display()
+            ))
+        })
 }
 
-fn sync_directory(directory: &Path) -> Result<(), StorageError> {
-    File::open(directory)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| journal_error("fsync directory", directory, error))
+fn temporary_name(name: &str) -> Result<String, StorageError> {
+    Ok(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        OWNER_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn journal_error(action: &str, path: &Path, error: std::io::Error) -> StorageError {

@@ -56,6 +56,9 @@ fn receipt() -> AllocationReceipt {
         labels: labels(),
         reserved_bytes: disk_gib_to_bytes(1).expect("bytes"),
         mount_path: root.clone(),
+        backend_kind: "apfs".to_owned(),
+        backend_key: "apfs:node-417-impl-01".to_owned(),
+        pool_identity: "POOL-UUID".to_owned(),
         backend: apfs_identity("disk9s1", "FS-7", "token-7"),
         docker_bind: DockerBindProof {
             daemon_id: "daemon-7".to_owned(),
@@ -116,6 +119,70 @@ fn docker_bind_contract_versions_the_verifier_and_proof_method() {
     assert_eq!(proof.method_version, capability.method_version);
 }
 
+#[derive(Debug)]
+struct DockerCliBindVerifier {
+    docker: std::path::PathBuf,
+    daemon_id: String,
+}
+
+impl DockerBindVerifier for DockerCliBindVerifier {
+    fn probe(&self) -> Result<DockerBindCapability, StorageError> {
+        Ok(DockerBindCapability {
+            daemon_id: self.daemon_id.clone(),
+            verifier: "docker-cli-stat".to_owned(),
+            method_version: "autospec.dev/docker-bind-stat/v1".to_owned(),
+        })
+    }
+
+    fn verify(&self, source: &Path) -> Result<DockerBindProof, StorageError> {
+        let canonical = source.canonicalize().map_err(|error| {
+            StorageError::Unavailable(format!("canonicalize Docker bind source: {error}"))
+        })?;
+        let mount = format!("type=bind,src={},dst=/proof,readonly", canonical.display());
+        let mut command = Command::new(&self.docker);
+        command.args(["run", "--rm", "--network", "none", "--read-only"]);
+        for (key, value) in labels().to_map() {
+            command.args(["--label", &format!("{key}={value}")]);
+        }
+        let output = command
+            .args([
+                "--mount",
+                &mount,
+                "alpine:3.20",
+                "stat",
+                "-c",
+                "%d:%i",
+                "/proof",
+            ])
+            .output()
+            .map_err(|error| StorageError::Command(format!("run Docker bind stat: {error}")))?;
+        if !output.status.success() {
+            return Err(StorageError::Command(format!(
+                "Docker bind stat failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let filesystem_id = String::from_utf8(output.stdout)
+            .map_err(|error| {
+                StorageError::IdentityMismatch(format!("Docker stat is not UTF-8: {error}"))
+            })?
+            .trim()
+            .to_owned();
+        if filesystem_id.is_empty() || !filesystem_id.contains(':') {
+            return Err(StorageError::IdentityMismatch(
+                "Docker stat lacks device/inode identity".to_owned(),
+            ));
+        }
+        Ok(DockerBindProof {
+            daemon_id: self.daemon_id.clone(),
+            verifier: "docker-cli-stat".to_owned(),
+            method_version: "autospec.dev/docker-bind-stat/v1".to_owned(),
+            source_path: canonical,
+            filesystem_id,
+        })
+    }
+}
+
 #[test]
 fn real_docker_bind_verifier_contract_is_versioned_when_available() {
     let docker = std::env::var_os("AUTOSPEC_DOCKER_BIN")
@@ -153,41 +220,22 @@ fn real_docker_bind_verifier_contract_is_versioned_when_available() {
     let source = tempfile::tempdir().expect("bind source");
     #[cfg(unix)]
     mode(source.path(), 0o700);
-    fs::write(source.path().join("proof"), "FS-CONTRACT-7\n").expect("proof marker");
     let canonical = source.path().canonicalize().expect("canonical bind source");
-    let mount = format!("type=bind,src={},dst=/proof,readonly", canonical.display());
-    let mut command = Command::new(&docker);
-    command.args(["run", "--rm", "--network", "none", "--read-only"]);
-    for (key, value) in labels().to_map() {
-        command.args(["--label", &format!("{key}={value}")]);
-    }
-    let output = command
-        .args(["--mount", &mount, "alpine:3.20", "cat", "/proof/proof"])
-        .output()
-        .expect("run concrete bind verifier");
-    assert!(output.status.success(), "real bind proof command failed");
-    assert_eq!(output.stdout, b"FS-CONTRACT-7\n");
-    let capability = DockerBindCapability {
+    let verifier = DockerCliBindVerifier {
+        docker,
         daemon_id: String::from_utf8(daemon.stdout)
             .expect("daemon UTF-8")
             .trim()
             .to_owned(),
-        verifier: "docker-cli-marker-reader".to_owned(),
-        method_version: "autospec.dev/docker-bind-marker/v1".to_owned(),
     };
-    let proof = DockerBindProof {
-        daemon_id: capability.daemon_id.clone(),
-        verifier: capability.verifier.clone(),
-        method_version: capability.method_version.clone(),
-        source_path: canonical,
-        filesystem_id: String::from_utf8(output.stdout)
-            .expect("proof UTF-8")
-            .trim()
-            .to_owned(),
-    };
+    let capability = verifier.probe().expect("probe verifier");
+    let proof = verifier
+        .verify(&canonical)
+        .expect("daemon-side bind identity");
     assert_eq!(proof.verifier, capability.verifier);
     assert_eq!(proof.method_version, capability.method_version);
-    assert_eq!(proof.filesystem_id, "FS-CONTRACT-7");
+    assert_eq!(proof.source_path, canonical);
+    assert!(proof.filesystem_id.contains(':'));
 }
 
 #[test]
@@ -215,6 +263,8 @@ fn manager_rejects_group_or_world_accessible_state_roots() {
             calls: Arc::new(Mutex::new(Vec::new())),
             removes_mountpoint: false,
             state: Arc::new(Mutex::new(BackendState::Absent)),
+            pool_identity: "pool-7",
+            mutate_prepared: false,
         }),
         Box::new(FakeDockerVerifier),
     )
@@ -253,14 +303,18 @@ fn journal_creation_is_exclusive_and_never_overwrites_existing_state() {
         labels(),
         disk_gib_to_bytes(1).expect("bytes"),
         layout.root.clone(),
-        "fake:key".to_owned(),
+        "fake".to_owned(),
+        format!("fake:{}", labels().execution_id),
+        "pool-7".to_owned(),
         "token-first".to_owned(),
     );
     let second = PhaseJournal::allocating(
         labels(),
         disk_gib_to_bytes(1).expect("bytes"),
         layout.root.clone(),
+        "fake".to_owned(),
         "fake:key".to_owned(),
+        "pool-7".to_owned(),
         "token-second".to_owned(),
     );
     store.create(&layout, &first).expect("first create");
@@ -277,6 +331,9 @@ fn receipt_wire_format_is_versioned_and_preserves_exact_identity() {
         labels: labels(),
         reserved_bytes: disk_gib_to_bytes(3).expect("bytes"),
         mount_path: layout.root.clone(),
+        backend_kind: "apfs".to_owned(),
+        backend_key: "apfs:node-417-impl-01".to_owned(),
+        pool_identity: "POOL-UUID".to_owned(),
         backend: apfs_identity("disk9s1", "A1B2-C3D4", "token-a"),
         docker_bind: DockerBindProof {
             daemon_id: "daemon-7".to_owned(),
@@ -306,7 +363,9 @@ fn journal_transitions_are_fsynced_and_symlinks_are_rejected() {
         labels(),
         disk_gib_to_bytes(3).expect("bytes"),
         layout.root.clone(),
+        "apfs".to_owned(),
         "apfs:disk3:autospec-node-417-impl-01".to_owned(),
+        "POOL-UUID".to_owned(),
         "token-a".to_owned(),
     );
     store
@@ -319,6 +378,9 @@ fn journal_transitions_are_fsynced_and_symlinks_are_rejected() {
         labels: labels(),
         reserved_bytes: disk_gib_to_bytes(3).expect("bytes"),
         mount_path: layout.root.clone(),
+        backend_kind: "apfs".to_owned(),
+        backend_key: "apfs:disk3:autospec-node-417-impl-01".to_owned(),
+        pool_identity: "POOL-UUID".to_owned(),
         backend: apfs_identity("disk9s1", "A1B2-C3D4", "token-a"),
         docker_bind: DockerBindProof {
             daemon_id: "daemon-7".to_owned(),
@@ -358,7 +420,9 @@ fn allocating_journal_can_persist_backend_identity_before_ready() {
         labels(),
         disk_gib_to_bytes(3).expect("bytes"),
         layout.root.clone(),
+        "apfs".to_owned(),
         "apfs:disk3:autospec-node-417-impl-01".to_owned(),
+        "POOL-UUID".to_owned(),
         "token-a".to_owned(),
     )
     .with_backend_identity(identity.clone());
@@ -380,6 +444,8 @@ struct FakeBackend {
     calls: Arc<Mutex<Vec<String>>>,
     removes_mountpoint: bool,
     state: Arc<Mutex<BackendState>>,
+    pool_identity: &'static str,
+    mutate_prepared: bool,
 }
 
 impl StorageBackend for FakeBackend {
@@ -394,7 +460,7 @@ impl StorageBackend for FakeBackend {
             .push(format!("probe:{required_bytes}"));
         Ok(BackendCapability {
             backend: "fake".to_owned(),
-            pool_identity: "pool-7".to_owned(),
+            pool_identity: self.pool_identity.to_owned(),
             reservable_bytes: required_bytes,
         })
     }
@@ -441,7 +507,13 @@ impl StorageBackend for FakeBackend {
             .expect("fake calls")
             .push(format!("prepare:{}", identity.filesystem_id()));
         *self.state.lock().expect("fake state") = BackendState::Unmounted;
-        Ok(identity.clone())
+        let mut prepared = identity.clone();
+        if self.mutate_prepared {
+            if let BackendIdentity::Apfs { volume_uuid, .. } = &mut prepared {
+                *volume_uuid = "mutated-filesystem".to_owned();
+            }
+        }
+        Ok(prepared)
     }
 
     fn mount(
@@ -520,13 +592,13 @@ impl DockerBindVerifier for FakeDockerVerifier {
         })
     }
 
-    fn verify(&self, source: &Path, filesystem_id: &str) -> Result<DockerBindProof, StorageError> {
+    fn verify(&self, source: &Path) -> Result<DockerBindProof, StorageError> {
         Ok(DockerBindProof {
             daemon_id: "daemon-7".to_owned(),
             verifier: "fake-docker-bind-inspector".to_owned(),
             method_version: "autospec.dev/docker-bind-proof/v1".to_owned(),
             source_path: source.to_path_buf(),
-            filesystem_id: filesystem_id.to_owned(),
+            filesystem_id: format!("daemon-stat:{}", source.display()),
         })
     }
 }
@@ -543,11 +615,7 @@ impl DockerBindVerifier for FailingDockerVerifier {
         })
     }
 
-    fn verify(
-        &self,
-        _source: &Path,
-        _filesystem_id: &str,
-    ) -> Result<DockerBindProof, StorageError> {
+    fn verify(&self, _source: &Path) -> Result<DockerBindProof, StorageError> {
         Err(StorageError::Unavailable(
             "Docker daemon cannot prove the bind source".to_owned(),
         ))
@@ -566,13 +634,13 @@ impl DockerBindVerifier for ChangingContractVerifier {
         })
     }
 
-    fn verify(&self, source: &Path, filesystem_id: &str) -> Result<DockerBindProof, StorageError> {
+    fn verify(&self, source: &Path) -> Result<DockerBindProof, StorageError> {
         Ok(DockerBindProof {
             daemon_id: "daemon-7".to_owned(),
             verifier: "bind-inspector".to_owned(),
             method_version: "v2".to_owned(),
             source_path: source.to_path_buf(),
-            filesystem_id: filesystem_id.to_owned(),
+            filesystem_id: format!("daemon-stat:{}", source.display()),
         })
     }
 }
@@ -587,7 +655,7 @@ impl DockerBindVerifier for SymlinkSwappingDockerVerifier {
         FailingDockerVerifier.probe()
     }
 
-    fn verify(&self, source: &Path, _filesystem_id: &str) -> Result<DockerBindProof, StorageError> {
+    fn verify(&self, source: &Path) -> Result<DockerBindProof, StorageError> {
         fs::remove_dir_all(source).expect("remove fake mounted filesystem");
         std::os::unix::fs::symlink(source.with_extension("foreign"), source)
             .expect("replace mountpoint with dangling symlink");
@@ -607,6 +675,8 @@ fn manager_fixture() -> (tempfile::TempDir, ExecutionStorage, Arc<Mutex<Vec<Stri
             calls: Arc::clone(&calls),
             removes_mountpoint: false,
             state: Arc::new(Mutex::new(BackendState::Absent)),
+            pool_identity: "pool-7",
+            mutate_prepared: false,
         }),
         Box::new(FakeDockerVerifier),
     )
@@ -624,6 +694,8 @@ fn release_accepts_backend_that_removes_its_mountpoint() {
             calls: Arc::new(Mutex::new(Vec::new())),
             removes_mountpoint: true,
             state: Arc::new(Mutex::new(BackendState::Absent)),
+            pool_identity: "pool-7",
+            mutate_prepared: false,
         }),
         Box::new(FakeDockerVerifier),
     )
@@ -755,6 +827,8 @@ fn failed_post_mount_proof_rolls_back_backend_mountpoint_and_journal() {
             calls: Arc::clone(&calls),
             removes_mountpoint: false,
             state: Arc::new(Mutex::new(BackendState::Absent)),
+            pool_identity: "pool-7",
+            mutate_prepared: false,
         }),
         Box::new(FailingDockerVerifier),
     )
@@ -787,6 +861,8 @@ fn verifier_method_change_fails_allocation_and_rolls_back() {
             calls: Arc::clone(&calls),
             removes_mountpoint: false,
             state: Arc::new(Mutex::new(BackendState::Absent)),
+            pool_identity: "pool-7",
+            mutate_prepared: false,
         }),
         Box::new(ChangingContractVerifier),
     )
@@ -817,7 +893,9 @@ fn existing_allocating_journal_is_recovered_before_a_new_exclusive_allocation() 
         labels(),
         disk_gib_to_bytes(3).expect("bytes"),
         layout.root.clone(),
-        "fake:key".to_owned(),
+        "fake".to_owned(),
+        format!("fake:{}", labels().execution_id),
+        "pool-7".to_owned(),
         "stale-token".to_owned(),
     );
     JournalStore::new(manager.state_root())
@@ -833,8 +911,9 @@ fn existing_allocating_journal_is_recovered_before_a_new_exclusive_allocation() 
         .expect("recover then allocate");
     assert_ne!(receipt.backend.ownership_token(), "stale-token");
     let calls = calls.lock().expect("calls");
-    assert_eq!(calls[0], "discover");
-    assert_eq!(calls[1], format!("probe:{}", disk_gib_to_bytes(3).unwrap()));
+    assert_eq!(calls[0], "probe:0");
+    assert_eq!(calls[1], "discover");
+    assert_eq!(calls[2], format!("probe:{}", disk_gib_to_bytes(3).unwrap()));
     assert_eq!(
         JournalStore::new(manager.state_root())
             .expect("store")
@@ -844,6 +923,85 @@ fn existing_allocating_journal_is_recovered_before_a_new_exclusive_allocation() 
         AllocationPhase::Ready
     );
     drop(root);
+}
+
+#[test]
+fn recovery_rejects_backend_pool_drift_before_discovery_or_cleanup() {
+    let root = tempfile::tempdir().expect("state");
+    storage_directories(root.path());
+    let canonical = root.path().canonicalize().expect("canonical state");
+    let layout = ExecutionLayout::new(&canonical, &labels().execution_id).expect("layout");
+    fs::create_dir(&layout.root).expect("stale mountpoint");
+    #[cfg(unix)]
+    mode(&layout.root, 0o700);
+    let stale = PhaseJournal::allocating(
+        labels(),
+        disk_gib_to_bytes(1).expect("bytes"),
+        layout.root.clone(),
+        "fake".to_owned(),
+        format!("fake:{}", labels().execution_id),
+        "old-pool".to_owned(),
+        "stale-token".to_owned(),
+    );
+    JournalStore::new(&canonical)
+        .expect("store")
+        .create(&layout, &stale)
+        .expect("journal");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let manager = ExecutionStorage::new(
+        root.path(),
+        Box::new(FakeBackend {
+            calls: Arc::clone(&calls),
+            removes_mountpoint: false,
+            state: Arc::new(Mutex::new(BackendState::Absent)),
+            pool_identity: "pool-7",
+            mutate_prepared: false,
+        }),
+        Box::new(FakeDockerVerifier),
+    )
+    .expect("manager");
+    let error = manager
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 1,
+        })
+        .expect_err("pool drift must retain allocation");
+    assert!(error.to_string().contains("pool identity changed"));
+    assert_eq!(*calls.lock().expect("calls"), vec!["probe:0"]);
+    assert_eq!(
+        JournalStore::new(&canonical)
+            .expect("store")
+            .read(&layout)
+            .expect("retained"),
+        stale
+    );
+}
+
+#[test]
+fn prepare_must_preserve_exact_apfs_identity() {
+    let root = tempfile::tempdir().expect("state");
+    storage_directories(root.path());
+    let manager = ExecutionStorage::new(
+        root.path(),
+        Box::new(FakeBackend {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            removes_mountpoint: false,
+            state: Arc::new(Mutex::new(BackendState::Absent)),
+            pool_identity: "pool-7",
+            mutate_prepared: true,
+        }),
+        Box::new(FakeDockerVerifier),
+    )
+    .expect("manager");
+    let error = manager
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 1,
+        })
+        .expect_err("prepare identity mutation must roll back");
+    assert!(error
+        .to_string()
+        .contains("prepared backend identity changed"));
 }
 
 #[test]
@@ -858,6 +1016,8 @@ fn release_resumes_from_unmounted_and_already_absent_subphases() {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 removes_mountpoint: false,
                 state: Arc::clone(&state),
+                pool_identity: "pool-7",
+                mutate_prepared: false,
             }),
             Box::new(FakeDockerVerifier),
         )
@@ -905,6 +1065,8 @@ fn allocation_rollback_rejects_a_mountpoint_replaced_by_a_symlink() {
             calls: Arc::new(Mutex::new(Vec::new())),
             removes_mountpoint: false,
             state: Arc::new(Mutex::new(BackendState::Absent)),
+            pool_identity: "pool-7",
+            mutate_prepared: false,
         }),
         Box::new(SymlinkSwappingDockerVerifier),
     )

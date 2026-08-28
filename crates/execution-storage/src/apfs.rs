@@ -205,18 +205,8 @@ impl StorageBackend for ApfsBackend {
             ),
             "create unmounted reserved APFS execution volume",
         )?;
-        let device = text(&created.stdout, "diskutil addVolume output")?
-            .split_whitespace()
-            .rev()
-            .find(|field| {
-                field.starts_with("disk") && field.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            })
-            .ok_or_else(|| {
-                StorageError::IdentityMismatch(
-                    "diskutil did not report the created APFS device".to_owned(),
-                )
-            })?;
-        self.identity_from_device(device, token, bytes)
+        let device = parse_created_device(&created.stdout)?;
+        self.identity_from_device(&device, token, bytes)
     }
     fn prepare(
         &self,
@@ -259,22 +249,24 @@ impl StorageBackend for ApfsBackend {
         identity: &BackendIdentity,
         bytes: u64,
     ) -> Result<BackendState, StorageError> {
-        let (_, _, volume, _, _, _) = apfs_identity(identity)?;
-        let output = self
-            .runner
-            .run(&CommandSpec::new(DISKUTIL, args(&["info", volume])))?;
-        if output.code != 0 {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("Could not find") || stderr.contains("not found") {
-                return Ok(BackendState::Absent);
-            }
-            return Err(StorageError::Command(format!(
-                "inspect APFS identity exited {}: {}",
-                output.code,
-                stderr.trim()
-            )));
+        let (container, container_uuid, volume, name, _, _) = apfs_identity(identity)?;
+        let listing = self.list(container)?;
+        if parse_container_uuid(&listing, container)? != container_uuid {
+            return Err(StorageError::IdentityMismatch(
+                "APFS container UUID changed".to_owned(),
+            ));
         }
-        let info = parse_info(&output.stdout)?;
+        let Some(discovered) =
+            find_volume_device_by_name(text(&listing, "diskutil apfs list")?, name)?
+        else {
+            return Ok(BackendState::Absent);
+        };
+        if discovered != volume {
+            return Err(StorageError::IdentityMismatch(
+                "APFS volume name now identifies a different device".to_owned(),
+            ));
+        }
+        let info = self.info(volume)?;
         let expected = self.verify_object(identity, bytes)?;
         if info != expected {
             return Err(StorageError::IdentityMismatch(
@@ -393,6 +385,29 @@ fn parse_info(output: &[u8]) -> Result<ApfsInfo, StorageError> {
         read_only: field(output, "Volume Read-Only")?,
     })
 }
+fn parse_created_device(output: &[u8]) -> Result<String, StorageError> {
+    let devices = text(output, "diskutil addVolume output")?
+        .split_whitespace()
+        .filter(|field| {
+            let Some(suffix) = field.strip_prefix("disk") else {
+                return false;
+            };
+            let Some((disk, slice)) = suffix.split_once('s') else {
+                return false;
+            };
+            !disk.is_empty()
+                && !slice.is_empty()
+                && disk.bytes().all(|byte| byte.is_ascii_digit())
+                && slice.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .collect::<Vec<_>>();
+    match devices.as_slice() {
+        [device] => Ok((*device).to_owned()),
+        _ => Err(StorageError::IdentityMismatch(
+            "diskutil did not report one exact created APFS volume device".to_owned(),
+        )),
+    }
+}
 fn find_volume_device_by_name(output: &str, name: &str) -> Result<Option<String>, StorageError> {
     let mut device = None;
     for line in output.lines().map(str::trim) {
@@ -438,16 +453,25 @@ fn is_not_mounted(value: &str) -> bool {
 }
 fn parse_volume_bounds(output: &[u8], volume: &str) -> Result<(u64, u64), StorageError> {
     let output = text(output, "diskutil apfs list")?;
-    let section = output
-        .split(&format!("Volume {volume}"))
-        .nth(1)
-        .ok_or_else(|| {
-            StorageError::IdentityMismatch(format!("APFS list does not contain volume {volume}"))
-        })?;
-    let section = section.split("+-> Volume ").next().unwrap_or(section);
+    let mut lines = output.lines();
+    let section = loop {
+        let Some(line) = lines.next() else {
+            return Err(StorageError::IdentityMismatch(format!(
+                "APFS list does not contain exact volume {volume}"
+            )));
+        };
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.get(0..3) == Some(["+->", "Volume", volume].as_slice()) {
+            break lines
+                .by_ref()
+                .take_while(|line| !line.trim_start().starts_with("+-> Volume "))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    };
     Ok((
-        parse_bytes_field(section, "Capacity Reserve")?,
-        parse_bytes_field(section, "Capacity Quota")?,
+        parse_bytes_field(&section, "Capacity Reserve")?,
+        parse_bytes_field(&section, "Capacity Quota")?,
     ))
 }
 fn parse_global_bytes(output: &[u8], name: &str) -> Result<u64, StorageError> {
@@ -490,4 +514,31 @@ fn path_text(path: &Path) -> Result<&str, StorageError> {
     path.to_str().ok_or_else(|| {
         StorageError::InvalidRequest(format!("path is not UTF-8: {}", path.display()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_volume_device_by_name, parse_created_device, parse_volume_bounds};
+
+    #[test]
+    fn exact_volume_header_does_not_accept_device_or_name_prefixes() {
+        let listing = b"+-> Volume disk9s10\n    Name: autospec-token-extra (Case-sensitive)\n    Capacity Reserve: 99 Bytes\n    Capacity Quota: 99 Bytes\n+-> Volume disk9s1\n    Name: autospec-token (Case-sensitive)\n    Capacity Reserve: 7 Bytes\n    Capacity Quota: 7 Bytes\n";
+        assert_eq!(
+            parse_volume_bounds(listing, "disk9s1").expect("exact bounds"),
+            (7, 7)
+        );
+        assert_eq!(
+            find_volume_device_by_name(
+                std::str::from_utf8(listing).expect("utf8"),
+                "autospec-token"
+            )
+            .expect("exact name"),
+            Some("disk9s1".to_owned())
+        );
+        assert!(parse_created_device(b"Created disk9s10 and disk9s1").is_err());
+        assert_eq!(
+            parse_created_device(b"Created disk9s1\n").expect("device"),
+            "disk9s1"
+        );
+    }
 }

@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+libc.workspace = true
 orchestrator-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

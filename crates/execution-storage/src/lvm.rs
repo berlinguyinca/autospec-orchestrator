@@ -119,36 +119,34 @@ impl LvmBackend {
     fn lv_name(token: &str) -> String {
         format!("autospec-{token}")
     }
-    fn inspect_lv_result(&self, vg_lv: &str) -> Result<Option<LvInfo>, StorageError> {
-        let command = CommandSpec::new(
-            LVM,
-            args(&[
-                "lvs",
-                "--noheadings",
-                "--units",
-                "b",
-                "--nosuffix",
-                "--separator",
-                ":",
-                "--options",
-                "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
-                "--",
-                vg_lv,
-            ]),
+    fn inspect_lv_result(&self, lv_name: &str) -> Result<Option<LvInfo>, StorageError> {
+        let target = format!("{}/{lv_name}", self.volume_group);
+        let output = run_checked(
+            self.runner.as_ref(),
+            CommandSpec::new(
+                LVM,
+                args(&[
+                    "lvs",
+                    "--noheadings",
+                    "--units",
+                    "b",
+                    "--nosuffix",
+                    "--separator",
+                    ":",
+                    "--options",
+                    "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                    "--",
+                    &target,
+                ]),
+            ),
+            "inspect logical volume inventory",
         );
-        let output = self.runner.run(&command)?;
-        if output.code != 0 {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("Failed to find") || stderr.contains("not found") {
-                return Ok(None);
-            }
-            return Err(StorageError::Command(format!(
-                "inspect logical volume exited {}: {}",
-                output.code,
-                stderr.trim()
-            )));
+        let output = output?;
+        if utf8_trim(&output.stdout, "lvs inventory output")?.is_empty() {
+            Ok(None)
+        } else {
+            parse_lv(&output.stdout).map(Some)
         }
-        parse_lv(&output.stdout).map(Some)
     }
     fn inspect_exact(
         &self,
@@ -161,7 +159,7 @@ impl LvmBackend {
                 "LVM volume group changed".to_owned(),
             ));
         }
-        let Some(info) = self.inspect_lv_result(&format!("{vg}/{lv}"))? else {
+        let Some(info) = self.inspect_lv_result(lv)? else {
             return Ok(None);
         };
         if info.vg_uuid != vg_uuid
@@ -206,26 +204,27 @@ impl LvmBackend {
             return Ok(BackendState::Unmounted);
         }
         let mount = path_text(&layout.root)?;
-        let output = self.runner.run(&CommandSpec::new(
-            FINDMNT,
-            args(&[
-                "--noheadings",
-                "--output",
-                "UUID,FSTYPE,TARGET",
-                "--target",
-                mount,
-            ]),
-        ))?;
-        if output.code != 0 {
-            return Ok(BackendState::Unmounted);
-        }
-        if utf8_trim(&output.stdout, "findmnt output")? == format!("{filesystem_uuid} ext4 {mount}")
-        {
-            Ok(BackendState::Mounted)
-        } else {
-            Err(StorageError::IdentityMismatch(
+        let output = run_checked(
+            self.runner.as_ref(),
+            CommandSpec::new(
+                FINDMNT,
+                args(&["--list", "--noheadings", "--output", "UUID,FSTYPE,TARGET"]),
+            ),
+            "inspect mount inventory",
+        )?;
+        let matches = utf8_trim(&output.stdout, "findmnt output")?
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.split_whitespace().nth(2) == Some(mount))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(BackendState::Unmounted),
+            [line] if *line == format!("{filesystem_uuid} ext4 {mount}") => {
+                Ok(BackendState::Mounted)
+            }
+            _ => Err(StorageError::IdentityMismatch(
                 "findmnt source, filesystem, or target changed".to_owned(),
-            ))
+            )),
         }
     }
 }
@@ -347,11 +346,9 @@ impl StorageBackend for LvmBackend {
             ),
             "create tagged thick logical volume",
         )?;
-        let info = self
-            .inspect_lv_result(&format!("{}/{}", self.volume_group, lv))?
-            .ok_or_else(|| {
-                StorageError::IdentityMismatch("created logical volume is absent".to_owned())
-            })?;
+        let info = self.inspect_lv_result(&lv)?.ok_or_else(|| {
+            StorageError::IdentityMismatch("created logical volume is absent".to_owned())
+        })?;
         if info.vg_uuid != pool.uuid
             || info.size_bytes != bytes
             || !info
@@ -467,13 +464,9 @@ impl StorageBackend for LvmBackend {
         if filesystem_uuid.is_empty() {
             return Ok(());
         }
-        let info = self
-            .inspect_lv_result(&format!("{}/{}", expected.0, expected.2))?
-            .ok_or_else(|| {
-                StorageError::IdentityMismatch(
-                    "logical volume disappeared before unmount".to_owned(),
-                )
-            })?;
+        let info = self.inspect_lv_result(expected.2)?.ok_or_else(|| {
+            StorageError::IdentityMismatch("logical volume disappeared before unmount".to_owned())
+        })?;
         if info.vg_uuid != expected.1
             || info.lv_uuid != expected.3
             || !info
@@ -494,13 +487,11 @@ impl StorageBackend for LvmBackend {
     }
     fn remove(&self, identity: &BackendIdentity) -> Result<(), StorageError> {
         let (vg, _, lv, _, _, _) = lvm_identity(identity)?;
-        let info = self
-            .inspect_lv_result(&format!("{vg}/{lv}"))?
-            .ok_or_else(|| {
-                StorageError::IdentityMismatch(
-                    "logical volume already absent before removal proof".to_owned(),
-                )
-            })?;
+        let info = self.inspect_lv_result(lv)?.ok_or_else(|| {
+            StorageError::IdentityMismatch(
+                "logical volume already absent before removal proof".to_owned(),
+            )
+        })?;
         let expected = lvm_identity(identity)?;
         if info.vg_uuid != expected.1
             || info.lv_uuid != expected.3

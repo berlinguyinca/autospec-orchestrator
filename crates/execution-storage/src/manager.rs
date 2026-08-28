@@ -1,4 +1,4 @@
-use crate::journal::{require_real_directory, DirectoryIdentity};
+use crate::journal::{require_real_directory, PinnedDirectory};
 use crate::{
     disk_gib_to_bytes, AllocationPhase, AllocationReceipt, BackendIdentity, BackendState,
     DockerBindProof, ExecutionLayout, JournalStore, PhaseJournal, ReleasePhase, StorageError,
@@ -100,7 +100,7 @@ pub trait StorageBackend: Debug + Send + Sync {
 pub trait DockerBindVerifier: Debug + Send + Sync {
     fn probe(&self) -> Result<DockerBindCapability, StorageError>;
 
-    fn verify(&self, source: &Path, filesystem_id: &str) -> Result<DockerBindProof, StorageError>;
+    fn verify(&self, source: &Path) -> Result<DockerBindProof, StorageError>;
 }
 
 pub trait ExecutionStorageManager: Send + Sync {
@@ -116,7 +116,7 @@ pub struct ExecutionStorage {
     journals: JournalStore,
     backend: Box<dyn StorageBackend>,
     docker: Box<dyn DockerBindVerifier>,
-    executions_directory: DirectoryIdentity,
+    executions_directory: PinnedDirectory,
 }
 
 impl ExecutionStorage {
@@ -131,9 +131,9 @@ impl ExecutionStorage {
                 state_root.as_ref().display()
             ))
         })?;
-        let state_identity = DirectoryIdentity::capture(&state_root, "state root")?;
+        let state_identity = PinnedDirectory::capture(&state_root, "state root")?;
         let executions_directory =
-            DirectoryIdentity::capture(&state_root.join("executions"), "executions directory")?;
+            PinnedDirectory::capture(&state_root.join("executions"), "executions directory")?;
         let journals = JournalStore::new(&state_root)?;
         state_identity.verify("state root")?;
         Ok(Self {
@@ -156,46 +156,28 @@ impl ExecutionStorage {
                 "execution mountpoint is outside the deterministic root".to_owned(),
             ));
         }
-        match fs::symlink_metadata(&layout.root) {
-            Ok(_) => Err(StorageError::IdentityMismatch(format!(
+        let name = mountpoint_name(layout)?;
+        match self.executions_directory.child_metadata(name)? {
+            Some(_) => Err(StorageError::IdentityMismatch(format!(
                 "execution mountpoint already exists: {}",
                 layout.root.display()
             ))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                create_secure_directory(&layout.root).map_err(|error| {
-                    StorageError::Journal(format!(
-                        "create mountpoint {}: {error}",
-                        layout.root.display()
-                    ))
-                })
-            }
-            Err(error) => Err(StorageError::Journal(format!(
-                "inspect mountpoint {}: {error}",
-                layout.root.display()
-            ))),
+            None => self.executions_directory.create_directory(name),
         }
     }
 
     fn remove_released_mountpoint(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
         self.executions_directory.verify("executions directory")?;
-        match fs::symlink_metadata(&layout.root) {
-            Ok(metadata) if metadata.file_type().is_dir() => {
-                fs::remove_dir(&layout.root).map_err(|error| {
-                    StorageError::Cleanup(format!(
-                        "remove mountpoint {}: {error}",
-                        layout.root.display()
-                    ))
-                })
+        let name = mountpoint_name(layout)?;
+        match self.executions_directory.child_metadata(name)? {
+            Some(metadata) if metadata.file_type().is_dir() => {
+                self.executions_directory.remove_directory(name)
             }
-            Ok(_) => Err(StorageError::IdentityMismatch(format!(
+            Some(_) => Err(StorageError::IdentityMismatch(format!(
                 "released mountpoint is not a real directory: {}",
                 layout.root.display()
             ))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(StorageError::Cleanup(format!(
-                "inspect released mountpoint {}: {error}",
-                layout.root.display()
-            ))),
+            None => Ok(()),
         }
     }
 
@@ -276,6 +258,7 @@ impl ExecutionStorage {
                 "existing journal belongs to a different allocation request".to_owned(),
             ));
         }
+        self.validate_backend_config(&journal)?;
         match journal.phase {
             AllocationPhase::Ready => Err(StorageError::IdentityMismatch(
                 "execution storage is already allocated".to_owned(),
@@ -319,6 +302,20 @@ impl ExecutionStorage {
                     self.journals.remove(layout)
                 }
             }
+        }
+    }
+
+    fn validate_backend_config(&self, journal: &PhaseJournal) -> Result<(), StorageError> {
+        let configured = self.backend.probe(0)?;
+        if journal.backend_kind == configured.backend
+            && journal.backend_key == self.backend.key(&journal.labels)
+            && journal.pool_identity == configured.pool_identity
+        {
+            Ok(())
+        } else {
+            Err(StorageError::IdentityMismatch(
+                "existing journal backend configuration or pool identity changed".to_owned(),
+            ))
         }
     }
 
@@ -372,6 +369,19 @@ fn create_secure_directory(path: &Path) -> std::io::Result<()> {
     fs::create_dir(path)
 }
 
+fn mountpoint_name(layout: &ExecutionLayout) -> Result<&str, StorageError> {
+    layout
+        .root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            StorageError::InvalidRequest(format!(
+                "execution mountpoint name is not UTF-8: {}",
+                layout.root.display()
+            ))
+        })
+}
+
 fn ownership_token() -> Result<String, StorageError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -383,6 +393,39 @@ fn ownership_token() -> Result<String, StorageError> {
         nanos as u64 ^ counter,
         std::process::id()
     ))
+}
+
+fn valid_prepared_transition(created: &BackendIdentity, prepared: &BackendIdentity) -> bool {
+    match (created, prepared) {
+        (BackendIdentity::Apfs { .. }, BackendIdentity::Apfs { .. }) => created == prepared,
+        (
+            BackendIdentity::Lvm {
+                volume_group,
+                volume_group_uuid,
+                logical_volume,
+                logical_volume_uuid,
+                filesystem_uuid,
+                ownership_token,
+            },
+            BackendIdentity::Lvm {
+                volume_group: prepared_group,
+                volume_group_uuid: prepared_group_uuid,
+                logical_volume: prepared_volume,
+                logical_volume_uuid: prepared_volume_uuid,
+                filesystem_uuid: prepared_filesystem_uuid,
+                ownership_token: prepared_token,
+            },
+        ) => {
+            filesystem_uuid.is_empty()
+                && !prepared_filesystem_uuid.is_empty()
+                && volume_group == prepared_group
+                && volume_group_uuid == prepared_group_uuid
+                && logical_volume == prepared_volume
+                && logical_volume_uuid == prepared_volume_uuid
+                && ownership_token == prepared_token
+        }
+        _ => false,
+    }
 }
 
 impl ExecutionStorageManager for ExecutionStorage {
@@ -399,15 +442,8 @@ impl ExecutionStorageManager for ExecutionStorage {
     fn allocate(&self, request: &AllocationRequest) -> Result<AllocationReceipt, StorageError> {
         let reserved_bytes = disk_gib_to_bytes(request.disk_gib)?;
         let layout = ExecutionLayout::new(&self.state_root, &request.labels.execution_id)?;
-        match fs::symlink_metadata(&layout.journal) {
-            Ok(_) => self.recover_existing(&layout, request)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(StorageError::Journal(format!(
-                    "inspect journal {}: {error}",
-                    layout.journal.display()
-                )))
-            }
+        if self.journals.exists(&layout)? {
+            self.recover_existing(&layout, request)?;
         }
         let capability = self.probe(request.disk_gib)?;
         if capability.backend.reservable_bytes < reserved_bytes {
@@ -422,7 +458,9 @@ impl ExecutionStorageManager for ExecutionStorage {
             request.labels.clone(),
             reserved_bytes,
             layout.root.clone(),
+            capability.backend.backend.clone(),
             self.backend.key(&request.labels),
+            capability.backend.pool_identity.clone(),
             ownership_token.clone(),
         );
         if let Err(error) = self.journals.create(&layout, &allocating) {
@@ -477,13 +515,14 @@ impl ExecutionStorageManager for ExecutionStorage {
                     ))
                 }
             };
-        if prepared_identity.ownership_token() != ownership_token {
+        if !valid_prepared_transition(&created_identity, &prepared_identity) {
             return Err(self.rollback_allocation(
                 &layout,
                 &allocating,
                 Some(&prepared_identity),
                 StorageError::IdentityMismatch(
-                    "prepared backend ownership token differs from the journal".to_owned(),
+                    "prepared backend identity changed outside the filesystem UUID transition"
+                        .to_owned(),
                 ),
             ));
         }
@@ -519,9 +558,7 @@ impl ExecutionStorageManager for ExecutionStorage {
                     "prepared backend is not mounted".to_owned(),
                 ));
             }
-            let docker_bind = self
-                .docker
-                .verify(&layout.root, prepared_identity.filesystem_id())?;
+            let docker_bind = self.docker.verify(&layout.root)?;
             if docker_bind.daemon_id != capability.docker_bind.daemon_id
                 || docker_bind.verifier != capability.docker_bind.verifier
                 || docker_bind.method_version != capability.docker_bind.method_version
@@ -536,6 +573,9 @@ impl ExecutionStorageManager for ExecutionStorage {
                 labels: request.labels.clone(),
                 reserved_bytes,
                 mount_path: layout.root.clone(),
+                backend_kind: capability.backend.backend.clone(),
+                backend_key: self.backend.key(&request.labels),
+                pool_identity: capability.backend.pool_identity.clone(),
                 backend: prepared_identity.clone(),
                 docker_bind,
             };
@@ -563,6 +603,7 @@ impl ExecutionStorageManager for ExecutionStorage {
                 "release receipt does not exactly match the durable journal".to_owned(),
             ));
         }
+        self.validate_backend_config(&journal)?;
         if journal.phase == AllocationPhase::Ready {
             if self
                 .backend
@@ -573,9 +614,7 @@ impl ExecutionStorageManager for ExecutionStorage {
                     "ready backend is not mounted".to_owned(),
                 ));
             }
-            let current_bind = self
-                .docker
-                .verify(&layout.root, receipt.backend.filesystem_id())?;
+            let current_bind = self.docker.verify(&layout.root)?;
             if current_bind != receipt.docker_bind {
                 return Err(StorageError::IdentityMismatch(
                     "Docker bind proof changed since allocation".to_owned(),
@@ -602,5 +641,41 @@ impl ExecutionStorageManager for ExecutionStorage {
             .into_iter()
             .filter(|journal| !live.contains(&journal.labels.execution_id))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_prepared_transition;
+    use crate::BackendIdentity;
+
+    fn lvm(filesystem_uuid: &str) -> BackendIdentity {
+        BackendIdentity::Lvm {
+            volume_group: "vg".to_owned(),
+            volume_group_uuid: "vg-uuid".to_owned(),
+            logical_volume: "lv".to_owned(),
+            logical_volume_uuid: "lv-uuid".to_owned(),
+            filesystem_uuid: filesystem_uuid.to_owned(),
+            ownership_token: "token".to_owned(),
+        }
+    }
+
+    #[test]
+    fn lvm_prepare_may_only_fill_the_filesystem_uuid() {
+        let created = lvm("");
+        assert!(valid_prepared_transition(&created, &lvm("fs-uuid")));
+        let mut changed = lvm("fs-uuid");
+        if let BackendIdentity::Lvm {
+            logical_volume_uuid,
+            ..
+        } = &mut changed
+        {
+            *logical_volume_uuid = "foreign".to_owned();
+        }
+        assert!(!valid_prepared_transition(&created, &changed));
+        assert!(!valid_prepared_transition(
+            &lvm("already-formatted"),
+            &lvm("fs-uuid")
+        ));
     }
 }
