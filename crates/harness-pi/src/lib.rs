@@ -5,6 +5,10 @@ mod resume;
 mod session;
 
 use async_trait::async_trait;
+use execution_storage::{
+    AllocationReceipt, ExecutionLayout, ReadyAllocationVerifier, ReadyLease,
+    VerifiedExecutionStorage,
+};
 use harness_traits::{AgentHarness, HarnessError, SessionRef};
 use orchestrator_core::{ExecutionEvent, ModelPolicy, OwnershipLabels, TaskPacket};
 use std::{
@@ -33,9 +37,21 @@ pub struct PiHarnessConfig {
     /// Additional explicit skill paths. Package discovery remains disabled.
     pub skills: Vec<PathBuf>,
     pub stop_timeout: Duration,
+    storage: Option<VerifiedAllocationConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedAllocationConfig {
+    verifier: Arc<dyn ReadyAllocationVerifier>,
+    receipt: AllocationReceipt,
+    layout: ExecutionLayout,
 }
 
 impl PiHarnessConfig {
+    /// Creates an unverified legacy configuration for non-execution uses.
+    ///
+    /// `PiHarness::start` deliberately rejects this configuration because the
+    /// paths are not backed by a live Ready allocation capability.
     pub fn for_execution(
         state_root: PathBuf,
         worktree: PathBuf,
@@ -58,7 +74,55 @@ impl PiHarnessConfig {
             ],
             skills: Vec::new(),
             stop_timeout: Duration::from_secs(10),
+            storage: None,
         }
+    }
+
+    /// Binds Pi to one exact Ready execution allocation.
+    pub fn for_ready_allocation(
+        verifier: Arc<dyn ReadyAllocationVerifier>,
+        receipt: AllocationReceipt,
+        agent_container: String,
+    ) -> Result<Self, HarnessError> {
+        let state_root = receipt
+            .mount_path
+            .parent()
+            .and_then(|executions| executions.parent())
+            .ok_or_else(|| {
+                HarnessError::Start(
+                    "execution allocation mount path lacks a deterministic state root".to_owned(),
+                )
+            })?
+            .to_path_buf();
+        let layout = ExecutionLayout::new(&state_root, &receipt.labels.execution_id)
+            .map_err(storage_error)?;
+        receipt
+            .validate(&receipt.labels, &layout)
+            .map_err(storage_error)?;
+        let labels = receipt.labels.clone();
+        let worktree = layout.repository.clone();
+        Ok(Self {
+            state_root,
+            worktree,
+            docker_binary: PathBuf::from("docker"),
+            agent_container,
+            pi_executable: "pi".to_owned(),
+            labels,
+            model_policy: None,
+            tools: vec![
+                "read".to_owned(),
+                "bash".to_owned(),
+                "edit".to_owned(),
+                "write".to_owned(),
+            ],
+            skills: Vec::new(),
+            stop_timeout: Duration::from_secs(10),
+            storage: Some(VerifiedAllocationConfig {
+                verifier,
+                receipt,
+                layout,
+            }),
+        })
     }
 }
 
@@ -74,6 +138,12 @@ struct ProcessRegistry {
 struct ManagedProcess {
     child: Mutex<Child>,
     pgid: u32,
+    _storage_lease: Box<dyn ReadyLease>,
+}
+
+pub(crate) struct ReadyPiStorage {
+    pub(crate) layout: ExecutionLayout,
+    pub(crate) lease: Box<dyn ReadyLease>,
 }
 
 impl Drop for ProcessRegistry {
@@ -123,6 +193,81 @@ impl PiHarness {
     pub fn unknown_event_count(&self) -> u64 {
         self.unknown_events.load(Ordering::Relaxed)
     }
+
+    pub(crate) fn acquire_ready_storage(&self) -> Result<ReadyPiStorage, HarnessError> {
+        let storage = self.config.storage.as_ref().ok_or_else(|| {
+            HarnessError::Start(
+                "Pi execution requires an exact Ready execution-storage allocation".to_owned(),
+            )
+        })?;
+        let expected =
+            ExecutionLayout::new(&self.config.state_root, &self.config.labels.execution_id)
+                .map_err(storage_error)?;
+        storage
+            .receipt
+            .validate(&self.config.labels, &expected)
+            .map_err(storage_error)?;
+        if storage.layout != expected
+            || storage.receipt.labels != self.config.labels
+            || self.config.worktree != expected.repository
+        {
+            return Err(HarnessError::Start(
+                "Pi configuration does not exactly match its execution allocation".to_owned(),
+            ));
+        }
+
+        let verified = storage
+            .verifier
+            .verify_ready(&storage.receipt)
+            .map_err(storage_error)?;
+        verify_storage_paths(verified.as_ref(), &expected)?;
+        let lease = storage
+            .verifier
+            .acquire_ready_lease(&storage.receipt)
+            .map_err(storage_error)?;
+        verify_storage_paths(lease.verified(), &expected)?;
+        Ok(ReadyPiStorage {
+            layout: expected,
+            lease,
+        })
+    }
+
+    pub(crate) fn validate_session(&self, session: &SessionRef) -> Result<(), HarnessError> {
+        let storage = self.config.storage.as_ref().ok_or_else(|| {
+            HarnessError::InvalidSession(
+                "Pi session has no verified execution allocation".to_owned(),
+            )
+        })?;
+        if session.execution_id != self.config.labels.execution_id
+            || session.path != storage.layout.session.display().to_string()
+            || session.worktree_path != storage.layout.repository.display().to_string()
+        {
+            return Err(HarnessError::InvalidSession(
+                "Pi session paths do not match the verified execution layout".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn verify_storage_paths(
+    verified: &dyn VerifiedExecutionStorage,
+    layout: &ExecutionLayout,
+) -> Result<(), HarnessError> {
+    verified.verify().map_err(storage_error)?;
+    if verified.repository_path() != layout.repository {
+        return Err(HarnessError::Start(
+            "verified repository path differs from the execution layout".to_owned(),
+        ));
+    }
+    for path in [&layout.repository, &layout.session, &layout.conversation] {
+        verified.verify_directory(path).map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn storage_error(error: execution_storage::StorageError) -> HarnessError {
+    HarnessError::Start(format!("execution storage verification failed: {error}"))
 }
 
 #[async_trait]

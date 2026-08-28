@@ -1,3 +1,8 @@
+use execution_storage::{
+    disk_gib_to_bytes, AllocationReceipt, BackendIdentity, DockerBindProof, ExecutionLayout,
+    ReadyAllocationVerifier, ReadyLease, StorageError, VerifiedExecutionStorage,
+    ALLOCATION_API_VERSION,
+};
 use harness_pi::{PiHarness, PiHarnessConfig};
 use harness_traits::{AgentHarness, HarnessError};
 use orchestrator_core::{
@@ -10,7 +15,10 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
@@ -33,7 +41,144 @@ struct DockerPi {
     root: TempDir,
     container: String,
     execution_id: String,
+    receipt: AllocationReceipt,
+    verifier: Arc<TestReadyVerifier>,
     removed: bool,
+}
+
+#[derive(Debug, Default)]
+struct LeaseState {
+    active: Mutex<usize>,
+    released: Condvar,
+}
+
+#[derive(Debug)]
+struct TestReadyVerifier {
+    expected: AllocationReceipt,
+    layout: ExecutionLayout,
+    reject: AtomicBool,
+    lease_state: Arc<LeaseState>,
+    verified_directories: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+#[derive(Debug)]
+struct TestVerifiedStorage {
+    layout: ExecutionLayout,
+    verified_directories: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl VerifiedExecutionStorage for TestVerifiedStorage {
+    fn repository_path(&self) -> &Path {
+        &self.layout.repository
+    }
+
+    fn verify(&self) -> Result<(), StorageError> {
+        for path in [&self.layout.root, &self.layout.repository] {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StorageError::IdentityMismatch(format!(
+                    "verified path is not a real directory: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_directory(&self, path: &Path) -> Result<(), StorageError> {
+        if !path.starts_with(&self.layout.root) {
+            return Err(StorageError::IdentityMismatch(format!(
+                "directory escaped allocation: {}",
+                path.display()
+            )));
+        }
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StorageError::IdentityMismatch(format!(
+                "directory is not real: {}",
+                path.display()
+            )));
+        }
+        self.verified_directories
+            .lock()
+            .unwrap()
+            .push(path.to_path_buf());
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct TestReadyLease {
+    verified: TestVerifiedStorage,
+    state: Arc<LeaseState>,
+}
+
+impl Drop for TestReadyLease {
+    fn drop(&mut self) {
+        let mut active = self.state.active.lock().unwrap();
+        *active -= 1;
+        self.state.released.notify_all();
+    }
+}
+
+impl ReadyLease for TestReadyLease {
+    fn verified(&self) -> &dyn VerifiedExecutionStorage {
+        &self.verified
+    }
+}
+
+impl ReadyAllocationVerifier for TestReadyVerifier {
+    fn verify_ready(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+        self.validate(receipt)?;
+        Ok(Box::new(self.verified()))
+    }
+
+    fn acquire_ready_lease(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn ReadyLease>, StorageError> {
+        self.validate(receipt)?;
+        *self.lease_state.active.lock().unwrap() += 1;
+        Ok(Box::new(TestReadyLease {
+            verified: self.verified(),
+            state: Arc::clone(&self.lease_state),
+        }))
+    }
+}
+
+impl TestReadyVerifier {
+    fn validate(&self, receipt: &AllocationReceipt) -> Result<(), StorageError> {
+        if self.reject.load(Ordering::SeqCst) || receipt != &self.expected {
+            Err(StorageError::IdentityMismatch(
+                "receipt is stale or forged".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verified(&self) -> TestVerifiedStorage {
+        TestVerifiedStorage {
+            layout: self.layout.clone(),
+            verified_directories: Arc::clone(&self.verified_directories),
+        }
+    }
+
+    fn active_leases(&self) -> usize {
+        *self.lease_state.active.lock().unwrap()
+    }
+
+    fn wait_for_release(&self) {
+        let mut active = self.lease_state.active.lock().unwrap();
+        while *active != 0 {
+            active = self.lease_state.released.wait(active).unwrap();
+        }
+    }
 }
 
 impl DockerPi {
@@ -55,13 +200,17 @@ impl DockerPi {
             return None;
         }
         let root = TempDir::new().expect("temporary Docker Pi fixture");
-        let worktree = root.path().join("worktree");
         let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let execution_id = format!("pi-test-{}-{sequence}", std::process::id());
-        let session = root.path().join("state/sessions").join(&execution_id);
-        let conversation = session.join("conversation");
+        let state_root = root.path().join("state");
+        let execution = ExecutionId::new(&execution_id);
+        let layout = ExecutionLayout::new(&state_root, &execution).unwrap();
+        let worktree = layout.repository.clone();
+        let conversation = layout.conversation.clone();
         fs::create_dir_all(worktree.join(".autospec")).unwrap();
         fs::create_dir_all(&conversation).unwrap();
+        fs::create_dir_all(&layout.credentials).unwrap();
+        fs::create_dir_all(&layout.runtime).unwrap();
         fs::write(worktree.join("AGENTS.md"), "Stay scoped.\n").unwrap();
         fs::write(worktree.join("role.md"), "Implement.\n").unwrap();
         fs::write(
@@ -121,52 +270,83 @@ impl DockerPi {
             .status()
             .unwrap()
             .success());
+        let receipt = AllocationReceipt {
+            api_version: ALLOCATION_API_VERSION.to_owned(),
+            labels: labels.clone(),
+            reserved_bytes: disk_gib_to_bytes(1).unwrap(),
+            mount_path: layout.root.clone(),
+            backend_kind: "test".to_owned(),
+            backend_key: "test-backend".to_owned(),
+            pool_identity: "test-pool".to_owned(),
+            backend: BackendIdentity::Apfs {
+                container: "test-container".to_owned(),
+                container_uuid: "test-container-uuid".to_owned(),
+                volume: "test-volume".to_owned(),
+                volume_name: "test-volume-name".to_owned(),
+                volume_uuid: "test-filesystem".to_owned(),
+                ownership_token: "test-owner-token".to_owned(),
+            },
+            docker_bind: DockerBindProof {
+                daemon_id: "test-daemon".to_owned(),
+                verifier: "test-verifier".to_owned(),
+                method_version: "test-method-v1".to_owned(),
+                source_path: layout.root.clone(),
+                filesystem_id: "test-filesystem".to_owned(),
+            },
+        };
+        let verifier = Arc::new(TestReadyVerifier {
+            expected: receipt.clone(),
+            layout,
+            reject: AtomicBool::new(false),
+            lease_state: Arc::new(LeaseState::default()),
+            verified_directories: Arc::new(Mutex::new(Vec::new())),
+        });
         Some(Self {
             root,
             container,
             execution_id,
+            receipt,
+            verifier,
             removed: false,
         })
     }
 
     fn harness(&self) -> PiHarness {
-        PiHarness::new(PiHarnessConfig {
-            state_root: self.root.path().join("state"),
-            worktree: self.root.path().join("worktree"),
-            docker_binary: PathBuf::from("docker"),
-            agent_container: self.container.clone(),
-            pi_executable: "/usr/local/bin/pi".to_owned(),
-            labels: labels(&self.execution_id),
-            model_policy: Some(ModelPolicy {
-                provider: "inferweave".to_owned(),
-                preferred: vec!["qwen/code".to_owned()],
-                alternatives: vec!["qwen/fallback".to_owned()],
-                fallback_class: Some("coding".to_owned()),
-            }),
-            tools: vec!["read".to_owned(), "bash".to_owned(), "edit".to_owned()],
-            skills: vec![],
-            stop_timeout: Duration::from_millis(250),
-        })
+        let mut config = PiHarnessConfig::for_ready_allocation(
+            self.verifier.clone(),
+            self.receipt.clone(),
+            self.container.clone(),
+        )
+        .unwrap();
+        config.docker_binary = PathBuf::from("docker");
+        config.pi_executable = "/usr/local/bin/pi".to_owned();
+        config.model_policy = Some(ModelPolicy {
+            provider: "inferweave".to_owned(),
+            preferred: vec!["qwen/code".to_owned()],
+            alternatives: vec!["qwen/fallback".to_owned()],
+            fallback_class: Some("coding".to_owned()),
+        });
+        config.tools = vec!["read".to_owned(), "bash".to_owned(), "edit".to_owned()];
+        config.skills = vec![];
+        config.stop_timeout = Duration::from_millis(250);
+        PiHarness::new(config)
     }
 
     fn session_dir(&self) -> PathBuf {
-        self.root
-            .path()
-            .join("state/sessions")
-            .join(&self.execution_id)
+        self.receipt.mount_path.join("session")
     }
 
     fn conversation_dir(&self) -> PathBuf {
         self.session_dir().join("conversation")
     }
 
+    fn worktree_dir(&self) -> PathBuf {
+        self.receipt.mount_path.join("repository")
+    }
+
     fn set_event_phases(&self, first: &str, second: &str) {
-        fs::write(
-            self.root.path().join("worktree/pi-json-events.jsonl"),
-            first,
-        )
-        .unwrap();
-        let second_path = self.root.path().join("worktree/pi-json-events-2.jsonl");
+        fs::write(self.worktree_dir().join("pi-json-events.jsonl"), first).unwrap();
+        let second_path = self.worktree_dir().join("pi-json-events-2.jsonl");
         if second.is_empty() {
             let _ = fs::remove_file(second_path);
         } else {
@@ -350,6 +530,172 @@ fn assert_zombie_only_group(fixture: &DockerPi, pgid: u32) {
 }
 
 #[tokio::test]
+async fn stale_or_forged_receipt_is_rejected_before_harness_writes() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let mut forged = fixture.receipt.clone();
+    forged.backend_key = "forged-backend".to_owned();
+    let config = PiHarnessConfig::for_ready_allocation(
+        fixture.verifier.clone(),
+        forged,
+        fixture.container.clone(),
+    )
+    .unwrap();
+    let result = PiHarness::new(config).start(&packet()).await;
+    assert!(matches!(result, Err(HarnessError::Start(_))));
+    assert!(!fixture
+        .receipt
+        .mount_path
+        .join("repository/.autospec/task-packet.json")
+        .exists());
+    assert!(!fixture.session_dir().join("owner.json").exists());
+    assert!(!fixture.session_dir().join(".cursor").exists());
+    assert!(!fixture
+        .receipt
+        .mount_path
+        .join("repository/pi-body-started")
+        .exists());
+}
+
+#[tokio::test]
+async fn legacy_arbitrary_paths_fail_closed_before_filesystem_mutation() {
+    let root = TempDir::new().unwrap();
+    let state_root = root.path().join("arbitrary-state");
+    let worktree = root.path().join("arbitrary-worktree");
+    let config = PiHarnessConfig::for_execution(
+        state_root.clone(),
+        worktree.clone(),
+        "not-started".to_owned(),
+        labels("legacy-path-test"),
+    );
+    let result = PiHarness::new(config).start(&packet()).await;
+    assert!(matches!(result, Err(HarnessError::Start(_))));
+    assert!(!state_root.exists());
+    assert!(!worktree.exists());
+}
+
+#[tokio::test]
+async fn ready_lease_blocks_release_until_the_live_pi_session_stops() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    assert_eq!(fixture.verifier.active_leases(), 1);
+
+    let verifier = Arc::clone(&fixture.verifier);
+    let (released_tx, released_rx) = std::sync::mpsc::channel();
+    let release = std::thread::spawn(move || {
+        verifier.wait_for_release();
+        released_tx.send(()).unwrap();
+    });
+    assert!(released_rx
+        .recv_timeout(Duration::from_millis(200))
+        .is_err());
+    harness.stop(&session).await.unwrap();
+    released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    release.join().unwrap();
+    assert_eq!(fixture.verifier.active_leases(), 0);
+}
+
+#[tokio::test]
+async fn harness_state_and_task_packet_stay_inside_the_verified_allocation() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let layout = ExecutionLayout::new(
+        fixture
+            .receipt
+            .mount_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap(),
+        &fixture.receipt.labels.execution_id,
+    )
+    .unwrap();
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    wait_for_content(
+        &fixture
+            .session_dir()
+            .join(format!("pi.events-{}.jsonl", fixture.execution_id)),
+        "agent_settled",
+    )
+    .await;
+    assert_eq!(Path::new(&session.path), layout.session);
+    assert_eq!(Path::new(&session.worktree_path), layout.repository);
+    for path in [
+        layout.repository.join(".autospec/task-packet.json"),
+        layout.session.join("owner.json"),
+        layout.session.join(".cursor"),
+        layout.session.join("resume-count"),
+        layout
+            .session
+            .join(format!("pi.events-{}.jsonl", fixture.execution_id)),
+        layout
+            .session
+            .join(format!("pi.stderr-{}.log", fixture.execution_id)),
+        layout
+            .conversation
+            .join(format!("session_{}.jsonl", fixture.execution_id)),
+    ] {
+        assert!(path.is_file(), "missing harness file {}", path.display());
+        assert!(path.starts_with(&layout.root));
+    }
+    assert!(!fixture.root.path().join("state/sessions").exists());
+    {
+        let verified = fixture.verifier.verified_directories.lock().unwrap();
+        assert!(verified.contains(&layout.repository));
+        assert!(verified.contains(&layout.session));
+        assert!(verified.contains(&layout.conversation));
+    }
+    harness.stop(&session).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_conversation_is_rejected_before_harness_writes() {
+    use std::os::unix::fs::symlink;
+
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let displaced = fixture.receipt.mount_path.join("conversation-displaced");
+    fs::rename(fixture.conversation_dir(), &displaced).unwrap();
+    symlink(&displaced, fixture.conversation_dir()).unwrap();
+    let result = fixture.harness().start(&packet()).await;
+    assert!(matches!(result, Err(HarnessError::Start(_))));
+    assert!(!fixture.session_dir().join("owner.json").exists());
+    assert!(!fixture
+        .receipt
+        .mount_path
+        .join("repository/.autospec/task-packet.json")
+        .exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_live_event_file_cannot_escape_private_session() {
+    use std::os::unix::fs::symlink;
+
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let outside = fixture.root.path().join("outside-events");
+    fs::write(&outside, "sentinel\n").unwrap();
+    let events = fixture
+        .session_dir()
+        .join(format!("pi.events-{}.jsonl", fixture.execution_id));
+    symlink(&outside, &events).unwrap();
+    let result = fixture.harness().start(&packet()).await;
+    assert!(matches!(result, Err(HarnessError::Start(_))));
+    assert_eq!(fs::read_to_string(outside).unwrap(), "sentinel\n");
+    assert!(!fixture.worktree_dir().join("pi-body-started").exists());
+}
+
+#[tokio::test]
 async fn docker_exec_uses_only_container_paths_and_carries_no_model_selection_flags() {
     let Some(fixture) = DockerPi::create() else {
         return;
@@ -453,7 +799,7 @@ async fn retrying_backend_error_emits_only_start_then_review_ready_across_restar
     ));
 
     let restarted = PiHarness::new(harness.config().clone());
-    fs::write(fixture.root.path().join("worktree/continue-events"), "").unwrap();
+    fs::write(fixture.worktree_dir().join("continue-events"), "").unwrap();
     wait_for_content(&events_path, "recovered").await;
     let terminal = restarted.poll_events(&session).await.unwrap();
     assert_eq!(terminal.len(), 1);
@@ -485,7 +831,7 @@ async fn exhausted_retry_emits_one_model_failure_and_never_review_ready() {
     ));
 
     let restarted = PiHarness::new(harness.config().clone());
-    fs::write(fixture.root.path().join("worktree/continue-events"), "").unwrap();
+    fs::write(fixture.worktree_dir().join("continue-events"), "").unwrap();
     wait_for_content(&events_path, "finalError").await;
     let terminal = restarted.poll_events(&session).await.unwrap();
     assert_eq!(terminal.len(), 1);
@@ -506,7 +852,7 @@ async fn pi_writable_conversation_cannot_forge_host_private_harness_state() {
     let Some(fixture) = DockerPi::create() else {
         return;
     };
-    fs::write(fixture.root.path().join("worktree/forge-metadata"), "").unwrap();
+    fs::write(fixture.worktree_dir().join("forge-metadata"), "").unwrap();
     let harness = fixture.harness();
     let session = harness.start(&packet()).await.unwrap();
     let events_path = fixture
@@ -560,12 +906,8 @@ async fn delayed_reader_failure_cannot_release_a_pi_body() {
     let Some(fixture) = DockerPi::create() else {
         return;
     };
-    fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
-    fs::write(
-        fixture.root.path().join("worktree/handshake-read-error"),
-        "",
-    )
-    .unwrap();
+    fs::write(fixture.worktree_dir().join("hung-descendant"), "").unwrap();
+    fs::write(fixture.worktree_dir().join("handshake-read-error"), "").unwrap();
     let mut config = fixture.harness().config().clone();
     config.docker_binary = fixture.delayed_docker_wrapper();
     let harness = PiHarness::new(config);
@@ -576,11 +918,7 @@ async fn delayed_reader_failure_cannot_release_a_pi_body() {
     assert!(started.elapsed() < Duration::from_secs(20));
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(
-        !fixture
-            .root
-            .path()
-            .join("worktree/pi-body-started")
-            .exists(),
+        !fixture.worktree_dir().join("pi-body-started").exists(),
         "Pi body executed after host startup failure"
     );
     assert!(
@@ -610,11 +948,7 @@ async fn docker_proxy_that_drops_ack_cannot_release_a_pi_body() {
     assert!(started.elapsed() < Duration::from_secs(20));
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        !fixture
-            .root
-            .path()
-            .join("worktree/pi-body-started")
-            .exists(),
+        !fixture.worktree_dir().join("pi-body-started").exists(),
         "Pi body executed without a READY confirmation"
     );
     assert!(!pi_is_alive(&fixture));
@@ -634,7 +968,7 @@ async fn startup_ready_failure_reaps(failure: &str) {
     let Some(fixture) = DockerPi::create() else {
         return;
     };
-    fs::write(fixture.root.path().join("worktree").join(failure), "").unwrap();
+    fs::write(fixture.worktree_dir().join(failure), "").unwrap();
     let harness = fixture.harness();
     let started = Instant::now();
     let result = harness.start(&packet()).await;
@@ -642,11 +976,7 @@ async fn startup_ready_failure_reaps(failure: &str) {
     assert!(matches!(result, Err(HarnessError::Start(_))));
     assert!(started.elapsed() < Duration::from_secs(20));
     assert!(
-        !fixture
-            .root
-            .path()
-            .join("worktree/pi-body-started")
-            .exists(),
+        !fixture.worktree_dir().join("pi-body-started").exists(),
         "Pi body executed after invalid READY confirmation"
     );
     assert!(!pi_is_alive(&fixture));
@@ -657,8 +987,8 @@ async fn startup_handshake_failure_reaps(failure: &str) {
     let Some(fixture) = DockerPi::create() else {
         return;
     };
-    fs::write(fixture.root.path().join("worktree").join(failure), "").unwrap();
-    fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
+    fs::write(fixture.worktree_dir().join(failure), "").unwrap();
+    fs::write(fixture.worktree_dir().join("hung-descendant"), "").unwrap();
     let harness = fixture.harness();
     let started = Instant::now();
     let result = harness.start(&packet()).await;
@@ -768,7 +1098,7 @@ async fn stop_and_duplicate_terminate_the_in_container_process_group() {
     let Some(fixture) = DockerPi::create() else {
         return;
     };
-    fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
+    fs::write(fixture.worktree_dir().join("hung-descendant"), "").unwrap();
     let harness = fixture.harness();
     let session = harness.start(&packet()).await.unwrap();
     let first_pgid = wait_for_pi_pgid(&fixture).await;
@@ -792,7 +1122,7 @@ async fn pi_cannot_replace_supervisor_control_state() {
     let Some(fixture) = DockerPi::create() else {
         return;
     };
-    fs::write(fixture.root.path().join("worktree/forge-control"), "").unwrap();
+    fs::write(fixture.worktree_dir().join("forge-control"), "").unwrap();
     let harness = fixture.harness();
     let session = harness.start(&packet()).await.unwrap();
     wait_for_content(
@@ -823,8 +1153,8 @@ async fn drop_is_bounded_when_a_descendant_ignores_term_and_pi_forges_control_fi
     let Some(mut fixture) = DockerPi::create() else {
         return;
     };
-    fs::write(fixture.root.path().join("worktree/forge-control"), "").unwrap();
-    fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
+    fs::write(fixture.worktree_dir().join("forge-control"), "").unwrap();
+    fs::write(fixture.worktree_dir().join("hung-descendant"), "").unwrap();
     let harness = fixture.harness();
     harness.start(&packet()).await.unwrap();
     let pgid = wait_for_pi_pgid(&fixture).await;

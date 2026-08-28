@@ -1,5 +1,7 @@
 use crate::{
-    session::{atomic_write, events_path, io_error, CURSOR_FILE},
+    session::{
+        atomic_write, events_path, io_error, open_real_file_read, read_real_file, CURSOR_FILE,
+    },
     PiHarness,
 };
 use harness_traits::{HarnessError, SessionRef};
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::atomic::Ordering,
@@ -50,6 +52,8 @@ pub(crate) fn poll_events(
     harness: &PiHarness,
     session: &SessionRef,
 ) -> Result<Vec<ExecutionEvent>, HarnessError> {
+    harness.validate_session(session)?;
+    let _storage = harness.acquire_ready_storage()?;
     let session_dir = Path::new(&session.path);
     let cursor_path = session_dir.join(CURSOR_FILE);
     let mut cursors = read_cursors(&cursor_path)?;
@@ -60,7 +64,7 @@ pub(crate) fn poll_events(
     if !cursor.path.exists() {
         return Ok(Vec::new());
     }
-    let mut file = File::open(&cursor.path).map_err(io_error)?;
+    let mut file = open_real_file_read(&cursor.path)?;
     let length = file.metadata().map_err(io_error)?.len();
     if cursor.offset > length {
         return Err(HarnessError::InvalidSession(format!(
@@ -265,10 +269,13 @@ fn is_test_tool(record: &Value) -> bool {
 }
 
 fn read_cursors(path: &Path) -> Result<CursorFile, HarnessError> {
-    if !path.exists() {
-        return Ok(CursorFile::default());
-    }
-    let bytes = fs::read(path).map_err(io_error)?;
+    let bytes = match fs::symlink_metadata(path) {
+        Ok(_) => read_real_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CursorFile::default())
+        }
+        Err(error) => return Err(io_error(error)),
+    };
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok(CursorFile::default());
     }
@@ -283,6 +290,7 @@ pub(crate) fn find_session_file(
     let mut candidates = fs::read_dir(session_dir)
         .map_err(io_error)?
         .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
         .filter(|path| {
@@ -304,9 +312,9 @@ pub(crate) fn find_session_file(
             return Ok(Some(path));
         }
         let mut first_line = String::new();
-        if File::open(&path)
+        if open_real_file_read(&path)
             .map(BufReader::new)
-            .and_then(|mut reader| reader.read_line(&mut first_line))
+            .and_then(|mut reader| reader.read_line(&mut first_line).map_err(io_error))
             .is_ok()
             && serde_json::from_str::<Value>(&first_line)
                 .ok()

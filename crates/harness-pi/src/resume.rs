@@ -1,14 +1,14 @@
 use crate::{
     events::find_session_file,
     session::{
-        atomic_write, base_args, io_error, spawn, CONTAINER_SESSION, CONVERSATION_DIR, OWNER_FILE,
-        RESUME_COUNT_FILE,
+        atomic_write, base_args, read_real_file, spawn, CONTAINER_SESSION, CONVERSATION_DIR,
+        OWNER_FILE, RESUME_COUNT_FILE,
     },
     PiHarness,
 };
 use harness_traits::{HarnessError, SessionRef};
 use orchestrator_core::SessionId;
-use std::{fs, path::Path};
+use std::path::Path;
 
 const MAX_RESUMES: u64 = 3;
 const RESUME_PROMPT: &str = "Continue from the persisted session without repeating completed work.";
@@ -19,12 +19,14 @@ enum DurableSession {
 }
 
 pub(crate) fn resume(harness: &PiHarness, session: &SessionRef) -> Result<(), HarnessError> {
+    harness.validate_session(session)?;
+    let storage = harness.acquire_ready_storage()?;
     validate_owner(harness, session)?;
     let session_dir = Path::new(&session.path);
     let conversation_dir = session_dir.join(CONVERSATION_DIR);
     let count_path = session_dir.join(RESUME_COUNT_FILE);
-    let current = fs::read_to_string(&count_path)
-        .map_err(io_error)?
+    let current = String::from_utf8(read_real_file(&count_path)?)
+        .map_err(|error| HarnessError::NotResumable(error.to_string()))?
         .trim()
         .parse::<u64>()
         .map_err(|error| HarnessError::NotResumable(error.to_string()))?;
@@ -55,20 +57,22 @@ pub(crate) fn resume(harness: &PiHarness, session: &SessionRef) -> Result<(), Ha
             // Fresh-start semantics reload the one materialized packet without
             // touching the already-delivered live-event cursor.
             let packet_path = Path::new(&session.worktree_path).join(".autospec/task-packet.json");
-            let bytes = fs::read(&packet_path).map_err(io_error)?;
+            let bytes = read_real_file(&packet_path)?;
             serde_json::from_slice::<orchestrator_core::TaskPacket>(&bytes)
                 .map_err(|error| HarnessError::NotResumable(error.to_string()))?;
             args.extend(["--session-id".into(), session.id.to_string()]);
             args.push("@/workspace/.autospec/task-packet.json".into());
         }
     }
-    spawn(harness, session, args)
+    spawn(harness, session, args, storage)
 }
 
 pub(crate) fn fork_conversation(
     harness: &PiHarness,
     session: &SessionRef,
 ) -> Result<SessionRef, HarnessError> {
+    harness.validate_session(session)?;
+    let storage = harness.acquire_ready_storage()?;
     validate_owner(harness, session)?;
     let session_dir = Path::new(&session.path);
     let conversation_dir = session_dir.join(CONVERSATION_DIR);
@@ -103,12 +107,12 @@ pub(crate) fn fork_conversation(
         "--session-id".into(),
         fork.id.to_string(),
     ]);
-    spawn(harness, &fork, args)?;
+    spawn(harness, &fork, args, storage)?;
     Ok(fork)
 }
 
 fn validate_owner(harness: &PiHarness, session: &SessionRef) -> Result<(), HarnessError> {
-    let bytes = fs::read(Path::new(&session.path).join(OWNER_FILE)).map_err(io_error)?;
+    let bytes = read_real_file(&Path::new(&session.path).join(OWNER_FILE))?;
     let owner: crate::session::SessionOwner = serde_json::from_slice(&bytes)
         .map_err(|error| HarnessError::NotResumable(error.to_string()))?;
     if owner.execution_id != session.execution_id.as_str()
@@ -125,7 +129,7 @@ fn validate_owner(harness: &PiHarness, session: &SessionRef) -> Result<(), Harne
 }
 
 fn validate_and_repair(path: &Path) -> Result<DurableSession, HarnessError> {
-    let bytes = fs::read(path).map_err(io_error)?;
+    let bytes = read_real_file(path)?;
     if bytes.is_empty() {
         return Ok(DurableSession::Empty);
     }
@@ -146,7 +150,7 @@ fn validate_and_repair(path: &Path) -> Result<DurableSession, HarnessError> {
         })?;
     }
     if complete_len != bytes.len() {
-        fs::write(path, &bytes[..complete_len]).map_err(io_error)?;
+        atomic_write(path, &bytes[..complete_len])?;
     }
     if complete_len == 0 {
         Ok(DurableSession::Empty)

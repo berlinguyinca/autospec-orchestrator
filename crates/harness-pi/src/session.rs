@@ -1,9 +1,9 @@
-use crate::{ManagedProcess, PiHarness};
+use crate::{verify_storage_paths, ManagedProcess, PiHarness, ReadyPiStorage};
 use harness_traits::{HarnessError, SessionRef};
 use orchestrator_core::{ModelPolicy, SessionId, TaskPacket};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
@@ -62,17 +62,18 @@ pub(crate) struct SessionOwner {
 }
 
 pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionRef, HarnessError> {
+    let storage = harness.acquire_ready_storage()?;
     ensure_docker_and_pi(harness)?;
     let execution_id = harness.config.labels.execution_id.clone();
     let session_id = SessionId::new(execution_id.to_string());
-    let session_dir = harness
-        .config
-        .state_root
-        .join("sessions")
-        .join(execution_id.as_str());
-    fs::create_dir_all(&session_dir).map_err(io_error)?;
-    fs::create_dir_all(session_dir.join(CONVERSATION_DIR)).map_err(io_error)?;
-    let packet_path = harness.config.worktree.join(".autospec/task-packet.json");
+    let session_dir = storage.layout.session.clone();
+    let packet_directory = storage.layout.repository.join(".autospec");
+    storage
+        .lease
+        .verified()
+        .verify_directory(&packet_directory)
+        .map_err(crate::storage_error)?;
+    let packet_path = packet_directory.join("task-packet.json");
     write_packet_once(&packet_path, packet)?;
     write_json_once(
         &session_dir.join(OWNER_FILE),
@@ -95,7 +96,7 @@ pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionR
     let mut args = base_args(harness)?;
     args.extend(["--session-id".into(), session.id.to_string()]);
     args.push("@/workspace/.autospec/task-packet.json".into());
-    spawn(harness, &session, args)?;
+    spawn(harness, &session, args, storage)?;
     Ok(session)
 }
 
@@ -166,7 +167,10 @@ pub(crate) fn spawn(
     harness: &PiHarness,
     session: &SessionRef,
     pi_args: Vec<String>,
+    storage: ReadyPiStorage,
 ) -> Result<(), HarnessError> {
+    harness.validate_session(session)?;
+    verify_storage_paths(storage.lease.verified(), &storage.layout)?;
     ensure_docker_and_pi(harness)?;
     let mut children = harness
         .processes
@@ -180,16 +184,8 @@ pub(crate) fn spawn(
         )));
     }
     let session_dir = Path::new(&session.path);
-    let events = File::options()
-        .create(true)
-        .append(true)
-        .open(live_events_path(session))
-        .map_err(io_error)?;
-    let stderr = File::options()
-        .create(true)
-        .append(true)
-        .open(session_dir.join(format!("pi.stderr-{}.log", session.id)))
-        .map_err(io_error)?;
+    let events = open_private_append(&live_events_path(session))?;
+    let stderr = open_private_append(&session_dir.join(format!("pi.stderr-{}.log", session.id)))?;
     let supervisor_token = supervisor_token()?;
     let mut command = Command::new(&harness.config.docker_binary);
     command
@@ -337,6 +333,7 @@ pub(crate) fn spawn(
         Arc::new(ManagedProcess {
             child: std::sync::Mutex::new(child),
             pgid,
+            _storage_lease: storage.lease,
         }),
     );
     Ok(())
@@ -835,8 +832,8 @@ pub(crate) fn events_path(session: &SessionRef) -> PathBuf {
 
 fn write_packet_once(path: &Path, packet: &TaskPacket) -> Result<(), HarnessError> {
     let bytes = serde_json::to_vec(packet).map_err(|error| HarnessError::Io(error.to_string()))?;
-    if path.exists() {
-        return if fs::read(path).map_err(io_error)? == bytes {
+    if let Some(existing) = read_real_file_optional(path)? {
+        return if existing == bytes {
             Ok(())
         } else {
             Err(HarnessError::InvalidSession(format!(
@@ -850,8 +847,8 @@ fn write_packet_once(path: &Path, packet: &TaskPacket) -> Result<(), HarnessErro
 
 fn write_json_once(path: &Path, value: &impl Serialize) -> Result<(), HarnessError> {
     let bytes = serde_json::to_vec(value).map_err(|error| HarnessError::Io(error.to_string()))?;
-    if path.exists() {
-        return if fs::read(path).map_err(io_error)? == bytes {
+    if let Some(existing) = read_real_file_optional(path)? {
+        return if existing == bytes {
             Ok(())
         } else {
             Err(HarnessError::InvalidSession(format!(
@@ -864,7 +861,7 @@ fn write_json_once(path: &Path, value: &impl Serialize) -> Result<(), HarnessErr
 }
 
 pub(crate) fn write_once(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
-    if path.exists() {
+    if read_real_file_optional(path)?.is_some() {
         return Ok(());
     }
     atomic_write(path, bytes)
@@ -874,12 +871,134 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), HarnessError
     let parent = path
         .parent()
         .ok_or_else(|| HarnessError::Io("path has no parent".to_owned()))?;
-    fs::create_dir_all(parent).map_err(io_error)?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut file = File::create(&temporary).map_err(io_error)?;
+    let metadata = fs::symlink_metadata(parent).map_err(io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(HarnessError::Io(format!(
+            "atomic write parent is not a real directory: {}",
+            parent.display()
+        )));
+    }
+    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(io_error)?;
+    restrict_private_file(&file)?;
     file.write_all(bytes).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
     fs::rename(&temporary, path).map_err(io_error)
+}
+
+pub(crate) fn read_real_file(path: &Path) -> Result<Vec<u8>, HarnessError> {
+    let mut file = open_real_file_read(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(io_error)?;
+    Ok(bytes)
+}
+
+fn read_real_file_optional(path: &Path) -> Result<Option<Vec<u8>>, HarnessError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(HarnessError::Start(format!(
+            "harness path is not a real file: {}",
+            path.display()
+        )));
+    }
+    read_real_file(path).map(Some)
+}
+
+pub(crate) fn open_real_file_read(path: &Path) -> Result<File, HarnessError> {
+    let expected = fs::symlink_metadata(path).map_err(io_error)?;
+    if expected.file_type().is_symlink() || !expected.is_file() {
+        return Err(HarnessError::Start(format!(
+            "harness path is not a real file: {}",
+            path.display()
+        )));
+    }
+    let file = File::open(path).map_err(io_error)?;
+    let current = fs::symlink_metadata(path).map_err(io_error)?;
+    let opened = file.metadata().map_err(io_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if current.file_type().is_symlink()
+            || !current.is_file()
+            || current.dev() != expected.dev()
+            || current.ino() != expected.ino()
+            || opened.dev() != expected.dev()
+            || opened.ino() != expected.ino()
+        {
+            return Err(HarnessError::Start(format!(
+                "harness file identity changed: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(file)
+}
+
+fn open_private_append(path: &Path) -> Result<File, HarnessError> {
+    let expected = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(HarnessError::Start(format!(
+                "harness append path is not a real file: {}",
+                path.display()
+            )))
+        }
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(io_error(error)),
+    };
+    let mut options = OpenOptions::new();
+    options.write(true).append(true);
+    if expected.is_some() {
+        options.create(false);
+    } else {
+        options.create_new(true);
+    }
+    let file = options.open(path).map_err(|error| {
+        HarnessError::Start(format!(
+            "open private harness file {}: {error}",
+            path.display()
+        ))
+    })?;
+    restrict_private_file(&file)?;
+    if let Some(expected) = expected {
+        let current = fs::symlink_metadata(path).map_err(io_error)?;
+        let opened = file.metadata().map_err(io_error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if current.file_type().is_symlink()
+                || !current.is_file()
+                || current.dev() != expected.dev()
+                || current.ino() != expected.ino()
+                || opened.dev() != expected.dev()
+                || opened.ino() != expected.ino()
+            {
+                return Err(HarnessError::Start(format!(
+                    "private harness file identity changed: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(file)
+}
+
+fn restrict_private_file(file: &File) -> Result<(), HarnessError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(io_error)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn io_error(error: io::Error) -> HarnessError {

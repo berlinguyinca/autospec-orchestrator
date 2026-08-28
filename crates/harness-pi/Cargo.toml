@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+execution-storage.workspace = true
 harness-traits.workspace = true
 orchestrator-core.workspace = true
 serde.workspace = true
