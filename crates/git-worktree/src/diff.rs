@@ -19,6 +19,7 @@ pub(crate) fn capture(
         || owner.labels.get(EXECUTION_ID).map(String::as_str)
             != Some(worktree.execution_id.as_str())
         || owner.base_sha != worktree.base_sha
+        || owner.branch != worktree.branch
     {
         return Err(WorktreeError::Ownership(worktree.path.clone()));
     }

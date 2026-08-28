@@ -25,7 +25,6 @@ authors = ["InferWeave"]
 
 [workspace.dependencies]
 bollard = "0.18"
-fs2 = "0.4"
 orchestrator-core = { path = "crates/orchestrator-core" }
 orchestrator-api = { path = "crates/orchestrator-api" }
 orchestrator-scheduler = { path = "crates/orchestrator-scheduler" }
@@ -41,6 +40,7 @@ async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
 futures-util = "0.3"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

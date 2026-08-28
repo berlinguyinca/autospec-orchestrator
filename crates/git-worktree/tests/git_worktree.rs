@@ -8,6 +8,7 @@ use tempfile::TempDir;
 struct TestRepository {
     _temp: TempDir,
     path: PathBuf,
+    clone_base: PathBuf,
 }
 
 impl TestRepository {
@@ -25,7 +26,12 @@ impl TestRepository {
         std::fs::write(path.join("README.md"), "first\n").expect("write initial file");
         git(&path, &["add", "README.md"]);
         git(&path, &["commit", "-m", "initial"]);
-        Self { _temp: temp, path }
+        let clone_base = temp.path().to_path_buf();
+        Self {
+            _temp: temp,
+            path,
+            clone_base,
+        }
     }
 
     fn commit(&self, contents: &str) -> String {
@@ -33,6 +39,10 @@ impl TestRepository {
         git(&self.path, &["add", "README.md"]);
         git(&self.path, &["commit", "-m", "update"]);
         git_output(&self.path, &["rev-parse", "HEAD"])
+    }
+
+    fn canonical(&self) -> &'static str {
+        "owner/project"
     }
 }
 
@@ -76,11 +86,18 @@ fn git_succeeds(current_dir: &Path, args: &[&str]) -> bool {
         .success()
 }
 
-fn labels(execution_id: &str, repository: &Path) -> OwnershipLabels {
+fn manager(state: &TempDir, repository: &TestRepository) -> GitWorktreeManager {
+    GitWorktreeManager::with_clone_base(
+        state.path(),
+        repository.clone_base.to_str().expect("utf-8 clone base"),
+    )
+}
+
+fn labels(execution_id: &str, repository: &str) -> OwnershipLabels {
     OwnershipLabels {
         execution_id: ExecutionId::new(execution_id),
         worker_id: WorkerId::new("worker-01"),
-        repository: repository.to_string_lossy().into_owned(),
+        repository: repository.to_owned(),
         issue: Some("11".to_owned()),
     }
 }
@@ -89,11 +106,11 @@ fn labels(execution_id: &str, repository: &Path) -> OwnershipLabels {
 fn mirror_uses_safe_owner_repo_name_and_refreshes() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
+    let manager = manager(&state, &repository);
 
     let mirror = PathBuf::from(
         manager
-            .ensure_mirror(repository.path.to_str().expect("utf-8 repository path"))
+            .ensure_mirror(repository.canonical())
             .expect("create mirror"),
     );
     assert_eq!(
@@ -107,7 +124,7 @@ fn mirror_uses_safe_owner_repo_name_and_refreshes() {
 
     let latest = repository.commit("second\n");
     manager
-        .ensure_mirror(repository.path.to_str().expect("utf-8 repository path"))
+        .ensure_mirror(repository.canonical())
         .expect("refresh mirror");
     assert_eq!(git_output(&mirror, &["rev-parse", "HEAD"]), latest);
 }
@@ -116,14 +133,14 @@ fn mirror_uses_safe_owner_repo_name_and_refreshes() {
 fn create_places_owned_worktree_under_execution_id() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
-    let labels = labels("project-11-impl-01", &repository.path);
+    let manager = manager(&state, &repository);
+    let labels = labels("project-11-impl-01", repository.canonical());
     let base_sha = git_output(&repository.path, &["rev-parse", "HEAD"]);
 
     let worktree = manager
         .create(
             &labels,
-            repository.path.to_str().expect("utf-8 repository path"),
+            repository.canonical(),
             "HEAD",
             "autospec/project-11-impl-01",
         )
@@ -145,6 +162,7 @@ fn create_places_owned_worktree_under_execution_id() {
     )
     .expect("parse owner record");
     assert_eq!(owner["base_sha"], base_sha);
+    assert_eq!(owner["branch"], "autospec/project-11-impl-01");
     assert_eq!(owner["labels"]["autospec.managed"], "true");
     assert_eq!(
         owner["labels"]["autospec.execution_id"],
@@ -152,20 +170,115 @@ fn create_places_owned_worktree_under_execution_id() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn create_rejects_execution_id_path_traversal() {
+fn create_rejects_committed_owner_symlinks_without_touching_targets() {
+    use std::os::unix::fs::symlink;
+
     let repository = TestRepository::new();
+    let external_final = repository.clone_base.join("external-final.json");
+    let external_temp = repository.clone_base.join("external-temp.json");
+    std::fs::write(&external_final, "final-safe\n").expect("write final target");
+    std::fs::write(&external_temp, "temp-safe\n").expect("write temp target");
+    symlink(
+        &external_final,
+        repository.path.join(".autospec-owner.json"),
+    )
+    .expect("create committed final symlink");
+    symlink(
+        &external_temp,
+        repository.path.join(".autospec-owner.json.tmp"),
+    )
+    .expect("create committed temp symlink");
+    git(
+        &repository.path,
+        &["add", ".autospec-owner.json", ".autospec-owner.json.tmp"],
+    );
+    git(&repository.path, &["commit", "-m", "malicious metadata"]);
+
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
-    let labels = labels("../escape", &repository.path);
+    let manager = manager(&state, &repository);
+    let mirror = manager
+        .ensure_mirror(repository.canonical())
+        .expect("create mirror");
+    let labels = labels("project-12-impl-02", repository.canonical());
 
     let error = manager
         .create(
             &labels,
-            repository.path.to_str().expect("utf-8 repository path"),
+            repository.canonical(),
             "HEAD",
-            "autospec/escape",
+            "autospec/project-12-impl-02",
         )
+        .expect_err("reject pre-existing metadata paths");
+
+    assert!(matches!(error, WorktreeError::Create(_)));
+    assert_eq!(
+        std::fs::read_to_string(&external_final).expect("read final target"),
+        "final-safe\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&external_temp).expect("read temp target"),
+        "temp-safe\n"
+    );
+    assert!(!state.path().join("worktrees/project-12-impl-02").exists());
+    assert!(!git_succeeds(
+        state.path(),
+        &[
+            "--git-dir",
+            &mirror,
+            "show-ref",
+            "--verify",
+            "refs/heads/autospec/project-12-impl-02",
+        ],
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn create_rejects_committed_owner_temp_symlink_without_touching_target() {
+    use std::os::unix::fs::symlink;
+
+    let repository = TestRepository::new();
+    let external = repository.clone_base.join("external-temp-only.json");
+    std::fs::write(&external, "still-safe\n").expect("write external target");
+    symlink(&external, repository.path.join(".autospec-owner.json.tmp"))
+        .expect("create committed temp symlink");
+    git(&repository.path, &["add", ".autospec-owner.json.tmp"]);
+    git(
+        &repository.path,
+        &["commit", "-m", "malicious temp metadata"],
+    );
+
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-12-impl-03", repository.canonical());
+
+    manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-12-impl-03",
+        )
+        .expect_err("reject pre-existing temp metadata path");
+
+    assert_eq!(
+        std::fs::read_to_string(external).expect("read external target"),
+        "still-safe\n"
+    );
+    assert!(!state.path().join("worktrees/project-12-impl-03").exists());
+}
+
+#[test]
+fn create_rejects_execution_id_path_traversal() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("../escape", repository.canonical());
+
+    let error = manager
+        .create(&labels, repository.canonical(), "HEAD", "autospec/escape")
         .expect_err("reject path traversal");
 
     assert!(matches!(error, WorktreeError::Create(message) if message.contains("execution_id")));
@@ -176,16 +289,11 @@ fn create_rejects_execution_id_path_traversal() {
 fn create_rejects_empty_execution_id() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
-    let labels = labels("", &repository.path);
+    let manager = manager(&state, &repository);
+    let labels = labels("", repository.canonical());
 
     let error = manager
-        .create(
-            &labels,
-            repository.path.to_str().expect("utf-8 repository path"),
-            "HEAD",
-            "autospec/empty",
-        )
+        .create(&labels, repository.canonical(), "HEAD", "autospec/empty")
         .expect_err("reject empty execution id");
 
     assert!(matches!(error, WorktreeError::Create(message) if message.contains("execution_id")));
@@ -195,14 +303,14 @@ fn create_rejects_empty_execution_id() {
 fn create_rejects_repository_label_mismatch() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
-    let mut labels = labels("project-12-impl-01", &repository.path);
+    let manager = manager(&state, &repository);
+    let mut labels = labels("project-12-impl-01", repository.canonical());
     labels.repository = "different/target".to_owned();
 
     let error = manager
         .create(
             &labels,
-            repository.path.to_str().expect("utf-8 repository path"),
+            repository.canonical(),
             "HEAD",
             "autospec/project-12-impl-01",
         )
@@ -213,25 +321,44 @@ fn create_rejects_repository_label_mismatch() {
 }
 
 #[test]
+fn mirror_rejects_noncanonical_repository_identity() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+
+    for invalid in [
+        "owner",
+        "/owner/project",
+        "owner/project/extra",
+        "owner/../project",
+    ] {
+        let error = manager
+            .ensure_mirror(invalid)
+            .expect_err("reject noncanonical repository identity");
+        assert!(matches!(error, WorktreeError::InvalidRepository(_)));
+    }
+}
+
+#[test]
 fn create_reports_execution_that_owns_checked_out_branch() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
-    let first_labels = labels("project-11-impl-01", &repository.path);
+    let manager = manager(&state, &repository);
+    let first_labels = labels("project-11-impl-01", repository.canonical());
     manager
         .create(
             &first_labels,
-            repository.path.to_str().expect("utf-8 repository path"),
+            repository.canonical(),
             "HEAD",
             "autospec/shared-branch",
         )
         .expect("create first worktree");
 
-    let second_labels = labels("project-11-review-01", &repository.path);
+    let second_labels = labels("project-11-review-01", repository.canonical());
     let error = manager
         .create(
             &second_labels,
-            repository.path.to_str().expect("utf-8 repository path"),
+            repository.canonical(),
             "HEAD",
             "autospec/shared-branch",
         )
@@ -248,12 +375,12 @@ fn create_reports_execution_that_owns_checked_out_branch() {
 fn capture_diff_includes_patch_and_all_changed_files() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
-    let labels = labels("project-13-impl-01", &repository.path);
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-impl-01", repository.canonical());
     let worktree = manager
         .create(
             &labels,
-            repository.path.to_str().expect("utf-8 repository path"),
+            repository.canonical(),
             "HEAD",
             "autospec/project-13-impl-01",
         )
@@ -274,12 +401,12 @@ fn capture_diff_includes_patch_and_all_changed_files() {
 fn capture_diff_refuses_owner_record_outside_execution_path() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
-    let labels = labels("project-13-impl-02", &repository.path);
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-impl-02", repository.canonical());
     let worktree = manager
         .create(
             &labels,
-            repository.path.to_str().expect("utf-8 repository path"),
+            repository.canonical(),
             "HEAD",
             "autospec/project-13-impl-02",
         )
@@ -302,12 +429,12 @@ fn capture_diff_refuses_owner_record_outside_execution_path() {
 fn destroy_removes_only_the_owned_worktree_and_branch() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
-    let repository_path = repository.path.to_str().expect("utf-8 repository path");
+    let manager = manager(&state, &repository);
+    let repository_path = repository.canonical();
     let mirror = manager
         .ensure_mirror(repository_path)
         .expect("create mirror");
-    let labels = labels("project-14-impl-01", &repository.path);
+    let labels = labels("project-14-impl-01", repository.canonical());
     let worktree = manager
         .create(
             &labels,
@@ -332,16 +459,82 @@ fn destroy_removes_only_the_owned_worktree_and_branch() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn destroy_retries_branch_cleanup_from_durable_journal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let mirror = manager
+        .ensure_mirror(repository.canonical())
+        .expect("create mirror");
+    let labels = labels("project-14-impl-04", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-14-impl-04",
+        )
+        .expect("create worktree");
+    let hook = Path::new(&mirror).join("hooks/reference-transaction");
+    std::fs::create_dir_all(hook.parent().expect("hook parent")).expect("create hooks directory");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("write rejecting Git hook");
+    let mut permissions = std::fs::metadata(&hook)
+        .expect("read hook metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).expect("make hook executable");
+
+    let first_error = manager
+        .destroy(&worktree)
+        .expect_err("branch cleanup is rejected");
+
+    assert!(matches!(first_error, WorktreeError::Cleanup(_)));
+    assert!(!Path::new(&worktree.path).exists());
+    let journal = state
+        .path()
+        .join("worktrees/.cleanup-project-14-impl-04.json");
+    assert!(journal.is_file());
+    assert!(git_succeeds(
+        state.path(),
+        &[
+            "--git-dir",
+            &mirror,
+            "show-ref",
+            "--verify",
+            "refs/heads/autospec/project-14-impl-04",
+        ],
+    ));
+
+    std::fs::remove_file(hook).expect("remove rejecting Git hook");
+    manager.destroy(&worktree).expect("retry cleanup");
+
+    assert!(!journal.exists());
+    assert!(!git_succeeds(
+        state.path(),
+        &[
+            "--git-dir",
+            &mirror,
+            "show-ref",
+            "--verify",
+            "refs/heads/autospec/project-14-impl-04",
+        ],
+    ));
+}
+
 #[test]
 fn destroy_refuses_tampered_owner_record() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
-    let labels = labels("project-14-impl-02", &repository.path);
+    let manager = manager(&state, &repository);
+    let labels = labels("project-14-impl-02", repository.canonical());
     let worktree = manager
         .create(
             &labels,
-            repository.path.to_str().expect("utf-8 repository path"),
+            repository.canonical(),
             "HEAD",
             "autospec/project-14-impl-02",
         )
@@ -366,12 +559,76 @@ fn destroy_refuses_tampered_owner_record() {
 }
 
 #[test]
+fn destroy_refuses_recorded_and_checked_out_branch_mismatch() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-14-impl-05", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-14-impl-05",
+        )
+        .expect("create worktree");
+    git(
+        Path::new(&worktree.path),
+        &["branch", "-m", "autospec/renamed-outside-owner-record"],
+    );
+
+    let error = manager
+        .destroy(&worktree)
+        .expect_err("refuse branch identity mismatch");
+
+    assert!(matches!(error, WorktreeError::Ownership(_)));
+    assert!(Path::new(&worktree.path).is_dir());
+    assert_eq!(
+        git_output(Path::new(&worktree.path), &["branch", "--show-current"]),
+        "autospec/renamed-outside-owner-record"
+    );
+}
+
+#[test]
+fn destroy_refuses_tampered_recorded_branch() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-14-impl-06", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-14-impl-06",
+        )
+        .expect("create worktree");
+    let owner_path = Path::new(&worktree.path).join(".autospec-owner.json");
+    let mut owner: Value =
+        serde_json::from_slice(&std::fs::read(&owner_path).expect("read owner record"))
+            .expect("parse owner record");
+    owner["branch"] = Value::String("autospec/different-recorded-branch".to_owned());
+    std::fs::write(
+        &owner_path,
+        serde_json::to_vec_pretty(&owner).expect("serialize owner record"),
+    )
+    .expect("tamper recorded branch");
+
+    let error = manager
+        .destroy(&worktree)
+        .expect_err("refuse tampered recorded branch");
+
+    assert!(matches!(error, WorktreeError::Ownership(_)));
+    assert!(Path::new(&worktree.path).is_dir());
+}
+
+#[test]
 fn find_stale_returns_owned_worktrees_not_in_live_set() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
-    let manager = GitWorktreeManager::new(state.path());
-    let repository_path = repository.path.to_str().expect("utf-8 repository path");
-    let live_labels = labels("project-14-impl-03", &repository.path);
+    let manager = manager(&state, &repository);
+    let repository_path = repository.canonical();
+    let live_labels = labels("project-14-impl-03", repository.canonical());
     manager
         .create(
             &live_labels,
@@ -380,7 +637,7 @@ fn find_stale_returns_owned_worktrees_not_in_live_set() {
             "autospec/project-14-impl-03",
         )
         .expect("create live worktree");
-    let stale_labels = labels("project-14-review-01", &repository.path);
+    let stale_labels = labels("project-14-review-01", repository.canonical());
     let stale_worktree = manager
         .create(
             &stale_labels,
@@ -399,4 +656,44 @@ fn find_stale_returns_owned_worktrees_not_in_live_set() {
     assert_eq!(stale[0].path, stale_worktree.path);
     assert_eq!(stale[0].branch, stale_worktree.branch);
     assert_eq!(stale[0].base_sha, stale_worktree.base_sha);
+}
+
+#[test]
+fn find_stale_surfaces_malformed_owner_record() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let path = state.path().join("worktrees/project-14-review-02");
+    std::fs::create_dir_all(&path).expect("create malformed worktree directory");
+    std::fs::write(path.join(".autospec-owner.json"), "not json\n")
+        .expect("write malformed owner record");
+
+    let error = manager
+        .find_stale(&[])
+        .expect_err("surface malformed owner record");
+
+    assert!(matches!(error, WorktreeError::Cleanup(_)));
+}
+
+#[cfg(unix)]
+#[test]
+fn find_stale_rejects_symlinked_execution_directory() {
+    use std::os::unix::fs::symlink;
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let external = tempfile::tempdir().expect("create external directory");
+    std::fs::create_dir_all(state.path().join("worktrees")).expect("create worktrees root");
+    symlink(
+        external.path(),
+        state.path().join("worktrees/project-14-review-03"),
+    )
+    .expect("create symlinked execution directory");
+
+    let error = manager
+        .find_stale(&[])
+        .expect_err("reject symlinked execution directory");
+
+    assert!(matches!(error, WorktreeError::Ownership(_)));
 }
