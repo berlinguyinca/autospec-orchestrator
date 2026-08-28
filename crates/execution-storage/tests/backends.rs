@@ -1,14 +1,18 @@
 use execution_storage::{
-    disk_gib_to_bytes, ApfsBackend, CommandOutput, CommandRunner, CommandSpec, ExecutionLayout,
+    ApfsBackend, BackendState, CommandOutput, CommandRunner, CommandSpec, ExecutionLayout,
     LvmBackend, ProcessCommandRunner, StorageBackend, StorageError,
 };
 use orchestrator_core::{ExecutionId, OwnershipLabels, WorkerId};
 use std::{
     collections::VecDeque,
     ffi::OsString,
-    path::{Path, PathBuf},
+    fs,
+    io::Write,
+    path::Path,
     sync::{Arc, Mutex},
 };
+
+const TOKEN: &str = "0123456789abcdef01234567";
 
 fn labels() -> OwnershipLabels {
     OwnershipLabels {
@@ -18,11 +22,9 @@ fn labels() -> OwnershipLabels {
         issue: Some("417".to_owned()),
     }
 }
-
-fn command(program: &str, args: &[&str]) -> CommandSpec {
-    CommandSpec::new(program, args.iter().map(OsString::from))
+fn command(program: &str, arguments: &[&str]) -> CommandSpec {
+    CommandSpec::new(program, arguments.iter().map(OsString::from))
 }
-
 fn success(stdout: impl Into<Vec<u8>>) -> CommandOutput {
     CommandOutput {
         code: 0,
@@ -30,10 +32,9 @@ fn success(stdout: impl Into<Vec<u8>>) -> CommandOutput {
         stderr: Vec::new(),
     }
 }
-
-fn failure(code: i32, stderr: &str) -> CommandOutput {
+fn failure(stderr: &str) -> CommandOutput {
     CommandOutput {
-        code,
+        code: 5,
         stdout: Vec::new(),
         stderr: stderr.as_bytes().to_vec(),
     }
@@ -43,28 +44,25 @@ fn failure(code: i32, stderr: &str) -> CommandOutput {
 struct FakeRunner {
     expected: Mutex<VecDeque<(CommandSpec, Result<CommandOutput, StorageError>)>>,
 }
-
 impl FakeRunner {
     fn new(expected: Vec<(CommandSpec, Result<CommandOutput, StorageError>)>) -> Arc<Self> {
         Arc::new(Self {
             expected: Mutex::new(expected.into()),
         })
     }
-
     fn assert_drained(&self) {
         assert!(
-            self.expected.lock().expect("fake command queue").is_empty(),
-            "not every separately-argued command was invoked"
+            self.expected.lock().expect("commands").is_empty(),
+            "not every separately-argued command ran"
         );
     }
 }
-
 impl CommandRunner for FakeRunner {
     fn run(&self, actual: &CommandSpec) -> Result<CommandOutput, StorageError> {
         let (expected, output) = self
             .expected
             .lock()
-            .expect("fake command queue")
+            .expect("commands")
             .pop_front()
             .expect("unexpected command");
         assert_eq!(*actual, expected);
@@ -72,211 +70,199 @@ impl CommandRunner for FakeRunner {
     }
 }
 
-fn apfs_info(path: &Path, volume: &str, uuid: &str) -> Vec<u8> {
-    format!(
-        "   Device Identifier:        {volume}\n\
-         APFS Container:              disk3\n\
-         File System Personality:     APFS\n\
-         Volume UUID:                 {uuid}\n\
-         Mount Point:                 {}\n\
-         Volume Read-Only:            No\n",
-        path.display()
-    )
-    .into_bytes()
+fn apfs_info(target: &Path, device: &str, name: &str, uuid: &str, mount: &str) -> Vec<u8> {
+    format!("Device Identifier: {device}\nAPFS Container: disk3\nAPFS Container UUID: POOL-UUID\nFile System Personality: APFS\nVolume Name: {name}\nVolume UUID: {uuid}\nMount Point: {mount}\nVolume Read-Only: No\nProbe: {}\n", target.display()).into_bytes()
 }
-
-fn apfs_list(volume: &str, reserve: u64, quota: u64, free: u64) -> Vec<u8> {
-    format!(
-        "APFS Container (1 found)\n\
-         +-- Container disk3\n\
-             Capacity Not Allocated: {free} B\n\
-             +-> Volume {volume}\n\
-                 Capacity Reserve: {reserve} B\n\
-                 Capacity Quota: {quota} B\n"
-    )
-    .into_bytes()
+fn apfs_list(device: &str, name: &str, bytes: u64, free: u64) -> Vec<u8> {
+    format!("+-- Container disk3 POOL-UUID\nCapacity Not Allocated: {free} B\n+-> Volume {device} VOL-UUID\nName: {name} (Case-insensitive)\nCapacity Reserve: {bytes} B\nCapacity Quota: {bytes} B\n").into_bytes()
 }
 
 #[test]
-fn apfs_uses_quota_and_reserve_and_verifies_exact_mount_identity() {
-    let state = tempfile::tempdir().expect("state root");
-    let mount = state.path().join("executions/node-417-impl-01");
-    std::fs::create_dir_all(&mount).expect("mountpoint");
-    let bytes = disk_gib_to_bytes(3).expect("bytes");
-    let diskutil = "/usr/sbin/diskutil";
-    let id = "/usr/bin/id";
-    let volume_name = "autospec-node-417-impl-01";
-    let runner = FakeRunner::new(vec![
-        (command(id, &["-u"]), Ok(success("0\n"))),
-        (
-            command(diskutil, &["info", state.path().to_str().unwrap()]),
-            Ok(success(apfs_info(state.path(), "disk3s5", "ROOT-UUID"))),
-        ),
-        (
-            command(diskutil, &["apfs", "list", "disk3"]),
-            Ok(success(apfs_list("disk3s5", 0, 0, bytes * 2))),
-        ),
-        (
-            command(diskutil, &["info", state.path().to_str().unwrap()]),
-            Ok(success(apfs_info(state.path(), "disk3s5", "ROOT-UUID"))),
-        ),
-        (
-            command(
-                diskutil,
-                &[
-                    "apfs",
-                    "addVolume",
-                    "disk3",
-                    "APFS",
-                    volume_name,
-                    "-quota",
-                    &format!("{bytes}b"),
-                    "-reserve",
-                    &format!("{bytes}b"),
-                    "-mountpoint",
-                    mount.to_str().unwrap(),
-                ],
-            ),
-            Ok(success("Created new APFS Volume disk9s1\n")),
-        ),
-        (
-            command(diskutil, &["info", mount.to_str().unwrap()]),
-            Ok(success(apfs_info(&mount, "disk9s1", "EXEC-UUID"))),
-        ),
-        (
-            command(diskutil, &["apfs", "list", "disk3"]),
-            Ok(success(apfs_list("disk9s1", bytes, bytes, bytes))),
-        ),
-        (
-            command(diskutil, &["info", mount.to_str().unwrap()]),
-            Ok(success(apfs_info(&mount, "disk9s1", "EXEC-UUID"))),
-        ),
-        (
-            command(diskutil, &["apfs", "list", "disk3"]),
-            Ok(success(apfs_list("disk9s1", bytes, bytes, bytes))),
-        ),
-        (
-            command(diskutil, &["info", mount.to_str().unwrap()]),
-            Ok(success(apfs_info(&mount, "disk9s1", "EXEC-UUID"))),
-        ),
-        (
-            command(diskutil, &["apfs", "list", "disk3"]),
-            Ok(success(apfs_list("disk9s1", bytes, bytes, bytes))),
-        ),
-        (
-            command(diskutil, &["apfs", "deleteVolume", "disk9s1"]),
-            Ok(success("Deleted APFS Volume\n")),
-        ),
-    ]);
-    let backend = ApfsBackend::new(state.path(), runner.clone()).expect("APFS backend");
-    let capability = backend.probe(bytes).expect("APFS capability");
-    assert_eq!(capability.pool_identity, "disk3");
-    assert!(capability.reservable_bytes >= bytes);
-    let layout = ExecutionLayout::new(state.path(), &labels().execution_id).expect("layout");
-    let identity = backend
-        .allocate(&layout, &labels(), bytes)
-        .expect("APFS allocation");
-    backend
-        .verify(&layout, &identity, bytes)
-        .expect("APFS verification");
-    backend
-        .release(&layout, &identity)
-        .expect("exact APFS release");
-    runner.assert_drained();
-}
-
-#[test]
-fn apfs_probe_fails_closed_without_root_privilege() {
-    let root = tempfile::tempdir().expect("state root");
-    let runner = FakeRunner::new(vec![(
-        command("/usr/bin/id", &["-u"]),
-        Ok(success("501\n")),
-    )]);
-    let backend = ApfsBackend::new(root.path(), runner.clone()).expect("APFS backend");
-    assert!(matches!(
-        backend.probe(disk_gib_to_bytes(1).unwrap()),
-        Err(StorageError::Unavailable(message)) if message.contains("root")
-    ));
-    runner.assert_drained();
-}
-
-#[test]
-fn apfs_allocation_removes_exact_created_volume_when_reservation_proof_fails() {
-    let state = tempfile::tempdir().expect("state root");
-    let mount = state.path().join("executions/node-417-impl-01");
-    std::fs::create_dir_all(&mount).expect("mountpoint");
-    let bytes = disk_gib_to_bytes(1).expect("bytes");
-    let runner = FakeRunner::new(vec![
+fn apfs_create_identity_is_proved_before_mount_and_cleanup_rechecks_uuid_and_token() {
+    let state = tempfile::tempdir().expect("state");
+    let canonical_state = state.path().canonicalize().expect("canonical state");
+    let mount = canonical_state.join("executions/node-417-impl-01");
+    fs::create_dir_all(&mount).expect("mount");
+    let bytes = 16 * 1024 * 1024;
+    let name = format!("autospec-{TOKEN}");
+    let info_unmounted = apfs_info(state.path(), "disk9s1", &name, "VOL-UUID", "Not mounted");
+    let info_mounted = apfs_info(
+        state.path(),
+        "disk9s1",
+        &name,
+        "VOL-UUID",
+        mount.to_str().unwrap(),
+    );
+    let list = apfs_list("disk9s1", &name, bytes, bytes * 4);
+    let root_info = apfs_info(
+        &canonical_state,
+        "disk3s5",
+        "Data",
+        "ROOT-UUID",
+        canonical_state.to_str().unwrap(),
+    );
+    let mut expected = vec![
+        (command("/usr/bin/id", &["-u"]), Ok(success("0\n"))),
         (
             command(
                 "/usr/sbin/diskutil",
-                &["info", state.path().to_str().unwrap()],
+                &["info", canonical_state.to_str().unwrap()],
             ),
-            Ok(success(apfs_info(state.path(), "disk3s5", "ROOT-UUID"))),
-        ),
-        (
-            command(
-                "/usr/sbin/diskutil",
-                &[
-                    "apfs",
-                    "addVolume",
-                    "disk3",
-                    "APFS",
-                    "autospec-node-417-impl-01",
-                    "-quota",
-                    &format!("{bytes}b"),
-                    "-reserve",
-                    &format!("{bytes}b"),
-                    "-mountpoint",
-                    mount.to_str().unwrap(),
-                ],
-            ),
-            Ok(success("Created new APFS Volume disk9s1\n")),
-        ),
-        (
-            command("/usr/sbin/diskutil", &["info", mount.to_str().unwrap()]),
-            Ok(success(apfs_info(&mount, "disk9s1", "EXEC-UUID"))),
+            Ok(success(root_info.clone())),
         ),
         (
             command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
-            Ok(success(apfs_list("disk9s1", 0, 0, bytes))),
+            Ok(success(list.clone())),
+        ),
+        (
+            command(
+                "/usr/sbin/diskutil",
+                &["info", canonical_state.to_str().unwrap()],
+            ),
+            Ok(success(root_info)),
+        ),
+        (
+            command(
+                "/usr/sbin/diskutil",
+                &[
+                    "apfs",
+                    "addVolume",
+                    "disk3",
+                    "APFS",
+                    &name,
+                    "-quota",
+                    &format!("{bytes}b"),
+                    "-reserve",
+                    &format!("{bytes}b"),
+                    "-nomount",
+                ],
+            ),
+            Ok(success("Created disk9s1\n")),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
+            Ok(success(info_unmounted.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
+            Ok(success(list.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
+            Ok(success(info_unmounted.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
+            Ok(success(list.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
+            Ok(success(info_unmounted.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
+            Ok(success(list.clone())),
+        ),
+        (
+            command(
+                "/usr/sbin/diskutil",
+                &["mount", "-mountPoint", mount.to_str().unwrap(), "disk9s1"],
+            ),
+            Ok(success(Vec::new())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
+            Ok(success(info_mounted.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
+            Ok(success(info_mounted.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
+            Ok(success(list.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
+            Ok(success(info_mounted)),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
+            Ok(success(list.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["unmount", "disk9s1"]),
+            Ok(success(Vec::new())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
+            Ok(success(info_unmounted.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
+            Ok(success(info_unmounted.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
+            Ok(success(list.clone())),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
+            Ok(success(info_unmounted)),
+        ),
+        (
+            command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
+            Ok(success(list)),
         ),
         (
             command("/usr/sbin/diskutil", &["apfs", "deleteVolume", "disk9s1"]),
-            Ok(success("Deleted APFS Volume\n")),
+            Ok(success(Vec::new())),
         ),
-    ]);
-    let backend = ApfsBackend::new(state.path(), runner.clone()).expect("APFS backend");
-    let layout = ExecutionLayout::new(state.path(), &labels().execution_id).expect("layout");
-
-    assert!(matches!(
-        backend.allocate(&layout, &labels(), bytes),
-        Err(StorageError::IdentityMismatch(message)) if message.contains("quota and reserve")
-    ));
+        (
+            command("/usr/sbin/diskutil", &["info", "disk9s1"]),
+            Ok(failure("Could not find disk")),
+        ),
+    ];
+    let runner = FakeRunner::new(std::mem::take(&mut expected));
+    let backend = ApfsBackend::new(state.path(), runner.clone()).expect("backend");
+    backend.probe(bytes).expect("probe");
+    let layout = ExecutionLayout::new(&canonical_state, &labels().execution_id).expect("layout");
+    let created = backend
+        .create(&layout, &labels(), TOKEN, bytes)
+        .expect("create");
+    let prepared = backend.prepare(&layout, &created, bytes).expect("prepare");
+    backend.mount(&layout, &prepared, bytes).expect("mount");
+    backend.unmount(&layout, &prepared).expect("unmount");
+    assert_eq!(
+        backend.state(&layout, &prepared, bytes).expect("state"),
+        BackendState::Unmounted
+    );
+    backend.remove(&prepared).expect("remove");
+    assert_eq!(
+        backend.state(&layout, &prepared, bytes).expect("absent"),
+        BackendState::Absent
+    );
     runner.assert_drained();
 }
 
 fn lvm_row(vg_uuid: &str, free: u64, extent: u64) -> Vec<u8> {
     format!("{vg_uuid}:{free}:{extent}\n").into_bytes()
 }
-
-fn lv_row(vg_uuid: &str, lv_uuid: &str, size: u64, path: &str) -> Vec<u8> {
-    format!("{vg_uuid}:{lv_uuid}:{size}:{path}\n").into_bytes()
+fn lv_row(bytes: u64, device: &str) -> Vec<u8> {
+    format!("VG-UUID:LV-UUID:{bytes}:{device}:autospec.{TOKEN}:autospec-{TOKEN}\n").into_bytes()
 }
 
 #[test]
-fn thick_lvm_reserves_extents_formats_mounts_and_verifies_every_identity() {
-    let state = tempfile::tempdir().expect("state root");
+fn lvm_create_is_tagged_and_identified_before_format_mount_and_exact_removal() {
+    let state = tempfile::tempdir().expect("state");
     let mount = state.path().join("executions/node-417-impl-01");
-    std::fs::create_dir_all(&mount).expect("mountpoint");
-    let bytes = disk_gib_to_bytes(3).expect("bytes");
+    fs::create_dir_all(&mount).expect("mount");
+    let bytes = 16 * 1024 * 1024;
     let extent = 4 * 1024 * 1024;
-    let extents = bytes / extent;
-    let lv = "autospec-node-417-impl-01";
-    let device = format!("/dev/vg-autospec/{lv}");
-    let vg_lv = format!("vg-autospec/{lv}");
+    let device = format!("/dev/vg-autospec/autospec-{TOKEN}");
+    let target = format!("vg-autospec/autospec-{TOKEN}");
     let mut expected = vec![(command("/usr/bin/id", &["-u"]), Ok(success("0\n")))];
-    for (program, version_arg) in [
+    for (program, version) in [
         ("/usr/sbin/lvm", "version"),
         ("/usr/sbin/mkfs.ext4", "-V"),
         ("/usr/bin/mount", "--version"),
@@ -284,7 +270,7 @@ fn thick_lvm_reserves_extents_formats_mounts_and_verifies_every_identity() {
         ("/usr/bin/findmnt", "--version"),
         ("/usr/sbin/blkid", "--version"),
     ] {
-        expected.push((command(program, &[version_arg]), Ok(success("available\n"))));
+        expected.push((command(program, &[version]), Ok(success("ok\n"))));
     }
     expected.extend([
         (
@@ -300,10 +286,11 @@ fn thick_lvm_reserves_extents_formats_mounts_and_verifies_every_identity() {
                     ":",
                     "--options",
                     "vg_uuid,vg_free,vg_extent_size",
+                    "--",
                     "vg-autospec",
                 ],
             ),
-            Ok(success(lvm_row("VG-UUID", bytes * 2, extent))),
+            Ok(success(lvm_row("VG-UUID", bytes * 4, extent))),
         ),
         (
             command(
@@ -314,13 +301,16 @@ fn thick_lvm_reserves_extents_formats_mounts_and_verifies_every_identity() {
                     "--type",
                     "linear",
                     "--extents",
-                    &extents.to_string(),
+                    "4",
                     "--name",
-                    lv,
+                    &format!("autospec-{TOKEN}"),
+                    "--addtag",
+                    &format!("autospec.{TOKEN}"),
+                    "--",
                     "vg-autospec",
                 ],
             ),
-            Ok(success("created\n")),
+            Ok(success(Vec::new())),
         ),
         (
             command(
@@ -334,190 +324,45 @@ fn thick_lvm_reserves_extents_formats_mounts_and_verifies_every_identity() {
                     "--separator",
                     ":",
                     "--options",
-                    "vg_uuid,lv_uuid,lv_size,lv_path",
-                    &vg_lv,
+                    "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                    "--",
+                    &target,
                 ],
             ),
-            Ok(success(lv_row("VG-UUID", "LV-UUID", bytes, &device))),
+            Ok(success(lv_row(bytes, &device))),
         ),
         (
-            command("/usr/sbin/mkfs.ext4", &["-F", &device]),
-            Ok(success("formatted\n")),
+            command(
+                "/usr/sbin/lvm",
+                &[
+                    "lvs",
+                    "--noheadings",
+                    "--units",
+                    "b",
+                    "--nosuffix",
+                    "--separator",
+                    ":",
+                    "--options",
+                    "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                    "--",
+                    &target,
+                ],
+            ),
+            Ok(success(lv_row(bytes, &device))),
+        ),
+        (
+            command("/usr/sbin/mkfs.ext4", &["-F", "--", &device]),
+            Ok(success(Vec::new())),
         ),
         (
             command(
                 "/usr/sbin/blkid",
-                &["--output", "value", "--match-tag", "UUID", &device],
+                &["--output", "value", "--match-tag", "UUID", "--", &device],
             ),
             Ok(success("FS-UUID\n")),
         ),
         (
             command(
-                "/usr/bin/mount",
-                &[
-                    "--types",
-                    "ext4",
-                    "--options",
-                    "nodev,nosuid",
-                    &device,
-                    mount.to_str().unwrap(),
-                ],
-            ),
-            Ok(success(Vec::new())),
-        ),
-    ]);
-    for _ in 0..3 {
-        expected.extend([
-            (
-                command(
-                    "/usr/sbin/lvm",
-                    &[
-                        "lvs",
-                        "--noheadings",
-                        "--units",
-                        "b",
-                        "--nosuffix",
-                        "--separator",
-                        ":",
-                        "--options",
-                        "vg_uuid,lv_uuid,lv_size,lv_path",
-                        &vg_lv,
-                    ],
-                ),
-                Ok(success(lv_row("VG-UUID", "LV-UUID", bytes, &device))),
-            ),
-            (
-                command(
-                    "/usr/bin/findmnt",
-                    &[
-                        "--noheadings",
-                        "--output",
-                        "UUID,FSTYPE,TARGET",
-                        "--target",
-                        mount.to_str().unwrap(),
-                    ],
-                ),
-                Ok(success(format!("FS-UUID ext4 {}\n", mount.display()))),
-            ),
-            (
-                command(
-                    "/usr/sbin/blkid",
-                    &["--output", "value", "--match-tag", "UUID", &device],
-                ),
-                Ok(success("FS-UUID\n")),
-            ),
-        ]);
-    }
-    expected.extend([
-        (
-            command("/usr/bin/umount", &["--", mount.to_str().unwrap()]),
-            Ok(success(Vec::new())),
-        ),
-        (
-            command("/usr/sbin/lvm", &["lvremove", "--yes", &vg_lv]),
-            Ok(success("removed\n")),
-        ),
-    ]);
-    let runner = FakeRunner::new(expected);
-    let backend = LvmBackend::new("vg-autospec", runner.clone()).expect("LVM backend");
-    assert!(
-        backend
-            .probe(bytes)
-            .expect("LVM capability")
-            .reservable_bytes
-            >= bytes
-    );
-    let layout = ExecutionLayout::new(state.path(), &labels().execution_id).expect("layout");
-    let identity = backend
-        .allocate(&layout, &labels(), bytes)
-        .expect("thick LVM allocation");
-    backend
-        .verify(&layout, &identity, bytes)
-        .expect("LVM verification");
-    backend
-        .release(&layout, &identity)
-        .expect("exact LVM release");
-    runner.assert_drained();
-}
-
-#[test]
-fn thick_lvm_probe_fails_closed_when_a_required_tool_is_missing() {
-    let runner = FakeRunner::new(vec![
-        (command("/usr/bin/id", &["-u"]), Ok(success("0\n"))),
-        (
-            command("/usr/sbin/lvm", &["version"]),
-            Ok(failure(127, "lvm missing")),
-        ),
-    ]);
-    let backend = LvmBackend::new("vg-autospec", runner.clone()).expect("LVM backend");
-
-    assert!(matches!(
-        backend.probe(disk_gib_to_bytes(1).unwrap()),
-        Err(StorageError::Command(message)) if message.contains("lvm missing")
-    ));
-    runner.assert_drained();
-}
-
-#[test]
-fn thick_lvm_allocation_unmounts_and_removes_exact_lv_when_mount_proof_fails() {
-    let state = tempfile::tempdir().expect("state root");
-    let mount = state.path().join("executions/node-417-impl-01");
-    std::fs::create_dir_all(&mount).expect("mountpoint");
-    let bytes = disk_gib_to_bytes(1).expect("bytes");
-    let extent = 4 * 1024 * 1024;
-    let extents = bytes / extent;
-    let lv = "autospec-node-417-impl-01";
-    let device = format!("/dev/vg-autospec/{lv}");
-    let vg_lv = format!("vg-autospec/{lv}");
-    let mut expected = vec![(command("/usr/bin/id", &["-u"]), Ok(success("0\n")))];
-    for (program, version_arg) in [
-        ("/usr/sbin/lvm", "version"),
-        ("/usr/sbin/mkfs.ext4", "-V"),
-        ("/usr/bin/mount", "--version"),
-        ("/usr/bin/umount", "--version"),
-        ("/usr/bin/findmnt", "--version"),
-        ("/usr/sbin/blkid", "--version"),
-    ] {
-        expected.push((command(program, &[version_arg]), Ok(success("available\n"))));
-    }
-    expected.extend([
-        (
-            command(
-                "/usr/sbin/lvm",
-                &[
-                    "vgs",
-                    "--noheadings",
-                    "--units",
-                    "b",
-                    "--nosuffix",
-                    "--separator",
-                    ":",
-                    "--options",
-                    "vg_uuid,vg_free,vg_extent_size",
-                    "vg-autospec",
-                ],
-            ),
-            Ok(success(lvm_row("VG-UUID", bytes * 2, extent))),
-        ),
-        (
-            command(
-                "/usr/sbin/lvm",
-                &[
-                    "lvcreate",
-                    "--yes",
-                    "--type",
-                    "linear",
-                    "--extents",
-                    &extents.to_string(),
-                    "--name",
-                    lv,
-                    "vg-autospec",
-                ],
-            ),
-            Ok(success("created\n")),
-        ),
-        (
-            command(
                 "/usr/sbin/lvm",
                 &[
                     "lvs",
@@ -528,54 +373,12 @@ fn thick_lvm_allocation_unmounts_and_removes_exact_lv_when_mount_proof_fails() {
                     "--separator",
                     ":",
                     "--options",
-                    "vg_uuid,lv_uuid,lv_size,lv_path",
-                    &vg_lv,
+                    "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                    "--",
+                    &target,
                 ],
             ),
-            Ok(success(lv_row("VG-UUID", "LV-UUID", bytes, &device))),
-        ),
-        (
-            command("/usr/sbin/mkfs.ext4", &["-F", &device]),
-            Ok(success("formatted\n")),
-        ),
-        (
-            command(
-                "/usr/sbin/blkid",
-                &["--output", "value", "--match-tag", "UUID", &device],
-            ),
-            Ok(success("FS-UUID\n")),
-        ),
-        (
-            command(
-                "/usr/bin/mount",
-                &[
-                    "--types",
-                    "ext4",
-                    "--options",
-                    "nodev,nosuid",
-                    &device,
-                    mount.to_str().unwrap(),
-                ],
-            ),
-            Ok(success(Vec::new())),
-        ),
-        (
-            command(
-                "/usr/sbin/lvm",
-                &[
-                    "lvs",
-                    "--noheadings",
-                    "--units",
-                    "b",
-                    "--nosuffix",
-                    "--separator",
-                    ":",
-                    "--options",
-                    "vg_uuid,lv_uuid,lv_size,lv_path",
-                    &vg_lv,
-                ],
-            ),
-            Ok(success(lv_row("VG-UUID", "LV-UUID", bytes, &device))),
+            Ok(success(lv_row(bytes, &device))),
         ),
         (
             command(
@@ -588,70 +391,306 @@ fn thick_lvm_allocation_unmounts_and_removes_exact_lv_when_mount_proof_fails() {
                     mount.to_str().unwrap(),
                 ],
             ),
-            Ok(success(format!("FOREIGN-FS ext4 {}\n", mount.display()))),
+            Ok(failure("not mounted")),
+        ),
+        (
+            command(
+                "/usr/bin/mount",
+                &[
+                    "--types",
+                    "ext4",
+                    "--options",
+                    "nodev,nosuid",
+                    "--",
+                    &device,
+                    mount.to_str().unwrap(),
+                ],
+            ),
+            Ok(success(Vec::new())),
+        ),
+        (
+            command(
+                "/usr/sbin/lvm",
+                &[
+                    "lvs",
+                    "--noheadings",
+                    "--units",
+                    "b",
+                    "--nosuffix",
+                    "--separator",
+                    ":",
+                    "--options",
+                    "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                    "--",
+                    &target,
+                ],
+            ),
+            Ok(success(lv_row(bytes, &device))),
+        ),
+        (
+            command(
+                "/usr/sbin/blkid",
+                &["--output", "value", "--match-tag", "UUID", "--", &device],
+            ),
+            Ok(success("FS-UUID\n")),
+        ),
+        (
+            command(
+                "/usr/bin/findmnt",
+                &[
+                    "--noheadings",
+                    "--output",
+                    "UUID,FSTYPE,TARGET",
+                    "--target",
+                    mount.to_str().unwrap(),
+                ],
+            ),
+            Ok(success(format!("FS-UUID ext4 {}\n", mount.display()))),
+        ),
+        (
+            command(
+                "/usr/sbin/lvm",
+                &[
+                    "lvs",
+                    "--noheadings",
+                    "--units",
+                    "b",
+                    "--nosuffix",
+                    "--separator",
+                    ":",
+                    "--options",
+                    "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                    "--",
+                    &target,
+                ],
+            ),
+            Ok(success(lv_row(bytes, &device))),
         ),
         (
             command("/usr/bin/umount", &["--", mount.to_str().unwrap()]),
             Ok(success(Vec::new())),
         ),
         (
-            command("/usr/sbin/lvm", &["lvremove", "--yes", &vg_lv]),
-            Ok(success("removed\n")),
+            command(
+                "/usr/sbin/lvm",
+                &[
+                    "lvs",
+                    "--noheadings",
+                    "--units",
+                    "b",
+                    "--nosuffix",
+                    "--separator",
+                    ":",
+                    "--options",
+                    "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                    "--",
+                    &target,
+                ],
+            ),
+            Ok(success(lv_row(bytes, &device))),
+        ),
+        (
+            command(
+                "/usr/sbin/blkid",
+                &["--output", "value", "--match-tag", "UUID", "--", &device],
+            ),
+            Ok(success("FS-UUID\n")),
+        ),
+        (
+            command(
+                "/usr/bin/findmnt",
+                &[
+                    "--noheadings",
+                    "--output",
+                    "UUID,FSTYPE,TARGET",
+                    "--target",
+                    mount.to_str().unwrap(),
+                ],
+            ),
+            Ok(failure("not mounted")),
+        ),
+        (
+            command(
+                "/usr/sbin/lvm",
+                &[
+                    "lvs",
+                    "--noheadings",
+                    "--units",
+                    "b",
+                    "--nosuffix",
+                    "--separator",
+                    ":",
+                    "--options",
+                    "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                    "--",
+                    &target,
+                ],
+            ),
+            Ok(success(lv_row(bytes, &device))),
+        ),
+        (
+            command("/usr/sbin/lvm", &["lvremove", "--yes", "--", &target]),
+            Ok(success(Vec::new())),
+        ),
+        (
+            command(
+                "/usr/sbin/lvm",
+                &[
+                    "lvs",
+                    "--noheadings",
+                    "--units",
+                    "b",
+                    "--nosuffix",
+                    "--separator",
+                    ":",
+                    "--options",
+                    "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                    "--",
+                    &target,
+                ],
+            ),
+            Ok(failure("Failed to find logical volume")),
         ),
     ]);
     let runner = FakeRunner::new(expected);
-    let backend = LvmBackend::new("vg-autospec", runner.clone()).expect("LVM backend");
-    backend.probe(bytes).expect("LVM capability");
+    let backend = LvmBackend::new("vg-autospec", runner.clone()).expect("backend");
+    backend.probe(bytes).expect("probe");
     let layout = ExecutionLayout::new(state.path(), &labels().execution_id).expect("layout");
-
-    assert!(matches!(
-        backend.allocate(&layout, &labels(), bytes),
-        Err(StorageError::IdentityMismatch(message)) if message.contains("findmnt")
-    ));
+    let created = backend
+        .create(&layout, &labels(), TOKEN, bytes)
+        .expect("create");
+    assert!(created.filesystem_id().is_empty());
+    let prepared = backend.prepare(&layout, &created, bytes).expect("prepare");
+    backend.mount(&layout, &prepared, bytes).expect("mount");
+    backend.unmount(&layout, &prepared).expect("unmount");
+    assert_eq!(
+        backend.state(&layout, &prepared, bytes).expect("unmounted"),
+        BackendState::Unmounted
+    );
+    backend.remove(&prepared).expect("remove");
+    assert_eq!(
+        backend.state(&layout, &prepared, bytes).expect("absent"),
+        BackendState::Absent
+    );
     runner.assert_drained();
 }
 
 #[test]
-fn real_platform_probe_is_explicitly_skipped_without_an_operator_pool() {
-    #[cfg(target_os = "macos")]
-    {
-        let root = tempfile::tempdir().expect("real APFS probe directory");
-        let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
-        let backend = ApfsBackend::new(root.path(), runner).expect("real APFS backend");
-        match backend.probe(disk_gib_to_bytes(1).expect("probe bytes")) {
-            Ok(capability) => println!(
-                "SKIP real APFS allocation: pool {} is probeable but no destructive test pool is configured",
-                capability.pool_identity
-            ),
-            Err(error) => println!("SKIP real APFS allocation: {error}"),
-        }
+fn lvm_volume_group_validation_rejects_option_injection_and_reserved_names() {
+    let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
+    for invalid in [
+        "-vg",
+        ".",
+        "..",
+        "snapshot",
+        "pvmove",
+        "mirrorpool",
+        "bad/name",
+        "",
+    ] {
+        assert!(
+            LvmBackend::new(invalid, runner.clone()).is_err(),
+            "accepted {invalid}"
+        );
     }
-    #[cfg(target_os = "linux")]
-    {
-        match std::env::var("AUTOSPEC_LVM_VOLUME_GROUP") {
-            Ok(volume_group) => {
-                let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
-                LvmBackend::new(volume_group, runner)
-                    .expect("configured real LVM backend")
-                    .probe(disk_gib_to_bytes(1).expect("probe bytes"))
-                    .expect("configured real thick-LVM pool must be usable");
-                println!("SKIP real thick-LVM allocation: probe passed but destructive tests are opt-in only");
-            }
-            Err(_) => println!(
-                "SKIP real thick-LVM allocation: AUTOSPEC_LVM_VOLUME_GROUP is not configured"
-            ),
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    println!("SKIP real storage allocation: platform has no supported backend");
+    LvmBackend::new("vg.safe-01", runner).expect("full safe grammar");
+}
+
+#[test]
+fn missing_required_lvm_tool_fails_closed() {
+    let runner = FakeRunner::new(vec![
+        (command("/usr/bin/id", &["-u"]), Ok(success("0\n"))),
+        (
+            command("/usr/sbin/lvm", &["version"]),
+            Ok(failure("missing")),
+        ),
+    ]);
+    let backend = LvmBackend::new("vg-autospec", runner.clone()).expect("backend");
+    assert!(backend.probe(16 * 1024 * 1024).is_err());
+    runner.assert_drained();
 }
 
 #[test]
 fn command_spec_keeps_program_and_arguments_separate() {
-    let spec = CommandSpec::new(
-        PathBuf::from("/usr/sbin/diskutil"),
-        [OsString::from("apfs"), OsString::from("list")],
+    let spec = command("/usr/sbin/lvm", &["lvs", "--", "vg.safe"]);
+    assert!(spec.program.is_absolute());
+    assert_eq!(spec.arguments, vec!["lvs", "--", "vg.safe"]);
+}
+
+#[test]
+fn configured_real_pool_runs_full_quota_lifecycle_or_explicitly_skips() {
+    #[cfg(target_os = "macos")]
+    let configured = std::env::var("AUTOSPEC_APFS_PROBE_PATH")
+        .ok()
+        .map(|path| ("apfs", path));
+    #[cfg(target_os = "linux")]
+    let configured = std::env::var("AUTOSPEC_LVM_VOLUME_GROUP")
+        .ok()
+        .map(|name| ("lvm", name));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let configured: Option<(&str, String)> = None;
+    let Some((kind, configured)) = configured else {
+        println!("SKIP real storage quota lifecycle: operator pool configuration is absent");
+        return;
+    };
+    let bytes = std::env::var("AUTOSPEC_STORAGE_TEST_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(16 * 1024 * 1024);
+    let state = tempfile::tempdir().expect("state");
+    let mount = state.path().join("executions/real-storage-proof");
+    fs::create_dir_all(&mount).expect("mount");
+    let layout = ExecutionLayout::new(state.path(), &ExecutionId::new("real-storage-proof"))
+        .expect("layout");
+    let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
+    let backend: Box<dyn StorageBackend> = if kind == "apfs" {
+        Box::new(ApfsBackend::new(configured, runner).expect("configured APFS backend"))
+    } else {
+        Box::new(LvmBackend::new(configured, runner).expect("configured LVM backend"))
+    };
+    backend.probe(bytes).expect("configured pool probe");
+    let created = backend
+        .create(&layout, &labels(), TOKEN, bytes)
+        .expect("physical create and identity");
+    let prepared = match backend.prepare(&layout, &created, bytes) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            backend.remove(&created).expect("rollback created object");
+            panic!("prepare configured storage: {error}");
+        }
+    };
+    if let Err(error) = backend.mount(&layout, &prepared, bytes) {
+        if matches!(
+            backend.state(&layout, &prepared, bytes),
+            Ok(BackendState::Mounted)
+        ) {
+            backend.unmount(&layout, &prepared).expect("rollback mount");
+        }
+        backend.remove(&prepared).expect("rollback prepared object");
+        panic!("mount configured storage: {error}");
+    }
+    let exercise = (|| -> std::io::Result<bool> {
+        fs::create_dir_all(&layout.repository)?;
+        let mut first = fs::File::create(layout.repository.join("aggregate-a"))?;
+        fs::create_dir_all(&layout.conversation)?;
+        let mut second = fs::File::create(layout.conversation.join("aggregate-b"))?;
+        let block = vec![0x5a; 1024 * 1024];
+        for index in 0..=(bytes / block.len() as u64 + 2) {
+            let result = if index % 2 == 0 {
+                first.write_all(&block)
+            } else {
+                second.write_all(&block)
+            };
+            if result.is_err() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })();
+    backend.unmount(&layout, &prepared).expect("unmount");
+    backend.remove(&prepared).expect("release");
+    assert!(
+        exercise.expect("exercise aggregate quota"),
+        "writes beyond the configured hard bound unexpectedly succeeded"
     );
-    assert_eq!(spec.program, PathBuf::from("/usr/sbin/diskutil"));
-    assert_eq!(spec.arguments, vec!["apfs", "list"]);
 }

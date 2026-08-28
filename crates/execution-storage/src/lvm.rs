@@ -1,6 +1,6 @@
 use crate::command::{args, run_checked};
 use crate::{
-    BackendCapability, BackendIdentity, CommandRunner, CommandSpec, ExecutionLayout,
+    BackendCapability, BackendIdentity, BackendState, CommandRunner, CommandSpec, ExecutionLayout,
     StorageBackend, StorageError,
 };
 use orchestrator_core::OwnershipLabels;
@@ -34,34 +34,27 @@ impl LvmBackend {
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Self, StorageError> {
         let volume_group = volume_group.into();
-        if volume_group.is_empty()
-            || !volume_group
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"+_.-".contains(&byte))
-        {
-            return Err(StorageError::InvalidRequest(format!(
-                "invalid LVM volume group: {volume_group}"
-            )));
-        }
+        validate_lvm_name(&volume_group)?;
         Ok(Self {
             volume_group,
             runner,
             pool: Mutex::new(None),
         })
     }
-
     fn require_root_and_tools(&self) -> Result<(), StorageError> {
-        let output = run_checked(
+        if run_checked(
             self.runner.as_ref(),
             CommandSpec::new(ID, args(&["-u"])),
-            "inspect LVM allocation privilege",
-        )?;
-        if output.stdout != b"0\n" {
+            "inspect LVM privilege",
+        )?
+        .stdout
+            != b"0\n"
+        {
             return Err(StorageError::Unavailable(
                 "thick-LVM allocation requires root".to_owned(),
             ));
         }
-        for (program, version_argument) in [
+        for (program, version) in [
             (LVM, "version"),
             (MKFS, "-V"),
             (MOUNT, "--version"),
@@ -71,13 +64,12 @@ impl LvmBackend {
         ] {
             run_checked(
                 self.runner.as_ref(),
-                CommandSpec::new(program, args(&[version_argument])),
+                CommandSpec::new(program, args(&[version])),
                 "probe required storage tool",
             )?;
         }
         Ok(())
     }
-
     fn inspect_pool(&self) -> Result<LvmPool, StorageError> {
         let output = run_checked(
             self.runner.as_ref(),
@@ -93,13 +85,16 @@ impl LvmBackend {
                     ":",
                     "--options",
                     "vg_uuid,vg_free,vg_extent_size",
+                    "--",
                     &self.volume_group,
                 ]),
             ),
             "inspect thick-LVM pool",
         )?;
-        let row = utf8_trim(&output.stdout, "vgs output")?;
-        let fields = row.split(':').map(str::trim).collect::<Vec<_>>();
+        let fields = utf8_trim(&output.stdout, "vgs output")?
+            .split(':')
+            .map(str::trim)
+            .collect::<Vec<_>>();
         if fields.len() != 3 || fields[0].is_empty() {
             return Err(StorageError::Unavailable(
                 "vgs did not return exact pool identity".to_owned(),
@@ -111,20 +106,161 @@ impl LvmBackend {
             extent_bytes: parse_u64(fields[2], "VG extent bytes")?,
         })
     }
-
     fn pool(&self) -> Result<LvmPool, StorageError> {
         self.pool
             .lock()
-            .map_err(|_| StorageError::Unavailable("LVM pool cache is poisoned".to_owned()))?
+            .map_err(|_| StorageError::Unavailable("LVM pool cache poisoned".to_owned()))?
             .clone()
             .ok_or_else(|| StorageError::Unavailable("LVM backend was not probed".to_owned()))
     }
-
-    fn lv_name(labels: &OwnershipLabels) -> String {
-        format!("autospec-{}", labels.execution_id)
+    fn tag(token: &str) -> String {
+        format!("autospec.{token}")
     }
+    fn lv_name(token: &str) -> String {
+        format!("autospec-{token}")
+    }
+    fn inspect_lv_result(&self, vg_lv: &str) -> Result<Option<LvInfo>, StorageError> {
+        let command = CommandSpec::new(
+            LVM,
+            args(&[
+                "lvs",
+                "--noheadings",
+                "--units",
+                "b",
+                "--nosuffix",
+                "--separator",
+                ":",
+                "--options",
+                "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                "--",
+                vg_lv,
+            ]),
+        );
+        let output = self.runner.run(&command)?;
+        if output.code != 0 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("Failed to find") || stderr.contains("not found") {
+                return Ok(None);
+            }
+            return Err(StorageError::Command(format!(
+                "inspect logical volume exited {}: {}",
+                output.code,
+                stderr.trim()
+            )));
+        }
+        parse_lv(&output.stdout).map(Some)
+    }
+    fn inspect_exact(
+        &self,
+        identity: &BackendIdentity,
+        expected_bytes: u64,
+    ) -> Result<Option<LvInfo>, StorageError> {
+        let (vg, vg_uuid, lv, lv_uuid, _, token) = lvm_identity(identity)?;
+        if vg != self.volume_group {
+            return Err(StorageError::IdentityMismatch(
+                "LVM volume group changed".to_owned(),
+            ));
+        }
+        let Some(info) = self.inspect_lv_result(&format!("{vg}/{lv}"))? else {
+            return Ok(None);
+        };
+        if info.vg_uuid != vg_uuid
+            || info.lv_uuid != lv_uuid
+            || info.size_bytes != expected_bytes
+            || info.name != lv
+            || !info
+                .tags
+                .split(',')
+                .any(|tag| tag.trim() == Self::tag(token))
+        {
+            return Err(StorageError::IdentityMismatch(
+                "LVM token, pool UUID, object UUID, or size changed".to_owned(),
+            ));
+        }
+        Ok(Some(info))
+    }
+    fn filesystem_uuid(&self, device: &str) -> Result<String, StorageError> {
+        let output = run_checked(
+            self.runner.as_ref(),
+            CommandSpec::new(
+                BLKID,
+                args(&["--output", "value", "--match-tag", "UUID", "--", device]),
+            ),
+            "inspect filesystem UUID",
+        )?;
+        let uuid = utf8_trim(&output.stdout, "blkid output")?;
+        if uuid.is_empty() {
+            Err(StorageError::IdentityMismatch(
+                "filesystem UUID is empty".to_owned(),
+            ))
+        } else {
+            Ok(uuid.to_owned())
+        }
+    }
+    fn mount_state(
+        &self,
+        layout: &ExecutionLayout,
+        filesystem_uuid: &str,
+    ) -> Result<BackendState, StorageError> {
+        if filesystem_uuid.is_empty() {
+            return Ok(BackendState::Unmounted);
+        }
+        let mount = path_text(&layout.root)?;
+        let output = self.runner.run(&CommandSpec::new(
+            FINDMNT,
+            args(&[
+                "--noheadings",
+                "--output",
+                "UUID,FSTYPE,TARGET",
+                "--target",
+                mount,
+            ]),
+        ))?;
+        if output.code != 0 {
+            return Ok(BackendState::Unmounted);
+        }
+        if utf8_trim(&output.stdout, "findmnt output")? == format!("{filesystem_uuid} ext4 {mount}")
+        {
+            Ok(BackendState::Mounted)
+        } else {
+            Err(StorageError::IdentityMismatch(
+                "findmnt source, filesystem, or target changed".to_owned(),
+            ))
+        }
+    }
+}
 
-    fn inspect_lv(&self, vg_lv: &str) -> Result<LvInfo, StorageError> {
+impl StorageBackend for LvmBackend {
+    fn key(&self, labels: &OwnershipLabels) -> String {
+        format!("lvm:{}:{}", self.volume_group, labels.execution_id)
+    }
+    fn probe(&self, required_bytes: u64) -> Result<BackendCapability, StorageError> {
+        self.require_root_and_tools()?;
+        let pool = self.inspect_pool()?;
+        if pool.extent_bytes == 0 || pool.free_bytes < required_bytes {
+            return Err(StorageError::Unavailable(format!(
+                "LVM pool has {} free bytes with {}-byte extents, need {required_bytes}",
+                pool.free_bytes, pool.extent_bytes
+            )));
+        }
+        *self
+            .pool
+            .lock()
+            .map_err(|_| StorageError::Unavailable("LVM pool cache poisoned".to_owned()))? =
+            Some(pool.clone());
+        Ok(BackendCapability {
+            backend: "thick_lvm".to_owned(),
+            pool_identity: pool.uuid,
+            reservable_bytes: pool.free_bytes,
+        })
+    }
+    fn discover(
+        &self,
+        _layout: &ExecutionLayout,
+        token: &str,
+        bytes: u64,
+    ) -> Result<Option<BackendIdentity>, StorageError> {
+        let tag = Self::tag(token);
         let output = run_checked(
             self.runner.as_ref(),
             CommandSpec::new(
@@ -138,215 +274,58 @@ impl LvmBackend {
                     "--separator",
                     ":",
                     "--options",
-                    "vg_uuid,lv_uuid,lv_size,lv_path",
-                    vg_lv,
+                    "vg_uuid,lv_uuid,lv_size,lv_path,lv_tags,lv_name",
+                    "--select",
+                    &format!("lv_tags={tag}"),
+                    "--",
+                    &self.volume_group,
                 ]),
             ),
-            "inspect thick logical volume",
+            "discover owned logical volume",
         )?;
-        let fields = utf8_trim(&output.stdout, "lvs output")?
-            .split(':')
-            .map(str::trim)
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        if fields.len() != 4 || fields.iter().any(String::is_empty) {
-            return Err(StorageError::IdentityMismatch(
-                "lvs did not return exact logical-volume identity".to_owned(),
-            ));
+        if utf8_trim(&output.stdout, "lvs discovery output")?.is_empty() {
+            return Ok(None);
         }
-        Ok(LvInfo {
-            vg_uuid: fields[0].clone(),
-            lv_uuid: fields[1].clone(),
-            size_bytes: parse_u64(&fields[2], "LV size bytes")?,
-            path: fields[3].clone(),
-        })
-    }
-
-    fn filesystem_uuid(&self, device: &str) -> Result<String, StorageError> {
-        let output = run_checked(
-            self.runner.as_ref(),
-            CommandSpec::new(
-                BLKID,
-                args(&["--output", "value", "--match-tag", "UUID", device]),
-            ),
-            "inspect filesystem UUID",
-        )?;
-        let uuid = utf8_trim(&output.stdout, "blkid output")?;
-        if uuid.is_empty() {
-            Err(StorageError::IdentityMismatch(
-                "filesystem UUID is empty".to_owned(),
-            ))
-        } else {
-            Ok(uuid.to_owned())
-        }
-    }
-
-    fn verify_internal(
-        &self,
-        layout: &ExecutionLayout,
-        identity: &BackendIdentity,
-        expected_bytes: Option<u64>,
-    ) -> Result<(), StorageError> {
-        let (volume_group, volume_group_uuid, logical_volume, logical_volume_uuid, filesystem_uuid) =
-            match identity {
-                BackendIdentity::Lvm {
-                    volume_group,
-                    volume_group_uuid,
-                    logical_volume,
-                    logical_volume_uuid,
-                    filesystem_uuid,
-                } => (
-                    volume_group,
-                    volume_group_uuid,
-                    logical_volume,
-                    logical_volume_uuid,
-                    filesystem_uuid,
-                ),
-                _ => {
-                    return Err(StorageError::IdentityMismatch(
-                        "LVM backend received a non-LVM identity".to_owned(),
-                    ))
-                }
-            };
-        if volume_group != &self.volume_group {
-            return Err(StorageError::IdentityMismatch(
-                "LVM volume group changed".to_owned(),
-            ));
-        }
-        let vg_lv = format!("{volume_group}/{logical_volume}");
-        let info = self.inspect_lv(&vg_lv)?;
-        if &info.vg_uuid != volume_group_uuid
-            || &info.lv_uuid != logical_volume_uuid
-            || expected_bytes.is_some_and(|bytes| info.size_bytes != bytes)
+        let info = parse_lv(&output.stdout)?;
+        if info.size_bytes != bytes
+            || !info
+                .tags
+                .split(',')
+                .any(|candidate| candidate.trim() == tag)
         {
             return Err(StorageError::IdentityMismatch(
-                "thick logical-volume identity or size changed".to_owned(),
+                "discovered LVM object does not match token and size".to_owned(),
             ));
         }
-        let mount = layout.root.to_str().ok_or_else(|| {
-            StorageError::InvalidRequest(format!(
-                "mount path is not UTF-8: {}",
-                layout.root.display()
-            ))
-        })?;
-        let output = run_checked(
-            self.runner.as_ref(),
-            CommandSpec::new(
-                FINDMNT,
-                args(&[
-                    "--noheadings",
-                    "--output",
-                    "UUID,FSTYPE,TARGET",
-                    "--target",
-                    mount,
-                ]),
-            ),
-            "verify thick-LVM mount",
-        )?;
-        let expected_mount = format!("{filesystem_uuid} ext4 {mount}");
-        if utf8_trim(&output.stdout, "findmnt output")? != expected_mount {
-            return Err(StorageError::IdentityMismatch(
-                "findmnt source, filesystem, or target changed".to_owned(),
-            ));
-        }
-        if &self.filesystem_uuid(&info.path)? != filesystem_uuid {
-            return Err(StorageError::IdentityMismatch(
-                "filesystem UUID changed".to_owned(),
-            ));
-        }
-        Ok(())
+        Ok(Some(BackendIdentity::Lvm {
+            volume_group: self.volume_group.clone(),
+            volume_group_uuid: info.vg_uuid,
+            logical_volume: info.name,
+            logical_volume_uuid: info.lv_uuid,
+            filesystem_uuid: String::new(),
+            ownership_token: token.to_owned(),
+        }))
     }
-
-    fn rollback_created_lv(
+    fn create(
         &self,
-        layout: &ExecutionLayout,
-        vg_lv: &str,
-        mounted: bool,
-        cause: StorageError,
-    ) -> StorageError {
-        let mut failures = Vec::new();
-        if mounted {
-            match layout.root.to_str() {
-                Some(mount) => {
-                    if let Err(error) = run_checked(
-                        self.runner.as_ref(),
-                        CommandSpec::new(UMOUNT, args(&["--", mount])),
-                        "rollback execution filesystem mount",
-                    ) {
-                        failures.push(error.to_string());
-                    }
-                }
-                None => failures.push(format!(
-                    "rollback mount path is not UTF-8: {}",
-                    layout.root.display()
-                )),
-            }
-        }
-        if let Err(error) = run_checked(
-            self.runner.as_ref(),
-            CommandSpec::new(LVM, args(&["lvremove", "--yes", vg_lv])),
-            "rollback exact thick logical volume",
-        ) {
-            failures.push(error.to_string());
-        }
-        if failures.is_empty() {
-            cause
-        } else {
-            StorageError::Cleanup(format!(
-                "thick-LVM allocation failed: {cause}; rollback failed: {}",
-                failures.join("; ")
-            ))
-        }
-    }
-}
-
-impl StorageBackend for LvmBackend {
-    fn key(&self, labels: &OwnershipLabels) -> String {
-        format!("lvm:{}/{}", self.volume_group, Self::lv_name(labels))
-    }
-
-    fn probe(&self, required_bytes: u64) -> Result<BackendCapability, StorageError> {
-        self.require_root_and_tools()?;
-        let pool = self.inspect_pool()?;
-        if pool.extent_bytes == 0 || pool.free_bytes < required_bytes {
-            return Err(StorageError::Unavailable(format!(
-                "LVM pool has {} free bytes with {}-byte extents, need {required_bytes}",
-                pool.free_bytes, pool.extent_bytes
-            )));
-        }
-        *self
-            .pool
-            .lock()
-            .map_err(|_| StorageError::Unavailable("LVM pool cache is poisoned".to_owned()))? =
-            Some(pool.clone());
-        Ok(BackendCapability {
-            backend: "thick_lvm".to_owned(),
-            pool_identity: pool.uuid,
-            reservable_bytes: pool.free_bytes,
-        })
-    }
-
-    fn allocate(
-        &self,
-        layout: &ExecutionLayout,
-        labels: &OwnershipLabels,
-        reserved_bytes: u64,
+        _layout: &ExecutionLayout,
+        _labels: &OwnershipLabels,
+        token: &str,
+        bytes: u64,
     ) -> Result<BackendIdentity, StorageError> {
         let pool = self.pool()?;
-        let extents = reserved_bytes
+        let extents = bytes
             .checked_add(pool.extent_bytes - 1)
             .ok_or_else(|| StorageError::InvalidRequest("LVM extent count overflows".to_owned()))?
             / pool.extent_bytes;
-        let allocated_bytes = extents.checked_mul(pool.extent_bytes).ok_or_else(|| {
-            StorageError::InvalidRequest("LVM allocation size overflows".to_owned())
-        })?;
-        if allocated_bytes != reserved_bytes {
+        if extents.checked_mul(pool.extent_bytes) != Some(bytes) {
             return Err(StorageError::Unavailable(format!(
-                "requested {reserved_bytes} bytes is not an exact multiple of the {}-byte LVM extent",
+                "requested {bytes} bytes is not an exact multiple of the {}-byte LVM extent",
                 pool.extent_bytes
             )));
         }
-        let logical_volume = Self::lv_name(labels);
+        let lv = Self::lv_name(token);
+        let tag = Self::tag(token);
         run_checked(
             self.runner.as_ref(),
             CommandSpec::new(
@@ -359,125 +338,278 @@ impl StorageBackend for LvmBackend {
                     "--extents",
                     &extents.to_string(),
                     "--name",
-                    &logical_volume,
+                    &lv,
+                    "--addtag",
+                    &tag,
+                    "--",
                     &self.volume_group,
                 ]),
             ),
-            "create thick logical volume",
+            "create tagged thick logical volume",
         )?;
-        let vg_lv = format!("{}/{}", self.volume_group, logical_volume);
-        let mut mounted = false;
-        let result = (|| {
-            let info = self.inspect_lv(&vg_lv)?;
-            if info.vg_uuid != pool.uuid || info.size_bytes != reserved_bytes {
-                return Err(StorageError::IdentityMismatch(
-                    "created logical volume does not match the probed pool or reservation"
-                        .to_owned(),
-                ));
-            }
-            run_checked(
-                self.runner.as_ref(),
-                CommandSpec::new(MKFS, args(&["-F", &info.path])),
-                "format execution filesystem",
-            )?;
-            let filesystem_uuid = self.filesystem_uuid(&info.path)?;
-            let mount = layout.root.to_str().ok_or_else(|| {
-                StorageError::InvalidRequest(format!(
-                    "mount path is not UTF-8: {}",
-                    layout.root.display()
-                ))
+        let info = self
+            .inspect_lv_result(&format!("{}/{}", self.volume_group, lv))?
+            .ok_or_else(|| {
+                StorageError::IdentityMismatch("created logical volume is absent".to_owned())
             })?;
-            run_checked(
-                self.runner.as_ref(),
-                CommandSpec::new(
-                    MOUNT,
-                    args(&[
-                        "--types",
-                        "ext4",
-                        "--options",
-                        "nodev,nosuid",
-                        &info.path,
-                        mount,
-                    ]),
-                ),
-                "mount execution filesystem",
-            )?;
-            mounted = true;
-            let identity = BackendIdentity::Lvm {
-                volume_group: self.volume_group.clone(),
-                volume_group_uuid: info.vg_uuid,
-                logical_volume,
-                logical_volume_uuid: info.lv_uuid,
-                filesystem_uuid,
-            };
-            self.verify_internal(layout, &identity, Some(reserved_bytes))?;
-            Ok(identity)
-        })();
-        result.map_err(|cause| self.rollback_created_lv(layout, &vg_lv, mounted, cause))
+        if info.vg_uuid != pool.uuid
+            || info.size_bytes != bytes
+            || !info
+                .tags
+                .split(',')
+                .any(|candidate| candidate.trim() == tag)
+        {
+            return Err(StorageError::IdentityMismatch(
+                "created logical volume identity does not match pool, token, or reservation"
+                    .to_owned(),
+            ));
+        }
+        Ok(BackendIdentity::Lvm {
+            volume_group: self.volume_group.clone(),
+            volume_group_uuid: info.vg_uuid,
+            logical_volume: info.name,
+            logical_volume_uuid: info.lv_uuid,
+            filesystem_uuid: String::new(),
+            ownership_token: token.to_owned(),
+        })
     }
-
-    fn verify(
+    fn prepare(
         &self,
-        layout: &ExecutionLayout,
+        _layout: &ExecutionLayout,
         identity: &BackendIdentity,
-        reserved_bytes: u64,
-    ) -> Result<(), StorageError> {
-        self.verify_internal(layout, identity, Some(reserved_bytes))
-    }
-
-    fn release(
-        &self,
-        layout: &ExecutionLayout,
-        identity: &BackendIdentity,
-    ) -> Result<(), StorageError> {
-        self.verify_internal(layout, identity, None)?;
-        let (volume_group, logical_volume) = match identity {
-            BackendIdentity::Lvm {
-                volume_group,
-                logical_volume,
-                ..
-            } => (volume_group, logical_volume),
-            _ => {
-                return Err(StorageError::IdentityMismatch(
-                    "LVM backend received a non-LVM identity".to_owned(),
-                ))
-            }
-        };
-        let mount = layout.root.to_str().ok_or_else(|| {
-            StorageError::InvalidRequest(format!(
-                "mount path is not UTF-8: {}",
-                layout.root.display()
-            ))
+        bytes: u64,
+    ) -> Result<BackendIdentity, StorageError> {
+        let info = self.inspect_exact(identity, bytes)?.ok_or_else(|| {
+            StorageError::IdentityMismatch("logical volume disappeared before prepare".to_owned())
         })?;
+        let (_, _, _, _, filesystem_uuid, _) = lvm_identity(identity)?;
+        if !filesystem_uuid.is_empty() {
+            return Err(StorageError::IdentityMismatch(
+                "logical volume was already formatted before prepare".to_owned(),
+            ));
+        }
         run_checked(
             self.runner.as_ref(),
-            CommandSpec::new(UMOUNT, args(&["--", mount])),
+            CommandSpec::new(MKFS, args(&["-F", "--", &info.path])),
+            "format exact execution filesystem",
+        )?;
+        let uuid = self.filesystem_uuid(&info.path)?;
+        let mut prepared = identity.clone();
+        if let BackendIdentity::Lvm {
+            filesystem_uuid, ..
+        } = &mut prepared
+        {
+            *filesystem_uuid = uuid;
+        }
+        Ok(prepared)
+    }
+    fn mount(
+        &self,
+        layout: &ExecutionLayout,
+        identity: &BackendIdentity,
+        bytes: u64,
+    ) -> Result<(), StorageError> {
+        let info = self.inspect_exact(identity, bytes)?.ok_or_else(|| {
+            StorageError::IdentityMismatch("logical volume disappeared before mount".to_owned())
+        })?;
+        if self.mount_state(layout, lvm_identity(identity)?.4)? != BackendState::Unmounted {
+            return Err(StorageError::IdentityMismatch(
+                "logical volume was mounted before mount phase".to_owned(),
+            ));
+        }
+        run_checked(
+            self.runner.as_ref(),
+            CommandSpec::new(
+                MOUNT,
+                args(&[
+                    "--types",
+                    "ext4",
+                    "--options",
+                    "nodev,nosuid",
+                    "--",
+                    &info.path,
+                    path_text(&layout.root)?,
+                ]),
+            ),
+            "mount exact execution filesystem",
+        )?;
+        if self.state(layout, identity, bytes)? != BackendState::Mounted {
+            return Err(StorageError::IdentityMismatch(
+                "LVM mount proof failed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+    fn state(
+        &self,
+        layout: &ExecutionLayout,
+        identity: &BackendIdentity,
+        bytes: u64,
+    ) -> Result<BackendState, StorageError> {
+        let Some(info) = self.inspect_exact(identity, bytes)? else {
+            return Ok(BackendState::Absent);
+        };
+        let (_, _, _, _, filesystem_uuid, _) = lvm_identity(identity)?;
+        if !filesystem_uuid.is_empty() && self.filesystem_uuid(&info.path)? != filesystem_uuid {
+            return Err(StorageError::IdentityMismatch(
+                "filesystem UUID changed".to_owned(),
+            ));
+        }
+        self.mount_state(layout, filesystem_uuid)
+    }
+    fn unmount(
+        &self,
+        layout: &ExecutionLayout,
+        identity: &BackendIdentity,
+    ) -> Result<(), StorageError> {
+        let expected = lvm_identity(identity)?;
+        let filesystem_uuid = expected.4;
+        if filesystem_uuid.is_empty() {
+            return Ok(());
+        }
+        let info = self
+            .inspect_lv_result(&format!("{}/{}", expected.0, expected.2))?
+            .ok_or_else(|| {
+                StorageError::IdentityMismatch(
+                    "logical volume disappeared before unmount".to_owned(),
+                )
+            })?;
+        if info.vg_uuid != expected.1
+            || info.lv_uuid != expected.3
+            || !info
+                .tags
+                .split(',')
+                .any(|tag| tag.trim() == Self::tag(expected.5))
+        {
+            return Err(StorageError::IdentityMismatch(
+                "refuse to unmount LVM object with changed token or UUID".to_owned(),
+            ));
+        }
+        run_checked(
+            self.runner.as_ref(),
+            CommandSpec::new(UMOUNT, args(&["--", path_text(&layout.root)?])),
             "unmount exact execution filesystem",
         )?;
-        let vg_lv = format!("{volume_group}/{logical_volume}");
+        Ok(())
+    }
+    fn remove(&self, identity: &BackendIdentity) -> Result<(), StorageError> {
+        let (vg, _, lv, _, _, _) = lvm_identity(identity)?;
+        let info = self
+            .inspect_lv_result(&format!("{vg}/{lv}"))?
+            .ok_or_else(|| {
+                StorageError::IdentityMismatch(
+                    "logical volume already absent before removal proof".to_owned(),
+                )
+            })?;
+        let expected = lvm_identity(identity)?;
+        if info.vg_uuid != expected.1
+            || info.lv_uuid != expected.3
+            || !info
+                .tags
+                .split(',')
+                .any(|tag| tag.trim() == Self::tag(expected.5))
+        {
+            return Err(StorageError::IdentityMismatch(
+                "refuse to remove LVM object with changed token or UUID".to_owned(),
+            ));
+        }
         run_checked(
             self.runner.as_ref(),
-            CommandSpec::new(LVM, args(&["lvremove", "--yes", &vg_lv])),
+            CommandSpec::new(
+                LVM,
+                args(&["lvremove", "--yes", "--", &format!("{vg}/{lv}")]),
+            ),
             "remove exact thick logical volume",
         )?;
         Ok(())
     }
 }
 
+fn validate_lvm_name(name: &str) -> Result<(), StorageError> {
+    let reserved = [".", "..", "snapshot", "pvmove"];
+    let reserved_prefixes = [
+        "mirror", "mimage", "mlog", "rimage", "rmeta", "tdata", "tmeta", "vdata", "vdo",
+    ];
+    let valid = !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"+_.-".contains(&byte))
+        && !reserved.contains(&name)
+        && !reserved_prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+    if valid {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidRequest(format!(
+            "invalid or reserved LVM volume group: {name}"
+        )))
+    }
+}
+fn lvm_identity(
+    identity: &BackendIdentity,
+) -> Result<(&str, &str, &str, &str, &str, &str), StorageError> {
+    match identity {
+        BackendIdentity::Lvm {
+            volume_group,
+            volume_group_uuid,
+            logical_volume,
+            logical_volume_uuid,
+            filesystem_uuid,
+            ownership_token,
+        } => Ok((
+            volume_group,
+            volume_group_uuid,
+            logical_volume,
+            logical_volume_uuid,
+            filesystem_uuid,
+            ownership_token,
+        )),
+        _ => Err(StorageError::IdentityMismatch(
+            "LVM backend received a non-LVM identity".to_owned(),
+        )),
+    }
+}
 #[derive(Debug)]
 struct LvInfo {
     vg_uuid: String,
     lv_uuid: String,
     size_bytes: u64,
     path: String,
+    tags: String,
+    name: String,
 }
-
+fn parse_lv(output: &[u8]) -> Result<LvInfo, StorageError> {
+    let fields = utf8_trim(output, "lvs output")?
+        .split(':')
+        .map(str::trim)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if fields.len() != 6 || fields.iter().any(String::is_empty) {
+        return Err(StorageError::IdentityMismatch(
+            "lvs did not return exact logical-volume identity".to_owned(),
+        ));
+    }
+    Ok(LvInfo {
+        vg_uuid: fields[0].clone(),
+        lv_uuid: fields[1].clone(),
+        size_bytes: parse_u64(&fields[2], "LV size bytes")?,
+        path: fields[3].clone(),
+        tags: fields[4].clone(),
+        name: fields[5].clone(),
+    })
+}
+fn path_text(path: &std::path::Path) -> Result<&str, StorageError> {
+    path.to_str().ok_or_else(|| {
+        StorageError::InvalidRequest(format!("path is not UTF-8: {}", path.display()))
+    })
+}
 fn utf8_trim<'a>(bytes: &'a [u8], purpose: &str) -> Result<&'a str, StorageError> {
     std::str::from_utf8(bytes)
         .map(str::trim)
         .map_err(|error| StorageError::Unavailable(format!("{purpose} is not UTF-8: {error}")))
 }
-
 fn parse_u64(value: &str, purpose: &str) -> Result<u64, StorageError> {
     value
         .parse()

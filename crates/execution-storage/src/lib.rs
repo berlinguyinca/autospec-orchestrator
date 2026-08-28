@@ -16,6 +16,7 @@ pub use manager::{
     ExecutionStorage, ExecutionStorageManager, StorageBackend, StorageCapability,
 };
 pub use model::{
-    disk_gib_to_bytes, AllocationPhase, AllocationReceipt, BackendIdentity, DockerBindProof,
-    ExecutionLayout, PhaseJournal, StorageError, ALLOCATION_API_VERSION,
+    disk_gib_to_bytes, AllocationPhase, AllocationReceipt, BackendIdentity, BackendState,
+    DockerBindProof, ExecutionLayout, PhaseJournal, ReleasePhase, StorageError,
+    ALLOCATION_API_VERSION,
 };
