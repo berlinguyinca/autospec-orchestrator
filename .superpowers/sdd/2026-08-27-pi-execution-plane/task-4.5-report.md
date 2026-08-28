@@ -412,6 +412,35 @@ polling loops, or `du`/`df` accounting.
   killed after hold creation but before PGID binding; token-derived recovery
   closes that crash window as well.
 
+## Pi/storage narrow fix round 3
+
+- Centralized the mutating Pi entry-point gate in `prepare_launch`. Fresh start,
+  resume, and conversation fork now acquire a Ready lease, prove the exact live
+  container capability, recover all abandoned execution lifecycle holds, and
+  confirm the durable hold set is empty before owner validation, JSONL repair,
+  resume-count updates, task-packet writes, or process launch.
+- Recovery uncertainty fails closed while the lifecycle hold remains durable.
+  Resume and fork therefore cannot mutate persisted session state or launch a
+  duplicate Pi beside an abandoned process.
+- Added real-Docker regressions that invoke the integration-test binary as a
+  separate OS process, start Pi, and exit with code 86 without running Drop.
+  Fresh harness instances inject an authentic cleanup-probe failure and prove
+  the durable conversation, owner, and resume count remain byte-identical with
+  exactly one Pi process. After control recovers, resume and fork each reap the
+  abandoned group before launching successfully.
+- Implementation commit: `74eee22adbed1d853cf0a410198f157b0b8e8c0e`.
+
+### Narrow-fix verification
+
+- `cargo test -p harness-pi -- --nocapture --test-threads=1` — 37/37
+  production-shaped real-Docker tests passed without `--init`.
+- Current toolchain: full workspace formatting check, build, test, and
+  warning-denied Clippy passed, including 37 Pi, 18 runtime-Docker, 58 real-Git,
+  30 storage, and 4 Postgres tests.
+- Rust 1.85.0: the same full workspace fmt/build/test/clippy matrix passed with
+  all Docker, Git, storage, and Postgres integration suites.
+- `git diff --check` — passed.
+
 ## Remaining Integration Work
 
 - Round-2 filesystem finding 3 is not fully closed on macOS. The exact missing
