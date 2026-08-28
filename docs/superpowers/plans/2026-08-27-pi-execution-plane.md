@@ -55,7 +55,8 @@
 - [x] Add daemon-probe and real-resource tests with explicit dependency skips.
 - [x] Connect through bollard with a minimum API version check.
 - [x] Provision one labelled network, limited agent container, and isolated service containers without host ports.
-- [x] Enforce CPU, memory, PID, and disk constraints on every container.
+- [x] Enforce CPU, memory, PID, and container-local disk constraints on every container.
+- [ ] Replace container-local disk accounting with one hard execution-wide storage boundary before declaring `disk_gib` enforced.
 - [x] Destroy only selector-matched resources and report—not delete—orphans during reconciliation.
 - [x] Prove unrelated Docker resources survive cleanup.
 
@@ -71,7 +72,7 @@
 
 - [x] Add tests using real temporary Git repositories.
 - [x] Implement locked bare mirrors and safe repository-name normalization.
-- [x] Create execution-scoped worktrees with `.autospec-owner.json`.
+- [ ] Create independent execution repositories whose Git common directory and objects remain inside the bounded execution root.
 - [x] Capture patch plus changed-file evidence.
 - [x] Destroy only verified owned worktrees and identify stale owner records.
 
@@ -92,6 +93,23 @@
 - [x] Resume the same session after container loss and fork conversations without copying worktrees.
 - [x] Add inactivity, wall-clock, and CPU-saturation health classification.
 
+### Task 4.5: Hard-bounded execution storage prerequisite
+
+**Files:**
+- Create: `crates/execution-storage/`
+- Modify: shared contracts, Git layout, Pi paths, Docker writable mounts, worker readiness
+
+**Interfaces:**
+- Produces a worker-owned `ExecutionStorageManager` that allocates and verifies one physically reserved filesystem before Git runs.
+- Consumed by Git, Docker, Pi, and the worker lifecycle; immutable mirrors and durable artifact retention remain separately capacity-managed infrastructure.
+
+- [ ] Define versioned allocation receipts, journals, exact-identity cleanup, and deterministic `executions/{execution_id}/...` paths.
+- [ ] Implement fail-closed APFS quota+reserve and Linux thick-LVM capability probes without heuristic usage polling.
+- [ ] Place an independent Git repository, Pi private/session state, credentials, and every runtime-writable path beneath the verified execution root.
+- [ ] Make agent and service root filesystems read-only; disable daemon logs or redirect them into the bounded root.
+- [ ] Prove aggregate exhaustion across Git, Pi, agent, and service paths cannot affect another execution.
+- [ ] Refuse worker readiness when physical reservation, exact mount identity, or Docker bind proof is unavailable.
+
 ### Task 5: Worker scheduling, lifecycle, and recovery (#19–#22)
 
 **Files:**
@@ -104,7 +122,7 @@
 - [ ] Add concurrency and failure-injection tests proving one execution cannot destabilize another.
 - [ ] Implement authenticated worker registration and heartbeats.
 - [ ] Reserve worker slots transactionally before assignment.
-- [ ] Execute worktree → runtime → Pi → incremental events → diff/artifacts with cleanup guards.
+- [ ] Execute storage → independent repository → runtime → Pi → incremental events → diff/artifacts with reverse-order cleanup guards.
 - [ ] Persist state before publishing events and recover executions from lost workers.
 
 ### Task 6: Versioned execution API and durable evidence (#23–#25)
@@ -136,6 +154,7 @@
 - Create: `deploy/docker-compose.yml`, `Dockerfile`, Podman/Apptainer crates, controller CLI module
 
 - [ ] Add a single-host deployment with constrained Docker access.
+- [ ] Provision the documented APFS or LVM execution-storage pool and surface capability failures in worker health.
 - [ ] Run the frozen runtime conformance suite against Docker, Podman, and Apptainer where available.
 - [ ] Implement operator commands for workers, executions, queue state, and cleanup health.
 
@@ -146,6 +165,7 @@
 
 - [ ] Demonstrate manifest → persisted execution → worker → worktree → Docker/services → Pi → events/artifacts → cleanup.
 - [ ] Demonstrate crash resume and independent review isolation.
+- [ ] Demonstrate aggregate disk exhaustion is contained by the execution filesystem and cannot mutate shared mirrors or another execution.
 - [ ] Assert forbidden prune/xargs/model-placement patterns are absent.
 - [ ] Run `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] Record evidence for every invariant and all unavailable external-runtime tests.
