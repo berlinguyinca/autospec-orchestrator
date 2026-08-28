@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete after review fix round 4. The Pi 0.84.3 harness now launches only
+Complete after review fix round 5. The Pi 0.84.3 harness now launches only
 inside its provisioned agent container through argument-separated `docker exec`,
 using `/workspace` and `/session` container paths and one compact materialized
 `TaskPacket`. The authoritative live JSON event stream is captured durably on
@@ -35,16 +35,16 @@ creates the process group, and emits one trusted control record before executing
 Pi. The host removes that record from the event stream and retains the PGID only
 in memory. Root `docker exec` control commands signal that trusted PGID, while
 bounded drop cleanup uses `try_wait`, TERM, and KILL without an indefinite wait.
-If the supervisor header is invalid, unreadable, or times out, the host first
-terminates and reaps the Docker exec client, then recovers trusted group identity
-from a per-launch environment token and reaps the process group and descendants.
-Token cleanup polls through a stable absence window, so an accepted exec with
-delayed `/proc` visibility cannot escape. Group reap uses Linux `/proc` PGID and
-non-zombie membership rather than `kill -0`; zombie-only groups no longer block
-stop, drop, or startup cleanup, and the harness does not depend on a PID 1 reaper.
-The durable live
-event file, reducer/cursor, owner, and resume count all stay in the host-private
-session root; only `session_root/conversation/` is mounted at `/session`.
+The supervisor now emits a token-bound PGID header and blocks before Pi exec on
+an interactive stdin acknowledgment. The host sends that ACK only after header
+validation and event-pump registration; invalid, unreadable, timed-out, or
+thread-spawn startup failures close the channel, so no accepted future launch can
+enter the Pi body. The removed token-free stability heuristic is no longer part
+of correctness. Group reap uses Linux `/proc` PGID and non-zombie membership
+rather than `kill -0`; zombie-only groups no longer block stop, drop, or startup
+cleanup, and the harness does not depend on a PID 1 reaper. The durable live event
+file, reducer/cursor, owner, and resume count all stay in the host-private session
+root; only `session_root/conversation/` is mounted at `/session`.
 
 ## Commits
 
@@ -56,6 +56,8 @@ session root; only `session_root/conversation/` is mounted at `/session`.
 - `fb59162` — review fix round 4 zombie-aware reap, delayed-start cleanup, and
   exact message normalization.
 - `96d3a68` — widen delayed-start stability under parallel Docker load.
+- `65dc4ae` — replace startup heuristics with the token-bound ACK gate and remove
+  public test injection controls.
 - Report commit — this report.
 
 ## Tests
@@ -77,7 +79,9 @@ session root; only `session_root/conversation/` is mounted at `/session`.
   are accepted only after every runnable descendant is gone across stop, drop,
   and startup failure, deterministically delays `/proc` visibility after an
   event-thread spawn failure, and verifies undeclared `message` records increase
-  the unknown counter.
+  the unknown counter. Round-5 coverage delays Docker acceptance, injects a
+  reader failure, and proves through a body marker that Pi never executes after
+  the host returns a startup error.
 - `cargo test -p orchestrator-worker --test health` — 3 passed; half-window
   inactivity warning/reset, inactivity and wall-clock failures, and sustained
   CPU saturation.
