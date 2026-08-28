@@ -98,6 +98,94 @@ pub(crate) async fn run_with_cancel(
     outcome
 }
 
+pub(crate) async fn run_adopted_with_cancel(
+    worker: &Worker,
+    execution: &Execution,
+    cancelled: &AtomicBool,
+) -> Result<ExecutionResult, WorkerError> {
+    let attempt_id = execution
+        .attempt_id
+        .as_ref()
+        .ok_or_else(|| WorkerError::Invalid("execution lacks attempt authority".into()))?;
+    let worker_id = execution
+        .worker_id
+        .as_ref()
+        .ok_or_else(|| WorkerError::Invalid("execution lacks worker authority".into()))?;
+    worker
+        .cleanup_authorities
+        .begin(&execution.id, attempt_id, worker_id)
+        .await
+        .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+    let mut guard = CleanupGuard::new(worker.lifecycle.clone(), execution);
+    let mut tracked = execution.clone();
+    let attempted = AssertUnwindSafe(adopt_inner(worker, &mut tracked, &mut guard, cancelled))
+        .catch_unwind()
+        .await;
+    let mut outcome = match attempted {
+        Ok(outcome) => outcome,
+        Err(panic) => Err(WorkerError::Panic(panic_message(panic))),
+    };
+    let mut cleanup_errors = Vec::new();
+    if outcome.is_err() && !tracked.state.is_terminal() {
+        if let Err(error) = persist_failure(worker, &mut tracked, FailureClass::WorkerLost).await {
+            cleanup_errors.push(error.to_string());
+        }
+    }
+    let cleanup_complete = match guard.cleanup().await {
+        Ok(()) => true,
+        Err(error) => {
+            cleanup_errors.push(error.to_string());
+            false
+        }
+    };
+    if cleanup_complete {
+        if let Err(error) = worker.reservations.release(&execution.id).await {
+            cleanup_errors.push(error.to_string());
+        } else if let Err(error) = worker.cleanup_authorities.resolve(&execution.id).await {
+            cleanup_errors.push(error.to_string());
+        }
+    }
+    if !cleanup_errors.is_empty() {
+        let cleanup = cleanup_errors.join("; ");
+        outcome = match outcome {
+            Ok(_) => Err(WorkerError::Cleanup(cleanup)),
+            Err(error) => Err(WorkerError::ExecutionAndCleanup {
+                execution: error.to_string(),
+                cleanup,
+            }),
+        };
+    }
+    outcome
+}
+
+async fn adopt_inner(
+    worker: &Worker,
+    execution: &mut Execution,
+    guard: &mut CleanupGuard,
+    cancelled: &AtomicBool,
+) -> Result<ExecutionResult, WorkerError> {
+    if execution.state != ExecutionState::Running {
+        return Err(WorkerError::Invalid(format!(
+            "execution {} is {:?}, not RUNNING",
+            execution.id, execution.state
+        )));
+    }
+    let adopted = worker.lifecycle.adopt(execution).await?;
+    guard.receipt = Some(adopted.receipt);
+    guard.worktree = Some(adopted.worktree.clone());
+    guard.runtime_created = true;
+    guard.session = Some(adopted.session.clone());
+    drive_running(
+        worker,
+        execution,
+        guard,
+        cancelled,
+        &adopted.worktree,
+        &adopted.session,
+    )
+    .await
+}
+
 async fn run_inner(
     worker: &Worker,
     execution: &mut Execution,
@@ -147,6 +235,17 @@ async fn run_inner(
     execution
         .transition(ExecutionState::Running)
         .map_err(|error| WorkerError::Invalid(error.to_string()))?;
+    drive_running(worker, execution, guard, cancelled, &worktree, &session).await
+}
+
+async fn drive_running(
+    worker: &Worker,
+    execution: &mut Execution,
+    guard: &mut CleanupGuard,
+    cancelled: &AtomicBool,
+    worktree: &git_worktree::Worktree,
+    session: &harness_traits::SessionRef,
+) -> Result<ExecutionResult, WorkerError> {
     let mut health = HealthMonitor::default_at(Instant::now());
     'events: loop {
         if cancelled.load(Ordering::SeqCst) {
@@ -162,7 +261,7 @@ async fn run_inner(
             }
         };
         let events = tokio::select! {
-            events = worker.lifecycle.poll(execution, &session) => events?,
+            events = worker.lifecycle.poll(execution, session) => events?,
             () = cancellation => {
                 persist_cancelled(worker, execution).await?;
                 return Err(WorkerError::Cancelled);
@@ -208,7 +307,7 @@ async fn run_inner(
         }
     }
     guard.stop_agent().await?;
-    let capture = worker.lifecycle.capture(&worktree).await?;
+    let capture = worker.lifecycle.capture(worktree).await?;
     let artifact = worker
         .lifecycle
         .persist_evidence(execution, &capture)

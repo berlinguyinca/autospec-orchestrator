@@ -2,7 +2,7 @@ use crate::{ExecutionLifecycle, WorkerError};
 use execution_storage::AllocationReceipt;
 use git_worktree::Worktree;
 use harness_traits::SessionRef;
-use orchestrator_core::{Execution, PersistenceMode};
+use orchestrator_core::Execution;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,21 +58,19 @@ impl CleanupGuard {
             .map_err(WorkerError::from)?;
             self.runtime_created = false;
         }
-        if self.execution.manifest.persistence != PersistenceMode::Resumable {
-            if let Some(worktree) = self.worktree.as_ref().cloned() {
-                tokio::time::timeout(CLEANUP_TIMEOUT, self.lifecycle.destroy_worktree(&worktree))
-                    .await
-                    .map_err(|_| WorkerError::Cleanup("timed out destroying worktree".into()))?
-                    .map_err(WorkerError::from)?;
-                self.worktree = None;
-            }
-            if let Some(receipt) = self.receipt.as_ref().cloned() {
-                tokio::time::timeout(CLEANUP_TIMEOUT, self.lifecycle.release_storage(&receipt))
-                    .await
-                    .map_err(|_| WorkerError::Cleanup("timed out releasing storage".into()))?
-                    .map_err(WorkerError::from)?;
-                self.receipt = None;
-            }
+        if let Some(worktree) = self.worktree.as_ref().cloned() {
+            tokio::time::timeout(CLEANUP_TIMEOUT, self.lifecycle.destroy_worktree(&worktree))
+                .await
+                .map_err(|_| WorkerError::Cleanup("timed out destroying worktree".into()))?
+                .map_err(WorkerError::from)?;
+            self.worktree = None;
+        }
+        if let Some(receipt) = self.receipt.as_ref().cloned() {
+            tokio::time::timeout(CLEANUP_TIMEOUT, self.lifecycle.release_storage(&receipt))
+                .await
+                .map_err(|_| WorkerError::Cleanup("timed out releasing storage".into()))?
+                .map_err(WorkerError::from)?;
+            self.receipt = None;
         }
         Ok(())
     }

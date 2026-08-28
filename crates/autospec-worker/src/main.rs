@@ -12,11 +12,12 @@ use orchestrator_core::{
     WorkerCapabilityProof, WorkerId, API_VERSION,
 };
 use orchestrator_persistence::{
-    PgCleanupAuthorityStore, PgExecutionStore, PgReservationStore, ReservationStore,
+    CleanupAuthorityStore, ExecutionStore, PgCleanupAuthorityStore, PgExecutionStore,
+    PgReservationStore, ReservationStore,
 };
 use orchestrator_worker::{
-    ExecutionTask, FilesystemEvidenceStore, SystemExecutionLifecycle, VerifiedDockerRuntimeFactory,
-    VerifiedPiHarnessFactory, Worker,
+    ExecutionTask, FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
+    VerifiedDockerRuntimeFactory, VerifiedPiHarnessFactory, Worker,
 };
 use runtime_docker::TrustedVerifierImage;
 use std::{
@@ -119,13 +120,18 @@ async fn main() -> Result<()> {
         trusted_verifier,
     ));
     let harnesses = Arc::new(VerifiedPiHarnessFactory::new(
-        verifier,
+        verifier.clone(),
         PathBuf::from(&cli.docker_binary),
         cli.pi_executable.clone(),
         vec!["read".into(), "bash".into(), "edit".into(), "write".into()],
         Vec::new(),
     ));
     let lifecycle = Arc::new(SystemExecutionLifecycle::new(
+        SystemRecoveryConfig {
+            state_root: cli.state_root.clone(),
+            verifier: verifier.clone(),
+            docker_binary: PathBuf::from(&cli.docker_binary),
+        },
         storage,
         worktrees,
         runtimes,
@@ -134,9 +140,9 @@ async fn main() -> Result<()> {
     ));
     let execution_worker = Arc::new(Worker::new(
         lifecycle,
-        executions,
+        executions.clone(),
         reservations.clone(),
-        cleanup,
+        cleanup.clone(),
     ));
     let token = Secret(cli.worker_token);
     let client = reqwest::Client::builder()
@@ -157,6 +163,28 @@ async fn main() -> Result<()> {
     let mut backoff = Duration::from_secs(1);
     let mut heartbeat_due = tokio::time::Instant::now();
     let mut tasks: Vec<ExecutionTask> = Vec::new();
+    for authority in cleanup.list_for_worker(&worker.id).await? {
+        let execution = executions.get(&authority.execution_id).await?;
+        if execution.worker_id.as_ref() != Some(&worker.id)
+            || execution.attempt_id.as_ref() != Some(&authority.attempt_id)
+            || execution.state != orchestrator_core::ExecutionState::Running
+            || authority.phase != "PI_STARTED"
+        {
+            anyhow::bail!(
+                "unresolved cleanup authority for {} cannot be adopted safely at phase {}",
+                authority.execution_id,
+                authority.phase
+            );
+        }
+        tracing::info!(
+            worker_id = %worker.id,
+            execution_id = %execution.id,
+            attempt_id = %authority.attempt_id,
+            session_id = ?execution.session_id,
+            "adopting durable Pi execution after worker restart"
+        );
+        tasks.push(execution_worker.clone().spawn_adopted(execution));
+    }
     loop {
         let mut index = tasks.len();
         while index > 0 {

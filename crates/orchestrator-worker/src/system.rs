@@ -1,7 +1,8 @@
-use crate::{ExecutionLifecycle, LifecycleError};
+use crate::{AdoptedExecution, ExecutionLifecycle, LifecycleError};
 use async_trait::async_trait;
 use execution_storage::{
-    AllocationReceipt, AllocationRequest, ExecutionStorageManager, ReadyAllocationVerifier,
+    AllocationPhase, AllocationReceipt, AllocationRequest, ExecutionLayout,
+    ExecutionLifecycleHoldStore, ExecutionStorageManager, JournalStore, ReadyAllocationVerifier,
 };
 use git_worktree::{DiffCapture, Worktree, WorktreeManager};
 use harness_pi::{PiHarness, PiHarnessConfig};
@@ -9,6 +10,7 @@ use harness_traits::{AgentHarness, SessionRef};
 use orchestrator_core::{Execution, ExecutionEvent, ExecutionId, TaskPacket};
 use runtime_docker::{DockerRuntime, TrustedVerifierImage};
 use runtime_traits::{EnvironmentHandle, Runtime};
+use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
@@ -267,6 +269,9 @@ fn validate_evidence_component(value: &str, purpose: &str) -> Result<(), Lifecyc
 /// Production composition of the worker lifecycle's independently testable
 /// storage, Git, runtime, harness, and evidence boundaries.
 pub struct SystemExecutionLifecycle {
+    state_root: PathBuf,
+    verifier: Arc<dyn ReadyAllocationVerifier>,
+    docker_binary: PathBuf,
     storage: Arc<dyn ExecutionStorageManager>,
     worktrees: Arc<dyn WorktreeManager>,
     runtimes: Arc<dyn RuntimeFactory>,
@@ -276,8 +281,16 @@ pub struct SystemExecutionLifecycle {
     active_harnesses: Mutex<BTreeMap<ExecutionId, Arc<dyn AgentHarness>>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SystemRecoveryConfig {
+    pub state_root: PathBuf,
+    pub verifier: Arc<dyn ReadyAllocationVerifier>,
+    pub docker_binary: PathBuf,
+}
+
 impl SystemExecutionLifecycle {
     pub fn new(
+        recovery: SystemRecoveryConfig,
         storage: Arc<dyn ExecutionStorageManager>,
         worktrees: Arc<dyn WorktreeManager>,
         runtimes: Arc<dyn RuntimeFactory>,
@@ -285,6 +298,9 @@ impl SystemExecutionLifecycle {
         evidence: Arc<dyn EvidenceStore>,
     ) -> Self {
         Self {
+            state_root: recovery.state_root,
+            verifier: recovery.verifier,
+            docker_binary: recovery.docker_binary,
             storage,
             worktrees,
             runtimes,
@@ -312,6 +328,131 @@ impl SystemExecutionLifecycle {
             .cloned()
             .ok_or_else(|| LifecycleError::Step(format!("harness is not active for {id}")))
     }
+}
+
+#[derive(Deserialize)]
+struct DurableWorktreeOwner {
+    labels: BTreeMap<String, String>,
+    base_sha: String,
+    branch: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerContainerInspect {
+    id: String,
+    state: DockerContainerState,
+    config: DockerContainerConfig,
+    mounts: Vec<DockerContainerMount>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerContainerState {
+    running: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerContainerConfig {
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerContainerMount {
+    #[serde(rename = "Type")]
+    mount_type: String,
+    source: PathBuf,
+    destination: String,
+    #[serde(rename = "RW")]
+    writable: bool,
+}
+
+fn docker_container_capability(
+    docker: &Path,
+    receipt: &AllocationReceipt,
+    layout: &ExecutionLayout,
+    container_id: &str,
+) -> Result<runtime_traits::VerifiedAgentContainer, LifecycleError> {
+    let daemon = Command::new(docker)
+        .args(["info", "--format={{.ID}}"])
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !daemon.status.success()
+        || String::from_utf8_lossy(&daemon.stdout).trim() != receipt.docker_bind.daemon_id
+    {
+        return Err(LifecycleError::Step(
+            "Docker daemon identity changed during restart adoption".into(),
+        ));
+    }
+    let output = Command::new(docker)
+        .args(["inspect", "--type", "container", container_id])
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !output.status.success() {
+        return Err(LifecycleError::Step(
+            "durable Pi container is unavailable during restart adoption".into(),
+        ));
+    }
+    let mut inspections: Vec<DockerContainerInspect> = serde_json::from_slice(&output.stdout)
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if inspections.len() != 1 {
+        return Err(LifecycleError::Step(
+            "Docker returned an ambiguous container inspection".into(),
+        ));
+    }
+    let inspection = inspections.pop().expect("length checked");
+    if inspection.id != container_id
+        || !inspection.state.running
+        || inspection.config.labels != receipt.labels.to_map()
+    {
+        return Err(LifecycleError::Step(
+            "durable Pi container authority changed during restart adoption".into(),
+        ));
+    }
+    let mut mounts = Vec::with_capacity(inspection.mounts.len());
+    for mount in inspection.mounts {
+        if mount.mount_type != "bind" {
+            return Err(LifecycleError::Step(
+                "adopted agent container has a non-bind mount".into(),
+            ));
+        }
+        mounts.push(runtime_traits::VerifiedBindMount {
+            source: mount
+                .source
+                .canonicalize()
+                .map_err(|error| LifecycleError::Step(error.to_string()))?,
+            target: mount.destination,
+            writable: mount.writable,
+        });
+    }
+    mounts.sort();
+    let expected_repository = layout
+        .repository
+        .canonicalize()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    let expected_conversation = layout
+        .conversation
+        .canonicalize()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !mounts.iter().any(|mount| {
+        mount.source == expected_repository && mount.target == "/workspace" && mount.writable
+    }) || !mounts.iter().any(|mount| {
+        mount.source == expected_conversation && mount.target == "/session" && mount.writable
+    }) || mounts.iter().any(|mount| mount.source == layout.session)
+    {
+        return Err(LifecycleError::Step(
+            "adopted agent container mounts do not match durable execution layout".into(),
+        ));
+    }
+    Ok(runtime_traits::VerifiedAgentContainer {
+        container_id: container_id.into(),
+        daemon_id: receipt.docker_bind.daemon_id.clone(),
+        labels: receipt.labels.clone(),
+        mounts,
+    })
 }
 
 #[async_trait]
@@ -383,6 +524,30 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         worktree: &Worktree,
         packet: &TaskPacket,
     ) -> Result<SessionRef, LifecycleError> {
+        let packet_directory = Path::new(&worktree.path).join(".autospec");
+        match std::fs::create_dir(&packet_directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(&packet_directory)
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(LifecycleError::Step(
+                        "TaskPacket staging path is not a real directory".into(),
+                    ));
+                }
+            }
+            Err(error) => return Err(LifecycleError::Step(error.to_string())),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&packet_directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        }
+        self.verifier
+            .verify_ready(receipt)
+            .and_then(|verified| verified.verify_directory(&packet_directory))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
         let harness = self
             .harnesses
             .build(execution, receipt, environment, worktree)
@@ -489,6 +654,122 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             .await
             .map_err(|error| LifecycleError::Step(error.to_string()))?
             .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn adopt(&self, execution: &Execution) -> Result<AdoptedExecution, LifecycleError> {
+        let session_id = execution
+            .session_id
+            .clone()
+            .ok_or_else(|| LifecycleError::Step("running execution lacks session id".into()))?;
+        let layout = ExecutionLayout::new(&self.state_root, &execution.id)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        if execution.worktree_path.as_deref() != Some(layout.repository.to_string_lossy().as_ref())
+        {
+            return Err(LifecycleError::Step(
+                "persisted worktree path differs from allocation layout".into(),
+            ));
+        }
+        let journal = JournalStore::new(&self.state_root)
+            .and_then(|journals| journals.read(&layout))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let receipt = journal.receipt.ok_or_else(|| {
+            LifecycleError::Step("storage journal lacks a durable allocation receipt".into())
+        })?;
+        if journal.phase != AllocationPhase::Ready
+            || receipt.labels != execution.labels
+            || receipt.mount_path != layout.root
+        {
+            return Err(LifecycleError::Step(
+                "storage allocation is not the exact durable Ready authority".into(),
+            ));
+        }
+        let ready = self
+            .verifier
+            .verify_ready(&receipt)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        ready
+            .verify()
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+
+        let owner: DurableWorktreeOwner = serde_json::from_slice(
+            &std::fs::read(layout.repository.join(".autospec-owner.json"))
+                .map_err(|error| LifecycleError::Step(error.to_string()))?,
+        )
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let branch = execution
+            .manifest
+            .repository
+            .branch
+            .as_deref()
+            .ok_or_else(|| LifecycleError::Step("execution lacks durable branch".into()))?;
+        if owner.labels != execution.labels.to_map() || owner.branch != branch {
+            return Err(LifecycleError::Step(
+                "Git owner record differs from persisted execution authority".into(),
+            ));
+        }
+        let worktree = Worktree {
+            execution_id: execution.id.clone(),
+            path: layout.repository.to_string_lossy().into_owned(),
+            branch: owner.branch,
+            base_sha: owner.base_sha,
+            repository: execution.manifest.repository.repo.clone(),
+        };
+
+        let holds = ExecutionLifecycleHoldStore::new(&self.state_root)
+            .and_then(|holds| holds.list(&execution.id))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let matching: Vec<_> = holds
+            .into_iter()
+            .filter(|hold| {
+                hold.labels == execution.labels && hold.session_id == session_id.as_str()
+            })
+            .collect();
+        if matching.len() != 1 {
+            return Err(LifecycleError::Step(format!(
+                "restart adoption requires exactly one matching Pi lifecycle hold, found {}",
+                matching.len()
+            )));
+        }
+        let container_id = matching[0].container_id.clone();
+        let container =
+            docker_container_capability(&self.docker_binary, &receipt, &layout, &container_id)?;
+        let environment = EnvironmentHandle {
+            execution_id: execution.id.clone(),
+            network: DockerRuntime::network_name(&execution.id),
+            agent_container: DockerRuntime::agent_container_name(&execution.id),
+            verified_agent_container: container,
+            service_containers: Vec::new(),
+            volumes: Vec::new(),
+            credentials_path: None,
+        };
+        let runtime = self.runtimes.build(execution, &receipt).await?;
+        let harness = self
+            .harnesses
+            .build(execution, &receipt, &environment, &worktree)
+            .await?;
+        let session = SessionRef {
+            id: session_id,
+            path: layout.session.to_string_lossy().into_owned(),
+            execution_id: execution.id.clone(),
+            worktree_path: layout.repository.to_string_lossy().into_owned(),
+        };
+        harness
+            .resume(&session)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        self.active_runtimes
+            .lock()
+            .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
+            .insert(execution.id.clone(), runtime);
+        self.active_harnesses
+            .lock()
+            .map_err(|_| LifecycleError::Step("harness registry lock poisoned".into()))?
+            .insert(execution.id.clone(), harness);
+        Ok(AdoptedExecution {
+            receipt,
+            worktree,
+            session,
+        })
     }
 }
 

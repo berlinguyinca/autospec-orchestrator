@@ -14,7 +14,7 @@ use orchestrator_persistence::{
     CleanupAuthority, CleanupAuthorityStore, ExecutionStore, Reservation, ReservationStore,
     StoreError,
 };
-use orchestrator_worker::{ExecutionLifecycle, LifecycleError, Worker};
+use orchestrator_worker::{AdoptedExecution, ExecutionLifecycle, LifecycleError, Worker};
 use runtime_traits::{EnvironmentHandle, VerifiedAgentContainer};
 use std::sync::{Arc, Mutex};
 
@@ -290,6 +290,65 @@ impl ExecutionLifecycle for FakeLifecycle {
             Ok(())
         }
     }
+    async fn adopt(&self, execution: &Execution) -> Result<AdoptedExecution, LifecycleError> {
+        self.step("adopt")?;
+        Ok(AdoptedExecution {
+            receipt: receipt(execution),
+            worktree: Worktree {
+                execution_id: execution.id.clone(),
+                path: "/allocation/repository".into(),
+                branch: "task".into(),
+                base_sha: "abc".into(),
+                repository: "owner/repo".into(),
+            },
+            session: SessionRef {
+                id: execution
+                    .session_id
+                    .clone()
+                    .ok_or_else(|| LifecycleError::Step("missing session".into()))?,
+                path: "/allocation/session".into(),
+                execution_id: execution.id.clone(),
+                worktree_path: "/allocation/repository".into(),
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn restart_adoption_reuses_attempt_session_and_skips_all_creation_steps() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::clone(&order),
+        fail_at: None,
+        poll_empty: false,
+        cleanup_fail: false,
+        hang_poll: false,
+    });
+    let store = Arc::new(FakeStore::default());
+    let reservations = Arc::new(FakeReservations::default());
+    let mut execution = execution();
+    execution.manifest.persistence = PersistenceMode::Resumable;
+    execution.state = ExecutionState::Running;
+    execution.session_id = Some(SessionId::new("durable-session"));
+    execution.worktree_path = Some("/allocation/repository".into());
+    store.insert(&execution).await.unwrap();
+    let worker = Arc::new(worker(lifecycle, store, reservations));
+
+    worker.spawn_adopted(execution).join().await.unwrap();
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec![
+            "adopt",
+            "pi-poll",
+            "pi-stop",
+            "git-capture",
+            "persist-evidence",
+            "docker-destroy",
+            "git-destroy",
+            "storage-release"
+        ]
+    );
 }
 
 #[tokio::test]

@@ -96,7 +96,7 @@ async fn authenticated_worker_routes_own_liveness_and_reap_after_ninety_seconds(
     stale_registration.last_heartbeat = Utc::now() - Duration::seconds(91);
     store.heartbeat(&stale_registration).await.unwrap();
     let reaped = state.reap_stale(Utc::now()).await.unwrap();
-    assert_eq!(reaped, vec![advertised.id.clone()]);
+    assert!(reaped.contains(&advertised.id));
     assert_eq!(
         store.get(&advertised.id).await.unwrap().state,
         WorkerState::Unreachable

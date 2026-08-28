@@ -376,6 +376,7 @@ async fn provision_inner(
             Config {
                 image: Some(image.to_owned()),
                 cmd: Some(vec!["sleep".to_owned(), "infinity".to_owned()]),
+                user: Some("0:0".to_owned()),
                 env: Some(vec![
                     "HOME=/home/autospec".to_owned(),
                     "TMPDIR=/tmp".to_owned(),
@@ -1022,7 +1023,7 @@ pub(crate) fn writable_container_mounts(
 fn make_container_writable(path: &Path) -> Result<(), RuntimeError> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o1777)).map_err(|error| {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
         RuntimeError::Provisioning(format!(
             "make container bind directory writable {}: {error}",
             path.display()

@@ -10,7 +10,8 @@ pub use health::{HealthAssessment, HealthMonitor};
 pub use recovery::{RecoveryAuthority, RecoveryCoordinator, RecoveryDisposition};
 pub use system::{
     EvidenceStore, FilesystemEvidenceStore, HarnessFactory, RuntimeFactory,
-    SystemExecutionLifecycle, VerifiedDockerRuntimeFactory, VerifiedPiHarnessFactory,
+    SystemExecutionLifecycle, SystemRecoveryConfig, VerifiedDockerRuntimeFactory,
+    VerifiedPiHarnessFactory,
 };
 
 use async_trait::async_trait;
@@ -96,6 +97,19 @@ pub trait ExecutionLifecycle: Send + Sync {
     async fn destroy_runtime(&self, execution: &Execution) -> Result<(), LifecycleError>;
     async fn destroy_worktree(&self, worktree: &Worktree) -> Result<(), LifecycleError>;
     async fn release_storage(&self, receipt: &AllocationReceipt) -> Result<(), LifecycleError>;
+
+    async fn adopt(&self, _execution: &Execution) -> Result<AdoptedExecution, LifecycleError> {
+        Err(LifecycleError::Step(
+            "execution lifecycle does not support restart adoption".into(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdoptedExecution {
+    pub receipt: AllocationReceipt,
+    pub worktree: Worktree,
+    pub session: SessionRef,
 }
 
 #[derive(Clone)]
@@ -151,6 +165,15 @@ impl Worker {
         let task_cancelled = Arc::clone(&cancelled);
         let join = tokio::spawn(async move {
             run::run_with_cancel(&self, &execution, task_cancelled.as_ref()).await
+        });
+        ExecutionTask { cancelled, join }
+    }
+
+    pub fn spawn_adopted(self: Arc<Self>, execution: Execution) -> ExecutionTask {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::clone(&cancelled);
+        let join = tokio::spawn(async move {
+            run::run_adopted_with_cancel(&self, &execution, task_cancelled.as_ref()).await
         });
         ExecutionTask { cancelled, join }
     }
