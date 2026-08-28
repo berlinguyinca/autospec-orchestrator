@@ -28,7 +28,6 @@ struct TrustedCaptureContext {
     work_tree: PathBuf,
     mirror: LockedMirror,
     object_database: VerifiedObjectDirectory,
-    has_index: bool,
     temp_objects: Option<SecureMetadataDirectory>,
     temp_refs: Option<SecureMetadataDirectory>,
     has_config: bool,
@@ -213,7 +212,6 @@ impl TrustedCaptureContext {
             name,
             mirror,
             object_database,
-            has_index: false,
             temp_objects: None,
             temp_refs: None,
             has_config: config.is_some(),
@@ -246,7 +244,6 @@ impl TrustedCaptureContext {
                 &context,
                 [OsStr::new("read-tree"), OsStr::new(&worktree.base_sha)],
             )?;
-            context.has_index = true;
             context
                 .directory
                 .restrict_file_to_owner("index")
@@ -298,12 +295,12 @@ impl TrustedCaptureContext {
 
     fn cleanup(&self) -> Result<(), String> {
         let mut errors = Vec::new();
-        if self.has_index {
-            if let Err(error) = self.directory.restrict_file_to_owner("index") {
-                errors.push(format!("restrict index: {error}"));
+        for name in ["index.lock", "index"] {
+            if let Err(error) = self.directory.remove_tool_file(name) {
+                errors.push(format!("remove {name}: {error}"));
             }
         }
-        for name in ["config", "HEAD", "index"] {
+        for name in ["config", "HEAD"] {
             if name == "config" && !self.has_config {
                 continue;
             }

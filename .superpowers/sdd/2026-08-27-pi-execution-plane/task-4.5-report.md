@@ -133,6 +133,15 @@ consume a verified allocation receipt.
 - Metadata-subdirectory creation is transactional after the direct child is
   created. Injected parent-fsync and child-pinning failures remove only the
   exact inode just created before returning the original failure.
+- Metadata-subdirectory rollback now begins with the first post-creation child
+  inspection. Injected child-metadata failure removes only the exact new child
+  while an unrelated sibling and its contents remain unchanged.
+- Trusted evidence contexts own both Git-produced `index` and `index.lock`
+  artifacts before `read-tree` starts. Failure cleanup opens each optional file
+  with no-follow semantics, verifies the opened inode, restricts it through the
+  descriptor, and exact-removes it before removing the capture directory. A
+  fake Git ENOSPC regression leaves permissive partial files and proves restart
+  cleanup removes them without touching a foreign metadata sibling.
 - The storage manager's full `verify_ready(receipt)` transition check runs a
   second time immediately before the first clone write. A stateful verifier
   regression proves a receipt that leaves Ready after preparation cannot write
@@ -257,12 +266,12 @@ polling loops, or `du`/`df` accounting.
 
 ## Verification
 
-- `cargo test -p git-worktree` — 57 real temporary Git repository tests passed,
+- `cargo test -p git-worktree` — 58 real temporary Git repository tests passed,
   including hostile Git environments, independent Git-path containment, mirror
   immutability/substitution rejection, receipt binding, create-intent recovery,
   phase-specific ENOSPC rollback, safe diff capture, pre-Git commondir rejection,
   exact cleanup, foreign-resource survival, and stale discovery.
-- `cargo test -p execution-storage -- --nocapture` — 38 passed. The real Docker
+- `cargo test -p execution-storage -- --nocapture` — 39 passed. The real Docker
   bind verifier contract ran. The destructive aggregate quota lifecycle printed
   an explicit skip because no operator pool is configured on this host; when
   configured it performs create, identity proof, substantial successful writes,
@@ -275,7 +284,7 @@ polling loops, or `du`/`df` accounting.
   `cargo clippy --workspace --all-targets -- -D warnings` — passed, including
   all real-Docker runtime tests.
 - Rust 1.85 ran the same full fmt/build/test/clippy workspace matrix — passed,
-  including all 57 Git tests and all 13 real-Docker runtime tests.
+  including all 58 Git tests and all 13 real-Docker runtime tests.
 - The first current-toolchain workspace test attempt saw the existing
   five-second `harness-pi` drop-bound test exceed its timing threshold under
   concurrent Docker load. The isolated retry passed in 4.76 seconds, and the

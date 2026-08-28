@@ -2461,6 +2461,95 @@ fn capture_diff_ignores_synchronized_execution_object_database_mutation() {
     assert!(capture.patch.contains("+untracked"));
 }
 
+#[cfg(unix)]
+#[test]
+fn capture_diff_removes_partial_trusted_index_after_read_tree_enospc() {
+    const CHILD: &str = "AUTOSPEC_PARTIAL_TRUSTED_INDEX_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "capture_diff_removes_partial_trusted_index_after_read_tree_enospc",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated partial-index test");
+        assert!(
+            output.status.success(),
+            "partial-index child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-partial-index", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-partial-index",
+        )
+        .expect("create worktree");
+    let metadata_root = state.path().join("worktrees");
+    let foreign = metadata_root.join("foreign-safe");
+    std::fs::create_dir(&foreign).expect("create foreign metadata directory");
+    std::fs::write(foreign.join("sentinel"), "still safe\n").expect("write foreign sentinel");
+    let fake_ran = state.path().join("partial-index-created");
+    let bin = tempfile::tempdir().expect("wrapper bin");
+    let wrapper = bin.path().join("git");
+    let real_git = real_git_program();
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ngit_dir=\nnext_is_git_dir=0\nfor arg do\n  if [ \"$next_is_git_dir\" = 1 ]; then git_dir=$arg; next_is_git_dir=0; fi\n  if [ \"$arg\" = --git-dir ]; then next_is_git_dir=1; fi\ndone\ncase \" $* \" in\n  *' read-tree '*)\n    printf 'partial index' > \"$git_dir/index\"\n    printf 'partial lock' > \"$git_dir/index.lock\"\n    chmod 0644 \"$git_dir/index\"\n    chmod 0666 \"$git_dir/index.lock\"\n    touch '{}'\n    printf 'No space left on device\\n' >&2\n    exit 28\n    ;;\nesac\nexec '{}' \"$@\"\n",
+            fake_ran.display(),
+            real_git.display()
+        ),
+    )
+    .expect("write partial-index Git wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+        .expect("make Git wrapper executable");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&original_path)),
+    )
+    .expect("wrapper PATH");
+    std::env::set_var("PATH", &path);
+
+    let error = manager
+        .capture_diff(&worktree)
+        .expect_err("surface read-tree ENOSPC");
+    std::env::set_var("PATH", original_path);
+
+    assert!(
+        fake_ran.exists(),
+        "fake Git did not create partial index files"
+    );
+    assert!(matches!(
+        error,
+        WorktreeError::Diff(_) | WorktreeError::StorageFull(_)
+    ));
+    let captures: Vec<_> = std::fs::read_dir(&metadata_root)
+        .expect("read metadata root")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".capture-"))
+        .collect();
+    assert!(
+        captures.is_empty(),
+        "partial trusted capture artifacts leaked: {captures:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(foreign.join("sentinel")).expect("read foreign sentinel"),
+        "still safe\n"
+    );
+}
+
 #[test]
 fn capture_diff_refuses_owner_record_outside_execution_path() {
     let repository = TestRepository::new();

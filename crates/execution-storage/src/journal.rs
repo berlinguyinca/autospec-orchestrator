@@ -131,20 +131,43 @@ impl SecureMetadataDirectory {
         self.directory.sync()
     }
 
+    /// Restricts and removes an optional real direct-child file created by a trusted host tool.
+    #[cfg(unix)]
+    pub fn remove_tool_file(&self, name: &str) -> Result<(), StorageError> {
+        validate_metadata_name(name)?;
+        self.directory.verify("metadata directory")?;
+        if self.directory.child_metadata(name)?.is_none() {
+            return Ok(());
+        }
+        self.restrict_file_to_owner(name)?;
+        self.remove(name)
+    }
+
     /// Creates and pins one owner-only direct child beneath this directory.
     #[cfg(unix)]
     pub fn create_subdirectory(&self, name: &str) -> Result<Self, StorageError> {
-        self.create_subdirectory_with(name, PinnedDirectory::sync, |path| Self::new(path))
+        self.create_subdirectory_with(
+            name,
+            |directory, child| {
+                directory.child_metadata(child)?.ok_or_else(|| {
+                    StorageError::IdentityMismatch("metadata subdirectory disappeared".to_owned())
+                })
+            },
+            PinnedDirectory::sync,
+            |path| Self::new(path),
+        )
     }
 
     #[cfg(unix)]
-    fn create_subdirectory_with<Sync, Pin>(
+    fn create_subdirectory_with<Metadata, Sync, Pin>(
         &self,
         name: &str,
+        inspect_child: Metadata,
         sync_parent: Sync,
         pin_child: Pin,
     ) -> Result<Self, StorageError>
     where
+        Metadata: FnOnce(&PinnedDirectory, &str) -> Result<fs::Metadata, StorageError>,
         Sync: FnOnce(&PinnedDirectory) -> Result<(), StorageError>,
         Pin: FnOnce(&Path) -> Result<Self, StorageError>,
     {
@@ -155,11 +178,10 @@ impl SecureMetadataDirectory {
                 "metadata subdirectory already exists: {name}"
             )));
         }
-        self.directory.create_directory_unsynced(name)?;
-        let expected = self.directory.child_metadata(name)?.ok_or_else(|| {
-            StorageError::IdentityMismatch("metadata subdirectory disappeared".to_owned())
-        })?;
+        let expected = self.directory.create_directory_unsynced(name)?;
         let result = (|| {
+            let observed = inspect_child(&self.directory, name)?;
+            verify_directory_identity(&expected, &observed, "metadata subdirectory")?;
             sync_parent(&self.directory)?;
             let child = pin_child(&self.directory.path.join(name))?;
             let opened = child
@@ -582,19 +604,40 @@ impl PinnedDirectory {
 
     #[cfg(unix)]
     pub(crate) fn create_directory(&self, name: &str) -> Result<(), StorageError> {
-        self.create_directory_unsynced(name)?;
+        let _ = self.create_directory_unsynced(name)?;
         self.sync()
     }
 
     #[cfg(unix)]
-    fn create_directory_unsynced(&self, name: &str) -> Result<(), StorageError> {
+    fn create_directory_unsynced(&self, name: &str) -> Result<fs::Metadata, StorageError> {
         use std::os::unix::fs::DirBuilderExt;
         let path = self.child_path(name)?;
         let mut builder = fs::DirBuilder::new();
         builder
             .mode(0o700)
             .create(&path)
-            .map_err(|error| journal_error("create directory", &path, error))
+            .map_err(|error| journal_error("create directory", &path, error))?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(metadata),
+            Ok(_) => {
+                let cleanup = fs::remove_dir(&path);
+                Err(match cleanup {
+                    Ok(()) => StorageError::IdentityMismatch(
+                        "new metadata child is not a real directory".to_owned(),
+                    ),
+                    Err(error) => journal_error("remove invalid new directory", &path, error),
+                })
+            }
+            Err(error) => {
+                let inspection = journal_error("inspect new directory", &path, error);
+                Err(match fs::remove_dir(&path) {
+                    Ok(()) => inspection,
+                    Err(cleanup) => StorageError::Journal(format!(
+                        "{inspection}; remove uninspected new directory failed: {cleanup}"
+                    )),
+                })
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -756,6 +799,25 @@ fn verify_opened_identity(
     Ok(())
 }
 
+#[cfg(unix)]
+fn verify_directory_identity(
+    expected: &fs::Metadata,
+    actual: &fs::Metadata,
+    purpose: &str,
+) -> Result<(), StorageError> {
+    if actual.file_type().is_symlink()
+        || !actual.is_dir()
+        || expected.dev() != actual.dev()
+        || expected.ino() != actual.ino()
+        || expected.uid() != actual.uid()
+    {
+        return Err(StorageError::IdentityMismatch(format!(
+            "{purpose} identity changed"
+        )));
+    }
+    Ok(())
+}
+
 fn journal_name(layout: &ExecutionLayout) -> Result<String, StorageError> {
     layout
         .journal
@@ -821,6 +883,13 @@ mod tests {
         let error = metadata
             .create_subdirectory_with(
                 "capture-fsync-failure",
+                |directory, name| {
+                    directory.child_metadata(name)?.ok_or_else(|| {
+                        StorageError::IdentityMismatch(
+                            "metadata subdirectory disappeared".to_owned(),
+                        )
+                    })
+                },
                 |_| {
                     Err(StorageError::Journal(
                         "injected parent fsync failure".to_owned(),
@@ -839,16 +908,55 @@ mod tests {
         let (root, metadata) = metadata_directory();
 
         let error = metadata
-            .create_subdirectory_with("capture-pin-failure", PinnedDirectory::sync, |_| {
-                Err::<SecureMetadataDirectory, _>(StorageError::IdentityMismatch(
-                    "injected child pin failure".to_owned(),
-                ))
-            })
+            .create_subdirectory_with(
+                "capture-pin-failure",
+                |directory, name| {
+                    directory.child_metadata(name)?.ok_or_else(|| {
+                        StorageError::IdentityMismatch(
+                            "metadata subdirectory disappeared".to_owned(),
+                        )
+                    })
+                },
+                PinnedDirectory::sync,
+                |_| {
+                    Err::<SecureMetadataDirectory, _>(StorageError::IdentityMismatch(
+                        "injected child pin failure".to_owned(),
+                    ))
+                },
+            )
             .expect_err("surface injected child pin failure");
 
         assert!(
             matches!(error, StorageError::IdentityMismatch(message) if message.contains("injected"))
         );
         assert!(!root.path().join("capture-pin-failure").exists());
+    }
+
+    #[test]
+    fn subdirectory_creation_metadata_failure_removes_only_the_created_child() {
+        let (root, metadata) = metadata_directory();
+        let foreign = root.path().join("foreign");
+        fs::create_dir(&foreign).expect("create foreign directory");
+        fs::write(foreign.join("sentinel"), b"still safe").expect("write foreign sentinel");
+
+        let error = metadata
+            .create_subdirectory_with(
+                "capture-metadata-failure",
+                |_, _| {
+                    Err(StorageError::Journal(
+                        "injected child metadata failure".to_owned(),
+                    ))
+                },
+                PinnedDirectory::sync,
+                |path| SecureMetadataDirectory::new(path),
+            )
+            .expect_err("surface injected metadata failure");
+
+        assert!(matches!(error, StorageError::Journal(message) if message.contains("injected")));
+        assert!(!root.path().join("capture-metadata-failure").exists());
+        assert_eq!(
+            fs::read(foreign.join("sentinel")).expect("read foreign sentinel"),
+            b"still safe"
+        );
     }
 }
