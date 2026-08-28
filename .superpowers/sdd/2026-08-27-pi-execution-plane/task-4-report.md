@@ -55,6 +55,7 @@ session root; only `session_root/conversation/` is mounted at `/session`.
   startup-failure cleanup.
 - `fb59162` — review fix round 4 zombie-aware reap, delayed-start cleanup, and
   exact message normalization.
+- `96d3a68` — widen delayed-start stability under parallel Docker load.
 - Report commit — this report.
 
 ## Tests
