@@ -49,6 +49,10 @@ orphans without deleting them.
   aggregates every error, fails the test on any cleanup error, and marks its
   guard clean only after complete success. Unwind cleanup is non-panicking and
   emits the same aggregate diagnostics.
+- The unwind path uses fallible `std::thread::Builder::spawn`, handles thread
+  creation, Tokio runtime creation, selector cleanup, and join failures, and
+  writes diagnostics through ignored-result `std::io::Write` calls. It contains
+  no `panic!`, `expect`, `unwrap`, direct `thread::spawn`, or `eprintln!` path.
 - Pinned compatible transitive lockfile releases so the workspace still checks
   with its declared Rust 1.85 toolchain after adding Bollard.
 
@@ -91,16 +95,21 @@ ownership, a real-Docker failure-injection test held one execution volume and on
 control volume under independently owned containers. The first cleanup returned
 both selector failures and kept the guard armed; after cleaning the blocker
 selectors, the retry succeeded.
+The final static regression first failed on direct `std::thread::spawn` and
+`eprintln!` in `Drop`. The replacement retains the concrete error from thread
+creation, runtime construction, thread panic payloads, and the aggregate returned
+by both selector destroys, while stderr write failures are deliberately ignored
+so cleanup cannot cause a second panic during unwinding.
 
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo build --workspace` — passed.
 - `cargo test --workspace -- --nocapture` — passed with normal test concurrency;
-  real Docker tests: 10 passed, 0 skipped. PostgreSQL tests printed their existing explicit
+  real Docker tests: 11 passed, 0 skipped. PostgreSQL tests printed their existing explicit
   skips because `AUTOSPEC_DATABASE_URL` was unset.
 - Two simultaneous `cargo test -p runtime-docker --test docker_runtime --
-  --nocapture` processes — both passed 10/10 with no name collisions.
+  --nocapture` processes — both passed 11/11 with no name collisions.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed.
 - `cargo +1.85.0 check --workspace` — passed.
 - `git diff --check` — passed.

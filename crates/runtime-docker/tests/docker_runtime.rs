@@ -12,8 +12,10 @@ use orchestrator_core::{
 use runtime_docker::{host_limits, DockerRuntime, DEFAULT_PIDS_LIMIT};
 use runtime_traits::Runtime;
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
+    io::Write,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -105,22 +107,44 @@ impl Drop for DockerTestScope {
         }
         let runtime = self.runtime.clone();
         let labels = self.labels.clone();
-        let cleanup = std::thread::spawn(move || {
-            let Ok(tokio_runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return Err("build Tokio runtime for Docker test cleanup".to_owned());
-            };
-            tokio_runtime.block_on(cleanup_test_resources(&runtime, &labels))
-        })
-        .join();
+        let cleanup_thread = std::thread::Builder::new()
+            .name("runtime-docker-test-cleanup".to_owned())
+            .spawn(move || {
+                let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("create cleanup Tokio runtime: {error}"))?;
+                tokio_runtime.block_on(cleanup_test_resources(&runtime, &labels))
+            });
+        let cleanup = match cleanup_thread {
+            Ok(thread) => thread.join().map_err(thread_panic_message),
+            Err(error) => {
+                write_cleanup_diagnostic(&format!("create cleanup thread: {error}"));
+                return;
+            }
+        };
         match cleanup {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => eprintln!("Docker test cleanup failed: {error}"),
-            Err(_) => eprintln!("Docker test cleanup thread panicked"),
+            Ok(Err(error)) => write_cleanup_diagnostic(&error),
+            Err(error) => write_cleanup_diagnostic(&error),
         }
     }
+}
+
+fn thread_panic_message(payload: Box<dyn Any + Send>) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload");
+    format!("cleanup thread panicked: {message}")
+}
+
+fn write_cleanup_diagnostic(message: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(b"Docker test cleanup failed: ");
+    let _ = stderr.write_all(message.as_bytes());
+    let _ = stderr.write_all(b"\n");
 }
 
 async fn cleanup_test_resources(
@@ -173,6 +197,41 @@ fn control_resources_use_only_distinct_contract_ownership_labels() {
         support_labels.get(labels::EXECUTION_ID),
         Some(&execution_labels.execution_id.to_string())
     );
+}
+
+#[test]
+fn unwind_cleanup_uses_only_fallible_thread_and_diagnostic_operations() {
+    let source = include_str!("docker_runtime.rs");
+    let scope_implementation = source
+        .split_once("struct DockerTestScope")
+        .expect("scope has a Drop implementation")
+        .1
+        .split_once("#[test]\nfn execution_ids_are_scoped_to_the_test_process")
+        .expect("scope helpers precede tests")
+        .0;
+    let drop_implementation = scope_implementation
+        .split_once("impl Drop for DockerTestScope")
+        .expect("scope has a Drop implementation")
+        .1
+        .split_once("fn thread_panic_message")
+        .expect("diagnostic helpers follow Drop")
+        .0;
+
+    assert!(!drop_implementation.contains("std::thread::spawn("));
+    assert!(!scope_implementation.contains(concat!("eprint", "ln!")));
+    assert!(!drop_implementation.contains(".expect("));
+    assert!(!drop_implementation.contains(".unwrap("));
+    assert!(!drop_implementation.contains("panic!("));
+    assert!(drop_implementation.contains("std::thread::Builder::new()"));
+    assert!(drop_implementation.contains("write_cleanup_diagnostic"));
+    assert!(scope_implementation.contains("stderr.write_all"));
+    for diagnostic in [
+        "create cleanup thread",
+        "create cleanup Tokio runtime",
+        "cleanup thread panicked",
+    ] {
+        assert!(scope_implementation.contains(diagnostic));
+    }
 }
 
 fn raw_client() -> Result<Docker, bollard::errors::Error> {
