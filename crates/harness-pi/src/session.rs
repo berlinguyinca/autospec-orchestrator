@@ -24,7 +24,8 @@ pub(crate) const CONVERSATION_DIR: &str = "conversation";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
-const STARTUP_STABILITY_WINDOW: Duration = Duration::from_secs(1);
+const STARTUP_STABILITY_WINDOW: Duration = Duration::from_secs(5);
+const STARTUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(12);
 const SUPERVISOR: &str = r#"printf '{"type":"autospec_control","pgid":%s}\n' "$$"; exec "$@""#;
 const GROUP_HAS_RUNNABLE: &str = r#"target=$1
 for stat_file in /proc/[0-9]*/stat; do
@@ -535,7 +536,7 @@ fn cleanup_token_authority_stable(
     container: &str,
     token: &str,
 ) -> Result<(), HarnessError> {
-    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    let deadline = Instant::now() + STARTUP_CLEANUP_TIMEOUT;
     let mut stable_since = None;
     while Instant::now() < deadline {
         let pgids = derive_token_pgids(docker_binary, container, token)?;
