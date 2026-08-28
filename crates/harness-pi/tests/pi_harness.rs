@@ -83,7 +83,7 @@ impl DockerPi {
         let container = format!("autospec-pi-test-{}-{nonce}-{sequence}", std::process::id());
         let labels = labels(&execution_id);
         let status = Command::new("docker")
-            .args(["create", "--init", "--name", &container])
+            .args(["create", "--name", &container])
             .args(
                 labels
                     .to_map()
@@ -146,6 +146,8 @@ impl DockerPi {
             tools: vec!["read".to_owned(), "bash".to_owned(), "edit".to_owned()],
             skills: vec![],
             stop_timeout: Duration::from_millis(250),
+            event_thread_stack_size: None,
+            event_thread_spawn_delay: Duration::ZERO,
         })
     }
 
@@ -172,6 +174,35 @@ impl DockerPi {
         } else {
             fs::write(second_path, second).unwrap();
         }
+    }
+
+    fn delayed_docker_wrapper(&self) -> PathBuf {
+        let docker = Command::new("sh")
+            .args(["-c", "command -v docker"])
+            .output()
+            .unwrap();
+        assert!(docker.status.success());
+        let docker = String::from_utf8(docker.stdout).unwrap();
+        let wrapper = self.root.path().join("delayed-docker");
+        fs::write(
+            &wrapper,
+            format!(
+                r#"#!/bin/sh
+real_docker={docker:?}
+case "$1 $2 $3" in
+  "exec --env AUTOSPEC_SUPERVISOR_TOKEN="*)
+    (trap '' HUP TERM; sleep 0.4; command=$1; shift; exec "$real_docker" "$command" --detach "$@") </dev/null >/dev/null 2>&1 &
+    wait $!
+    ;;
+  *) exec "$real_docker" "$@" ;;
+esac
+"#,
+                docker = docker.trim()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        wrapper
     }
 
     fn remove_container(&mut self) {
@@ -202,7 +233,7 @@ fn labels(execution_id: &str) -> OwnershipLabels {
 }
 
 async fn wait_for_content(path: &Path, needle: &str) -> String {
-    for _ in 0..200 {
+    for _ in 0..500 {
         if let Ok(contents) = fs::read_to_string(path) {
             if contents.contains(needle) {
                 return contents;
@@ -234,6 +265,58 @@ fn pi_is_alive(fixture: &DockerPi) -> bool {
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains("/usr/local/bin/pi")
         })
+}
+
+async fn wait_for_pi_pgid(fixture: &DockerPi) -> u32 {
+    let path = fixture.conversation_dir().join("test-pgid");
+    for _ in 0..500 {
+        if let Ok(contents) = fs::read_to_string(&path) {
+            if let Ok(pgid) = contents.trim().parse() {
+                return pgid;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for Pi PGID in {}", path.display());
+}
+
+fn group_states(fixture: &DockerPi, pgid: u32) -> Vec<String> {
+    let output = Command::new("docker")
+        .args([
+            "exec",
+            "--user",
+            "root",
+            &fixture.container,
+            "/bin/sh",
+            "-c",
+            r#"target=$1
+for stat_file in /proc/[0-9]*/stat; do
+  stat=$(cat "$stat_file" 2>/dev/null) || continue
+  rest=${stat##*) }
+  set -- $rest
+  [ "$3" = "$target" ] && printf '%s\n' "$1"
+done
+exit 0"#,
+            "test-group-states",
+            &pgid.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn assert_zombie_only_group(fixture: &DockerPi, pgid: u32) {
+    let states = group_states(fixture, pgid);
+    assert!(!states.is_empty(), "expected unreaped zombie group {pgid}");
+    assert!(
+        states.iter().all(|state| state == "Z"),
+        "group {pgid} still has runnable members: {states:?}"
+    );
 }
 
 #[tokio::test]
@@ -280,7 +363,7 @@ async fn live_event_stdout_is_incremental_and_distinct_from_durable_conversation
         ExecutionEventKind::AgentStarted { .. }
     ));
     assert!(matches!(first[1].kind, ExecutionEventKind::ReviewReady));
-    assert_eq!(harness.unknown_event_count(), 1);
+    assert_eq!(harness.unknown_event_count(), 2);
     let live_jsonl = fs::read_to_string(&events_path).unwrap();
     assert!(live_jsonl.starts_with("{\"type\":\"session\""));
     assert!(!live_jsonl.contains("autospec_control"));
@@ -442,6 +525,37 @@ async fn supervisor_header_timeout_reaps_started_pi_and_descendant() {
     startup_handshake_failure_reaps("handshake-timeout").await;
 }
 
+#[tokio::test]
+async fn reader_thread_spawn_failure_reaps_a_delayed_in_container_process_group() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
+    let mut config = fixture.harness().config().clone();
+    config.docker_binary = fixture.delayed_docker_wrapper();
+    config.event_thread_stack_size = Some(1usize << 50);
+    config.event_thread_spawn_delay = Duration::from_millis(100);
+    let harness = PiHarness::new(config);
+    let started = Instant::now();
+    let result = harness.start(&packet()).await;
+    let pgid = wait_for_pi_pgid(&fixture).await;
+    assert!(matches!(result.unwrap_err(), HarnessError::Start(_)));
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(
+        !pi_is_alive(&fixture),
+        "delayed Pi survived cleanup: {}",
+        String::from_utf8_lossy(
+            &Command::new("docker")
+                .args(["top", &fixture.container, "-eo", "pid,pgid,stat,args"])
+                .output()
+                .unwrap()
+                .stdout
+        )
+    );
+    assert_zombie_only_group(&fixture, pgid);
+}
+
 async fn startup_handshake_failure_reaps(failure: &str) {
     let Some(fixture) = DockerPi::create() else {
         return;
@@ -450,12 +564,12 @@ async fn startup_handshake_failure_reaps(failure: &str) {
     fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
     let harness = fixture.harness();
     let started = Instant::now();
-    assert!(matches!(
-        harness.start(&packet()).await.unwrap_err(),
-        HarnessError::Start(_)
-    ));
+    let result = harness.start(&packet()).await;
+    let pgid = wait_for_pi_pgid(&fixture).await;
+    assert!(matches!(result.unwrap_err(), HarnessError::Start(_)));
     assert!(started.elapsed() < Duration::from_secs(20));
     assert!(!pi_is_alive(&fixture));
+    assert_zombie_only_group(&fixture, pgid);
 }
 
 #[tokio::test]
@@ -553,12 +667,14 @@ async fn resume_rejects_malformed_complete_record_but_truncates_only_a_torn_tail
 }
 
 #[tokio::test]
-async fn stop_duplicate_and_drop_terminate_the_in_container_process_group() {
+async fn stop_and_duplicate_terminate_the_in_container_process_group() {
     let Some(fixture) = DockerPi::create() else {
         return;
     };
+    fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
     let harness = fixture.harness();
     let session = harness.start(&packet()).await.unwrap();
+    let first_pgid = wait_for_pi_pgid(&fixture).await;
     wait_for_content(&fixture.conversation_dir().join("arguments"), "--mode json").await;
     assert!(pi_is_alive(&fixture));
     assert!(matches!(
@@ -571,13 +687,7 @@ async fn stop_duplicate_and_drop_terminate_the_in_container_process_group() {
     harness.stop(&session).await.unwrap();
     assert!(started.elapsed() <= Duration::from_secs(5));
     assert!(!pi_is_alive(&fixture));
-
-    fs::remove_file(fixture.conversation_dir().join("ignore-term")).unwrap();
-    harness.resume(&session).await.unwrap();
-    wait_for_content(&fixture.conversation_dir().join("arguments"), "--mode json").await;
-    assert!(pi_is_alive(&fixture));
-    drop(harness);
-    assert!(!pi_is_alive(&fixture));
+    assert_zombie_only_group(&fixture, first_pgid);
 }
 
 #[tokio::test]
@@ -620,6 +730,7 @@ async fn drop_is_bounded_when_a_descendant_ignores_term_and_pi_forges_control_fi
     fs::write(fixture.root.path().join("worktree/hung-descendant"), "").unwrap();
     let harness = fixture.harness();
     harness.start(&packet()).await.unwrap();
+    let pgid = wait_for_pi_pgid(&fixture).await;
     wait_for_content(
         &fixture.conversation_dir().join("pi-process-forged"),
         "999999",
@@ -641,6 +752,7 @@ async fn drop_is_bounded_when_a_descendant_ignores_term_and_pi_forges_control_fi
         "ProcessRegistry::drop exceeded its five-second bound"
     );
     assert!(!pi_is_alive(&fixture));
+    assert_zombie_only_group(&fixture, pgid);
 }
 
 #[tokio::test]
@@ -682,6 +794,10 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
+stat=$(cat /proc/$$/stat)
+rest=${stat##*) }
+set -- $rest
+printf '%s\n' "$3" > "$session_dir/test-pgid"
 printf '%s\n' "$all_args" > "$session_dir/arguments"
 if [ -z "$session_id" ] && [ -n "$source_session" ]; then
   session_id=$(sed -n '1s/.*"id":"\([^"]*\)".*/\1/p' "$source_session")

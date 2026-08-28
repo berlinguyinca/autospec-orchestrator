@@ -8,4 +8,5 @@
 {"type":"agent_end","messages":[],"willRetry":false}
 {"type":"agent_settled"}
 {"type":"queue_update","steering":[],"followUp":[]}
+{"type":"message","message":{"role":"assistant","content":[]}}
 {"type":"future_pi_record","prompt":"never-log-this"}

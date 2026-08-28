@@ -131,7 +131,7 @@ fn normalize(session: &SessionRef, record: &Value, reducer: &mut ReducerState) -
         "done" => return settle(session, reducer),
         "agent_settled" => return settle(session, reducer),
         "model_error" => return model_failed(session, reducer),
-        "message_end" | "message" => {
+        "message_end" => {
             if is_assistant_message(record) {
                 reducer.pending_model_error = is_model_error(record);
             }

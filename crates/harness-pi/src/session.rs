@@ -24,10 +24,19 @@ pub(crate) const CONVERSATION_DIR: &str = "conversation";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const STARTUP_STABILITY_WINDOW: Duration = Duration::from_secs(1);
 const SUPERVISOR: &str = r#"printf '{"type":"autospec_control","pgid":%s}\n' "$$"; exec "$@""#;
-const TOKEN_CONTROL: &str = r#"token=$1
-action=$2
-found=0
+const GROUP_HAS_RUNNABLE: &str = r#"target=$1
+for stat_file in /proc/[0-9]*/stat; do
+  stat=$(cat "$stat_file" 2>/dev/null) || continue
+  rest=${stat##*) }
+  set -- $rest
+  state=$1
+  pgid=$3
+  [ "$pgid" = "$target" ] && [ "$state" != Z ] && exit 0
+done
+exit 1"#;
+const TOKEN_PGIDS: &str = r#"token=$1
 for environment in /proc/[0-9]*/environ; do
   [ -r "$environment" ] || continue
   if tr '\000' '\n' < "$environment" 2>/dev/null | grep -Fqx "AUTOSPEC_SUPERVISOR_TOKEN=$token"; then
@@ -36,17 +45,11 @@ for environment in /proc/[0-9]*/environ; do
     stat=$(cat "/proc/$pid/stat" 2>/dev/null) || continue
     rest=${stat##*) }
     set -- $rest
+    state=$1
     pgid=$3
-    case "$action" in
-      CHECK) kill -0 "-$pgid" 2>/dev/null && found=1 ;;
-      DERIVE) printf '%s\n' "$pgid" ;;
-      TERM) kill -TERM "-$pgid" 2>/dev/null || : ;;
-      KILL) kill -KILL "-$pgid" 2>/dev/null || : ;;
-      *) exit 2 ;;
-    esac
+    [ "$state" = Z ] || printf '%s\n' "$pgid"
   fi
-done
-[ "$action" != CHECK ] || [ "$found" -eq 1 ]"#;
+done"#;
 static SUPERVISOR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,44 +227,44 @@ pub(crate) fn spawn(
     let (control_tx, control_rx) = mpsc::sync_channel(1);
     let pump_docker = harness.config.docker_binary.clone();
     let pump_container = harness.config.agent_container.clone();
-    if let Err(error) = thread::Builder::new()
-        .name(format!("pi-events-{}", session.id))
-        .spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut header = String::new();
-            let control = reader
-                .read_line(&mut header)
-                .map_err(|error| error.to_string())
-                .and_then(|length| {
-                    if length == 0 {
-                        Err("supervisor exited before its control record".to_owned())
-                    } else {
-                        parse_supervisor_header(&header)
-                    }
-                });
-            let valid = control.is_ok();
-            let pgid = control.as_ref().ok().copied();
-            if control_tx.send(control).is_ok() && valid {
-                let mut events = events;
-                if let Err(error) = io::copy(&mut reader, &mut events) {
-                    if let Some(pgid) = pgid {
-                        let cleanup = cleanup_container_authority(
-                            &pump_docker,
-                            &pump_container,
-                            Some(pgid),
-                            "",
-                        );
-                        tracing::error!(
-                            error = %error,
-                            cleanup_error = cleanup.err().map(|failure| failure.to_string()),
-                            "Pi event reader failed; terminated its process group"
-                        );
-                    }
+    let mut event_thread = thread::Builder::new().name(format!("pi-events-{}", session.id));
+    if let Some(stack_size) = harness.config.event_thread_stack_size {
+        event_thread = event_thread.stack_size(stack_size);
+    }
+    if !harness.config.event_thread_spawn_delay.is_zero() {
+        thread::sleep(harness.config.event_thread_spawn_delay);
+    }
+    if let Err(error) = event_thread.spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut header = String::new();
+        let control = reader
+            .read_line(&mut header)
+            .map_err(|error| error.to_string())
+            .and_then(|length| {
+                if length == 0 {
+                    Err("supervisor exited before its control record".to_owned())
+                } else {
+                    parse_supervisor_header(&header)
                 }
-                let _ = events.flush();
+            });
+        let valid = control.is_ok();
+        let pgid = control.as_ref().ok().copied();
+        if control_tx.send(control).is_ok() && valid {
+            let mut events = events;
+            if let Err(error) = io::copy(&mut reader, &mut events) {
+                if let Some(pgid) = pgid {
+                    let cleanup =
+                        cleanup_container_authority(&pump_docker, &pump_container, Some(pgid), "");
+                    tracing::error!(
+                        error = %error,
+                        cleanup_error = cleanup.err().map(|failure| failure.to_string()),
+                        "Pi event reader failed; terminated its process group"
+                    );
+                }
             }
-        })
-    {
+            let _ = events.flush();
+        }
+    }) {
         cleanup_failed_start(harness, &supervisor_token, None, &mut child)?;
         return Err(HarnessError::Start(error.to_string()));
     }
@@ -440,7 +443,23 @@ fn container_group_alive_with(
     container: &str,
     pgid: u32,
 ) -> Result<bool, HarnessError> {
-    Ok(run_control_command(docker_binary, container, pgid, "0")?.success())
+    let mut command = Command::new(docker_binary);
+    command
+        .args([
+            "exec",
+            "--user",
+            "root",
+            container,
+            "/bin/sh",
+            "-c",
+            GROUP_HAS_RUNNABLE,
+            "autospec-pi-group-liveness",
+        ])
+        .arg(pgid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(run_command_bounded(&mut command, CONTROL_TIMEOUT)?.success())
 }
 
 fn run_control_command(
@@ -469,50 +488,34 @@ fn run_control_command(
     run_command_bounded(&mut command, CONTROL_TIMEOUT)
 }
 
-fn run_token_control_command(
-    docker_binary: &Path,
-    container: &str,
-    token: &str,
-    action: &str,
-) -> Result<ExitStatus, HarnessError> {
-    let mut command = Command::new(docker_binary);
-    command
-        .args([
-            "exec",
-            "--user",
-            "root",
-            container,
-            "/bin/sh",
-            "-c",
-            TOKEN_CONTROL,
-            "autospec-pi-token-control",
-            token,
-            action,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    run_command_bounded(&mut command, CONTROL_TIMEOUT)
-}
-
 fn cleanup_failed_start(
     harness: &PiHarness,
     token: &str,
     pgid: Option<u32>,
     child: &mut std::process::Child,
 ) -> Result<(), HarnessError> {
+    let client = terminate_host_child(child, CONTROL_TIMEOUT);
     let cleanup = cleanup_container_authority(
         &harness.config.docker_binary,
         &harness.config.agent_container,
         pgid,
         token,
     );
-    terminate_host_child(child, CONTROL_TIMEOUT);
-    cleanup.map_err(|error| {
-        HarnessError::Start(format!(
-            "failed to reap Pi after supervisor handshake failure: {error}"
-        ))
-    })
+    match (client, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (client, cleanup) => Err(HarnessError::Start(format!(
+            "failed startup cleanup: docker client={}; Pi authority={}",
+            cleanup_result(client),
+            cleanup_result(cleanup)
+        ))),
+    }
+}
+
+fn cleanup_result(result: Result<(), HarnessError>) -> String {
+    match result {
+        Ok(()) => "reaped".to_owned(),
+        Err(error) => error.to_string(),
+    }
 }
 
 fn cleanup_container_authority(
@@ -521,30 +524,35 @@ fn cleanup_container_authority(
     pgid: Option<u32>,
     token: &str,
 ) -> Result<(), HarnessError> {
-    if pgid.is_none() {
+    if let Some(pgid) = pgid {
+        return cleanup_process_groups(docker_binary, container, &[pgid]);
+    }
+    cleanup_token_authority_stable(docker_binary, container, token)
+}
+
+fn cleanup_token_authority_stable(
+    docker_binary: &Path,
+    container: &str,
+    token: &str,
+) -> Result<(), HarnessError> {
+    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    let mut stable_since = None;
+    while Instant::now() < deadline {
         let pgids = derive_token_pgids(docker_binary, container, token)?;
-        if !pgids.is_empty() {
-            return cleanup_process_groups(docker_binary, container, &pgids);
+        if pgids.is_empty() {
+            let since = stable_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= STARTUP_STABILITY_WINDOW {
+                return Ok(());
+            }
+        } else {
+            stable_since = None;
+            cleanup_process_groups(docker_binary, container, &pgids)?;
         }
+        thread::sleep(Duration::from_millis(20));
     }
-    signal_authority(docker_binary, container, pgid, token, "TERM")?;
-    if wait_for_authority_reap(
-        docker_binary,
-        container,
-        pgid,
-        token,
-        Duration::from_millis(250),
-    )? {
-        return Ok(());
-    }
-    signal_authority(docker_binary, container, pgid, token, "KILL")?;
-    if wait_for_authority_reap(docker_binary, container, pgid, token, KILL_REAP_TIMEOUT)? {
-        Ok(())
-    } else {
-        Err(HarnessError::Crashed(
-            "startup-failed Pi process group was not reaped".to_owned(),
-        ))
-    }
+    Err(HarnessError::Crashed(
+        "startup cleanup did not reach a stable token-free window".to_owned(),
+    ))
 }
 
 fn cleanup_process_groups(
@@ -604,10 +612,9 @@ fn derive_token_pgids(
             container,
             "/bin/sh",
             "-c",
-            TOKEN_CONTROL,
+            TOKEN_PGIDS,
             "autospec-pi-token-control",
             token,
-            "DERIVE",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -626,49 +633,6 @@ fn derive_token_pgids(
     pgids.sort_unstable();
     pgids.dedup();
     Ok(pgids)
-}
-
-fn signal_authority(
-    docker_binary: &Path,
-    container: &str,
-    pgid: Option<u32>,
-    token: &str,
-    signal: &str,
-) -> Result<(), HarnessError> {
-    if let Some(pgid) = pgid {
-        signal_container_group(docker_binary, container, pgid, signal)
-    } else {
-        let status = run_token_control_command(docker_binary, container, token, signal)?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(HarnessError::Crashed(format!(
-                "failed to signal startup process identified by token with {signal}"
-            )))
-        }
-    }
-}
-
-fn wait_for_authority_reap(
-    docker_binary: &Path,
-    container: &str,
-    pgid: Option<u32>,
-    token: &str,
-    timeout: Duration,
-) -> Result<bool, HarnessError> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let alive = if let Some(pgid) = pgid {
-            container_group_alive_with(docker_binary, container, pgid)?
-        } else {
-            run_token_control_command(docker_binary, container, token, "CHECK")?.success()
-        };
-        if !alive {
-            return Ok(true);
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    Ok(false)
 }
 
 fn container_group_alive(harness: &PiHarness, pgid: u32) -> Result<bool, HarnessError> {
@@ -765,15 +729,21 @@ fn run_command_capture_bounded(
     ))
 }
 
-fn terminate_host_child(child: &mut std::process::Child, timeout: Duration) {
+fn terminate_host_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<(), HarnessError> {
     let _ = child.kill();
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if child.try_wait().ok().flatten().is_some() {
-            return;
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(10));
     }
+    Err(HarnessError::Crashed(
+        "Docker exec client was not reaped after startup failure".to_owned(),
+    ))
 }
 
 #[derive(Deserialize)]

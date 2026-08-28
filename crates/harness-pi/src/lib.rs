@@ -33,6 +33,12 @@ pub struct PiHarnessConfig {
     /// Additional explicit skill paths. Package discovery remains disabled.
     pub skills: Vec<PathBuf>,
     pub stop_timeout: Duration,
+    /// Optional event-pump thread stack override for constrained hosts and failure testing.
+    #[doc(hidden)]
+    pub event_thread_stack_size: Option<usize>,
+    /// Optional launch-to-pump delay used by deterministic lifecycle tests.
+    #[doc(hidden)]
+    pub event_thread_spawn_delay: Duration,
 }
 
 impl PiHarnessConfig {
@@ -58,6 +64,8 @@ impl PiHarnessConfig {
             ],
             skills: Vec::new(),
             stop_timeout: Duration::from_secs(10),
+            event_thread_stack_size: None,
+            event_thread_spawn_delay: Duration::ZERO,
         }
     }
 }
