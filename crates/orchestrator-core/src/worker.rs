@@ -73,6 +73,16 @@ pub struct WorkerRegistration {
     pub capability_proof: Option<WorkerCapabilityProof>,
 }
 
+/// Worker-owned capability advertisement. Liveness, state, and running counts
+/// are intentionally absent because the controller owns those fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerAdvertisement {
+    pub id: WorkerId,
+    pub capabilities: WorkerCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_proof: Option<WorkerCapabilityProof>,
+}
+
 impl WorkerRegistration {
     pub fn has_capacity(&self) -> bool {
         self.state == WorkerState::Ready

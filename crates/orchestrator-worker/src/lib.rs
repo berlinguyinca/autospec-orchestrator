@@ -8,14 +8,17 @@ mod system;
 
 pub use health::{HealthAssessment, HealthMonitor};
 pub use recovery::{RecoveryAuthority, RecoveryCoordinator, RecoveryDisposition};
-pub use system::{EvidenceStore, HarnessFactory, RuntimeFactory, SystemExecutionLifecycle};
+pub use system::{
+    EvidenceStore, FilesystemEvidenceStore, HarnessFactory, RuntimeFactory,
+    SystemExecutionLifecycle, VerifiedDockerRuntimeFactory, VerifiedPiHarnessFactory,
+};
 
 use async_trait::async_trait;
 use execution_storage::AllocationReceipt;
 use git_worktree::{DiffCapture, Worktree};
 use harness_traits::SessionRef;
 use orchestrator_core::{Execution, ExecutionEvent, ExecutionResult, TaskPacket};
-use orchestrator_persistence::{ExecutionStore, ReservationStore};
+use orchestrator_persistence::{CleanupAuthorityStore, ExecutionStore, ReservationStore};
 use runtime_traits::EnvironmentHandle;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -81,6 +84,7 @@ pub trait ExecutionLifecycle: Send + Sync {
         execution: &Execution,
         session: &SessionRef,
     ) -> Result<Vec<ExecutionEvent>, LifecycleError>;
+    async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError>;
     async fn stop(&self, execution: &Execution, session: &SessionRef)
         -> Result<(), LifecycleError>;
     async fn capture(&self, worktree: &Worktree) -> Result<DiffCapture, LifecycleError>;
@@ -99,6 +103,7 @@ pub struct Worker {
     lifecycle: Arc<dyn ExecutionLifecycle>,
     executions: Arc<dyn ExecutionStore>,
     reservations: Arc<dyn ReservationStore>,
+    cleanup_authorities: Arc<dyn CleanupAuthorityStore>,
 }
 
 pub struct ExecutionTask {
@@ -116,6 +121,10 @@ impl ExecutionTask {
             .await
             .map_err(|error| WorkerError::Panic(error.to_string()))?
     }
+
+    pub fn is_finished(&self) -> bool {
+        self.join.is_finished()
+    }
 }
 
 impl Worker {
@@ -123,11 +132,13 @@ impl Worker {
         lifecycle: Arc<dyn ExecutionLifecycle>,
         executions: Arc<dyn ExecutionStore>,
         reservations: Arc<dyn ReservationStore>,
+        cleanup_authorities: Arc<dyn CleanupAuthorityStore>,
     ) -> Self {
         Self {
             lifecycle,
             executions,
             reservations,
+            cleanup_authorities,
         }
     }
 

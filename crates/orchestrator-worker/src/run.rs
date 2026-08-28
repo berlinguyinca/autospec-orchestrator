@@ -1,4 +1,7 @@
-use crate::{cleanup_guard::CleanupGuard, LifecycleError, Worker, WorkerError};
+use crate::{
+    cleanup_guard::CleanupGuard, HealthAssessment, HealthMonitor, LifecycleError, Worker,
+    WorkerError,
+};
 use chrono::Utc;
 use futures_util::FutureExt;
 use orchestrator_core::{
@@ -9,6 +12,7 @@ use std::{
     any::Any,
     panic::AssertUnwindSafe,
     sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 pub(crate) async fn run(
@@ -23,6 +27,19 @@ pub(crate) async fn run_with_cancel(
     execution: &Execution,
     cancelled: &AtomicBool,
 ) -> Result<ExecutionResult, WorkerError> {
+    let attempt_id = execution
+        .attempt_id
+        .as_ref()
+        .ok_or_else(|| WorkerError::Invalid("execution lacks attempt authority".into()))?;
+    let worker_id = execution
+        .worker_id
+        .as_ref()
+        .ok_or_else(|| WorkerError::Invalid("execution lacks worker authority".into()))?;
+    worker
+        .cleanup_authorities
+        .begin(&execution.id, attempt_id, worker_id)
+        .await
+        .map_err(|error| WorkerError::Persistence(error.to_string()))?;
     let mut guard = CleanupGuard::new(worker.lifecycle.clone(), execution);
     let mut tracked = execution.clone();
     let attempted = AssertUnwindSafe(run_inner(worker, &mut tracked, &mut guard, cancelled))
@@ -32,6 +49,7 @@ pub(crate) async fn run_with_cancel(
         Ok(outcome) => outcome,
         Err(panic) => Err(WorkerError::Panic(panic_message(panic))),
     };
+    let mut cleanup_errors = Vec::new();
     if outcome.is_err() && !tracked.state.is_terminal() {
         let failure = if !guard.runtime_created {
             FailureClass::EnvironmentFailed
@@ -40,14 +58,32 @@ pub(crate) async fn run_with_cancel(
         } else {
             FailureClass::Internal
         };
-        persist_failure(worker, &mut tracked, failure).await?;
+        if let Err(error) = persist_failure(worker, &mut tracked, failure).await {
+            cleanup_errors.push(error.to_string());
+        }
     }
-    let mut cleanup_errors = Vec::new();
-    if let Err(error) = guard.cleanup().await {
-        cleanup_errors.push(error.to_string());
-    }
-    if let Err(error) = worker.reservations.release(&execution.id).await {
-        cleanup_errors.push(error.to_string());
+    let cleanup_complete = match guard.cleanup().await {
+        Ok(()) => true,
+        Err(error) => {
+            cleanup_errors.push(error.to_string());
+            false
+        }
+    };
+    if cleanup_complete {
+        let reservation_released = match worker.reservations.release(&execution.id).await {
+            Ok(()) => true,
+            Err(error) => {
+                cleanup_errors.push(error.to_string());
+                false
+            }
+        };
+        if reservation_released {
+            if let Err(error) = worker.cleanup_authorities.resolve(&execution.id).await {
+                cleanup_errors.push(error.to_string());
+            }
+        } else {
+            cleanup_errors.push("cleanup authority retained for reservation recovery".into());
+        }
     }
     if !cleanup_errors.is_empty() {
         let cleanup = cleanup_errors.join("; ");
@@ -80,12 +116,14 @@ async fn run_inner(
     }
     let receipt = worker.lifecycle.allocate(execution).await?;
     guard.receipt = Some(receipt.clone());
+    advance_cleanup(worker, execution, "STORAGE_ALLOCATED").await?;
     let worktree = worker
         .lifecycle
         .create_worktree(execution, &receipt)
         .await?;
     execution.worktree_path = Some(worktree.path.clone());
     guard.worktree = Some(worktree.clone());
+    advance_cleanup(worker, execution, "WORKTREE_CREATED").await?;
     execution
         .transition(ExecutionState::Provisioning)
         .map_err(|error| WorkerError::Invalid(error.to_string()))?;
@@ -94,6 +132,7 @@ async fn run_inner(
         .provision(execution, &receipt, &worktree)
         .await?;
     guard.runtime_created = true;
+    advance_cleanup(worker, execution, "RUNTIME_CREATED").await?;
     record(worker, execution, ExecutionEventKind::EnvironmentReady).await?;
     let packet = execution.manifest.task_packet.as_ref().ok_or_else(|| {
         WorkerError::Invalid("execution manifest lacks compact TaskPacket".to_owned())
@@ -104,33 +143,52 @@ async fn run_inner(
         .await?;
     execution.session_id = Some(session.id.clone());
     guard.session = Some(session.clone());
+    advance_cleanup(worker, execution, "PI_STARTED").await?;
     execution
         .transition(ExecutionState::Running)
         .map_err(|error| WorkerError::Invalid(error.to_string()))?;
-    record(
-        worker,
-        execution,
-        ExecutionEventKind::AgentStarted {
-            session_id: session.id.clone(),
-        },
-    )
-    .await?;
-    let mut empty_polls = 0_u32;
+    let mut health = HealthMonitor::default_at(Instant::now());
     'events: loop {
         if cancelled.load(Ordering::SeqCst) {
             persist_cancelled(worker, execution).await?;
             return Err(WorkerError::Cancelled);
         }
-        let events = worker.lifecycle.poll(execution, &session).await?;
-        if events.is_empty() {
-            empty_polls += 1;
-            if empty_polls >= 1_000 {
-                return fail(worker, execution, FailureClass::Inactivity).await;
+        let cancellation = async {
+            loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            tokio::task::yield_now().await;
+        };
+        let events = tokio::select! {
+            events = worker.lifecycle.poll(execution, &session) => events?,
+            () = cancellation => {
+                persist_cancelled(worker, execution).await?;
+                return Err(WorkerError::Cancelled);
+            }
+        };
+        if events.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        } else {
+            health.record_event(Instant::now());
+        }
+        let cpu_percent = worker.lifecycle.cpu_percent(execution).await?;
+        match health.assess(Instant::now(), cpu_percent) {
+            HealthAssessment::Healthy => {}
+            HealthAssessment::InactiveWarning { seconds } => {
+                record(
+                    worker,
+                    execution,
+                    ExecutionEventKind::AgentInactive { seconds },
+                )
+                .await?;
+            }
+            HealthAssessment::Failed(failure) => return fail(worker, execution, failure).await,
+        }
+        if events.is_empty() {
             continue;
         }
-        empty_polls = 0;
         for mut event in events {
             match &event.kind {
                 ExecutionEventKind::ReviewReady => break 'events,
@@ -171,6 +229,18 @@ async fn run_inner(
     execution.result = Some(result.clone());
     record(worker, execution, ExecutionEventKind::ReviewReady).await?;
     Ok(result)
+}
+
+async fn advance_cleanup(
+    worker: &Worker,
+    execution: &Execution,
+    phase: &str,
+) -> Result<(), WorkerError> {
+    worker
+        .cleanup_authorities
+        .advance(&execution.id, phase)
+        .await
+        .map_err(|error| WorkerError::Persistence(error.to_string()))
 }
 
 async fn persist_cancelled(worker: &Worker, execution: &mut Execution) -> Result<(), WorkerError> {

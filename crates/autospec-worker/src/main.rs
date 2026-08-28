@@ -1,15 +1,39 @@
 //! `autospec-worker` — authenticated worker registration and heartbeat daemon.
 
 use anyhow::{Context, Result};
-use chrono::Utc;
-use clap::Parser;
-use orchestrator_core::{
-    RuntimeKind, WorkerCapabilities, WorkerCapabilityProof, WorkerId, WorkerRegistration,
-    WorkerState, API_VERSION,
+use clap::{Parser, ValueEnum};
+use execution_storage::{
+    ApfsBackend, DockerBindCapability, DockerBindProof, DockerBindVerifier, ExecutionStorage,
+    ExecutionStorageManager, LvmBackend, ProcessCommandRunner, StorageBackend, StorageError,
 };
-use std::{fmt, time::Duration};
+use git_worktree::GitWorktreeManager;
+use orchestrator_core::{
+    ExecutionId, OwnershipLabels, RuntimeKind, WorkerAdvertisement, WorkerCapabilities,
+    WorkerCapabilityProof, WorkerId, API_VERSION,
+};
+use orchestrator_persistence::{
+    PgCleanupAuthorityStore, PgExecutionStore, PgReservationStore, ReservationStore,
+};
+use orchestrator_worker::{
+    ExecutionTask, FilesystemEvidenceStore, SystemExecutionLifecycle, VerifiedDockerRuntimeFactory,
+    VerifiedPiHarnessFactory, Worker,
+};
+use runtime_docker::TrustedVerifierImage;
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
 
 struct Secret(String);
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum StorageKind {
+    Apfs,
+    Lvm,
+}
 
 impl fmt::Debug for Secret {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -36,16 +60,28 @@ struct Cli {
     memory_mib: u64,
     #[arg(long, default_value_t = 20)]
     disk_gib: u64,
+    #[arg(long, value_enum)]
+    storage_kind: StorageKind,
+    /// APFS probe path or LVM volume-group name; its identity is probed, not advertised verbatim.
     #[arg(long)]
-    storage_backend: Option<String>,
+    storage_pool: String,
+    /// Immutable verifier image ID (`sha256:<64 hex>`).
     #[arg(long)]
-    storage_pool_identity: Option<String>,
-    #[arg(long)]
-    docker_daemon_id: Option<String>,
-    #[arg(long)]
-    docker_verifier: Option<String>,
-    #[arg(long)]
-    docker_method_version: Option<String>,
+    docker_verifier_image: String,
+    #[arg(long, default_value = "/usr/bin/stat")]
+    docker_verifier_command: String,
+    #[arg(long, default_value = "docker")]
+    docker_binary: String,
+    #[arg(long, env = "AUTOSPEC_DATABASE_URL")]
+    database_url: String,
+    #[arg(long, env = "AUTOSPEC_STATE_ROOT", default_value = "/var/lib/autospec")]
+    state_root: PathBuf,
+    #[arg(long, default_value = "https://github.com")]
+    clone_base: String,
+    #[arg(long, env = "AUTOSPEC_DOCKER_SOCKET")]
+    docker_socket: Option<String>,
+    #[arg(long, default_value = "pi")]
+    pi_executable: String,
 }
 
 #[tokio::main]
@@ -56,7 +92,52 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    let mut worker = registration(&cli)?;
+    let storage = build_storage(&cli)?;
+    let proof = match probe_capabilities(&cli, storage.as_ref()) {
+        Ok(proof) => Some(proof),
+        Err(error) => {
+            tracing::error!(worker_id = %cli.worker_id, %error, "worker capability proof unavailable; advertising no runtime capacity");
+            None
+        }
+    };
+    let worker = advertisement(&cli, proof)?;
+    let executions = Arc::new(PgExecutionStore::connect(&cli.database_url).await?);
+    let reservations = Arc::new(PgReservationStore::connect(&cli.database_url).await?);
+    let cleanup = Arc::new(PgCleanupAuthorityStore::connect(&cli.database_url).await?);
+    let verifier: Arc<dyn execution_storage::ReadyAllocationVerifier> = storage.clone();
+    let worktrees = Arc::new(GitWorktreeManager::with_clone_base_and_verifier(
+        &cli.state_root,
+        &cli.clone_base,
+        verifier.clone(),
+    ));
+    let trusted_verifier =
+        TrustedVerifierImage::new(&cli.docker_verifier_image, &cli.docker_verifier_command)?;
+    let runtimes = Arc::new(VerifiedDockerRuntimeFactory::new(
+        cli.docker_socket.clone(),
+        PathBuf::from(&cli.docker_binary),
+        verifier.clone(),
+        trusted_verifier,
+    ));
+    let harnesses = Arc::new(VerifiedPiHarnessFactory::new(
+        verifier,
+        PathBuf::from(&cli.docker_binary),
+        cli.pi_executable.clone(),
+        vec!["read".into(), "bash".into(), "edit".into(), "write".into()],
+        Vec::new(),
+    ));
+    let lifecycle = Arc::new(SystemExecutionLifecycle::new(
+        storage,
+        worktrees,
+        runtimes,
+        harnesses,
+        Arc::new(FilesystemEvidenceStore::new(&cli.state_root)),
+    ));
+    let execution_worker = Arc::new(Worker::new(
+        lifecycle,
+        executions,
+        reservations.clone(),
+        cleanup,
+    ));
     let token = Secret(cli.worker_token);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -64,7 +145,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         worker_id = %worker.id,
         controller = %cli.controller,
-        state = ?worker.state,
+        ready = worker.capability_proof.is_some(),
         "autospec-worker starting"
     );
     let workers_url = format!(
@@ -74,73 +155,79 @@ async fn main() -> Result<()> {
     let heartbeat_url = format!("{}/{}/heartbeat", workers_url, worker.id);
     let mut registered = false;
     let mut backoff = Duration::from_secs(1);
+    let mut heartbeat_due = tokio::time::Instant::now();
+    let mut tasks: Vec<ExecutionTask> = Vec::new();
     loop {
-        worker.last_heartbeat = Utc::now();
-        let request = if registered {
-            client.post(&heartbeat_url)
-        } else {
-            client.post(&workers_url)
-        };
-        let sent = request
-            .bearer_auth(&token.0)
-            .json(&worker)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status);
-        match sent {
-            Ok(_) => {
-                registered = true;
-                backoff = Duration::from_secs(1);
-                tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(30)) => {}
-                    signal = tokio::signal::ctrl_c() => {
-                        signal.context("failed to listen for shutdown")?;
-                        break;
-                    }
+        let mut index = tasks.len();
+        while index > 0 {
+            index -= 1;
+            if tasks[index].is_finished() {
+                let task = tasks.swap_remove(index);
+                if let Err(error) = task.join().await {
+                    tracing::error!(worker_id = %worker.id, %error, "execution task failed");
                 }
             }
-            Err(error) => {
-                tracing::warn!(worker_id = %worker.id, %error, retry_seconds = backoff.as_secs(), "worker control-plane request failed");
-                tokio::select! {
-                    () = tokio::time::sleep(backoff) => {}
-                    signal = tokio::signal::ctrl_c() => {
-                        signal.context("failed to listen for shutdown")?;
-                        break;
+        }
+        while registered && tasks.len() < usize::try_from(cli.concurrency)? {
+            match reservations.reserve_next(&worker.id).await? {
+                Some(reservation) => {
+                    tasks.push(execution_worker.clone().spawn(reservation.execution));
+                }
+                None => break,
+            }
+        }
+        if tokio::time::Instant::now() >= heartbeat_due {
+            let request = if registered {
+                client.post(&heartbeat_url)
+            } else {
+                client.post(&workers_url)
+            };
+            match request
+                .bearer_auth(&token.0)
+                .json(&worker)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+            {
+                Ok(_) => {
+                    registered = true;
+                    backoff = Duration::from_secs(1);
+                    heartbeat_due = tokio::time::Instant::now() + Duration::from_secs(30);
+                }
+                Err(error) => {
+                    tracing::warn!(worker_id = %worker.id, %error, retry_seconds = backoff.as_secs(), "worker control-plane request failed");
+                    heartbeat_due = tokio::time::Instant::now() + backoff;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("failed to listen for shutdown")?;
+                for task in &tasks {
+                    task.cancel();
+                }
+                for task in tasks {
+                    if let Err(error) = task.join().await {
+                        tracing::error!(worker_id = %worker.id, %error, "execution cleanup during drain failed");
                     }
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                break;
             }
         }
     }
     Ok(())
 }
 
-fn registration(cli: &Cli) -> Result<WorkerRegistration> {
+fn advertisement(cli: &Cli, proof: Option<WorkerCapabilityProof>) -> Result<WorkerAdvertisement> {
     if cli.concurrency == 0 || cli.concurrency > 64 {
         anyhow::bail!("worker concurrency must be between 1 and 64");
     }
-    let proof = match (
-        &cli.storage_backend,
-        &cli.storage_pool_identity,
-        &cli.docker_daemon_id,
-        &cli.docker_verifier,
-        &cli.docker_method_version,
-    ) {
-        (Some(backend), Some(pool), Some(daemon), Some(verifier), Some(method)) => {
-            Some(WorkerCapabilityProof {
-                storage_backend: backend.clone(),
-                storage_pool_identity: pool.clone(),
-                docker_daemon_id: daemon.clone(),
-                docker_verifier: verifier.clone(),
-                docker_method_version: method.clone(),
-            })
-        }
-        _ => None,
-    };
     let ready = proof
         .as_ref()
         .is_some_and(WorkerCapabilityProof::is_complete);
-    Ok(WorkerRegistration {
+    Ok(WorkerAdvertisement {
         id: WorkerId::new(&cli.worker_id),
         capabilities: WorkerCapabilities {
             os: std::env::consts::OS.to_owned(),
@@ -162,15 +249,153 @@ fn registration(cli: &Cli) -> Result<WorkerRegistration> {
             },
             max_concurrent_executions: cli.concurrency,
         },
-        state: if ready {
-            WorkerState::Ready
-        } else {
-            WorkerState::Offline
-        },
-        running_executions: 0,
-        last_heartbeat: Utc::now(),
         capability_proof: proof,
     })
+}
+
+fn probe_capabilities(
+    cli: &Cli,
+    storage: &dyn ExecutionStorageManager,
+) -> Result<WorkerCapabilityProof> {
+    let capability = storage.probe(cli.disk_gib)?;
+    Ok(WorkerCapabilityProof {
+        storage_backend: capability.backend.backend,
+        storage_pool_identity: capability.backend.pool_identity,
+        docker_daemon_id: capability.docker_bind.daemon_id,
+        docker_verifier: capability.docker_bind.verifier,
+        docker_method_version: capability.docker_bind.method_version,
+    })
+}
+
+fn build_storage(cli: &Cli) -> Result<Arc<ExecutionStorage>> {
+    let runner = Arc::new(ProcessCommandRunner);
+    let backend: Box<dyn StorageBackend> = match cli.storage_kind {
+        StorageKind::Apfs => Box::new(ApfsBackend::new(&cli.storage_pool, runner)?),
+        StorageKind::Lvm => Box::new(LvmBackend::new(&cli.storage_pool, runner)?),
+    };
+    let verifier =
+        TrustedVerifierImage::new(&cli.docker_verifier_image, &cli.docker_verifier_command)?;
+    let output = Command::new(&cli.docker_binary)
+        .args(["info", "--format", "{{.ID}}"])
+        .output()
+        .with_context(|| format!("execute {} info", cli.docker_binary))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Docker daemon identity probe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let daemon_id = String::from_utf8(output.stdout)?.trim().to_owned();
+    if daemon_id.is_empty() {
+        anyhow::bail!("Docker daemon identity probe returned empty ID");
+    }
+    Ok(Arc::new(ExecutionStorage::new(
+        &cli.state_root,
+        backend,
+        Box::new(DockerCapabilityVerifier {
+            docker: PathBuf::from(&cli.docker_binary),
+            daemon_id,
+            verifier_image: cli.docker_verifier_image.clone(),
+            verifier_command: cli.docker_verifier_command.clone(),
+            method_version: verifier.proof_method(),
+            worker_id: WorkerId::new(&cli.worker_id),
+        }),
+    )?))
+}
+
+#[derive(Debug)]
+struct DockerCapabilityVerifier {
+    docker: PathBuf,
+    daemon_id: String,
+    verifier_image: String,
+    verifier_command: String,
+    method_version: String,
+    worker_id: WorkerId,
+}
+
+impl DockerBindVerifier for DockerCapabilityVerifier {
+    fn probe(&self) -> Result<DockerBindCapability, StorageError> {
+        let output = Command::new(&self.docker)
+            .args([
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                &self.verifier_image,
+            ])
+            .output()
+            .map_err(|error| StorageError::Command(error.to_string()))?;
+        if !output.status.success()
+            || String::from_utf8_lossy(&output.stdout).trim() != self.verifier_image
+        {
+            return Err(StorageError::Unavailable(
+                "immutable Docker verifier image is unavailable or changed".into(),
+            ));
+        }
+        Ok(DockerBindCapability {
+            daemon_id: self.daemon_id.clone(),
+            verifier: self.verifier_image.clone(),
+            method_version: self.method_version.clone(),
+        })
+    }
+
+    fn verify(&self, source: &Path) -> Result<DockerBindProof, StorageError> {
+        let canonical = source
+            .canonicalize()
+            .map_err(|error| StorageError::Unavailable(error.to_string()))?;
+        let execution_id = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ExecutionId::new)
+            .ok_or_else(|| {
+                StorageError::IdentityMismatch("allocation lacks execution id".into())
+            })?;
+        let labels = OwnershipLabels {
+            execution_id,
+            worker_id: self.worker_id.clone(),
+            repository: "storage-proof".into(),
+            issue: None,
+        };
+        let mount = format!("type=bind,src={},dst=/proof,readonly", canonical.display());
+        let mut command = Command::new(&self.docker);
+        command.args(["run", "--rm", "--network", "none", "--read-only"]);
+        for (key, value) in labels.to_map() {
+            command.args(["--label", &format!("{key}={value}")]);
+        }
+        let output = command
+            .args([
+                "--mount",
+                &mount,
+                &self.verifier_image,
+                &self.verifier_command,
+                "-c",
+                "%d:%i",
+                "/proof",
+            ])
+            .output()
+            .map_err(|error| StorageError::Command(error.to_string()))?;
+        if !output.status.success() {
+            return Err(StorageError::Command(
+                String::from_utf8_lossy(&output.stderr).trim().into(),
+            ));
+        }
+        let filesystem_id = String::from_utf8(output.stdout)
+            .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?
+            .trim()
+            .to_owned();
+        if filesystem_id.is_empty() || !filesystem_id.contains(':') {
+            return Err(StorageError::IdentityMismatch(
+                "Docker verifier returned malformed filesystem identity".into(),
+            ));
+        }
+        Ok(DockerBindProof {
+            daemon_id: self.daemon_id.clone(),
+            verifier: self.verifier_image.clone(),
+            method_version: self.method_version.clone(),
+            source_path: canonical,
+            filesystem_id,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -185,30 +410,40 @@ mod tests {
             concurrency: 2,
             memory_mib: 4096,
             disk_gib: 100,
-            storage_backend: None,
-            storage_pool_identity: None,
-            docker_daemon_id: None,
-            docker_verifier: None,
-            docker_method_version: None,
+            storage_kind: StorageKind::Apfs,
+            storage_pool: "/tmp".into(),
+            docker_verifier_image: format!("sha256:{}", "a".repeat(64)),
+            docker_verifier_command: "/usr/bin/stat".into(),
+            docker_binary: "docker".into(),
+            database_url: "postgres://test".into(),
+            state_root: "/tmp".into(),
+            clone_base: "https://github.com".into(),
+            docker_socket: None,
+            pi_executable: "pi".into(),
         }
     }
 
     #[test]
     fn missing_storage_proof_forces_offline_and_token_debug_is_redacted() {
-        let worker = registration(&cli()).unwrap();
-        assert_eq!(worker.state, WorkerState::Offline);
-        assert!(!worker.has_capacity());
+        let worker = advertisement(&cli(), None).unwrap();
+        assert!(worker.capability_proof.is_none());
+        let wire = serde_json::to_value(worker).unwrap();
+        assert!(wire.get("state").is_none());
+        assert!(wire.get("last_heartbeat").is_none());
+        assert!(wire.get("running_executions").is_none());
         assert_eq!(format!("{:?}", Secret("do-not-log".into())), "[REDACTED]");
     }
 
     #[test]
     fn complete_storage_and_docker_proof_allows_ready() {
-        let mut cli = cli();
-        cli.storage_backend = Some("apfs".into());
-        cli.storage_pool_identity = Some("pool".into());
-        cli.docker_daemon_id = Some("daemon".into());
-        cli.docker_verifier = Some("probe".into());
-        cli.docker_method_version = Some("v1".into());
-        assert_eq!(registration(&cli).unwrap().state, WorkerState::Ready);
+        let proof = WorkerCapabilityProof {
+            storage_backend: "apfs".into(),
+            storage_pool_identity: "pool".into(),
+            docker_daemon_id: "daemon".into(),
+            docker_verifier: format!("sha256:{}", "a".repeat(64)),
+            docker_method_version: "v2".into(),
+        };
+        let worker = advertisement(&cli(), Some(proof)).unwrap();
+        assert_eq!(worker.capabilities.runtimes, vec![RuntimeKind::Docker]);
     }
 }

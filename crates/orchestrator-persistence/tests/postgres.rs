@@ -2,11 +2,12 @@ use chrono::{Duration, Utc};
 use orchestrator_core::{
     event::ExecutionEventKind, AgentAssignment, Execution, ExecutionEvent, ExecutionId,
     ExecutionManifest, ExecutionState, HarnessKind, ModelPolicy, OwnershipLabels, PersistenceMode,
-    RepositoryReference, Role, RuntimeRequirement,
+    RepositoryReference, Role, RuntimeRequirement, WorkerId,
 };
 use orchestrator_persistence::{
-    EventLog, ExecutionStore, PgEventLog, PgExecutionStore, PgReservationStore, PgWorkerStore,
-    ReservationStore, StoreError, WorkerStore,
+    CleanupAuthorityStore, EventLog, ExecutionStore, LostWorkerRecovery, PgCleanupAuthorityStore,
+    PgEventLog, PgExecutionStore, PgReservationStore, PgWorkerStore, ReservationStore, StoreError,
+    WorkerStore,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
@@ -30,6 +31,43 @@ async fn stores() -> Option<(PgExecutionStore, PgEventLog)> {
         .await
         .expect("event log connects after execution store migrated the database");
     Some((executions, events))
+}
+
+#[tokio::test]
+async fn cleanup_authority_is_durable_until_explicit_resolution() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real PostgreSQL test");
+        return;
+    };
+    let store = PgCleanupAuthorityStore::connect(&database_url)
+        .await
+        .unwrap();
+    let worker_id = WorkerId::new(format!("worker-cleanup-{}", uuid::Uuid::new_v4().simple()));
+    let execution_id = ExecutionId::new(format!(
+        "execution-cleanup-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let attempt_id =
+        orchestrator_core::AttemptId::new(format!("attempt-{}", uuid::Uuid::new_v4().simple()));
+    store
+        .begin(&execution_id, &attempt_id, &worker_id)
+        .await
+        .unwrap();
+    store.advance(&execution_id, "PI_STARTED").await.unwrap();
+    drop(store);
+
+    let reopened = PgCleanupAuthorityStore::connect(&database_url)
+        .await
+        .unwrap();
+    let pending = reopened.list_for_worker(&worker_id).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].phase, "PI_STARTED");
+    reopened.resolve(&execution_id).await.unwrap();
+    assert!(reopened
+        .list_for_worker(&worker_id)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 fn execution(state: ExecutionState) -> Execution {
@@ -377,7 +415,89 @@ async fn progress_commit_persists_execution_attempt_and_event_atomically() {
 }
 
 #[tokio::test]
-async fn stale_worker_becomes_offline_and_fresh_proven_heartbeat_restores_ready() {
+async fn progress_rejects_stale_cancelled_reassigned_and_forged_attempts() {
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let worker = registered_worker(
+        &format!("worker-fence-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    let queued = execution(ExecutionState::Queued);
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut provisioning = reservation.execution.clone();
+    provisioning
+        .transition(ExecutionState::Provisioning)
+        .unwrap();
+    let progress = progress_event(&provisioning, ExecutionEventKind::EnvironmentReady);
+    executions
+        .record_progress(&provisioning, &progress)
+        .await
+        .unwrap();
+
+    let stale = provisioning.clone();
+    let mut cancelled = provisioning.clone();
+    cancelled.transition(ExecutionState::Cancelled).unwrap();
+    let cancelled_event = progress_event(&cancelled, ExecutionEventKind::ExecutionCancelled);
+    executions
+        .record_progress(&cancelled, &cancelled_event)
+        .await
+        .unwrap();
+
+    let mut stale_running = stale;
+    stale_running.transition(ExecutionState::Running).unwrap();
+    let stale_event = progress_event(
+        &stale_running,
+        ExecutionEventKind::AgentStarted {
+            session_id: orchestrator_core::SessionId::new("stale"),
+        },
+    );
+    assert!(matches!(
+        executions
+            .record_progress(&stale_running, &stale_event)
+            .await,
+        Err(StoreError::Conflict(_)) | Err(StoreError::IllegalTransition { .. })
+    ));
+
+    let mut forged = cancelled.clone();
+    forged.worker_id = Some(orchestrator_core::WorkerId::new("foreign-worker"));
+    let forged_event = progress_event(&forged, ExecutionEventKind::ExecutionCancelled);
+    assert!(matches!(
+        executions.record_progress(&forged, &forged_event).await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        executions.get(&cancelled.id).await.unwrap().state,
+        ExecutionState::Cancelled
+    );
+    let events = PgEventLog::connect(&std::env::var("AUTOSPEC_DATABASE_URL").unwrap())
+        .await
+        .unwrap()
+        .since(&cancelled.id, 0)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+}
+
+fn progress_event(execution: &Execution, kind: ExecutionEventKind) -> ExecutionEvent {
+    ExecutionEvent {
+        execution_id: execution.id.clone(),
+        attempt_id: execution.attempt_id.clone(),
+        sequence: 0,
+        at: Utc::now(),
+        state: execution.state,
+        kind,
+    }
+}
+
+#[tokio::test]
+async fn stale_worker_becomes_unreachable_and_fresh_proven_heartbeat_restores_ready() {
     let Some((_, workers, _)) = worker_stores().await else {
         return;
     };
@@ -394,7 +514,7 @@ async fn stale_worker_becomes_offline_and_fresh_proven_heartbeat_restores_ready(
     assert!(stale.contains(&worker.id));
     assert_eq!(
         workers.get(&worker.id).await.unwrap().state,
-        orchestrator_core::WorkerState::Offline
+        orchestrator_core::WorkerState::Unreachable
     );
 
     worker.state = orchestrator_core::WorkerState::Ready;
@@ -428,6 +548,89 @@ async fn orphan_reservation_reconcile_is_idempotent() {
         .unwrap()
         .contains(&assigned.execution.id));
     assert!(reservations.reconcile(&[]).await.unwrap().is_empty());
+    assert!(reservations
+        .list_for_worker(&worker.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn unreachable_worker_atomically_requeues_resumable_and_fails_ephemeral_attempts() {
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let mut worker =
+        registered_worker(&format!("worker-lost-{}", uuid::Uuid::new_v4().simple()), 2);
+    let isolation_capability = format!("lost-worker-{}", uuid::Uuid::new_v4().simple());
+    worker
+        .capabilities
+        .capabilities
+        .push(isolation_capability.clone());
+    worker.capabilities.cpu = 2;
+    worker.capabilities.memory_mib = 2048;
+    worker.capabilities.disk_gib = 1;
+    workers.register(&worker).await.unwrap();
+    let mut resumable = execution(ExecutionState::Queued);
+    resumable.manifest.persistence = PersistenceMode::Resumable;
+    resumable
+        .manifest
+        .runtime
+        .capabilities
+        .push(isolation_capability.clone());
+    resumable.manifest.runtime.cpu = 1;
+    resumable.manifest.runtime.memory_mib = 1024;
+    resumable.manifest.runtime.disk_gib = 1;
+    let mut ephemeral = execution(ExecutionState::Queued);
+    ephemeral
+        .manifest
+        .runtime
+        .capabilities
+        .push(isolation_capability);
+    ephemeral.manifest.runtime.cpu = 1;
+    ephemeral.manifest.runtime.memory_mib = 1024;
+    ephemeral.manifest.runtime.disk_gib = 1;
+    executions.insert(&resumable).await.unwrap();
+    executions.insert(&ephemeral).await.unwrap();
+    let resumable = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let ephemeral = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    worker.last_heartbeat = Utc::now() - Duration::seconds(120);
+    workers.heartbeat(&worker).await.unwrap();
+    workers
+        .mark_stale_before(Utc::now() - Duration::seconds(90))
+        .await
+        .unwrap();
+
+    let recovered = reservations.recover_unreachable(&worker.id).await.unwrap();
+
+    assert!(matches!(
+        recovered.as_slice(),
+        [
+            LostWorkerRecovery::Requeued(_),
+            LostWorkerRecovery::Failed(_)
+        ] | [
+            LostWorkerRecovery::Failed(_),
+            LostWorkerRecovery::Requeued(_)
+        ]
+    ));
+    let requeued = executions.get(&resumable.execution.id).await.unwrap();
+    assert_eq!(requeued.state, ExecutionState::Queued);
+    assert!(requeued.worker_id.is_none());
+    assert!(requeued.attempt_id.is_none());
+    let failed = executions.get(&ephemeral.execution.id).await.unwrap();
+    assert_eq!(failed.state, ExecutionState::Failed);
+    assert_eq!(
+        failed.result.unwrap().failure,
+        Some(orchestrator_core::FailureClass::WorkerLost)
+    );
     assert!(reservations
         .list_for_worker(&worker.id)
         .await

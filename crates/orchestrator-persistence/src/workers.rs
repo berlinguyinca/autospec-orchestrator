@@ -137,7 +137,7 @@ impl WorkerStore for PgWorkerStore {
         deadline: DateTime<Utc>,
     ) -> Result<Vec<WorkerId>, StoreError> {
         let rows = sqlx::query(
-            "UPDATE workers SET state = 'OFFLINE', updated_at = now() \
+            "UPDATE workers SET state = 'UNREACHABLE', updated_at = now() \
              WHERE state IN ('READY', 'DRAINING') AND last_heartbeat < $1 RETURNING id",
         )
         .bind(deadline)

@@ -1,13 +1,15 @@
 //! Durable PostgreSQL storage for execution-plane records (spec sections 32, 49, 61, 74).
 
+mod cleanup;
 mod error;
 mod event_log;
 mod reservations;
 mod workers;
 
+pub use cleanup::{CleanupAuthority, CleanupAuthorityStore, PgCleanupAuthorityStore};
 pub use error::StoreError;
 pub use event_log::{EventLog, PgEventLog};
-pub use reservations::{PgReservationStore, Reservation, ReservationStore};
+pub use reservations::{LostWorkerRecovery, PgReservationStore, Reservation, ReservationStore};
 pub use workers::{PgWorkerStore, WorkerStore};
 
 use async_trait::async_trait;
@@ -153,10 +155,50 @@ impl ExecutionStore for PgExecutionStore {
             ));
         }
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        let locked = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
             .bind(execution.id.as_str())
-            .fetch_one(&mut *transaction)
-            .await?;
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(execution.id.to_string()))?;
+        let persisted = decode_execution(&locked)?;
+        let version = locked.try_get::<i64, _>("version")?;
+        if persisted.worker_id != execution.worker_id
+            || persisted.attempt_id != execution.attempt_id
+        {
+            return Err(StoreError::Conflict(
+                "execution worker or attempt authority changed".to_owned(),
+            ));
+        }
+        if persisted.state != execution.state && !persisted.state.can_transition_to(execution.state)
+        {
+            return Err(StoreError::IllegalTransition {
+                from: persisted.state,
+                to: execution.state,
+            });
+        }
+        let (attempt_id, worker_id) = execution
+            .attempt_id
+            .as_ref()
+            .zip(execution.worker_id.as_ref())
+            .ok_or_else(|| {
+                StoreError::Conflict("execution progress lacks active attempt authority".to_owned())
+            })?;
+        let active_attempts = sqlx::query_scalar::<_, String>(
+            "SELECT attempt_id FROM execution_attempts \
+             WHERE attempt_id = $1 AND execution_id = $2 AND worker_id = $3 \
+             AND finished_at IS NULL FOR UPDATE",
+        )
+        .bind(attempt_id.as_str())
+        .bind(execution.id.as_str())
+        .bind(worker_id.as_str())
+        .fetch_all(&mut *transaction)
+        .await?;
+        if active_attempts.len() != 1 {
+            return Err(StoreError::Conflict(format!(
+                "expected exactly one active attempt, found {}",
+                active_attempts.len()
+            )));
+        }
         let sequence: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM execution_events WHERE execution_id = $1",
         )
@@ -166,9 +208,10 @@ impl ExecutionStore for PgExecutionStore {
         let sequence = u64::try_from(sequence)
             .map_err(|_| StoreError::Conflict("negative event sequence".to_owned()))?;
         let result = execution.result.as_ref().map(to_json).transpose()?;
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE executions SET state = $2, worker_id = $3, attempt_id = $4, session_id = $5, \
-             worktree_path = $6, result = $7, updated_at = $8, version = version + 1 WHERE id = $1",
+             worktree_path = $6, result = $7, updated_at = $8, version = version + 1 \
+             WHERE id = $1 AND version = $9",
         )
         .bind(execution.id.as_str())
         .bind(enum_text(&execution.state)?)
@@ -178,10 +221,16 @@ impl ExecutionStore for PgExecutionStore {
         .bind(execution.worktree_path.as_deref())
         .bind(result.clone())
         .bind(execution.updated_at)
+        .bind(version)
         .execute(&mut *transaction)
         .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "execution version changed while recording progress".to_owned(),
+            ));
+        }
         if let Some(attempt_id) = &execution.attempt_id {
-            sqlx::query(
+            let updated = sqlx::query(
                 "UPDATE execution_attempts SET state = $2, worktree_path = $3, session_id = $4, \
                  result = $5, updated_at = $6, finished_at = CASE WHEN $7 THEN $6 ELSE NULL END \
                  WHERE attempt_id = $1",
@@ -195,6 +244,11 @@ impl ExecutionStore for PgExecutionStore {
             .bind(execution.state.is_terminal())
             .execute(&mut *transaction)
             .await?;
+            if updated.rows_affected() != 1 {
+                return Err(StoreError::Conflict(
+                    "active execution attempt disappeared while recording progress".to_owned(),
+                ));
+            }
         }
         let mut persisted = event.clone();
         persisted.sequence = sequence;

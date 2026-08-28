@@ -10,7 +10,10 @@ use orchestrator_core::{
     ExecutionManifest, ExecutionState, HarnessKind, ModelPolicy, OwnershipLabels, PersistenceMode,
     RepositoryReference, Role, RuntimeRequirement, SessionId, TaskPacket, WorkerId,
 };
-use orchestrator_persistence::{ExecutionStore, Reservation, ReservationStore, StoreError};
+use orchestrator_persistence::{
+    CleanupAuthority, CleanupAuthorityStore, ExecutionStore, Reservation, ReservationStore,
+    StoreError,
+};
 use orchestrator_worker::{ExecutionLifecycle, LifecycleError, Worker};
 use runtime_traits::{EnvironmentHandle, VerifiedAgentContainer};
 use std::sync::{Arc, Mutex};
@@ -19,6 +22,7 @@ use std::sync::{Arc, Mutex};
 struct FakeStore {
     execution: Mutex<Option<Execution>>,
     events: Mutex<Vec<ExecutionEvent>>,
+    fail_record: bool,
 }
 
 #[async_trait]
@@ -52,6 +56,9 @@ impl ExecutionStore for FakeStore {
         execution: &Execution,
         event: &ExecutionEvent,
     ) -> Result<u64, StoreError> {
+        if self.fail_record {
+            return Err(StoreError::Conflict("injected progress failure".into()));
+        }
         *self.execution.lock().unwrap() = Some(execution.clone());
         let mut events = self.events.lock().unwrap();
         let mut event = event.clone();
@@ -64,6 +71,53 @@ impl ExecutionStore for FakeStore {
 #[derive(Default)]
 struct FakeReservations {
     released: Mutex<Vec<ExecutionId>>,
+}
+
+#[derive(Default)]
+struct FakeCleanupAuthorities {
+    pending: Mutex<Vec<ExecutionId>>,
+}
+
+#[async_trait]
+impl CleanupAuthorityStore for FakeCleanupAuthorities {
+    async fn begin(
+        &self,
+        execution_id: &ExecutionId,
+        _: &AttemptId,
+        _: &WorkerId,
+    ) -> Result<(), StoreError> {
+        self.pending.lock().unwrap().push(execution_id.clone());
+        Ok(())
+    }
+
+    async fn advance(&self, _: &ExecutionId, _: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn resolve(&self, execution_id: &ExecutionId) -> Result<(), StoreError> {
+        self.pending
+            .lock()
+            .unwrap()
+            .retain(|pending| pending != execution_id);
+        Ok(())
+    }
+
+    async fn list_for_worker(&self, _: &WorkerId) -> Result<Vec<CleanupAuthority>, StoreError> {
+        Ok(Vec::new())
+    }
+}
+
+fn worker(
+    lifecycle: Arc<FakeLifecycle>,
+    store: Arc<FakeStore>,
+    reservations: Arc<FakeReservations>,
+) -> Worker {
+    Worker::new(
+        lifecycle,
+        store,
+        reservations,
+        Arc::new(FakeCleanupAuthorities::default()),
+    )
 }
 
 #[async_trait]
@@ -88,6 +142,7 @@ struct FakeLifecycle {
     fail_at: Option<&'static str>,
     poll_empty: bool,
     cleanup_fail: bool,
+    hang_poll: bool,
 }
 
 impl FakeLifecycle {
@@ -174,6 +229,9 @@ impl ExecutionLifecycle for FakeLifecycle {
         _: &SessionRef,
     ) -> Result<Vec<ExecutionEvent>, LifecycleError> {
         self.step("pi-poll")?;
+        if self.hang_poll {
+            std::future::pending::<()>().await;
+        }
         if self.poll_empty {
             tokio::task::yield_now().await;
             return Ok(Vec::new());
@@ -189,6 +247,9 @@ impl ExecutionLifecycle for FakeLifecycle {
     }
     async fn stop(&self, _: &Execution, _: &SessionRef) -> Result<(), LifecycleError> {
         self.step("pi-stop")
+    }
+    async fn cpu_percent(&self, _: &Execution) -> Result<f64, LifecycleError> {
+        Ok(0.0)
     }
     async fn capture(&self, _: &Worktree) -> Result<DiffCapture, LifecycleError> {
         self.step("git-capture")?;
@@ -239,12 +300,13 @@ async fn successful_run_uses_exact_order_and_persists_result_before_cleanup() {
         fail_at: None,
         poll_empty: false,
         cleanup_fail: false,
+        hang_poll: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
     let execution = execution();
     store.insert(&execution).await.unwrap();
-    let worker = Worker::new(lifecycle, store.clone(), reservations.clone());
+    let worker = worker(lifecycle, store.clone(), reservations.clone());
 
     let result = worker.run(&execution).await.unwrap();
 
@@ -265,6 +327,12 @@ async fn successful_run_uses_exact_order_and_persists_result_before_cleanup() {
             "storage-release"
         ]
     );
+    assert!(store
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|event| !matches!(event.kind, ExecutionEventKind::AgentStarted { .. })));
     assert_eq!(
         reservations.released.lock().unwrap().as_slice(),
         &[execution.id]
@@ -279,12 +347,13 @@ async fn provisioning_failure_runs_reverse_cleanup_and_returns_worker_lost_peer_
         fail_at: Some("docker-provision"),
         poll_empty: false,
         cleanup_fail: false,
+        hang_poll: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
     let execution = execution();
     store.insert(&execution).await.unwrap();
-    let worker = Worker::new(lifecycle, store.clone(), reservations);
+    let worker = worker(lifecycle, store.clone(), reservations);
 
     assert!(worker.run(&execution).await.is_err());
     let failed = store.get(&execution.id).await.unwrap();
@@ -313,12 +382,13 @@ async fn cancelling_one_execution_stops_only_its_task_and_persists_cancelled() {
         fail_at: None,
         poll_empty: true,
         cleanup_fail: false,
+        hang_poll: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
     let execution = execution();
     store.insert(&execution).await.unwrap();
-    let worker = Arc::new(Worker::new(lifecycle, store.clone(), reservations));
+    let worker = Arc::new(worker(lifecycle, store.clone(), reservations));
     let task = worker.spawn(execution.clone());
     tokio::task::yield_now().await;
     task.cancel();
@@ -338,15 +408,66 @@ async fn execution_and_reverse_cleanup_failures_are_all_reported() {
         fail_at: Some("docker-provision"),
         poll_empty: false,
         cleanup_fail: true,
+        hang_poll: false,
     });
     let store = Arc::new(FakeStore::default());
     let execution = execution();
     store.insert(&execution).await.unwrap();
-    let worker = Worker::new(lifecycle, store, Arc::new(FakeReservations::default()));
+    let worker = worker(lifecycle, store, Arc::new(FakeReservations::default()));
     let error = worker.run(&execution).await.unwrap_err().to_string();
     assert!(error.contains("docker-provision"), "{error}");
     assert!(error.contains("git cleanup"), "{error}");
-    assert!(error.contains("storage cleanup"), "{error}");
+    assert!(!error.contains("storage cleanup"), "{error}");
+}
+
+#[tokio::test]
+async fn uncertain_pi_stop_retains_runtime_storage_and_reservation_authority() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::clone(&order),
+        fail_at: Some("pi-stop"),
+        poll_empty: false,
+        cleanup_fail: false,
+        hang_poll: false,
+    });
+    let store = Arc::new(FakeStore::default());
+    let reservations = Arc::new(FakeReservations::default());
+    let execution = execution();
+    store.insert(&execution).await.unwrap();
+    let worker = worker(lifecycle, store, reservations.clone());
+
+    assert!(worker.run(&execution).await.is_err());
+    let steps = order.lock().unwrap().clone();
+    assert!(!steps.contains(&"docker-destroy"));
+    assert!(!steps.contains(&"git-destroy"));
+    assert!(!steps.contains(&"storage-release"));
+    assert!(reservations.released.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_hung_poll_and_still_runs_cleanup() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::clone(&order),
+        fail_at: None,
+        poll_empty: false,
+        cleanup_fail: false,
+        hang_poll: true,
+    });
+    let store = Arc::new(FakeStore::default());
+    let reservations = Arc::new(FakeReservations::default());
+    let execution = execution();
+    store.insert(&execution).await.unwrap();
+    let worker = Arc::new(worker(lifecycle, store, reservations));
+    let task = worker.spawn(execution);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    task.cancel();
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(2), task.join()).await;
+    assert!(
+        joined.is_ok(),
+        "cancelled poll task did not stop within bound"
+    );
+    assert!(order.lock().unwrap().contains(&"pi-stop"));
 }
 
 fn execution() -> Execution {

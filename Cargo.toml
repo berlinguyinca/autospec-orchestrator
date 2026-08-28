@@ -29,6 +29,7 @@ bollard = "0.18"
 execution-storage = { path = "crates/execution-storage" }
 orchestrator-core = { path = "crates/orchestrator-core" }
 orchestrator-api = { path = "crates/orchestrator-api" }
+orchestrator-persistence = { path = "crates/orchestrator-persistence" }
 orchestrator-scheduler = { path = "crates/orchestrator-scheduler" }
 orchestrator-worker = { path = "crates/orchestrator-worker" }
 runtime-traits = { path = "crates/runtime-traits" }
