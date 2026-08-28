@@ -69,11 +69,11 @@
 - Produces `GitWorktreeManager` and `DiffCapture` through the existing synchronous trait.
 - Consumed by the worker run loop through `spawn_blocking`.
 
-- [ ] Add tests using real temporary Git repositories.
-- [ ] Implement locked bare mirrors and safe repository-name normalization.
-- [ ] Create execution-scoped worktrees with `.autospec-owner.json`.
-- [ ] Capture patch plus changed-file evidence.
-- [ ] Destroy only verified owned worktrees and identify stale owner records.
+- [x] Add tests using real temporary Git repositories.
+- [x] Implement locked bare mirrors and safe repository-name normalization.
+- [x] Create execution-scoped worktrees with `.autospec-owner.json`.
+- [x] Capture patch plus changed-file evidence.
+- [x] Destroy only verified owned worktrees and identify stale owner records.
 
 ### Task 4: Token-efficient Pi harness (#15–#18)
 
