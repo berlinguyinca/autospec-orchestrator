@@ -1,0 +1,430 @@
+use async_trait::async_trait;
+use chrono::Utc;
+use execution_storage::{
+    AllocationReceipt, BackendIdentity, DockerBindProof, ALLOCATION_API_VERSION,
+};
+use git_worktree::{DiffCapture, Worktree};
+use harness_traits::SessionRef;
+use orchestrator_core::{
+    event::ExecutionEventKind, AgentAssignment, AttemptId, Execution, ExecutionEvent, ExecutionId,
+    ExecutionManifest, ExecutionState, HarnessKind, ModelPolicy, OwnershipLabels, PersistenceMode,
+    RepositoryReference, Role, RuntimeRequirement, SessionId, TaskPacket, WorkerId,
+};
+use orchestrator_persistence::{ExecutionStore, Reservation, ReservationStore, StoreError};
+use orchestrator_worker::{ExecutionLifecycle, LifecycleError, Worker};
+use runtime_traits::{EnvironmentHandle, VerifiedAgentContainer};
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+struct FakeStore {
+    execution: Mutex<Option<Execution>>,
+    events: Mutex<Vec<ExecutionEvent>>,
+}
+
+#[async_trait]
+impl ExecutionStore for FakeStore {
+    async fn insert(&self, execution: &Execution) -> Result<(), StoreError> {
+        *self.execution.lock().unwrap() = Some(execution.clone());
+        Ok(())
+    }
+    async fn get(&self, _: &ExecutionId) -> Result<Execution, StoreError> {
+        self.execution
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| StoreError::NotFound("execution".into()))
+    }
+    async fn list_live(&self) -> Result<Vec<Execution>, StoreError> {
+        Ok(self.execution.lock().unwrap().clone().into_iter().collect())
+    }
+    async fn transition(
+        &self,
+        _: &ExecutionId,
+        next: ExecutionState,
+    ) -> Result<Execution, StoreError> {
+        let mut execution = self.execution.lock().unwrap();
+        let execution = execution.as_mut().unwrap();
+        execution.transition(next).unwrap();
+        Ok(execution.clone())
+    }
+    async fn record_progress(
+        &self,
+        execution: &Execution,
+        event: &ExecutionEvent,
+    ) -> Result<u64, StoreError> {
+        *self.execution.lock().unwrap() = Some(execution.clone());
+        let mut events = self.events.lock().unwrap();
+        let mut event = event.clone();
+        event.sequence = events.len() as u64 + 1;
+        events.push(event);
+        Ok(events.len() as u64)
+    }
+}
+
+#[derive(Default)]
+struct FakeReservations {
+    released: Mutex<Vec<ExecutionId>>,
+}
+
+#[async_trait]
+impl ReservationStore for FakeReservations {
+    async fn reserve_next(&self, _: &WorkerId) -> Result<Option<Reservation>, StoreError> {
+        Ok(None)
+    }
+    async fn release(&self, id: &ExecutionId) -> Result<(), StoreError> {
+        self.released.lock().unwrap().push(id.clone());
+        Ok(())
+    }
+    async fn list_for_worker(&self, _: &WorkerId) -> Result<Vec<Reservation>, StoreError> {
+        Ok(Vec::new())
+    }
+    async fn reconcile(&self, _: &[ExecutionId]) -> Result<Vec<ExecutionId>, StoreError> {
+        Ok(Vec::new())
+    }
+}
+
+struct FakeLifecycle {
+    order: Arc<Mutex<Vec<&'static str>>>,
+    fail_at: Option<&'static str>,
+    poll_empty: bool,
+    cleanup_fail: bool,
+}
+
+impl FakeLifecycle {
+    fn step(&self, name: &'static str) -> Result<(), LifecycleError> {
+        self.order.lock().unwrap().push(name);
+        if self.fail_at == Some(name) {
+            Err(LifecycleError::Step(name.to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionLifecycle for FakeLifecycle {
+    async fn allocate(&self, execution: &Execution) -> Result<AllocationReceipt, LifecycleError> {
+        self.step("allocate")?;
+        Ok(receipt(execution))
+    }
+    async fn create_worktree(
+        &self,
+        execution: &Execution,
+        _: &AllocationReceipt,
+    ) -> Result<Worktree, LifecycleError> {
+        self.step("git-create")?;
+        Ok(Worktree {
+            execution_id: execution.id.clone(),
+            path: "/allocation/repository".into(),
+            branch: "task".into(),
+            base_sha: "abc".into(),
+            repository: "owner/repo".into(),
+        })
+    }
+    async fn provision(
+        &self,
+        execution: &Execution,
+        _: &AllocationReceipt,
+        _: &Worktree,
+    ) -> Result<EnvironmentHandle, LifecycleError> {
+        self.step("docker-provision")?;
+        Ok(EnvironmentHandle {
+            execution_id: execution.id.clone(),
+            network: "network".into(),
+            agent_container: "container".into(),
+            verified_agent_container: VerifiedAgentContainer {
+                container_id: "container-id".into(),
+                daemon_id: "daemon".into(),
+                labels: execution.labels.clone(),
+                mounts: Vec::new(),
+            },
+            service_containers: Vec::new(),
+            volumes: Vec::new(),
+            credentials_path: None,
+        })
+    }
+    async fn start(
+        &self,
+        execution: &Execution,
+        _: &AllocationReceipt,
+        _: &EnvironmentHandle,
+        worktree: &Worktree,
+        _: &TaskPacket,
+    ) -> Result<SessionRef, LifecycleError> {
+        self.step("pi-start")?;
+        Ok(SessionRef {
+            id: SessionId::new(execution.id.to_string()),
+            path: "/allocation/session".into(),
+            execution_id: execution.id.clone(),
+            worktree_path: worktree.path.clone(),
+        })
+    }
+    async fn resume(
+        &self,
+        _: &Execution,
+        _: &AllocationReceipt,
+        _: &EnvironmentHandle,
+        _: &SessionRef,
+    ) -> Result<(), LifecycleError> {
+        self.step("pi-resume")
+    }
+    async fn poll(
+        &self,
+        execution: &Execution,
+        _: &SessionRef,
+    ) -> Result<Vec<ExecutionEvent>, LifecycleError> {
+        self.step("pi-poll")?;
+        if self.poll_empty {
+            tokio::task::yield_now().await;
+            return Ok(Vec::new());
+        }
+        Ok(vec![ExecutionEvent {
+            execution_id: execution.id.clone(),
+            attempt_id: execution.attempt_id.clone(),
+            sequence: 0,
+            at: Utc::now(),
+            state: ExecutionState::ReviewReady,
+            kind: ExecutionEventKind::ReviewReady,
+        }])
+    }
+    async fn stop(&self, _: &Execution, _: &SessionRef) -> Result<(), LifecycleError> {
+        self.step("pi-stop")
+    }
+    async fn capture(&self, _: &Worktree) -> Result<DiffCapture, LifecycleError> {
+        self.step("git-capture")?;
+        Ok(DiffCapture {
+            patch: "diff".into(),
+            changed_files: vec!["src/lib.rs".into()],
+        })
+    }
+    async fn persist_evidence(
+        &self,
+        _: &Execution,
+        _: &DiffCapture,
+    ) -> Result<String, LifecycleError> {
+        self.step("persist-evidence")?;
+        Ok("sha256:diff".into())
+    }
+    async fn destroy_runtime(&self, _: &Execution) -> Result<(), LifecycleError> {
+        self.step("docker-destroy")?;
+        if self.cleanup_fail {
+            Err(LifecycleError::Step("docker cleanup".into()))
+        } else {
+            Ok(())
+        }
+    }
+    async fn destroy_worktree(&self, _: &Worktree) -> Result<(), LifecycleError> {
+        self.step("git-destroy")?;
+        if self.cleanup_fail {
+            Err(LifecycleError::Step("git cleanup".into()))
+        } else {
+            Ok(())
+        }
+    }
+    async fn release_storage(&self, _: &AllocationReceipt) -> Result<(), LifecycleError> {
+        self.step("storage-release")?;
+        if self.cleanup_fail {
+            Err(LifecycleError::Step("storage cleanup".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn successful_run_uses_exact_order_and_persists_result_before_cleanup() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::clone(&order),
+        fail_at: None,
+        poll_empty: false,
+        cleanup_fail: false,
+    });
+    let store = Arc::new(FakeStore::default());
+    let reservations = Arc::new(FakeReservations::default());
+    let execution = execution();
+    store.insert(&execution).await.unwrap();
+    let worker = Worker::new(lifecycle, store.clone(), reservations.clone());
+
+    let result = worker.run(&execution).await.unwrap();
+
+    assert_eq!(result.diff_artifact.as_deref(), Some("sha256:diff"));
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec![
+            "allocate",
+            "git-create",
+            "docker-provision",
+            "pi-start",
+            "pi-poll",
+            "pi-stop",
+            "git-capture",
+            "persist-evidence",
+            "docker-destroy",
+            "git-destroy",
+            "storage-release"
+        ]
+    );
+    assert_eq!(
+        reservations.released.lock().unwrap().as_slice(),
+        &[execution.id]
+    );
+}
+
+#[tokio::test]
+async fn provisioning_failure_runs_reverse_cleanup_and_returns_worker_lost_peer_safe_error() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::clone(&order),
+        fail_at: Some("docker-provision"),
+        poll_empty: false,
+        cleanup_fail: false,
+    });
+    let store = Arc::new(FakeStore::default());
+    let reservations = Arc::new(FakeReservations::default());
+    let execution = execution();
+    store.insert(&execution).await.unwrap();
+    let worker = Worker::new(lifecycle, store.clone(), reservations);
+
+    assert!(worker.run(&execution).await.is_err());
+    let failed = store.get(&execution.id).await.unwrap();
+    assert_eq!(failed.state, ExecutionState::Failed);
+    assert_eq!(
+        failed.result.unwrap().failure,
+        Some(orchestrator_core::FailureClass::EnvironmentFailed)
+    );
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec![
+            "allocate",
+            "git-create",
+            "docker-provision",
+            "git-destroy",
+            "storage-release"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cancelling_one_execution_stops_only_its_task_and_persists_cancelled() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order,
+        fail_at: None,
+        poll_empty: true,
+        cleanup_fail: false,
+    });
+    let store = Arc::new(FakeStore::default());
+    let reservations = Arc::new(FakeReservations::default());
+    let execution = execution();
+    store.insert(&execution).await.unwrap();
+    let worker = Arc::new(Worker::new(lifecycle, store.clone(), reservations));
+    let task = worker.spawn(execution.clone());
+    tokio::task::yield_now().await;
+    task.cancel();
+    assert!(task.join().await.is_err());
+    let cancelled = store.get(&execution.id).await.unwrap();
+    assert_eq!(cancelled.state, ExecutionState::Cancelled);
+    assert_eq!(
+        cancelled.result.unwrap().failure,
+        Some(orchestrator_core::FailureClass::Cancelled)
+    );
+}
+
+#[tokio::test]
+async fn execution_and_reverse_cleanup_failures_are_all_reported() {
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::new(Mutex::new(Vec::new())),
+        fail_at: Some("docker-provision"),
+        poll_empty: false,
+        cleanup_fail: true,
+    });
+    let store = Arc::new(FakeStore::default());
+    let execution = execution();
+    store.insert(&execution).await.unwrap();
+    let worker = Worker::new(lifecycle, store, Arc::new(FakeReservations::default()));
+    let error = worker.run(&execution).await.unwrap_err().to_string();
+    assert!(error.contains("docker-provision"), "{error}");
+    assert!(error.contains("git cleanup"), "{error}");
+    assert!(error.contains("storage cleanup"), "{error}");
+}
+
+fn execution() -> Execution {
+    let id = ExecutionId::new("worker-run-test");
+    Execution {
+        id: id.clone(),
+        role: Role::Implementation,
+        state: ExecutionState::WorkerAssigned,
+        manifest: ExecutionManifest {
+            api_version: orchestrator_core::MANIFEST_API_VERSION.into(),
+            role: Role::Implementation,
+            task: None,
+            repository: RepositoryReference {
+                repo: "owner/repo".into(),
+                base_ref: "main".into(),
+                base_sha: Some("abc".into()),
+                branch: Some("task".into()),
+            },
+            agent: AgentAssignment {
+                harness: HarnessKind::Pi,
+                model_policy: ModelPolicy {
+                    provider: "inferweave".into(),
+                    preferred: Vec::new(),
+                    alternatives: Vec::new(),
+                    fallback_class: None,
+                },
+            },
+            runtime: RuntimeRequirement::default(),
+            services: Vec::new(),
+            persistence: PersistenceMode::Ephemeral,
+            task_packet: Some(TaskPacket {
+                goal: "change".into(),
+                acceptance_criteria: vec!["pass".into()],
+                non_goals: Vec::new(),
+                relevant_context: Vec::new(),
+                required_tests: Vec::new(),
+                role_skill: None,
+            }),
+        },
+        worker_id: Some(WorkerId::new("worker")),
+        attempt_id: Some(AttemptId::new("attempt")),
+        session_id: None,
+        worktree_path: None,
+        labels: OwnershipLabels {
+            execution_id: id,
+            worker_id: WorkerId::new("worker"),
+            repository: "owner/repo".into(),
+            issue: None,
+        },
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        result: None,
+    }
+}
+
+fn receipt(execution: &Execution) -> AllocationReceipt {
+    AllocationReceipt {
+        api_version: ALLOCATION_API_VERSION.into(),
+        labels: execution.labels.clone(),
+        reserved_bytes: 1,
+        mount_path: "/allocation".into(),
+        backend_kind: "test".into(),
+        backend_key: "key".into(),
+        pool_identity: "pool".into(),
+        backend: BackendIdentity::Apfs {
+            container: "c".into(),
+            container_uuid: "cu".into(),
+            volume: "v".into(),
+            volume_name: "vn".into(),
+            volume_uuid: "vu".into(),
+            ownership_token: "t".into(),
+        },
+        docker_bind: DockerBindProof {
+            daemon_id: "daemon".into(),
+            verifier: "probe".into(),
+            method_version: "v1".into(),
+            source_path: "/allocation".into(),
+            filesystem_id: "fs".into(),
+        },
+    }
+}

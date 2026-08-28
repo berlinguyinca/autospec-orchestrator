@@ -12,9 +12,14 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
+execution-storage.workspace = true
+futures-util.workspace = true
 orchestrator-core.workspace = true
+orchestrator-persistence = { path = "../orchestrator-persistence" }
 runtime-traits.workspace = true
 harness-traits.workspace = true
 git-worktree.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
