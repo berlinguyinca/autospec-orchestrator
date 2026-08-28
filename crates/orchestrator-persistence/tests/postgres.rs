@@ -7,6 +7,7 @@ use orchestrator_core::{
 use orchestrator_persistence::{
     EventLog, ExecutionStore, PgEventLog, PgExecutionStore, StoreError,
 };
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 
 async fn stores() -> Option<(PgExecutionStore, PgEventLog)> {
@@ -14,13 +15,16 @@ async fn stores() -> Option<(PgExecutionStore, PgEventLog)> {
         eprintln!("skipping PostgreSQL test: AUTOSPEC_DATABASE_URL is not set");
         return None;
     };
-    let executions = match PgExecutionStore::connect(&url).await {
-        Ok(store) => store,
+    match PgPoolOptions::new().max_connections(1).connect(&url).await {
+        Ok(pool) => pool.close().await,
         Err(error) => {
             eprintln!("skipping PostgreSQL test: database is unavailable: {error}");
             return None;
         }
-    };
+    }
+    let executions = PgExecutionStore::connect(&url)
+        .await
+        .expect("database migrations and execution schema must succeed");
     let events = PgEventLog::connect(&url)
         .await
         .expect("event log connects after execution store migrated the database");
@@ -180,7 +184,7 @@ async fn concurrent_events_are_gapless_and_replay_in_order() {
 }
 
 #[tokio::test]
-async fn event_replay_batches_are_capped_at_five_hundred() {
+async fn event_replay_returns_the_complete_tail_without_a_pagination_contract() {
     let Some((_, log)) = stores().await else {
         return;
     };
@@ -189,5 +193,5 @@ async fn event_replay_batches_are_capped_at_five_hundred() {
         log.append(&event(&id)).await.unwrap();
     }
 
-    assert_eq!(log.since(&id, 0).await.unwrap().len(), 500);
+    assert_eq!(log.since(&id, 0).await.unwrap().len(), 501);
 }

@@ -1,9 +1,8 @@
 //! Structured, correlation-aware logging (spec sections 37, 72, 99).
 
 use crate::Execution;
-use regex::Regex;
 use serde_json::{Map, Number, Value};
-use std::{collections::BTreeMap, fmt, sync::OnceLock};
+use std::{collections::BTreeMap, fmt};
 use tracing::{
     field::{Field, Visit},
     span::{Attributes, Id, Record},
@@ -56,7 +55,7 @@ struct JsonVisitor<'a>(&'a mut BTreeMap<String, Value>);
 
 impl JsonVisitor<'_> {
     fn insert(&mut self, field: &Field, value: Value) {
-        if !secret_field_pattern().is_match(field.name()) {
+        if !is_secret_field_name(field.name()) {
             self.0.insert(field.name().to_owned(), value);
         }
     }
@@ -131,11 +130,15 @@ where
     }
 }
 
-fn secret_field_pattern() -> &'static Regex {
-    static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)(token|secret|password|api_key)").expect("static regex is valid")
-    })
+fn is_secret_field_name(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    ["token", "secret", "password", "apikey"]
+        .iter()
+        .any(|sensitive| normalized.contains(sensitive))
 }
 
 pub(crate) fn telemetry_subscriber<W>(service: &str, writer: W) -> impl Subscriber + Send + Sync
@@ -169,13 +172,6 @@ pub fn execution_span(execution: &Execution) -> tracing::Span {
     let attempt_id = execution.attempt_id.as_ref().map_or("", |id| id.as_str());
     let session_id = execution.session_id.as_ref().map_or("", |id| id.as_str());
     let worker_id = execution.worker_id.as_ref().map_or("", |id| id.as_str());
-    let model_id = execution
-        .manifest
-        .agent
-        .model_policy
-        .preferred
-        .first()
-        .map_or("", String::as_str);
     tracing::info_span!(
         "execution",
         project_id,
@@ -185,7 +181,6 @@ pub fn execution_span(execution: &Execution) -> tracing::Span {
         attempt_id,
         session_id,
         worker_id,
-        model_id,
     )
 }
 
@@ -304,12 +299,41 @@ mod tests {
         assert_eq!(line["issue_id"], "417");
         assert_eq!(line["task_id"], "reservation-cancellation");
         assert_eq!(line["execution_id"], "node-417-impl-01");
-        assert_eq!(line["model_id"], "qwen3.8-27b");
+        assert!(line.get("model_id").is_none());
         assert_eq!(line["action"], "started");
         let rendered = String::from_utf8(bytes).expect("UTF-8 log output");
         assert!(!rendered.contains("github_token"));
         assert!(!rendered.contains("never-log-this"));
         assert!(!rendered.contains("password"));
         assert!(!rendered.contains("also-secret"));
+        assert!(!rendered.contains("qwen3.8-27b"));
+    }
+
+    #[test]
+    fn secret_field_normalization_covers_api_key_spellings() {
+        let output = Buffer::default();
+        let subscriber = telemetry_subscriber("test-service", output.clone());
+
+        with_default(subscriber, || {
+            tracing::info!(
+                apiKey = "camel-secret",
+                apikey = "compact-secret",
+                api_key = "snake-secret",
+                "api-key" = "kebab-secret",
+                action = "safe"
+            );
+        });
+
+        let rendered = String::from_utf8(output.0.lock().expect("buffer lock").clone())
+            .expect("UTF-8 log output");
+        assert!(rendered.contains("safe"));
+        for secret in [
+            "camel-secret",
+            "compact-secret",
+            "snake-secret",
+            "kebab-secret",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
     }
 }

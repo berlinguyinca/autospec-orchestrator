@@ -37,30 +37,41 @@ impl ExecutionManifest {
             ));
         }
         validate_repository(&self.repository.repo)?;
-        if self.runtime.cpu == 0 {
-            return invalid("runtime cpu must be greater than zero");
-        }
-        if self.runtime.memory_mib < 256 {
-            return invalid("runtime memoryMib must be at least 256");
-        }
-        if self.runtime.disk_gib == 0 {
-            return invalid("runtime diskGib must be greater than zero");
-        }
-        if let Some(image) = &self.runtime.image {
-            validate_image(image, "runtime image")?;
-        }
-        for capability in &self.runtime.capabilities {
-            if !capability_pattern().is_match(capability) {
-                return invalid(format!("invalid runtime capability: {capability}"));
-            }
-        }
+        validate_runtime(&self.runtime)?;
         for service in &self.services {
-            if !capability_pattern().is_match(&service.name) {
-                return invalid(format!("invalid service name: {}", service.name));
-            }
+            validate_service_name(&service.name)?;
             validate_image(&service.image, "service image")?;
         }
         Ok(())
+    }
+}
+
+pub(crate) fn validate_runtime(runtime: &RuntimeRequirement) -> Result<(), CoreError> {
+    if runtime.cpu == 0 {
+        return invalid("runtime cpu must be greater than zero");
+    }
+    if runtime.memory_mib < 256 {
+        return invalid("runtime memoryMib must be at least 256");
+    }
+    if runtime.disk_gib == 0 {
+        return invalid("runtime diskGib must be greater than zero");
+    }
+    if let Some(image) = &runtime.image {
+        validate_image(image, "runtime image")?;
+    }
+    for capability in &runtime.capabilities {
+        if !capability_pattern().is_match(capability) {
+            return invalid(format!("invalid runtime capability: {capability}"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_service_name(name: &str) -> Result<(), CoreError> {
+    if capability_pattern().is_match(name) {
+        Ok(())
+    } else {
+        invalid(format!("invalid service name: {name}"))
     }
 }
 

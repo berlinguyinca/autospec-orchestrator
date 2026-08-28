@@ -89,7 +89,7 @@ impl EventLog for PgEventLog {
         let rows = sqlx::query(
             "SELECT sequence, payload FROM execution_events \
              WHERE execution_id = $1 AND sequence > $2 \
-             ORDER BY sequence ASC LIMIT 500",
+             ORDER BY sequence ASC",
         )
         .bind(id.as_str())
         .bind(after)
