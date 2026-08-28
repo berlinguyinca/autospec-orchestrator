@@ -14,7 +14,7 @@ use bollard::{image::CreateImageOptions, models::ImageInspect, Docker};
 use futures_util::StreamExt;
 use orchestrator_core::{ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::{EnvironmentHandle, Runtime, RuntimeError};
-use std::env;
+use std::{env, path::PathBuf};
 
 pub use limits::{host_limits, HostConfigLimits, DEFAULT_PIDS_LIMIT};
 
@@ -24,10 +24,23 @@ const DEFAULT_MIN_API_VERSION: &str = "1.41";
 pub struct DockerRuntime {
     pub(crate) client: Docker,
     min_api_version: String,
+    pub(crate) state_root: PathBuf,
 }
 
 impl DockerRuntime {
+    /// Connects using `AUTOSPEC_STATE_ROOT`, defaulting to `/var/lib/autospec`.
     pub fn connect(socket: Option<&str>) -> Result<Self, RuntimeError> {
+        let state_root = env::var_os("AUTOSPEC_STATE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/lib/autospec"));
+        Self::connect_with_state_root(socket, state_root)
+    }
+
+    /// Connects using an explicit shared state root for execution worktrees and sessions.
+    pub fn connect_with_state_root(
+        socket: Option<&str>,
+        state_root: impl Into<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
         let configured_socket = socket
             .map(ToOwned::to_owned)
             .or_else(|| env::var("AUTOSPEC_DOCKER_SOCKET").ok());
@@ -39,6 +52,7 @@ impl DockerRuntime {
         Ok(Self {
             client,
             min_api_version: DEFAULT_MIN_API_VERSION.to_owned(),
+            state_root: state_root.into(),
         })
     }
 

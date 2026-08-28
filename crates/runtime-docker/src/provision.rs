@@ -9,6 +9,10 @@ use bollard::{
 };
 use orchestrator_core::{OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::{EnvironmentHandle, RuntimeError};
+use std::{fs, io, path::Path};
+
+const CONTAINER_WORKTREE: &str = "/workspace";
+const CONTAINER_SESSION: &str = "/session";
 
 pub(crate) async fn provision(
     runtime: &DockerRuntime,
@@ -47,6 +51,7 @@ async fn provision_inner(
         .chain(service_images.iter())
         .collect::<Vec<_>>();
     let disk_slot_bytes = execution_disk_slot_bytes(requirement, &image_inspects)?;
+    let execution_mounts = execution_bind_mounts(runtime, labels)?;
 
     let network = DockerRuntime::network_name(&labels.execution_id);
     runtime
@@ -81,7 +86,9 @@ async fn provision_inner(
     let agent_mounts = bounded_image_mounts(&image_inspect, disk_slot_bytes);
     set_writable_layer_limit(&mut limits, agent_mounts.writable_layer_bytes);
     let has_bounded_mounts = !agent_mounts.mounts.is_empty();
-    limits.mounts = has_bounded_mounts.then_some(agent_mounts.mounts);
+    let mut mounts = agent_mounts.mounts;
+    mounts.extend(execution_mounts);
+    limits.mounts = Some(mounts);
     runtime
         .client
         .create_container(
@@ -121,6 +128,98 @@ async fn provision_inner(
         service_containers,
         volumes: Vec::new(),
         credentials_path: None,
+    })
+}
+
+fn execution_bind_mounts(
+    runtime: &DockerRuntime,
+    labels: &OwnershipLabels,
+) -> Result<Vec<Mount>, RuntimeError> {
+    validate_execution_id(labels.execution_id.as_str())?;
+    ensure_real_directory(&runtime.state_root, false, "state root")?;
+    let worktrees_root = runtime.state_root.join("worktrees");
+    ensure_real_directory(&worktrees_root, false, "worktrees root")?;
+    let worktree = worktrees_root.join(labels.execution_id.as_str());
+    ensure_real_directory(&worktree, false, "execution worktree")?;
+
+    let sessions_root = runtime.state_root.join("sessions");
+    ensure_real_directory(&sessions_root, false, "sessions root")?;
+    let session_root = sessions_root.join(labels.execution_id.as_str());
+    ensure_real_directory(&session_root, false, "execution session root")?;
+    let conversation = session_root.join("conversation");
+    ensure_real_directory(&conversation, true, "conversation directory")?;
+
+    Ok(vec![
+        bind_mount(&worktree, CONTAINER_WORKTREE)?,
+        bind_mount(&conversation, CONTAINER_SESSION)?,
+    ])
+}
+
+fn validate_execution_id(execution_id: &str) -> Result<(), RuntimeError> {
+    let bytes = execution_id.as_bytes();
+    let valid = (1..=63).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(RuntimeError::Provisioning(format!(
+            "invalid execution_id for runtime paths: {execution_id}"
+        )))
+    }
+}
+
+fn ensure_real_directory(path: &Path, create: bool, purpose: &str) -> Result<(), RuntimeError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(RuntimeError::Provisioning(format!(
+                "{purpose} is not a real directory: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
+            match fs::create_dir(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    ensure_real_directory(path, false, purpose)
+                }
+                Err(error) => Err(RuntimeError::Provisioning(format!(
+                    "create {purpose} {}: {error}",
+                    path.display()
+                ))),
+            }
+        }
+        Err(error) => Err(RuntimeError::Provisioning(format!(
+            "inspect {purpose} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn bind_mount(source: &Path, target: &str) -> Result<Mount, RuntimeError> {
+    let source = fs::canonicalize(source).map_err(|error| {
+        RuntimeError::Provisioning(format!(
+            "canonicalize bind source {}: {error}",
+            source.display()
+        ))
+    })?;
+    let source = source.into_os_string().into_string().map_err(|source| {
+        RuntimeError::Provisioning(format!(
+            "bind source is not UTF-8: {}",
+            Path::new(&source).display()
+        ))
+    })?;
+    Ok(Mount {
+        target: Some(target.to_owned()),
+        source: Some(source),
+        typ: Some(MountTypeEnum::BIND),
+        read_only: Some(false),
+        ..Default::default()
     })
 }
 
@@ -267,5 +366,22 @@ mod tests {
         );
 
         assert!(matches!(error, RuntimeError::ResourceLimit(message) if message.contains("tmpfs")));
+    }
+
+    #[test]
+    fn runtime_paths_accept_only_safe_execution_id_components() {
+        assert!(validate_execution_id("node-417-impl-01").is_ok());
+        for invalid in [
+            "",
+            "../escape",
+            "Uppercase",
+            "contains_underscore",
+            "a234567890123456789012345678901234567890123456789012345678901234",
+        ] {
+            assert!(
+                validate_execution_id(invalid).is_err(),
+                "accepted unsafe execution id {invalid}"
+            );
+        }
     }
 }

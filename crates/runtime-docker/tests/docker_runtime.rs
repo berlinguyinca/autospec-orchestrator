@@ -14,13 +14,70 @@ use runtime_traits::Runtime;
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet, HashMap},
-    env,
+    env, fs,
     io::Write,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 static EXECUTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TestStateRoot {
+    path: PathBuf,
+}
+
+impl TestStateRoot {
+    fn new(labels: &OwnershipLabels) -> Self {
+        let path = env::temp_dir().join(format!(
+            "autospec-runtime-docker-state-{}",
+            labels.execution_id
+        ));
+        fs::create_dir(&path).expect("create unique test state root");
+        fs::create_dir_all(path.join("worktrees").join(labels.execution_id.as_str()))
+            .expect("create execution worktree");
+        let session = path.join("sessions").join(labels.execution_id.as_str());
+        fs::create_dir_all(&session).expect("create host-private session root");
+        for (name, contents) in [
+            ("owner.json", "host owner\n"),
+            (".cursor", "host cursor\n"),
+            ("resume-count", "7\n"),
+            (
+                &format!("pi.events-{}.jsonl", labels.execution_id),
+                "host live events\n",
+            ),
+        ] {
+            fs::write(session.join(name), contents).expect("write host-private session metadata");
+        }
+        Self { path }
+    }
+
+    fn worktree(&self, labels: &OwnershipLabels) -> PathBuf {
+        self.path
+            .join("worktrees")
+            .join(labels.execution_id.as_str())
+    }
+
+    fn session(&self, labels: &OwnershipLabels) -> PathBuf {
+        self.path
+            .join("sessions")
+            .join(labels.execution_id.as_str())
+    }
+}
+
+impl Drop for TestStateRoot {
+    fn drop(&mut self) {
+        let is_owned_test_path = self.path.parent() == Some(env::temp_dir().as_path())
+            && self
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("autospec-runtime-docker-state-"));
+        if is_owned_test_path {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
 
 async fn volume_names(docker: &Docker) -> BTreeSet<String> {
     docker
@@ -262,6 +319,39 @@ async fn runtime_or_skip(test_name: &str) -> Option<DockerRuntime> {
     Some(runtime)
 }
 
+async fn runtime_at_state_root_or_skip(
+    test_name: &str,
+    state_root: &Path,
+) -> Option<DockerRuntime> {
+    let runtime = match DockerRuntime::connect_with_state_root(None, state_root) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            println!("SKIP {test_name}: Docker daemon unavailable: {error}");
+            return None;
+        }
+    };
+    let daemon =
+        raw_client().expect("runtime connection and raw test connection use the same socket");
+    if let Err(error) = daemon.version().await {
+        println!("SKIP {test_name}: Docker daemon unavailable: {error}");
+        return None;
+    }
+    assert!(
+        runtime.available().await,
+        "Docker daemon is present but below the runtime's required API version"
+    );
+    Some(runtime)
+}
+
+async fn execution_runtime_or_skip(
+    test_name: &str,
+    labels: &OwnershipLabels,
+) -> Option<(TestStateRoot, DockerRuntime)> {
+    let state = TestStateRoot::new(labels);
+    let runtime = runtime_at_state_root_or_skip(test_name, &state.path).await?;
+    Some((state, runtime))
+}
+
 #[test]
 fn host_limits_enforce_cpu_memory_pid_and_disk_quotas() {
     let limits = host_limits(&runtime_requirement());
@@ -310,6 +400,144 @@ async fn daemon_probe_reports_a_compatible_real_daemon() {
         bollard::API_DEFAULT_VERSION.minor_version,
     ));
     assert_eq!(runtime.client_api_version(), expected);
+}
+
+#[tokio::test]
+async fn agent_mounts_only_writable_worktree_and_durable_conversation() {
+    let execution_labels = labels_for(unique_execution_id());
+    let state = TestStateRoot::new(&execution_labels);
+    let Some(runtime) = runtime_at_state_root_or_skip(
+        "agent_mounts_only_writable_worktree_and_durable_conversation",
+        &state.path,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let handle = runtime
+        .provision(&execution_labels, &runtime_requirement(), &[])
+        .await
+        .expect("provision mounted agent");
+    let inspect = docker
+        .inspect_container(&handle.agent_container, None)
+        .await
+        .expect("inspect mounted agent");
+    let mounts = inspect
+        .host_config
+        .expect("agent host config")
+        .mounts
+        .expect("agent bind mounts");
+    let actual_mounts = mounts
+        .iter()
+        .map(|mount| {
+            (
+                mount.target.clone().expect("mount target"),
+                mount.source.clone().expect("mount source"),
+                mount.typ,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(mounts.iter().all(|mount| mount.read_only != Some(true)));
+    let expected_mounts = BTreeSet::from([
+        (
+            "/workspace".to_owned(),
+            fs::canonicalize(state.worktree(&execution_labels))
+                .expect("canonical worktree")
+                .display()
+                .to_string(),
+            Some(MountTypeEnum::BIND),
+        ),
+        (
+            "/session".to_owned(),
+            fs::canonicalize(state.session(&execution_labels).join("conversation"))
+                .expect("canonical conversation")
+                .display()
+                .to_string(),
+            Some(MountTypeEnum::BIND),
+        ),
+    ]);
+    assert_eq!(actual_mounts, expected_mounts);
+
+    let private_live_events = format!("pi.events-{}.jsonl", execution_labels.execution_id);
+    let probe = docker
+        .create_exec(
+            &handle.agent_container,
+            CreateExecOptions {
+                cmd: Some(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    format!(
+                        "printf workspace > /workspace/container-write && \
+                         printf conversation > /session/container-write && \
+                         test ! -e /session/owner.json && \
+                         test ! -e /session/.cursor && \
+                         test ! -e /session/resume-count && \
+                         test ! -e /session/{private_live_events} && \
+                         test ! -e /var/run/docker.sock"
+                    ),
+                ]),
+                attach_stdout: Some(false),
+                attach_stderr: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create mount isolation probe");
+    docker
+        .start_exec(
+            &probe.id,
+            Some(StartExecOptions {
+                detach: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("start mount isolation probe");
+    let mut exit_code = None;
+    for _ in 0..200 {
+        let inspect = docker
+            .inspect_exec(&probe.id)
+            .await
+            .expect("inspect mount isolation probe");
+        if inspect.running == Some(false) {
+            exit_code = inspect.exit_code;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(exit_code, Some(0));
+    assert_eq!(
+        fs::read_to_string(state.worktree(&execution_labels).join("container-write"))
+            .expect("read worktree write"),
+        "workspace"
+    );
+    let conversation_write = state
+        .session(&execution_labels)
+        .join("conversation/container-write");
+    assert_eq!(
+        fs::read_to_string(&conversation_write).expect("read conversation write"),
+        "conversation"
+    );
+    for (name, contents) in [
+        ("owner.json", "host owner\n"),
+        (".cursor", "host cursor\n"),
+        ("resume-count", "7\n"),
+        (private_live_events.as_str(), "host live events\n"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(state.session(&execution_labels).join(name))
+                .expect("read private metadata"),
+            contents
+        );
+    }
+
+    scope.cleanup().await.expect("cleanup mounted agent");
+    assert_eq!(
+        fs::read_to_string(conversation_write).expect("conversation survives container cleanup"),
+        "conversation"
+    );
 }
 
 #[tokio::test]
@@ -444,13 +672,16 @@ async fn failed_normal_cleanup_keeps_scope_armed() {
 
 #[tokio::test]
 async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
-    let Some(runtime) =
-        runtime_or_skip("provision_reconcile_and_destroy_preserve_execution_isolation").await
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((_state, runtime)) = execution_runtime_or_skip(
+        "provision_reconcile_and_destroy_preserve_execution_isolation",
+        &execution_labels,
+    )
+    .await
     else {
         return;
     };
     let docker = raw_client().expect("the already-probed Docker daemon remains connectable");
-    let execution_labels = labels_for(unique_execution_id());
     let mut scope = DockerTestScope::new(&runtime, &execution_labels);
     let service = ServiceRequirement {
         name: "cache".to_owned(),
@@ -660,13 +891,16 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
 
 #[tokio::test]
 async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
-    let Some(runtime) =
-        runtime_or_skip("image_tmpfs_rejects_writes_past_the_execution_disk_budget").await
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((_state, runtime)) = execution_runtime_or_skip(
+        "image_tmpfs_rejects_writes_past_the_execution_disk_budget",
+        &execution_labels,
+    )
+    .await
     else {
         return;
     };
     let docker = raw_client().expect("connect to probed daemon");
-    let execution_labels = labels_for(unique_execution_id());
     let mut scope = DockerTestScope::new(&runtime, &execution_labels);
     let requirement = RuntimeRequirement {
         image: Some("alpine:3.20".to_owned()),
@@ -869,15 +1103,16 @@ async fn cleanup_aggregates_volume_failures_and_still_removes_the_network() {
 
 #[tokio::test]
 async fn provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_volume() {
-    let Some(runtime) = runtime_or_skip(
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((_state, runtime)) = execution_runtime_or_skip(
         "provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_volume",
+        &execution_labels,
     )
     .await
     else {
         return;
     };
     let docker = raw_client().expect("connect to probed daemon");
-    let execution_labels = labels_for(unique_execution_id());
     let mut scope = DockerTestScope::new(&runtime, &execution_labels);
     let owned_volume = DockerRuntime::volume_name(&execution_labels.execution_id, "cache-data");
     let holder = format!("autospec-{}-holder", execution_labels.execution_id);

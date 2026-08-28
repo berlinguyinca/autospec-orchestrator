@@ -5,13 +5,26 @@
 Implemented a real Bollard-backed `DockerRuntime` that provisions one isolated,
 ownership-labelled Docker network per execution, starts a limited agent container
 and isolated service containers, performs selector-scoped destruction, and reports
-orphans without deleting them.
+orphans without deleting them. The agent now receives only its execution worktree
+at `/workspace` and durable conversation directory at `/session`; host-private
+session metadata and the Docker socket remain outside the container boundary.
 
 ## Changes
 
 - Added Bollard connection handling through `DockerRuntime::connect`, including
   `AUTOSPEC_DOCKER_SOCKET` support, Docker API 1.41 compatibility validation,
   daemon-minimum validation, and Bollard client-version negotiation.
+- Added `DockerRuntime::connect_with_state_root` while preserving `connect` and
+  `new`. The default constructor reads the one shared `AUTOSPEC_STATE_ROOT`, and
+  the explicit constructor supports deterministic worker/test configuration
+  without changing the frozen `Runtime` trait.
+- Agent provisioning derives the owned worktree and conversation paths from the
+  validated execution ID. It requires the harness-owned state/worktree/session
+  hierarchy, safely creates only `conversation/`, canonicalizes both sources, and
+  bind-mounts them read-write at `/workspace` and `/session` respectively.
+- Service containers receive neither host bind. The host-private session root,
+  `owner.json`, `.cursor`, `resume-count`, live-event files, and the Docker socket
+  are never mounted.
 - Added deterministic network, agent-container, and service-container naming from
   the shared contracts.
 - Added CPU, memory, swap, PID, and writable-layer disk limits to every agent and
@@ -101,17 +114,28 @@ creation, runtime construction, thread panic payloads, and the aggregate returne
 by both selector destroys, while stderr write failures are deliberately ignored
 so cleanup cannot cause a second panic during unwinding.
 
+The Pi integration regression first failed because the agent had no bind mounts.
+After wiring the configured shared state root, the real-Docker inspection test
+found the expected sources and destinations; Docker normalized an explicit
+read-write flag to its omitted/default form, so writability is additionally
+proved by container writes observed on the host. The same test proves only the
+previously absent conversation directory is created, private session siblings and
+the Docker socket are inaccessible, and conversation data survives container
+destruction.
+
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo build --workspace` — passed.
 - `cargo test --workspace -- --nocapture` — passed with normal test concurrency;
-  real Docker tests: 11 passed, 0 skipped. PostgreSQL tests printed their existing explicit
+  real Docker tests: 12 passed, 0 skipped. PostgreSQL tests printed their existing explicit
   skips because `AUTOSPEC_DATABASE_URL` was unset.
 - Two simultaneous `cargo test -p runtime-docker --test docker_runtime --
-  --nocapture` processes — both passed 11/11 with no name collisions.
+  --nocapture` processes — both passed 12/12 with no name or state-root collisions.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed.
-- `cargo +1.85.0 check --workspace` — passed.
+- `cargo +1.85.0 fmt --all -- --check`, `build --workspace`, `test
+  --workspace -- --nocapture`, and `clippy --workspace --all-targets -- -D
+  warnings` — passed; the Rust 1.85 real-Docker run also passed 12/12.
 - `git diff --check` — passed.
 - Post-test Docker inventory for the new process/time/sequence execution IDs and
   their valid control execution IDs — empty. Old wall-clock-only
@@ -127,6 +151,9 @@ so cleanup cannot cause a second panic during unwinding.
 - Bounded image paths are intentionally ephemeral tmpfs state. Services that need
   persistence beyond an execution require a future explicitly budgeted storage
   contract rather than falling back to unbounded Docker volumes.
+- The configured state root, worktree, and harness-owned session root must exist
+  as real directories before provisioning. The runtime deliberately refuses
+  symlinked/missing roots and creates only the conversation child.
 - The agent container currently uses the runtime image's `sleep infinity`
   capability. Task 4/5 integration may replace that command when the Pi harness
   launch contract is wired, without changing the runtime trait.
