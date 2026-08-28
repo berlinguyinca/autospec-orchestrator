@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete after review fix round 2. The Pi 0.84.3 harness now launches only
+Complete after review fix round 3. The Pi 0.84.3 harness now launches only
 inside its provisioned agent container through argument-separated `docker exec`,
 using `/workspace` and `/session` container paths and one compact materialized
 `TaskPacket`. The authoritative live JSON event stream is captured durably on
@@ -18,11 +18,15 @@ disposable agent container is removed. Native non-empty conversation resume/fork
 normalized sequence-zero events, unknown-event accounting, and inactivity,
 wall-clock, and CPU-saturation health classification remain implemented.
 
-The live protocol normalizer now follows the installed Pi 0.84.3 declaration:
+The live protocol normalizer now follows the installed Pi 0.84.3 implementation:
 the session header and turn start are recognized but ignored, `agent_start`
-emits the sole `AgentStarted`, assistant `message_end` backend failures emit
-`ModelFailed`, and `agent_settled` emits `ReviewReady`. Other declared protocol
-records are deliberately ignored without inflating the unknown-event counter.
+emits the sole `AgentStarted`, and terminal state is reduced across incremental
+polls and harness restarts. Assistant errors remain pending through
+`agent_end.willRetry` and `auto_retry_start`; a successful `auto_retry_end`
+allows `agent_settled` to emit `ReviewReady`, while an exhausted retry emits one
+`ModelFailed` and suppresses the finally-block `agent_settled`. Other declared
+protocol records are deliberately ignored without inflating the unknown-event
+counter.
 
 Process-group authority no longer crosses into the Pi-writable session mount.
 An immutable inline supervisor runs through argument-separated `docker exec`,
@@ -30,17 +34,24 @@ creates the process group, and emits one trusted control record before executing
 Pi. The host removes that record from the event stream and retains the PGID only
 in memory. Root `docker exec` control commands signal that trusted PGID, while
 bounded drop cleanup uses `try_wait`, TERM, and KILL without an indefinite wait.
+If the supervisor header is invalid, unreadable, or times out, the host recovers
+trusted group identity from a per-launch environment token, reaps the process
+group and descendants, then terminates the Docker exec client. The durable live
+event file, reducer/cursor, owner, and resume count all stay in the host-private
+session root; only `session_root/conversation/` is mounted at `/session`.
 
 ## Commits
 
 - `279b7fb` — implementation and tests.
 - `3076652` — review fix round 1 implementation and real-Docker tests.
 - `a274938` — review fix round 2 protocol normalization and trusted supervisor.
+- `54d9164` — review fix round 3 retry reducer, private state boundary, and
+  startup-failure cleanup.
 - Report commit — this report.
 
 ## Tests
 
-- `cargo test -p harness-pi --test pi_harness` — 10 passed against a real Docker
+- `cargo test -p harness-pi --test pi_harness` — 16 passed against a real Docker
   daemon and isolated labelled Debian containers with a mounted stub Pi. Coverage
   includes container-only paths, absent model-selection flags, distinct live and
   conversation JSONL, incremental partial-line delivery, persistence after
@@ -49,7 +60,11 @@ bounded drop cleanup uses `try_wait`, TERM, and KILL without an indefinite wait.
   Round-2 coverage adds an ordered Pi 0.84.3 JSON fixture, both assistant backend
   failure shapes, deliberate known-record ignores, trusted-header stripping,
   forged session control files/PGIDs, and bounded cleanup of a TERM-ignoring
-  descendant.
+  descendant. Round-3 coverage adds retry-success and final-failure sequences
+  in authoritative Pi order across incremental polls and harness restart,
+  malicious conversation writes against all host-private metadata, and cleanup
+  after invalid JSON, invalid UTF-8 reader failure, and a silent supervisor
+  header timeout.
 - `cargo test -p orchestrator-worker --test health` — 3 passed; half-window
   inactivity warning/reset, inactivity and wall-clock failures, and sustained
   CPU saturation.
@@ -58,12 +73,13 @@ bounded drop cleanup uses `try_wait`, TERM, and KILL without an indefinite wait.
   `cargo fmt --all -- --check` — passed, including real Docker, PostgreSQL, and
   Git suites.
 - Rust 1.85: the same complete build/test/clippy/fmt gate — passed, including
-  the ten real-Docker Pi harness tests.
+  the sixteen real-Docker Pi harness tests.
 
 ## Concerns
 
 - Live InferWeave inference was not exercised; the installed Pi 0.84.3 CLI/help
   and package source were used as the authoritative process/session interface.
 - Production runtime mount provisioning is intentionally unchanged in this fix
-  round; the harness requires the caller-provisioned agent container to bind the
-  host worktree at `/workspace` and durable session directory at `/session`.
+  round; the upcoming runtime contract must bind the host worktree at
+  `/workspace` and only `session_root/conversation/` at `/session`, leaving the
+  session root host-private.
