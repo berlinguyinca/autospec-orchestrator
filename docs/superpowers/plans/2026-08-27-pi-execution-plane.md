@@ -52,12 +52,12 @@
 - Produces a real `DockerRuntime` implementing the frozen `Runtime` trait.
 - Consumes ownership labels and runtime/service requirements.
 
-- [ ] Add daemon-probe and real-resource tests with explicit dependency skips.
-- [ ] Connect through bollard with a minimum API version check.
-- [ ] Provision one labelled network, limited agent container, and isolated service containers without host ports.
-- [ ] Enforce CPU, memory, PID, and disk constraints on every container.
-- [ ] Destroy only selector-matched resources and report—not delete—orphans during reconciliation.
-- [ ] Prove unrelated Docker resources survive cleanup.
+- [x] Add daemon-probe and real-resource tests with explicit dependency skips.
+- [x] Connect through bollard with a minimum API version check.
+- [x] Provision one labelled network, limited agent container, and isolated service containers without host ports.
+- [x] Enforce CPU, memory, PID, and disk constraints on every container.
+- [x] Destroy only selector-matched resources and report—not delete—orphans during reconciliation.
+- [x] Prove unrelated Docker resources survive cleanup.
 
 ### Task 3: Physical Git isolation and evidence (#11–#14)
 
