@@ -11,10 +11,11 @@ mod services;
 
 use async_trait::async_trait;
 use bollard::{image::CreateImageOptions, models::ImageInspect, Docker};
+use execution_storage::{AllocationReceipt, ReadyAllocationVerifier};
 use futures_util::StreamExt;
 use orchestrator_core::{ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::{EnvironmentHandle, Runtime, RuntimeError};
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, sync::Arc};
 
 pub use limits::{host_limits, HostConfigLimits, DEFAULT_PIDS_LIMIT};
 
@@ -25,6 +26,8 @@ pub struct DockerRuntime {
     pub(crate) client: Docker,
     min_api_version: String,
     pub(crate) state_root: PathBuf,
+    pub(crate) storage_verifier: Option<Arc<dyn ReadyAllocationVerifier>>,
+    pub(crate) allocation: Option<AllocationReceipt>,
 }
 
 impl DockerRuntime {
@@ -36,7 +39,10 @@ impl DockerRuntime {
         Self::connect_with_state_root(socket, state_root)
     }
 
-    /// Connects using an explicit shared state root for execution worktrees and sessions.
+    /// Connects for availability/reconciliation without a storage allocation.
+    ///
+    /// Provisioning through this legacy constructor fails closed because it has
+    /// no live Ready execution-storage capability.
     pub fn connect_with_state_root(
         socket: Option<&str>,
         state_root: impl Into<PathBuf>,
@@ -53,7 +59,32 @@ impl DockerRuntime {
             client,
             min_api_version: DEFAULT_MIN_API_VERSION.to_owned(),
             state_root: state_root.into(),
+            storage_verifier: None,
+            allocation: None,
         })
+    }
+
+    /// Connects a runtime to one exact durable Ready execution allocation.
+    ///
+    /// The verifier is invoked immediately before provisioning; its receipt
+    /// supplies the canonical state root and Docker bind-proof identity.
+    pub fn connect_with_execution_storage(
+        socket: Option<&str>,
+        verifier: Arc<dyn ReadyAllocationVerifier>,
+        allocation: AllocationReceipt,
+    ) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::connect(socket)?;
+        runtime.state_root = allocation
+            .mount_path
+            .parent()
+            .and_then(|executions| executions.parent())
+            .ok_or_else(|| {
+                RuntimeError::ResourceLimit("allocation mount path lacks state root".to_owned())
+            })?
+            .to_path_buf();
+        runtime.storage_verifier = Some(verifier);
+        runtime.allocation = Some(allocation);
+        Ok(runtime)
     }
 
     pub fn new() -> Result<Self, RuntimeError> {

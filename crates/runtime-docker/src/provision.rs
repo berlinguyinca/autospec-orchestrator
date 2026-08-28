@@ -1,15 +1,15 @@
-use crate::{
-    limits::{host_limits, set_writable_layer_limit},
-    services, DockerRuntime,
-};
+use crate::{limits::host_limits, services, DockerRuntime};
 use bollard::{
-    container::{Config, CreateContainerOptions},
-    models::{ImageInspect, Mount, MountTmpfsOptions, MountTypeEnum},
+    container::{Config, CreateContainerOptions, LogOutput},
+    exec::{CreateExecOptions, StartExecResults},
+    models::{ImageInspect, Mount, MountTypeEnum},
     network::CreateNetworkOptions,
 };
+use execution_storage::{disk_gib_to_bytes, ExecutionLayout, VerifiedExecutionStorage};
+use futures_util::StreamExt;
 use orchestrator_core::{OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::{EnvironmentHandle, RuntimeError};
-use std::{fs, io, path::Path};
+use std::{collections::BTreeSet, fs, io, path::Path};
 
 const CONTAINER_WORKTREE: &str = "/workspace";
 const CONTAINER_SESSION: &str = "/session";
@@ -20,8 +20,19 @@ pub(crate) async fn provision(
     requirement: &RuntimeRequirement,
     service_requirements: &[ServiceRequirement],
 ) -> Result<EnvironmentHandle, RuntimeError> {
+    let (verified, layout) = verified_execution_layout(runtime, labels, requirement)?;
     runtime.require_compatible_daemon().await?;
-    match provision_inner(runtime, labels, requirement, service_requirements).await {
+    validate_storage_daemon(runtime).await?;
+    match provision_inner(
+        runtime,
+        labels,
+        requirement,
+        service_requirements,
+        verified.as_ref(),
+        &layout,
+    )
+    .await
+    {
         Ok(handle) => Ok(handle),
         Err(provision_error) => match crate::cleanup::destroy(runtime, labels).await {
             Ok(()) => Err(provision_error),
@@ -33,12 +44,45 @@ pub(crate) async fn provision(
     }
 }
 
+async fn validate_storage_daemon(runtime: &DockerRuntime) -> Result<(), RuntimeError> {
+    let expected = &runtime
+        .allocation
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::ResourceLimit(
+                "Docker provisioning requires an exact Ready allocation receipt".to_owned(),
+            )
+        })?
+        .docker_bind
+        .daemon_id;
+    let actual = runtime
+        .client
+        .info()
+        .await
+        .map_err(|error| {
+            RuntimeError::Unavailable(format!("inspect Docker daemon identity: {error}"))
+        })?
+        .id
+        .ok_or_else(|| {
+            RuntimeError::ResourceLimit("Docker daemon did not report an identity".to_owned())
+        })?;
+    if &actual != expected {
+        return Err(RuntimeError::ResourceLimit(format!(
+            "Docker daemon identity {actual} does not match the Ready storage proof"
+        )));
+    }
+    Ok(())
+}
+
 async fn provision_inner(
     runtime: &DockerRuntime,
     labels: &OwnershipLabels,
     requirement: &RuntimeRequirement,
     service_requirements: &[ServiceRequirement],
+    verified: &dyn VerifiedExecutionStorage,
+    layout: &ExecutionLayout,
 ) -> Result<EnvironmentHandle, RuntimeError> {
+    verified.verify().map_err(storage_error)?;
     let image = requirement.image.as_deref().ok_or_else(|| {
         RuntimeError::Provisioning("runtime image is required for Docker provisioning".to_owned())
     })?;
@@ -51,8 +95,16 @@ async fn provision_inner(
         .chain(service_images.iter())
         .collect::<Vec<_>>();
     validate_reserved_image_volumes(&image_inspects)?;
-    let disk_slot_bytes = execution_disk_slot_bytes(requirement, &image_inspects)?;
-    let execution_mounts = execution_bind_mounts(runtime, labels)?;
+    let execution_mounts = execution_bind_mounts(layout)?;
+    let agent_mounts = writable_container_mounts(&layout.runtime, "agent", &image_inspect)?;
+    let service_mounts = service_requirements
+        .iter()
+        .zip(&service_images)
+        .map(|(service, image)| {
+            writable_container_mounts(&layout.runtime, &format!("service-{}", service.name), image)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    verified.verify().map_err(storage_error)?;
 
     let network = DockerRuntime::network_name(&labels.execution_id);
     runtime
@@ -75,21 +127,19 @@ async fn provision_inner(
         labels,
         requirement,
         service_requirements,
-        &service_images,
         &network,
-        disk_slot_bytes,
+        &service_mounts,
+        (&layout.root, verified),
     )
     .await?;
 
     let agent_container = DockerRuntime::agent_container_name(&labels.execution_id);
     let mut limits = host_limits(requirement);
     limits.network_mode = Some(network.clone());
-    let agent_mounts = bounded_image_mounts(&image_inspect, disk_slot_bytes);
-    set_writable_layer_limit(&mut limits, agent_mounts.writable_layer_bytes);
-    let has_bounded_mounts = !agent_mounts.mounts.is_empty();
-    let mut mounts = agent_mounts.mounts;
+    let mut mounts = agent_mounts;
     mounts.extend(execution_mounts);
     limits.mounts = Some(mounts);
+    verified.verify().map_err(storage_error)?;
     runtime
         .client
         .create_container(
@@ -100,6 +150,10 @@ async fn provision_inner(
             Config {
                 image: Some(image.to_owned()),
                 cmd: Some(vec!["sleep".to_owned(), "infinity".to_owned()]),
+                env: Some(vec![
+                    "HOME=/home/autospec".to_owned(),
+                    "TMPDIR=/tmp".to_owned(),
+                ]),
                 labels: Some(labels.to_map().into_iter().collect()),
                 host_config: Some(limits),
                 networking_config: Some(services::networking_config(&network, "agent")),
@@ -111,9 +165,11 @@ async fn provision_inner(
             container_create_error(
                 format!("create agent container {agent_container}"),
                 error,
-                has_bounded_mounts,
+                true,
             )
         })?;
+    verified.verify().map_err(storage_error)?;
+    verify_container_mount_sources(runtime, &agent_container, &layout.root).await?;
     runtime
         .client
         .start_container::<String>(&agent_container, None)
@@ -121,6 +177,8 @@ async fn provision_inner(
         .map_err(|error| {
             RuntimeError::Provisioning(format!("start agent container {agent_container}: {error}"))
         })?;
+    verified.verify().map_err(storage_error)?;
+    verify_container_mount_devices(runtime, &agent_container).await?;
 
     Ok(EnvironmentHandle {
         execution_id: labels.execution_id.clone(),
@@ -132,46 +190,58 @@ async fn provision_inner(
     })
 }
 
-fn execution_bind_mounts(
-    runtime: &DockerRuntime,
-    labels: &OwnershipLabels,
-) -> Result<Vec<Mount>, RuntimeError> {
-    validate_execution_id(labels.execution_id.as_str())?;
-    ensure_real_directory(&runtime.state_root, false, "state root")?;
-    let worktrees_root = runtime.state_root.join("worktrees");
-    ensure_real_directory(&worktrees_root, false, "worktrees root")?;
-    let worktree = worktrees_root.join(labels.execution_id.as_str());
-    ensure_real_directory(&worktree, false, "execution worktree")?;
-
-    let sessions_root = runtime.state_root.join("sessions");
-    ensure_real_directory(&sessions_root, false, "sessions root")?;
-    let session_root = sessions_root.join(labels.execution_id.as_str());
-    ensure_real_directory(&session_root, false, "execution session root")?;
-    let conversation = session_root.join("conversation");
-    ensure_real_directory(&conversation, true, "conversation directory")?;
-
+fn execution_bind_mounts(layout: &ExecutionLayout) -> Result<Vec<Mount>, RuntimeError> {
     Ok(vec![
-        bind_mount(&worktree, CONTAINER_WORKTREE)?,
-        bind_mount(&conversation, CONTAINER_SESSION)?,
+        bind_mount(&layout.repository, CONTAINER_WORKTREE)?,
+        bind_mount(&layout.conversation, CONTAINER_SESSION)?,
     ])
 }
 
-fn validate_execution_id(execution_id: &str) -> Result<(), RuntimeError> {
-    let bytes = execution_id.as_bytes();
-    let valid = (1..=63).contains(&bytes.len())
-        && bytes
-            .first()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
-    if valid {
-        Ok(())
-    } else {
-        Err(RuntimeError::Provisioning(format!(
-            "invalid execution_id for runtime paths: {execution_id}"
-        )))
+fn verified_execution_layout(
+    runtime: &DockerRuntime,
+    labels: &OwnershipLabels,
+    requirement: &RuntimeRequirement,
+) -> Result<(Box<dyn VerifiedExecutionStorage>, ExecutionLayout), RuntimeError> {
+    let verifier = runtime.storage_verifier.as_ref().ok_or_else(|| {
+        RuntimeError::ResourceLimit(
+            "Docker provisioning requires a live Ready execution-storage verifier".to_owned(),
+        )
+    })?;
+    let receipt = runtime.allocation.as_ref().ok_or_else(|| {
+        RuntimeError::ResourceLimit(
+            "Docker provisioning requires an exact Ready allocation receipt".to_owned(),
+        )
+    })?;
+    if &receipt.labels != labels
+        || receipt.reserved_bytes
+            != disk_gib_to_bytes(requirement.disk_gib).map_err(storage_error)?
+    {
+        return Err(RuntimeError::ResourceLimit(
+            "runtime request does not exactly match the Ready allocation".to_owned(),
+        ));
     }
+    let verified = verifier.verify_ready(receipt).map_err(storage_error)?;
+    verified.verify().map_err(storage_error)?;
+    let layout =
+        ExecutionLayout::new(&runtime.state_root, &labels.execution_id).map_err(storage_error)?;
+    if layout.root != receipt.mount_path || verified.repository_path() != layout.repository {
+        return Err(RuntimeError::ResourceLimit(
+            "verified storage paths do not match the exact execution layout".to_owned(),
+        ));
+    }
+    for (path, purpose) in [
+        (&layout.root, "execution root"),
+        (&layout.repository, "execution repository"),
+        (&layout.conversation, "execution conversation"),
+        (&layout.runtime, "execution runtime"),
+    ] {
+        ensure_real_directory(path, false, purpose)?;
+    }
+    Ok((verified, layout))
+}
+
+fn storage_error(error: execution_storage::StorageError) -> RuntimeError {
+    RuntimeError::ResourceLimit(format!("execution storage verification failed: {error}"))
 }
 
 fn ensure_real_directory(path: &Path, create: bool, purpose: &str) -> Result<(), RuntimeError> {
@@ -224,29 +294,275 @@ fn bind_mount(source: &Path, target: &str) -> Result<Mount, RuntimeError> {
     })
 }
 
-pub(crate) fn bounded_image_mounts(
-    image: &ImageInspect,
-    disk_slot_bytes: u64,
-) -> BoundedImageMounts {
-    let targets = image_volume_targets(image);
-    let mounts = targets
-        .into_iter()
-        .map(|target| Mount {
-            target: Some(target),
-            source: None,
-            typ: Some(MountTypeEnum::TMPFS),
-            tmpfs_options: Some(MountTmpfsOptions {
-                size_bytes: Some(disk_slot_bytes as i64),
-                mode: Some(0o1777),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .collect();
-    BoundedImageMounts {
-        writable_layer_bytes: disk_slot_bytes,
-        mounts,
+pub(crate) async fn verify_container_mount_sources(
+    runtime: &DockerRuntime,
+    container: &str,
+    execution_root: &Path,
+) -> Result<(), RuntimeError> {
+    let root = fs::canonicalize(execution_root).map_err(|error| {
+        RuntimeError::ResourceLimit(format!("canonicalize execution root: {error}"))
+    })?;
+    #[cfg(unix)]
+    let root_device = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(&root)
+            .map_err(|error| {
+                RuntimeError::ResourceLimit(format!("inspect execution root: {error}"))
+            })?
+            .dev()
+    };
+    let inspect = runtime
+        .client
+        .inspect_container(container, None)
+        .await
+        .map_err(|error| {
+            RuntimeError::Provisioning(format!("inspect container {container}: {error}"))
+        })?;
+    let host = inspect.host_config.ok_or_else(|| {
+        RuntimeError::ResourceLimit(format!("container {container} lacks host configuration"))
+    })?;
+    if host.readonly_rootfs != Some(true)
+        || host
+            .log_config
+            .as_ref()
+            .and_then(|config| config.typ.as_deref())
+            != Some("none")
+        || host
+            .storage_opt
+            .as_ref()
+            .is_some_and(|options| !options.is_empty())
+        || host.tmpfs.as_ref().is_some_and(|mounts| !mounts.is_empty())
+    {
+        return Err(RuntimeError::ResourceLimit(format!(
+            "container {container} does not use readonly rootfs, log none, and bind-only storage"
+        )));
     }
+    let mounts = host.mounts.ok_or_else(|| {
+        RuntimeError::ResourceLimit(format!("container {container} has no writable bind mounts"))
+    })?;
+    for mount in mounts {
+        if mount.typ != Some(MountTypeEnum::BIND) || mount.read_only == Some(true) {
+            return Err(RuntimeError::ResourceLimit(format!(
+                "container {container} has a non-bind or read-only writable-path mount"
+            )));
+        }
+        let target = mount.target.unwrap_or_default();
+        if target == "/var/run/docker.sock" || target == "/run/docker.sock" {
+            return Err(RuntimeError::ResourceLimit(
+                "Docker socket mount is forbidden".to_owned(),
+            ));
+        }
+        let source = mount.source.ok_or_else(|| {
+            RuntimeError::ResourceLimit(format!("container {container} bind lacks source"))
+        })?;
+        let canonical = fs::canonicalize(&source).map_err(|error| {
+            RuntimeError::ResourceLimit(format!(
+                "canonicalize daemon bind source {source}: {error}"
+            ))
+        })?;
+        if !canonical.starts_with(&root) || canonical == root {
+            return Err(RuntimeError::ResourceLimit(format!(
+                "daemon bind source {} escapes execution root {}",
+                canonical.display(),
+                root.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if fs::metadata(&canonical)
+                .map_err(|error| {
+                    RuntimeError::ResourceLimit(format!("inspect bind source: {error}"))
+                })?
+                .dev()
+                != root_device
+            {
+                return Err(RuntimeError::ResourceLimit(format!(
+                    "daemon bind source {} is on a different execution filesystem",
+                    canonical.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn verify_container_mount_devices(
+    runtime: &DockerRuntime,
+    container: &str,
+) -> Result<(), RuntimeError> {
+    let inspect = runtime
+        .client
+        .inspect_container(container, None)
+        .await
+        .map_err(|error| {
+            RuntimeError::Provisioning(format!("inspect running container {container}: {error}"))
+        })?;
+    let targets = inspect
+        .mounts
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|mount| mount.rw == Some(true))
+        .filter_map(|mount| mount.destination)
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Err(RuntimeError::ResourceLimit(format!(
+            "container {container} has no daemon-inspected RW mounts"
+        )));
+    }
+    let mut command = vec!["stat".to_owned(), "-c".to_owned(), "%d".to_owned()];
+    command.extend(targets.iter().cloned());
+    let exec = runtime
+        .client
+        .create_exec(
+            container,
+            CreateExecOptions {
+                cmd: Some(command),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| {
+            RuntimeError::ResourceLimit(format!("create daemon-side mount proof: {error}"))
+        })?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    match runtime
+        .client
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(|error| {
+            RuntimeError::ResourceLimit(format!("start daemon-side mount proof: {error}"))
+        })? {
+        StartExecResults::Attached { mut output, .. } => {
+            while let Some(item) = output.next().await {
+                match item.map_err(|error| {
+                    RuntimeError::ResourceLimit(format!("read daemon-side mount proof: {error}"))
+                })? {
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                        stdout.extend_from_slice(&message)
+                    }
+                    LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
+                    _ => {}
+                }
+            }
+        }
+        StartExecResults::Detached => {
+            return Err(RuntimeError::ResourceLimit(
+                "daemon-side mount proof detached".to_owned(),
+            ))
+        }
+    }
+    let result = runtime
+        .client
+        .inspect_exec(&exec.id)
+        .await
+        .map_err(|error| {
+            RuntimeError::ResourceLimit(format!("inspect daemon-side mount proof: {error}"))
+        })?;
+    if result.exit_code != Some(0) {
+        return Err(RuntimeError::ResourceLimit(format!(
+            "daemon-side mount proof failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )));
+    }
+    let output = String::from_utf8(stdout).map_err(|error| {
+        RuntimeError::ResourceLimit(format!("daemon-side device proof is not UTF-8: {error}"))
+    })?;
+    let devices = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<BTreeSet<_>>();
+    if devices.len() != 1 {
+        return Err(RuntimeError::ResourceLimit(format!(
+            "RW mounts do not share one daemon-observed device: {devices:?}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn writable_container_mounts(
+    runtime_root: &Path,
+    scope: &str,
+    image: &ImageInspect,
+) -> Result<Vec<Mount>, RuntimeError> {
+    validate_safe_component(scope, "container storage scope")?;
+    ensure_real_directory(runtime_root, false, "execution runtime root")?;
+    let scope_root = runtime_root.join(scope);
+    ensure_real_directory(&scope_root, true, "container storage root")?;
+    let fixed = [
+        ("home", "/home/autospec"),
+        ("tmp", "/tmp"),
+        ("var-tmp", "/var/tmp"),
+        ("run", "/run"),
+    ];
+    let mut mounts = Vec::new();
+    let mut targets = BTreeSet::new();
+    for (purpose, target) in fixed {
+        let source = scope_root.join(purpose);
+        ensure_real_directory(&source, true, "container writable directory")?;
+        make_container_writable(&source)?;
+        mounts.push(bind_mount(&source, target)?);
+        targets.insert(target.to_owned());
+    }
+    let image_root = scope_root.join("image-volumes");
+    ensure_real_directory(&image_root, true, "image volume root")?;
+    for target in image_volume_targets(image) {
+        if !targets.insert(target.clone()) {
+            continue;
+        }
+        let source = image_root.join(hex_component(target.as_bytes()));
+        ensure_real_directory(&source, true, "image volume directory")?;
+        make_container_writable(&source)?;
+        mounts.push(bind_mount(&source, &target)?);
+    }
+    Ok(mounts)
+}
+
+#[cfg(unix)]
+fn make_container_writable(path: &Path) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o1777)).map_err(|error| {
+        RuntimeError::Provisioning(format!(
+            "make container bind directory writable {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn make_container_writable(_path: &Path) -> Result<(), RuntimeError> {
+    Err(RuntimeError::ResourceLimit(
+        "storage-backed writable container binds require Unix permissions".to_owned(),
+    ))
+}
+
+fn validate_safe_component(value: &str, purpose: &str) -> Result<(), RuntimeError> {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(RuntimeError::Provisioning(format!(
+            "invalid {purpose}: {value}"
+        )))
+    }
+}
+
+fn hex_component(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn image_volume_targets(image: &ImageInspect) -> Vec<String> {
@@ -292,37 +608,6 @@ fn validate_reserved_image_volumes(images: &[&ImageInspect]) -> Result<(), Runti
     Ok(())
 }
 
-fn execution_disk_slot_bytes(
-    requirement: &RuntimeRequirement,
-    images: &[&ImageInspect],
-) -> Result<u64, RuntimeError> {
-    let total_bytes = requirement
-        .disk_gib
-        .checked_mul(1024 * 1024 * 1024)
-        .ok_or_else(|| RuntimeError::ResourceLimit("disk budget overflows bytes".to_owned()))?;
-    let slot_count = images
-        .iter()
-        .try_fold(images.len(), |count, image| {
-            count.checked_add(image_volume_targets(image).len())
-        })
-        .ok_or_else(|| RuntimeError::ResourceLimit("too many image volume paths".to_owned()))?;
-    let divisor = u64::try_from(slot_count)
-        .map_err(|_| RuntimeError::ResourceLimit("too many image volume paths".to_owned()))?;
-    let slot_bytes = total_bytes / divisor;
-    if slot_bytes == 0 || slot_bytes > i64::MAX as u64 {
-        return Err(RuntimeError::ResourceLimit(format!(
-            "disk budget {}GiB cannot bound {slot_count} execution storage slots",
-            requirement.disk_gib
-        )));
-    }
-    Ok(slot_bytes)
-}
-
-pub(crate) struct BoundedImageMounts {
-    pub(crate) writable_layer_bytes: u64,
-    pub(crate) mounts: Vec<Mount>,
-}
-
 pub(crate) fn container_create_error(
     context: String,
     error: bollard::errors::Error,
@@ -347,7 +632,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn all_container_layers_and_tmpfs_mounts_share_one_execution_disk_budget() {
+    fn writable_image_paths_are_bind_mapped_beneath_execution_runtime() {
         let agent_image = ImageInspect {
             config: Some(ImageConfig {
                 volumes: Some(HashMap::from([
@@ -358,64 +643,44 @@ mod tests {
             }),
             ..Default::default()
         };
-        let service_image = ImageInspect::default();
-        let requirement = RuntimeRequirement {
-            disk_gib: 1,
-            ..RuntimeRequirement::default()
-        };
+        let state = tempfile::tempdir().expect("state");
+        let runtime_root = state.path().join("runtime");
+        std::fs::create_dir(&runtime_root).expect("runtime root");
+        let runtime_root = std::fs::canonicalize(runtime_root).expect("canonical runtime root");
+        let mounts = writable_container_mounts(&runtime_root, "agent", &agent_image)
+            .expect("build writable binds");
 
-        let slot_bytes = execution_disk_slot_bytes(&requirement, &[&agent_image, &service_image])
-            .expect("allocate disk budget");
-        let allocation = bounded_image_mounts(&agent_image, slot_bytes);
-        let mount_bytes = allocation
-            .mounts
+        assert!(mounts
             .iter()
-            .map(|mount| {
-                mount
-                    .tmpfs_options
-                    .as_ref()
-                    .and_then(|options| options.size_bytes)
-                    .expect("every image path is bounded") as u64
-            })
-            .sum::<u64>();
-
-        assert_eq!(allocation.mounts.len(), 2);
-        assert_eq!(
-            allocation.writable_layer_bytes + mount_bytes + slot_bytes,
-            (1024 * 1024 * 1024 / 4) * 4
-        );
-        assert!(allocation.writable_layer_bytes + mount_bytes + slot_bytes <= 1024 * 1024 * 1024);
+            .all(|mount| mount.typ == Some(MountTypeEnum::BIND)));
+        assert!(mounts.iter().all(|mount| mount.tmpfs_options.is_none()));
+        assert!(mounts.iter().all(|mount| {
+            Path::new(mount.source.as_deref().expect("source")).starts_with(&runtime_root)
+        }));
+        let targets = mounts
+            .iter()
+            .filter_map(|mount| mount.target.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(targets.contains("/home/autospec"));
+        assert!(targets.contains("/tmp"));
+        assert!(targets.contains("/var/tmp"));
+        assert!(targets.contains("/run"));
+        assert!(targets.contains("/cache"));
+        assert!(targets.contains("/data"));
     }
 
     #[test]
-    fn daemon_rejection_of_a_bounded_mount_is_a_resource_limit_error() {
+    fn daemon_rejection_of_an_execution_bind_is_a_resource_limit_error() {
         let error = container_create_error(
             "create service container".to_owned(),
             bollard::errors::Error::DockerResponseServerError {
                 status_code: 400,
-                message: "invalid mount config for type tmpfs".to_owned(),
+                message: "invalid mount config for type bind".to_owned(),
             },
             true,
         );
 
-        assert!(matches!(error, RuntimeError::ResourceLimit(message) if message.contains("tmpfs")));
-    }
-
-    #[test]
-    fn runtime_paths_accept_only_safe_execution_id_components() {
-        assert!(validate_execution_id("node-417-impl-01").is_ok());
-        for invalid in [
-            "",
-            "../escape",
-            "Uppercase",
-            "contains_underscore",
-            "a234567890123456789012345678901234567890123456789012345678901234",
-        ] {
-            assert!(
-                validate_execution_id(invalid).is_err(),
-                "accepted unsafe execution id {invalid}"
-            );
-        }
+        assert!(matches!(error, RuntimeError::ResourceLimit(message) if message.contains("bind")));
     }
 
     #[test]

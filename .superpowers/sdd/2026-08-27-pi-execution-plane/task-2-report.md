@@ -1,181 +1,86 @@
-# Task 2 Report: Docker runtime MVP and safe cleanup
+# Task 2 Report: storage-backed Docker runtime
 
 ## Outcome
 
-Implemented a real Bollard-backed `DockerRuntime` that provisions one isolated,
-ownership-labelled Docker network per execution, starts a limited agent container
-and isolated service containers, performs selector-scoped destruction, and reports
-orphans without deleting them. The agent now receives only its execution worktree
-at `/workspace` and durable conversation directory at `/session`; host-private
-session metadata and the Docker socket remain outside the container boundary.
+`DockerRuntime` now provisions only from an exact live Ready
+`execution-storage` allocation. Agent and service containers use immutable root
+filesystems, disabled Docker logging, and deterministic writable bind directories
+inside the allocation's aggregate hard-quota filesystem. Legacy constructors
+remain available for daemon probes, reconciliation, and cleanup, but provisioning
+through them fails closed.
 
-## Changes
+## Runtime integration
 
-- Added Bollard connection handling through `DockerRuntime::connect`, including
-  `AUTOSPEC_DOCKER_SOCKET` support, Docker API 1.41 compatibility validation,
-  daemon-minimum validation, and Bollard client-version negotiation.
-- Added `DockerRuntime::connect_with_state_root` while preserving `connect` and
-  `new`. The default constructor reads the one shared `AUTOSPEC_STATE_ROOT`, and
-  the explicit constructor supports deterministic worker/test configuration
-  without changing the frozen `Runtime` trait.
-- Agent provisioning derives the owned worktree and conversation paths from the
-  validated execution ID. It requires the harness-owned state/worktree/session
-  hierarchy, safely creates only `conversation/`, canonicalizes both sources, and
-  bind-mounts them read-write at `/workspace` and `/session` respectively.
-- Service containers receive neither host bind. The host-private session root,
-  `owner.json`, `.cursor`, `resume-count`, live-event files, and the Docker socket
-  are never mounted.
-- Image-declared `VOLUME` metadata is normalized and rejected before disk-slot or
-  Docker resource creation when it equals, descends from, or shadows the reserved
-  `/workspace` and `/session` agent mounts. This check covers agent and service
-  images and fails closed as `RuntimeError::ResourceLimit`.
-- Added deterministic network, agent-container, and service-container naming from
-  the shared contracts.
-- Added CPU, memory, swap, PID, and writable-layer disk limits to every agent and
-  service container; explicitly disabled privilege and automatic port publication.
-- Added labelled network/container provisioning, service network aliases, image
-  pulls, and rollback through execution-scoped cleanup on provisioning failure.
-- Image inspection now pulls only after an actual Docker 404. Permission, daemon,
-  API, timeout, and transport failures are propagated without registry fallback.
-- Image-declared `VOLUME` paths are overridden with bounded tmpfs mounts. Every
-  agent/service writable layer and declared mount conservatively shares one
-  execution-wide `disk_gib` budget, so aggregate configured capacity cannot
-  exceed the manifest even when services are added.
-- Bounded mounts are ephemeral container state rather than standalone Docker
-  resources, preventing anonymous or unlabelled volume creation. Environment
-  handles therefore report no volumes for these mounts.
-- Added cleanup for containers, volumes, and networks selected only by
-  `OwnershipLabels::selector()`. Cleanup attempts every resource class and
-  aggregates removal failures instead of returning after the first failure.
-- Provisioning rollback preserves the original provisioning error, aggregated
-  rollback failure, and `execution_id` in one diagnostic.
-- Added read-only reconciliation across managed containers, networks, and volumes;
-  live execution IDs are excluded and orphan IDs are deduplicated.
-- Appended `credentials_path: Option<PathBuf>` to `EnvironmentHandle` as reserved by
-  the shared runtime contract.
-- Added real-Docker tests with explicit printed skips only when the daemon is
-  unavailable. Tests inspect daemon-created resources and prove labels, limits,
-  running state, network aliases, no host ports, read-only reconciliation,
-  selector cleanup, and survival of unrelated containers, networks, and volumes.
-- Hardened real-Docker test isolation for concurrent workspace sessions. Test
-  execution IDs combine process ID, wall-clock nanoseconds, and a process-local
-  atomic sequence; an unwind-safe scope removes managed resources only through
-  valid `OwnershipLabels` selectors. Control resources use a distinct control
-  `execution_id` and exactly the five shared `autospec.*` ownership keys.
-- Normal test cleanup attempts both the control and execution selectors,
-  aggregates every error, fails the test on any cleanup error, and marks its
-  guard clean only after complete success. Unwind cleanup is non-panicking and
-  emits the same aggregate diagnostics.
-- The unwind path uses fallible `std::thread::Builder::spawn`, handles thread
-  creation, Tokio runtime creation, selector cleanup, and join failures, and
-  writes diagnostics through ignored-result `std::io::Write` calls. It contains
-  no `panic!`, `expect`, `unwrap`, direct `thread::spawn`, or `eprintln!` path.
-- Pinned compatible transitive lockfile releases so the workspace still checks
-  with its declared Rust 1.85 toolchain after adding Bollard.
+- Added `connect_with_execution_storage`, consuming an exact
+  `AllocationReceipt` and a live `ReadyAllocationVerifier` without changing the
+  frozen `Runtime` trait.
+- Provisioning exact-matches allocation ownership labels and `disk_gib`, verifies
+  the durable Ready journal/backend/mount/Docker proof through the capability,
+  pins that capability through provisioning, and revalidates it before Docker
+  mutation.
+- The runtime compares the current Docker daemon's immutable daemon ID with the
+  allocation's daemon-derived bind proof before creating a network or container.
+  A foreign-daemon receipt fails as `RuntimeError::ResourceLimit`.
+- The agent receives the verified `layout.repository` at `/workspace` and only
+  `layout.session/conversation` at `/session`. Host-private session siblings and
+  the Docker socket are not mounted.
+- Agent and service containers set `ReadonlyRootfs=true` and log driver `none`.
+  No `StorageOpt`, tmpfs, anonymous volume, named volume, or published host port
+  is used as quota authority.
+- Every intentional writable location is a read-write bind beneath the one
+  verified execution filesystem: deterministic per-container home, `/tmp`,
+  `/var/tmp`, `/run`, and remapped image-declared `VOLUME` paths. Bind sources
+  are canonicalized and created as direct descendants of `layout.runtime`.
+- Image `VOLUME` declarations equal to, nested beneath, or shadowing
+  `/workspace` or `/session` remain rejected before Docker resource creation.
+- After container creation, daemon inspection must report readonly rootfs, log
+  driver `none`, bind-only mounts, and canonical sources strictly below the
+  execution root on the same host filesystem. After start, a daemon-side `stat`
+  proves every read-write mount resolves to one device. Any failure rolls back
+  through the execution-label selector.
+- Existing API 1.41 negotiation, 404-only image pulls, execution-labelled object
+  creation, aggregated rollback/cleanup diagnostics, selector-only destruction,
+  and read-only reconciliation remain intact.
 
-## TDD Evidence
+## TDD and real-Docker evidence
 
-The first focused compile failed because `host_limits`, `DEFAULT_PIDS_LIMIT`, the
-Bollard-backed constructor, and `EnvironmentHandle::credentials_path` did not yet
-exist. After implementation, the first real-Docker lifecycle run found Docker's
-empty-map representation for absent port bindings; the assertion was corrected to
-accept both `null` and an empty map, without weakening the no-published-port check.
-
-Fix-round tests first failed on the missing image-error classifier, negotiated
-client-version surface, deterministic volume naming, populated handle volumes,
-and aggregate rollback behavior. Real Docker failure injection then proved two
-in-use volume failures are both retained while network cleanup still runs, and
-that a failed Redis provisioning attempt leaves no anonymous volume.
-
-The second fix round first failed because Redis provisioning still added the
-standalone `autospec-{execution_id}-cache-data` volume. The next red test exposed
-that allocating one budget per container multiplied capacity when services were
-added. The final allocation divides the one execution budget across every agent
-and service writable layer plus every image-declared path before Docker objects
-are created. With a 1 GiB execution, one agent, one Redis service, and Redis
-`/data`, each of the three storage slots receives 357,913,941 bytes; a real write
-past the `/data` bound fails at the daemon-enforced boundary. A multi-container,
-multi-mount unit case proves aggregate capacity cannot exceed the requested
-budget. Daemon rejection of a bounded mount is classified as
-`RuntimeError::ResourceLimit`.
-
-The post-review regression test first proved that wall-clock-only IDs were not
-process-scoped, then created an owned network and intentionally panicked. Before
-the guard existed, the network survived the unwind. Concurrent runtime-docker
-tests then exposed a second issue: global volume-set equality observed another
-test's labelled volumes. Assertions now inspect execution-specific resources and
-only treat newly-created 64-hex Docker volume names as anonymous leaks. Two
-runtime-docker test binaries subsequently passed concurrently without collisions.
-The follow-up label test then failed on the invented
-`autospec.test_execution_id` key. After replacing it with distinct contract
-ownership, a real-Docker failure-injection test held one execution volume and one
-control volume under independently owned containers. The first cleanup returned
-both selector failures and kept the guard armed; after cleaning the blocker
-selectors, the retry succeeded.
-The final static regression first failed on direct `std::thread::spawn` and
-`eprintln!` in `Drop`. The replacement retains the concrete error from thread
-creation, runtime construction, thread panic payloads, and the aggregate returned
-by both selector destroys, while stderr write failures are deliberately ignored
-so cleanup cannot cause a second panic during unwinding.
-
-The Pi integration regression first failed because the agent had no bind mounts.
-After wiring the configured shared state root, the real-Docker inspection test
-found the expected sources and destinations; Docker normalized an explicit
-read-write flag to its omitted/default form, so writability is additionally
-proved by container writes observed on the host. The same test proves only the
-previously absent conversation directory is created, private session siblings and
-the Docker socket are inaccessible, and conversation data survives container
-destruction.
-
-The reserved-mount regression first failed to compile because no image-volume
-collision validator existed. Unit cases then drove exact, descendant, normalized,
-and root-ancestor rejection while preserving non-colliding paths. A real-Docker
-test commits three ownership-labelled images carrying `/workspace`,
-`/session/history`, and `/` volume declarations. Each is rejected before an
-execution network or container appears, and an independently provisioned agent
-remains running throughout all three failures.
+- A new red regression first showed that a foreign-daemon receipt could provision
+  successfully. The runtime now rejects it before a network exists; the same test
+  proves legacy provisioning fails closed.
+- Real Docker inspection proves exact `/workspace` and `/session` sources,
+  deterministic runtime bind sources, `ReadonlyRootfs=true`, log driver `none`,
+  no tmpfs/storage options/volumes/socket/ports, and one daemon-observed device.
+- Container writes prove `/workspace`, `/session`, home, temp, run, and Redis
+  `/data` are writable and durable after container destruction. Writes to `/etc`
+  fail for both agent and service roots. Private session metadata remains
+  inaccessible.
+- Real images declaring `/workspace`, `/session/history`, and `/` are rejected
+  before execution resources appear while another execution remains running.
+- The operator-configured lifecycle allocates two independent APFS/LVM execution
+  filesystems, alternates 64 MiB writes across one execution's agent and service,
+  accepts only ENOSPC after substantial successful writes, proves the other
+  execution remains writable, then selector-cleans Docker resources and releases
+  both exact storage receipts. It runs only when `AUTOSPEC_APFS_PROBE_PATH` or
+  `AUTOSPEC_LVM_VOLUME_GROUP` is configured.
 
 ## Verification
 
-- `cargo fmt --all -- --check` — passed.
-- `cargo build --workspace` — passed.
-- `cargo test --workspace -- --nocapture` — passed with normal test concurrency;
-  real Docker tests: 12 passed, 0 skipped. PostgreSQL tests printed their existing explicit
-  skips because `AUTOSPEC_DATABASE_URL` was unset.
-- `cargo test -p runtime-docker -- --nocapture` and `cargo clippy -p
-  runtime-docker --all-targets -- -D warnings` after reserved-volume hardening —
-  10 unit and 13 real-Docker tests passed on current and Rust 1.85 toolchains.
-- Two simultaneous `cargo test -p runtime-docker --test docker_runtime --
-  --nocapture` processes — both passed 12/12 with no name or state-root collisions.
-- `cargo clippy --workspace --all-targets -- -D warnings` — passed.
-- `cargo +1.85.0 fmt --all -- --check`, `build --workspace`, `test
-  --workspace -- --nocapture`, and `clippy --workspace --all-targets -- -D
-  warnings` — passed; the Rust 1.85 real-Docker run also passed 12/12.
+- `cargo test -p runtime-docker -- --nocapture` — 9 unit and 15 integration tests
+  passed against the real Docker daemon. The destructive aggregate quota test
+  printed an explicit skip because no operator APFS/LVM pool is configured.
+- `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo test
+  --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` —
+  passed on the current toolchain.
+- `cargo +1.85.0 fmt --all -- --check`, `build --workspace`, `test --workspace`,
+  and `clippy --workspace --all-targets -- -D warnings` — passed; all 15
+  runtime-docker integration tests passed under Rust 1.85 with the same explicit
+  operator-pool skip.
 - `git diff --check` — passed.
-- Post-test Docker inventory for the new process/time/sequence execution IDs and
-  their valid control execution IDs — empty. Old wall-clock-only
-  resources from a foreign failed session remained untouched, as required by the
-  no-foreign-cleanup rule.
 
-## Remaining Risks
+## Remaining concern
 
-- Docker writable-layer `StorageOpt.size` support depends on the daemon storage
-  driver. The tested Docker Desktop daemon accepted and reported the quota; an
-  unsupported production daemon will reject provisioning instead of silently
-  running without the disk limit.
-- Bounded image paths are intentionally ephemeral tmpfs state. Services that need
-  persistence beyond an execution require a future explicitly budgeted storage
-  contract rather than falling back to unbounded Docker volumes.
-- **Open architecture blocker:** Docker writable-layer quotas do not constrain
-  macOS host binds presented to LinuxKit through `fakeowner`; APFS provides
-  volume-level rather than cross-directory project quotas. Therefore writes to
-  `/workspace` and `/session` are not yet inside the execution-wide `disk_gib`
-  hard limit. A host execution-storage provisioner must create a quota-controlled
-  filesystem boundary before the worktree and Pi session are populated; no fake
-  accounting or prompt-level workaround was added in this round.
-- The configured state root, worktree, and harness-owned session root must exist
-  as real directories before provisioning. The runtime deliberately refuses
-  symlinked/missing roots and creates only the conversation child.
-- The agent container currently uses the runtime image's `sleep infinity`
-  capability. Task 4/5 integration may replace that command when the Pi harness
-  launch contract is wired, without changing the runtime trait.
+- This workstation has no configured destructive APFS/LVM worker pool, so the
+  end-to-end aggregate ENOSPC test compiled and explicitly skipped rather than
+  performing allocation. The execution-storage backend's own configured
+  lifecycle test has the same operator gate. Production provisioning fails
+  closed when the live Ready allocation or its daemon bind proof is unavailable.

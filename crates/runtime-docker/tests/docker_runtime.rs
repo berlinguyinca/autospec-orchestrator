@@ -1,11 +1,21 @@
 use bollard::{
-    container::{Config, CreateContainerOptions},
-    exec::{CreateExecOptions, StartExecOptions},
+    container::{Config, CreateContainerOptions, LogOutput},
+    exec::{CreateExecOptions, StartExecOptions, StartExecResults},
     image::{CommitContainerOptions, CreateImageOptions, RemoveImageOptions},
     models::{HostConfig, Mount, MountTypeEnum},
     network::CreateNetworkOptions,
     volume::CreateVolumeOptions,
     Docker,
+};
+#[cfg(target_os = "macos")]
+use execution_storage::ApfsBackend;
+#[cfg(target_os = "linux")]
+use execution_storage::LvmBackend;
+use execution_storage::{
+    AllocationReceipt, AllocationRequest, BackendIdentity, CommandRunner, DockerBindCapability,
+    DockerBindProof, DockerBindVerifier, ExecutionStorage, ExecutionStorageManager,
+    ProcessCommandRunner, ReadyAllocationVerifier, StorageBackend, StorageError,
+    VerifiedExecutionStorage, ALLOCATION_API_VERSION,
 };
 use futures_util::StreamExt;
 use orchestrator_core::{
@@ -19,9 +29,20 @@ use std::{
     env, fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    process::Command,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+fn secure_mode(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("set owner-only mode");
+}
 
 static EXECUTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -42,17 +63,15 @@ impl TestStateRoot {
     }
 
     fn add_execution(&self, labels: &OwnershipLabels) {
-        fs::create_dir_all(
-            self.path
-                .join("worktrees")
-                .join(labels.execution_id.as_str()),
-        )
-        .expect("create execution worktree");
-        let session = self
+        let root = self
             .path
-            .join("sessions")
+            .join("executions")
             .join(labels.execution_id.as_str());
+        fs::create_dir_all(root.join("repository")).expect("create execution repository");
+        fs::create_dir_all(root.join("runtime")).expect("create execution runtime");
+        let session = root.join("session");
         fs::create_dir_all(&session).expect("create host-private session root");
+        fs::create_dir(session.join("conversation")).expect("create conversation");
         for (name, contents) in [
             ("owner.json", "host owner\n"),
             (".cursor", "host cursor\n"),
@@ -68,14 +87,193 @@ impl TestStateRoot {
 
     fn worktree(&self, labels: &OwnershipLabels) -> PathBuf {
         self.path
-            .join("worktrees")
+            .join("executions")
             .join(labels.execution_id.as_str())
+            .join("repository")
     }
 
     fn session(&self, labels: &OwnershipLabels) -> PathBuf {
         self.path
-            .join("sessions")
+            .join("executions")
             .join(labels.execution_id.as_str())
+            .join("session")
+    }
+
+    fn receipt(&self, labels: &OwnershipLabels, disk_gib: u64) -> AllocationReceipt {
+        let root = self
+            .path
+            .join("executions")
+            .join(labels.execution_id.as_str());
+        AllocationReceipt {
+            api_version: ALLOCATION_API_VERSION.to_owned(),
+            labels: labels.clone(),
+            reserved_bytes: disk_gib * 1024 * 1024 * 1024,
+            mount_path: root.clone(),
+            backend_kind: "test".to_owned(),
+            backend_key: format!("test:{}", labels.execution_id),
+            pool_identity: "test-pool".to_owned(),
+            backend: BackendIdentity::Apfs {
+                container: "test-container".to_owned(),
+                container_uuid: "test-pool".to_owned(),
+                volume: "test-volume".to_owned(),
+                volume_name: format!("autospec-{}", labels.execution_id),
+                volume_uuid: "test-filesystem".to_owned(),
+                ownership_token: "test-token".to_owned(),
+            },
+            docker_bind: DockerBindProof {
+                daemon_id: "test-daemon".to_owned(),
+                verifier: "test-ready-verifier".to_owned(),
+                method_version: "v1".to_owned(),
+                source_path: root,
+                filesystem_id: "test-device".to_owned(),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TestReadyVerifier;
+
+#[derive(Debug)]
+struct TestVerifiedStorage {
+    root: PathBuf,
+    repository: PathBuf,
+}
+
+impl VerifiedExecutionStorage for TestVerifiedStorage {
+    fn repository_path(&self) -> &Path {
+        &self.repository
+    }
+    fn verify(&self) -> Result<(), StorageError> {
+        let root = fs::canonicalize(&self.root)
+            .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?;
+        let repository = fs::canonicalize(&self.repository)
+            .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?;
+        if repository.parent() != Some(root.as_path()) {
+            return Err(StorageError::IdentityMismatch(
+                "repository escaped execution root".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ReadyAllocationVerifier for TestReadyVerifier {
+    fn verify_ready(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+        let repository = receipt.mount_path.join("repository");
+        let verified = TestVerifiedStorage {
+            root: receipt.mount_path.clone(),
+            repository,
+        };
+        verified.verify()?;
+        Ok(Box::new(verified))
+    }
+}
+
+#[derive(Debug)]
+struct DockerCliBindVerifier {
+    docker: PathBuf,
+    labels: OwnershipLabels,
+    daemon_id: String,
+}
+
+impl DockerBindVerifier for DockerCliBindVerifier {
+    fn probe(&self) -> Result<DockerBindCapability, StorageError> {
+        Ok(DockerBindCapability {
+            daemon_id: self.daemon_id.clone(),
+            verifier: "docker-cli-stat".to_owned(),
+            method_version: "autospec.dev/docker-bind-stat/v1".to_owned(),
+        })
+    }
+
+    fn verify(&self, source: &Path) -> Result<DockerBindProof, StorageError> {
+        let canonical = source.canonicalize().map_err(|error| {
+            StorageError::Unavailable(format!("canonicalize Docker bind source: {error}"))
+        })?;
+        let mount = format!("type=bind,src={},dst=/proof,readonly", canonical.display());
+        let name = format!("autospec-{}-storage-proof", self.labels.execution_id);
+        let mut command = Command::new(&self.docker);
+        command.args([
+            "run",
+            "--rm",
+            "--name",
+            &name,
+            "--network",
+            "none",
+            "--read-only",
+        ]);
+        for (key, value) in self.labels.to_map() {
+            command.args(["--label", &format!("{key}={value}")]);
+        }
+        let output = command
+            .args([
+                "--mount",
+                &mount,
+                "alpine:3.20",
+                "stat",
+                "-c",
+                "%d:%i",
+                "/proof",
+            ])
+            .output()
+            .map_err(|error| StorageError::Command(format!("run Docker bind stat: {error}")))?;
+        if !output.status.success() {
+            return Err(StorageError::Command(format!(
+                "Docker bind stat failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let filesystem_id = String::from_utf8(output.stdout)
+            .map_err(|error| {
+                StorageError::IdentityMismatch(format!("Docker stat is not UTF-8: {error}"))
+            })?
+            .trim()
+            .to_owned();
+        if !filesystem_id.contains(':') {
+            return Err(StorageError::IdentityMismatch(
+                "Docker stat lacks device/inode identity".to_owned(),
+            ));
+        }
+        Ok(DockerBindProof {
+            daemon_id: self.daemon_id.clone(),
+            verifier: "docker-cli-stat".to_owned(),
+            method_version: "autospec.dev/docker-bind-stat/v1".to_owned(),
+            source_path: canonical,
+            filesystem_id,
+        })
+    }
+}
+
+fn docker_cli() -> Option<PathBuf> {
+    env::var_os("AUTOSPEC_DOCKER_BIN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            [
+                "/usr/local/bin/docker",
+                "/opt/homebrew/bin/docker",
+                "/usr/bin/docker",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+        })
+}
+
+fn configured_storage_backend(
+    configured: String,
+    runner: Arc<dyn CommandRunner>,
+) -> Box<dyn StorageBackend> {
+    #[cfg(target_os = "macos")]
+    return Box::new(ApfsBackend::new(configured, runner).expect("configured APFS backend"));
+    #[cfg(target_os = "linux")]
+    return Box::new(LvmBackend::new(configured, runner).expect("configured LVM backend"));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (configured, runner);
+        panic!("configured execution storage is unsupported on this platform")
     }
 }
 
@@ -89,6 +287,40 @@ impl Drop for TestStateRoot {
                 .is_some_and(|name| name.starts_with("autospec-runtime-docker-state-"));
         if is_owned_test_path {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+struct StorageReceiptGuard {
+    manager: Arc<ExecutionStorage>,
+    receipt: Option<AllocationReceipt>,
+}
+
+impl StorageReceiptGuard {
+    fn new(manager: Arc<ExecutionStorage>, receipt: AllocationReceipt) -> Self {
+        Self {
+            manager,
+            receipt: Some(receipt),
+        }
+    }
+
+    fn receipt(&self) -> &AllocationReceipt {
+        self.receipt.as_ref().expect("live storage receipt")
+    }
+
+    fn release(&mut self) {
+        let receipt = self.receipt.as_ref().expect("live storage receipt");
+        self.manager
+            .release(receipt)
+            .expect("release configured execution storage");
+        self.receipt = None;
+    }
+}
+
+impl Drop for StorageReceiptGuard {
+    fn drop(&mut self) {
+        if let Some(receipt) = self.receipt.take() {
+            let _ = self.manager.release(&receipt);
         }
     }
 }
@@ -392,6 +624,52 @@ fn raw_client() -> Result<Docker, bollard::errors::Error> {
     }
 }
 
+async fn exec_output(docker: &Docker, container: &str, command: &str) -> (i64, String, String) {
+    let exec = docker
+        .create_exec(
+            container,
+            CreateExecOptions {
+                cmd: Some(vec!["sh".to_owned(), "-c".to_owned(), command.to_owned()]),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create quota probe exec");
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    match docker
+        .start_exec(&exec.id, None)
+        .await
+        .expect("start quota probe exec")
+    {
+        StartExecResults::Attached { mut output, .. } => {
+            while let Some(item) = output.next().await {
+                match item.expect("read quota probe output") {
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                        stdout.extend_from_slice(&message)
+                    }
+                    LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
+                    _ => {}
+                }
+            }
+        }
+        StartExecResults::Detached => panic!("quota probe unexpectedly detached"),
+    }
+    let exit = docker
+        .inspect_exec(&exec.id)
+        .await
+        .expect("inspect quota probe exec")
+        .exit_code
+        .expect("quota probe has exit code");
+    (
+        exit,
+        String::from_utf8(stdout).expect("quota stdout UTF-8"),
+        String::from_utf8(stderr).expect("quota stderr UTF-8"),
+    )
+}
+
 async fn runtime_or_skip(test_name: &str) -> Option<DockerRuntime> {
     let runtime = match DockerRuntime::new() {
         Ok(runtime) => runtime,
@@ -416,13 +694,11 @@ async fn runtime_or_skip(test_name: &str) -> Option<DockerRuntime> {
 async fn runtime_at_state_root_or_skip(
     test_name: &str,
     state_root: &Path,
+    labels: &OwnershipLabels,
+    disk_gib: u64,
 ) -> Option<DockerRuntime> {
-    let runtime = match DockerRuntime::connect_with_state_root(None, state_root) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            println!("SKIP {test_name}: Docker daemon unavailable: {error}");
-            return None;
-        }
+    let state = TestStateRoot {
+        path: state_root.to_path_buf(),
     };
     let daemon =
         raw_client().expect("runtime connection and raw test connection use the same socket");
@@ -430,6 +706,26 @@ async fn runtime_at_state_root_or_skip(
         println!("SKIP {test_name}: Docker daemon unavailable: {error}");
         return None;
     }
+    let daemon_id = daemon
+        .info()
+        .await
+        .expect("read probed daemon identity")
+        .id
+        .expect("Docker daemon reports an identity");
+    let mut receipt = state.receipt(labels, disk_gib);
+    receipt.docker_bind.daemon_id = daemon_id;
+    std::mem::forget(state);
+    let runtime = match DockerRuntime::connect_with_execution_storage(
+        None,
+        Arc::new(TestReadyVerifier),
+        receipt,
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            println!("SKIP {test_name}: Docker daemon unavailable: {error}");
+            return None;
+        }
+    };
     assert!(
         runtime.available().await,
         "Docker daemon is present but below the runtime's required API version"
@@ -442,7 +738,23 @@ async fn execution_runtime_or_skip(
     labels: &OwnershipLabels,
 ) -> Option<(TestStateRoot, DockerRuntime)> {
     let state = TestStateRoot::new(labels);
-    let runtime = runtime_at_state_root_or_skip(test_name, &state.path).await?;
+    let runtime = runtime_at_state_root_or_skip(
+        test_name,
+        &state.path,
+        labels,
+        runtime_requirement().disk_gib,
+    )
+    .await?;
+    Some((state, runtime))
+}
+
+async fn execution_runtime_with_disk_or_skip(
+    test_name: &str,
+    labels: &OwnershipLabels,
+    disk_gib: u64,
+) -> Option<(TestStateRoot, DockerRuntime)> {
+    let state = TestStateRoot::new(labels);
+    let runtime = runtime_at_state_root_or_skip(test_name, &state.path, labels, disk_gib).await?;
     Some((state, runtime))
 }
 
@@ -506,19 +818,21 @@ async fn commit_volume_image(
 }
 
 #[test]
-fn host_limits_enforce_cpu_memory_pid_and_disk_quotas() {
+fn host_limits_enforce_compute_limits_and_disable_the_writable_layer() {
     let limits = host_limits(&runtime_requirement());
 
     assert_eq!(limits.nano_cpus, Some(2_000_000_000));
     assert_eq!(limits.memory, Some(384 * 1024 * 1024));
     assert_eq!(limits.memory_swap, Some(384 * 1024 * 1024));
     assert_eq!(limits.pids_limit, Some(DEFAULT_PIDS_LIMIT));
+    assert_eq!(limits.storage_opt, None);
+    assert_eq!(limits.readonly_rootfs, Some(true));
     assert_eq!(
         limits
-            .storage_opt
+            .log_config
             .as_ref()
-            .and_then(|opts| opts.get("size")),
-        Some(&"3G".to_owned())
+            .and_then(|config| config.typ.as_deref()),
+        Some("none")
     );
     assert_eq!(limits.publish_all_ports, Some(false));
     assert_eq!(limits.privileged, Some(false));
@@ -556,6 +870,51 @@ async fn daemon_probe_reports_a_compatible_real_daemon() {
 }
 
 #[tokio::test]
+async fn legacy_runtime_and_foreign_daemon_receipts_fail_before_docker_resources() {
+    let labels = labels_for(unique_execution_id());
+    let state = TestStateRoot::new(&labels);
+    let Some(legacy) =
+        runtime_or_skip("legacy_runtime_and_foreign_daemon_receipts_fail_before_docker_resources")
+            .await
+    else {
+        return;
+    };
+    let error = legacy
+        .provision(&labels, &runtime_requirement(), &[])
+        .await
+        .expect_err("legacy provisioning must fail closed");
+    assert!(
+        matches!(error, runtime_traits::RuntimeError::ResourceLimit(message)
+        if message.contains("Ready execution-storage verifier"))
+    );
+
+    let mut receipt = state.receipt(&labels, runtime_requirement().disk_gib);
+    receipt.docker_bind.daemon_id = "definitely-not-this-daemon".to_owned();
+    let foreign =
+        DockerRuntime::connect_with_execution_storage(None, Arc::new(TestReadyVerifier), receipt)
+            .expect("connect runtime with foreign receipt");
+    let mut scope = DockerTestScope::new(&foreign, &labels);
+    let error = foreign
+        .provision(&labels, &runtime_requirement(), &[])
+        .await
+        .expect_err("foreign Docker proof must fail closed");
+    assert!(
+        matches!(error, runtime_traits::RuntimeError::ResourceLimit(message)
+        if message.contains("Docker daemon identity"))
+    );
+
+    let docker = raw_client().expect("connect to probed daemon");
+    assert!(docker
+        .inspect_network::<String>(&DockerRuntime::network_name(&labels.execution_id), None)
+        .await
+        .is_err());
+    scope
+        .cleanup()
+        .await
+        .expect("cleanup foreign-proof test scope");
+}
+
+#[tokio::test]
 async fn real_image_volume_collisions_fail_before_resources_and_preserve_another_execution() {
     let execution_labels = labels_for(unique_execution_id());
     let healthy_labels = labels_for(unique_execution_id());
@@ -564,15 +923,25 @@ async fn real_image_volume_collisions_fail_before_resources_and_preserve_another
     let Some(runtime) = runtime_at_state_root_or_skip(
         "real_image_volume_collisions_fail_before_resources_and_preserve_another_execution",
         &state.path,
+        &execution_labels,
+        runtime_requirement().disk_gib,
     )
     .await
     else {
         return;
     };
+    let healthy_runtime = runtime_at_state_root_or_skip(
+        "healthy execution for collision isolation",
+        &state.path,
+        &healthy_labels,
+        runtime_requirement().disk_gib,
+    )
+    .await
+    .expect("same Docker daemon remains available");
     let docker = raw_client().expect("connect to probed daemon");
     ensure_alpine_image(&docker).await;
     let mut execution_scope = DockerTestScope::new(&runtime, &execution_labels);
-    let mut healthy_scope = DockerTestScope::new(&runtime, &healthy_labels);
+    let mut healthy_scope = DockerTestScope::new(&healthy_runtime, &healthy_labels);
     let control_labels = control_labels_for(&execution_labels);
     let source_container = format!("autospec-{}-image-source", control_labels.execution_id);
     docker
@@ -606,7 +975,7 @@ async fn real_image_volume_collisions_fail_before_resources_and_preserve_another
         .await
         .expect("remove labelled image source container");
 
-    let healthy = runtime
+    let healthy = healthy_runtime
         .provision(&healthy_labels, &runtime_requirement(), &[])
         .await
         .expect("provision independent healthy execution");
@@ -671,6 +1040,8 @@ async fn agent_mounts_only_writable_worktree_and_durable_conversation() {
     let Some(runtime) = runtime_at_state_root_or_skip(
         "agent_mounts_only_writable_worktree_and_durable_conversation",
         &state.path,
+        &execution_labels,
+        runtime_requirement().disk_gib,
     )
     .await
     else {
@@ -702,25 +1073,36 @@ async fn agent_mounts_only_writable_worktree_and_durable_conversation() {
         })
         .collect::<BTreeSet<_>>();
     assert!(mounts.iter().all(|mount| mount.read_only != Some(true)));
-    let expected_mounts = BTreeSet::from([
-        (
-            "/workspace".to_owned(),
-            fs::canonicalize(state.worktree(&execution_labels))
-                .expect("canonical worktree")
-                .display()
-                .to_string(),
-            Some(MountTypeEnum::BIND),
-        ),
-        (
-            "/session".to_owned(),
-            fs::canonicalize(state.session(&execution_labels).join("conversation"))
-                .expect("canonical conversation")
-                .display()
-                .to_string(),
-            Some(MountTypeEnum::BIND),
-        ),
-    ]);
-    assert_eq!(actual_mounts, expected_mounts);
+    assert!(actual_mounts.contains(&(
+        "/workspace".to_owned(),
+        fs::canonicalize(state.worktree(&execution_labels))
+            .expect("canonical worktree")
+            .display()
+            .to_string(),
+        Some(MountTypeEnum::BIND),
+    )));
+    assert!(actual_mounts.contains(&(
+        "/session".to_owned(),
+        fs::canonicalize(state.session(&execution_labels).join("conversation"))
+            .expect("canonical conversation")
+            .display()
+            .to_string(),
+        Some(MountTypeEnum::BIND),
+    )));
+    let runtime_root = fs::canonicalize(
+        state
+            .path
+            .join("executions")
+            .join(execution_labels.execution_id.as_str())
+            .join("runtime"),
+    )
+    .expect("runtime root");
+    assert!(actual_mounts
+        .iter()
+        .filter(|(target, _, _)| target != "/workspace" && target != "/session")
+        .all(|(_, source, typ)| {
+            *typ == Some(MountTypeEnum::BIND) && Path::new(source).starts_with(&runtime_root)
+        }));
 
     let private_live_events = format!("pi.events-{}.jsonl", execution_labels.execution_id);
     let probe = docker
@@ -935,7 +1317,7 @@ async fn failed_normal_cleanup_keeps_scope_armed() {
 #[tokio::test]
 async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
     let execution_labels = labels_for(unique_execution_id());
-    let Some((_state, runtime)) = execution_runtime_or_skip(
+    let Some((state, runtime)) = execution_runtime_or_skip(
         "provision_reconcile_and_destroy_preserve_execution_isolation",
         &execution_labels,
     )
@@ -1031,24 +1413,20 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
             assert_eq!(host.memory, Some(384 * 1024 * 1024));
             assert_eq!(host.memory_swap, Some(384 * 1024 * 1024));
             assert_eq!(host.pids_limit, Some(DEFAULT_PIDS_LIMIT));
-            let writable_layer_bytes = host
-                .storage_opt
-                .as_ref()
-                .and_then(|opts| opts.get("size"))
-                .expect("writable layer has a byte quota")
-                .parse::<u64>()
-                .expect("writable layer quota is numeric bytes");
-            let tmpfs_bytes = host
+            assert_eq!(host.storage_opt, None);
+            assert_eq!(host.readonly_rootfs, Some(true));
+            assert_eq!(
+                host.log_config
+                    .as_ref()
+                    .and_then(|config| config.typ.as_deref()),
+                Some("none")
+            );
+            assert!(host
                 .mounts
                 .as_ref()
-                .into_iter()
-                .flatten()
-                .filter_map(|mount| mount.tmpfs_options.as_ref())
-                .filter_map(|options| options.size_bytes)
-                .map(|bytes| bytes as u64)
-                .sum::<u64>();
-            assert!(writable_layer_bytes > 0);
-            assert!(writable_layer_bytes + tmpfs_bytes <= 3 * 1024 * 1024 * 1024);
+                .is_some_and(|mounts| mounts.iter().all(|mount| {
+                    mount.typ == Some(MountTypeEnum::BIND) && mount.tmpfs_options.is_none()
+                })));
             assert!(host.port_bindings.as_ref().is_none_or(HashMap::is_empty));
             assert_eq!(host.publish_all_ports, Some(false));
             assert_eq!(host.network_mode.as_deref(), Some(handle.network.as_str()));
@@ -1077,8 +1455,20 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
             .expect("Redis image-declared /data volume is overridden");
         assert_eq!(
             data_mount.typ,
-            Some(bollard::models::MountPointTypeEnum::TMPFS)
+            Some(bollard::models::MountPointTypeEnum::BIND)
         );
+        let runtime_root = fs::canonicalize(
+            state
+                .path
+                .join("executions")
+                .join(execution_labels.execution_id.as_str())
+                .join("runtime"),
+        )
+        .expect("canonical execution runtime");
+        assert!(data_mount
+            .source
+            .as_ref()
+            .is_some_and(|source| { Path::new(source).starts_with(&runtime_root) }));
         assert!(data_mount.name.is_none());
         assert!(service_mounts
             .iter()
@@ -1152,11 +1542,12 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
 }
 
 #[tokio::test]
-async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
+async fn image_volumes_are_bind_backed_and_container_roots_are_read_only() {
     let execution_labels = labels_for(unique_execution_id());
-    let Some((_state, runtime)) = execution_runtime_or_skip(
-        "image_tmpfs_rejects_writes_past_the_execution_disk_budget",
+    let Some((state, runtime)) = execution_runtime_with_disk_or_skip(
+        "image_volumes_are_bind_backed_and_container_roots_are_read_only",
         &execution_labels,
+        1,
     )
     .await
     else {
@@ -1179,7 +1570,7 @@ async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
     let handle = runtime
         .provision(&execution_labels, &requirement, &[service])
         .await
-        .expect("provision bounded tmpfs service");
+        .expect("provision storage-backed service");
     let agent_inspect = docker
         .inspect_container(&handle.agent_container, None)
         .await
@@ -1192,29 +1583,21 @@ async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
         agent_inspect.host_config.expect("agent host config"),
         service_inspect.host_config.expect("service host config"),
     ];
-    let total_configured_bytes = hosts
-        .iter()
-        .map(|host| {
-            let root = host
-                .storage_opt
-                .as_ref()
-                .and_then(|options| options.get("size"))
-                .expect("root quota")
-                .parse::<u64>()
-                .expect("numeric root quota");
-            let mounts = host
-                .mounts
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .filter_map(|mount| mount.tmpfs_options.as_ref())
-                .filter_map(|options| options.size_bytes)
-                .map(|bytes| bytes as u64)
-                .sum::<u64>();
-            root + mounts
-        })
-        .sum::<u64>();
-    assert!(total_configured_bytes <= 1024 * 1024 * 1024);
+    for host in &hosts {
+        assert_eq!(host.readonly_rootfs, Some(true));
+        assert_eq!(
+            host.log_config.as_ref().and_then(|log| log.typ.as_deref()),
+            Some("none")
+        );
+        assert!(host.storage_opt.is_none());
+        assert!(host.tmpfs.is_none());
+        assert!(host
+            .mounts
+            .as_ref()
+            .expect("writable bind mounts")
+            .iter()
+            .all(|mount| mount.typ == Some(MountTypeEnum::BIND)));
+    }
 
     let host_mount = hosts[1]
         .mounts
@@ -1222,13 +1605,64 @@ async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
         .unwrap_or_default()
         .into_iter()
         .find(|mount| mount.target.as_deref() == Some("/data"))
-        .expect("bounded /data mount exists");
-    assert_eq!(host_mount.typ, Some(MountTypeEnum::TMPFS));
-    let mount_bytes = host_mount
-        .tmpfs_options
-        .and_then(|options| options.size_bytes)
-        .expect("tmpfs byte limit");
-    let overflow_mib = mount_bytes as u64 / (1024 * 1024) + 1;
+        .expect("storage-backed /data mount exists");
+    assert_eq!(host_mount.typ, Some(MountTypeEnum::BIND));
+    let runtime_root = fs::canonicalize(
+        state
+            .path
+            .join("executions")
+            .join(execution_labels.execution_id.as_str())
+            .join("runtime"),
+    )
+    .expect("canonical runtime root");
+    let data_source = fs::canonicalize(host_mount.source.expect("/data bind source"))
+        .expect("canonical /data bind source");
+    assert!(data_source.starts_with(&runtime_root));
+
+    for (container, command) in [
+        (
+            handle.agent_container.as_str(),
+            "printf home > /home/autospec/durable; printf tmp > /tmp/durable; \
+             printf vartmp > /var/tmp/durable; printf run > /run/durable",
+        ),
+        (
+            handle.service_containers[0].as_str(),
+            "printf home > /home/autospec/durable; printf tmp > /tmp/durable; \
+             printf vartmp > /var/tmp/durable; printf run > /run/durable; \
+             printf data > /data/durable",
+        ),
+    ] {
+        let (exit, _, error) = exec_output(&docker, container, command).await;
+        assert_eq!(exit, 0, "allowed bind write failed: {error}");
+        let (exit, _, _) = exec_output(&docker, container, "touch /etc/root-write-must-fail").await;
+        assert_ne!(exit, 0, "container root unexpectedly remained writable");
+    }
+
+    let durable_files = hosts
+        .iter()
+        .flat_map(|host| host.mounts.as_ref().into_iter().flatten())
+        .filter_map(|mount| {
+            let target = mount.target.as_deref()?;
+            let expected = match target {
+                "/home/autospec" => "home",
+                "/tmp" => "tmp",
+                "/var/tmp" => "vartmp",
+                "/run" => "run",
+                "/data" => "data",
+                _ => return None,
+            };
+            Some((
+                PathBuf::from(mount.source.as_deref().expect("bind source")).join("durable"),
+                expected,
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (path, expected) in &durable_files {
+        assert_eq!(
+            fs::read_to_string(path).expect("read durable bind write"),
+            *expected
+        );
+    }
 
     let exec = docker
         .create_exec(
@@ -1237,7 +1671,7 @@ async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
                 cmd: Some(vec![
                     "sh".to_owned(),
                     "-c".to_owned(),
-                    format!("dd if=/dev/zero of=/data/overflow bs=1M count={overflow_mib}"),
+                    "touch /etc/root-write-must-fail".to_owned(),
                 ]),
                 attach_stdout: Some(false),
                 attach_stderr: Some(false),
@@ -1245,7 +1679,7 @@ async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
             },
         )
         .await
-        .expect("create disk-boundary probe");
+        .expect("create read-only root probe");
     docker
         .start_exec(
             &exec.id,
@@ -1255,13 +1689,13 @@ async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
             }),
         )
         .await
-        .expect("start disk-boundary probe");
+        .expect("start read-only root probe");
     let mut exit_code = None;
     for _ in 0..300 {
         let inspect = docker
             .inspect_exec(&exec.id)
             .await
-            .expect("inspect disk-boundary probe");
+            .expect("inspect read-only root probe");
         if inspect.running == Some(false) {
             exit_code = inspect.exit_code;
             break;
@@ -1272,12 +1706,181 @@ async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
     scope
         .cleanup()
         .await
-        .expect("cleanup disk-boundary resources");
+        .expect("cleanup storage-backed resources");
+    for (path, expected) in durable_files {
+        assert_eq!(
+            fs::read_to_string(path).expect("bind write survives container cleanup"),
+            expected
+        );
+    }
     assert!(exit_code.is_some_and(|code| code != 0));
     assert!(docker
         .inspect_container(&handle.service_containers[0], None)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn configured_storage_enforces_one_aggregate_quota_and_preserves_another_execution() {
+    #[cfg(target_os = "macos")]
+    let configured = env::var("AUTOSPEC_APFS_PROBE_PATH").ok();
+    #[cfg(target_os = "linux")]
+    let configured = env::var("AUTOSPEC_LVM_VOLUME_GROUP").ok();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let configured: Option<String> = None;
+    let Some(configured) = configured else {
+        println!("SKIP configured Docker aggregate quota: operator storage pool is absent");
+        return;
+    };
+    let Some(docker_bin) = docker_cli() else {
+        println!("SKIP configured Docker aggregate quota: Docker CLI is absent");
+        return;
+    };
+    let daemon = Command::new(&docker_bin)
+        .args(["info", "--format", "{{.ID}}"])
+        .output()
+        .expect("run Docker info");
+    if !daemon.status.success() {
+        println!("SKIP configured Docker aggregate quota: Docker daemon is absent");
+        return;
+    }
+    let daemon_id = String::from_utf8(daemon.stdout)
+        .expect("Docker daemon id UTF-8")
+        .trim()
+        .to_owned();
+    let docker = raw_client().expect("connect to configured Docker daemon");
+    ensure_alpine_image(&docker).await;
+
+    let state = tempfile::tempdir().expect("configured storage state root");
+    secure_mode(state.path());
+    for directory in ["execution-storage", "executions"] {
+        let path = state.path().join(directory);
+        fs::create_dir(&path).expect("create storage control directory");
+        secure_mode(&path);
+    }
+    let first_labels = labels_for(unique_execution_id());
+    let second_labels = labels_for(unique_execution_id());
+    let make_manager = |labels: &OwnershipLabels| {
+        Arc::new(
+            ExecutionStorage::new(
+                state.path(),
+                configured_storage_backend(configured.clone(), Arc::new(ProcessCommandRunner)),
+                Box::new(DockerCliBindVerifier {
+                    docker: docker_bin.clone(),
+                    labels: labels.clone(),
+                    daemon_id: daemon_id.clone(),
+                }),
+            )
+            .expect("configured execution storage manager"),
+        )
+    };
+    let first_manager = make_manager(&first_labels);
+    let second_manager = make_manager(&second_labels);
+    let mut first_storage = StorageReceiptGuard::new(
+        first_manager.clone(),
+        first_manager
+            .allocate(&AllocationRequest {
+                labels: first_labels.clone(),
+                disk_gib: 1,
+            })
+            .expect("allocate first hard-bounded execution"),
+    );
+    let mut second_storage = StorageReceiptGuard::new(
+        second_manager.clone(),
+        second_manager
+            .allocate(&AllocationRequest {
+                labels: second_labels.clone(),
+                disk_gib: 1,
+            })
+            .expect("allocate isolated control execution"),
+    );
+    let first_runtime = DockerRuntime::connect_with_execution_storage(
+        None,
+        first_manager,
+        first_storage.receipt().clone(),
+    )
+    .expect("connect first storage-backed runtime");
+    let second_runtime = DockerRuntime::connect_with_execution_storage(
+        None,
+        second_manager,
+        second_storage.receipt().clone(),
+    )
+    .expect("connect second storage-backed runtime");
+    let mut first_scope = DockerTestScope::new(&first_runtime, &first_labels);
+    let mut second_scope = DockerTestScope::new(&second_runtime, &second_labels);
+    let requirement = RuntimeRequirement {
+        image: Some("alpine:3.20".to_owned()),
+        cpu: 1,
+        memory_mib: 2048,
+        disk_gib: 1,
+        ..RuntimeRequirement::default()
+    };
+    let service = ServiceRequirement {
+        name: "cache".to_owned(),
+        image: "redis:7-alpine".to_owned(),
+        env: BTreeMap::new(),
+    };
+    let control = second_runtime
+        .provision(&second_labels, &requirement, &[])
+        .await
+        .expect("provision isolated control execution");
+    let bounded = first_runtime
+        .provision(&first_labels, &requirement, &[service])
+        .await
+        .expect("provision aggregate-bounded agent and service");
+
+    let mut successful = 0_u64;
+    let mut quota_failure = None;
+    for index in 0..20 {
+        let (container, path) = if index % 2 == 0 {
+            (&bounded.agent_container, format!("/workspace/fill-{index}"))
+        } else {
+            (
+                &bounded.service_containers[0],
+                format!("/data/fill-{index}"),
+            )
+        };
+        let (exit, _stdout, stderr) = exec_output(
+            &docker,
+            container,
+            &format!("dd if=/dev/zero of={path} bs=1M count=64 conv=fsync"),
+        )
+        .await;
+        if exit == 0 {
+            successful += 64 * 1024 * 1024;
+        } else {
+            quota_failure = Some(stderr);
+            break;
+        }
+    }
+    assert!(
+        successful >= 256 * 1024 * 1024,
+        "quota failed before substantial aggregate writes: {successful}"
+    );
+    assert!(
+        quota_failure
+            .as_deref()
+            .is_some_and(|error| error.contains("No space left on device")),
+        "aggregate fill did not fail with ENOSPC: {quota_failure:?}"
+    );
+    let (exit, _, error) = exec_output(
+        &docker,
+        &control.agent_container,
+        "printf isolated > /workspace/after-peer-enospc",
+    )
+    .await;
+    assert_eq!(exit, 0, "control execution write failed: {error}");
+
+    first_scope
+        .cleanup()
+        .await
+        .expect("cleanup bounded Docker resources");
+    second_scope
+        .cleanup()
+        .await
+        .expect("cleanup control Docker resources");
+    first_storage.release();
+    second_storage.release();
 }
 
 #[tokio::test]
