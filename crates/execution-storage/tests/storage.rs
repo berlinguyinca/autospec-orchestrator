@@ -67,6 +67,31 @@ fn journal_store_discards_partial_orphan_temporary_file() {
     assert!(!temporary.exists());
 }
 
+#[test]
+fn secure_metadata_directory_owns_exact_temporary_subdirectories() {
+    let root = tempfile::tempdir().expect("temporary metadata root");
+    #[cfg(unix)]
+    mode(root.path(), 0o700);
+    let metadata = SecureMetadataDirectory::new(root.path()).expect("secure metadata directory");
+
+    let capture = metadata
+        .create_subdirectory("capture-node-417")
+        .expect("create pinned capture directory");
+    capture
+        .create("index", b"trusted index")
+        .expect("copy index");
+    assert_eq!(
+        capture.read("index").expect("read copied index"),
+        Some(b"trusted index".to_vec())
+    );
+    capture.remove("index").expect("remove copied index");
+    metadata
+        .remove_subdirectory("capture-node-417", &capture)
+        .expect("remove exact pinned capture directory");
+
+    assert!(!root.path().join("capture-node-417").exists());
+}
+
 fn labels() -> OwnershipLabels {
     OwnershipLabels {
         execution_id: ExecutionId::new("node-417-impl-01"),

@@ -1656,9 +1656,41 @@ fn capture_diff_includes_patch_and_all_changed_files() {
     assert!(capture.patch.contains("+untracked evidence"));
 }
 
+#[test]
+fn capture_diff_accepts_non_executable_diff_attributes() {
+    for (index, attribute) in ["-diff", "!diff", "diff"].into_iter().enumerate() {
+        let repository = TestRepository::new();
+        let state = tempfile::tempdir().expect("create state root");
+        let manager = manager(&state, &repository);
+        let execution_id = format!("project-13-safe-diff-{index}");
+        let labels = labels(&execution_id, repository.canonical());
+        let worktree = manager
+            .create(
+                &labels,
+                repository.canonical(),
+                "HEAD",
+                &format!("autospec/{execution_id}"),
+            )
+            .expect("create worktree");
+        let path = Path::new(&worktree.path);
+        std::fs::write(
+            path.join(".gitattributes"),
+            format!("README.md {attribute}\n"),
+        )
+        .expect("write safe diff attribute");
+        std::fs::write(path.join("README.md"), "modified\n").expect("modify tracked file");
+
+        let capture = manager
+            .capture_diff(&worktree)
+            .unwrap_or_else(|error| panic!("safe attribute {attribute} rejected: {error}"));
+
+        assert!(capture.changed_files.contains(&"README.md".to_owned()));
+    }
+}
+
 #[cfg(unix)]
 #[test]
-fn capture_diff_rejects_repository_configured_helpers_without_execution() {
+fn capture_diff_ignores_repository_configured_helpers_without_execution() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
     let manager = manager(&state, &repository);
@@ -1750,20 +1782,17 @@ fn capture_diff_rejects_repository_configured_helpers_without_execution() {
     )
     .expect("modify tracked file");
 
-    let error = manager
+    let capture = manager
         .capture_diff(&worktree)
-        .expect_err("reject repository-configured helpers");
+        .expect("capture without repository-configured helpers");
 
-    assert!(matches!(
-        error,
-        WorktreeError::Diff(_) | WorktreeError::Ownership(_)
-    ));
+    assert!(capture.patch.contains("modified without helpers"));
     assert!(!marker.exists(), "repository-controlled helper executed");
 }
 
 #[cfg(unix)]
 #[test]
-fn capture_diff_rejects_clean_filter_without_executing_it() {
+fn capture_diff_ignores_clean_filter_without_executing_it() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
     let manager = manager(&state, &repository);
@@ -1798,20 +1827,17 @@ fn capture_diff_rejects_clean_filter_without_executing_it() {
         .expect("select clean filter");
     std::fs::write(path.join("README.md"), "modified\n").expect("modify tracked file");
 
-    let error = manager
+    let capture = manager
         .capture_diff(&worktree)
-        .expect_err("reject repository clean filter");
+        .expect("capture without repository clean filter");
 
-    assert!(matches!(
-        error,
-        WorktreeError::Diff(_) | WorktreeError::Ownership(_)
-    ));
+    assert!(capture.patch.contains("modified"));
     assert!(!marker.exists(), "clean filter executed on the host");
 }
 
 #[cfg(unix)]
 #[test]
-fn capture_diff_rejects_long_running_process_filter_without_starting_it() {
+fn capture_diff_ignores_long_running_process_filter_without_starting_it() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
     let manager = manager(&state, &repository);
@@ -1847,14 +1873,11 @@ fn capture_diff_rejects_long_running_process_filter_without_starting_it() {
     std::fs::write(path.join("README.md"), "modified\n").expect("modify tracked file");
 
     let started = std::time::Instant::now();
-    let error = manager
+    let capture = manager
         .capture_diff(&worktree)
-        .expect_err("reject repository process filter");
+        .expect("capture without repository process filter");
 
-    assert!(matches!(
-        error,
-        WorktreeError::Diff(_) | WorktreeError::Ownership(_)
-    ));
+    assert!(capture.patch.contains("modified"));
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     assert!(!marker.exists(), "process filter started on the host");
 }
@@ -1988,38 +2011,59 @@ fn capture_diff_targets_only_the_explicit_git_directory_and_work_tree() {
     manager.capture_diff(&worktree).expect("capture diff");
     std::env::set_var("PATH", original_path);
 
-    let expected = format!(
-        "\t--git-dir\t{}\t--work-tree\t{}",
-        repository_path.join(".git").display(),
-        repository_path.display()
-    );
     let log = std::fs::read_to_string(log).expect("read Git argument log");
-    let repository_calls: Vec<_> = log
-        .lines()
-        .filter(|line| !line.starts_with("\tconfig\t--file"))
-        .collect();
-    assert!(!repository_calls.is_empty());
     assert!(
-        repository_calls.iter().all(|line| line.contains(&expected)),
+        !log.lines().any(|line| line.starts_with("\tconfig\t--file")),
+        "capture read mutable local config:\n{log}"
+    );
+    let repository_calls: Vec<_> = log.lines().collect();
+    assert!(!repository_calls.is_empty());
+    let expected_git_dir_prefix = format!(
+        "\t--git-dir\t{}/.capture-",
+        state
+            .path()
+            .canonicalize()
+            .expect("canonical state")
+            .join("worktrees")
+            .display()
+    );
+    let expected_work_tree = format!("\t--work-tree\t{}", repository_path.display());
+    assert!(
+        repository_calls.iter().all(|line| {
+            line.contains(&expected_git_dir_prefix) && line.contains(&expected_work_tree)
+        }),
         "repository Git invocation lacked exact selectors:\n{log}"
     );
+    assert!(!log.contains(&format!(
+        "\t--git-dir\t{}",
+        repository_path.join(".git").display()
+    )));
     assert!(
         repository_calls
             .iter()
             .any(|line| line.contains("\trev-parse\t--show-toplevel")),
         "repository root was not verified:\n{log}"
     );
+    let capture_contexts: Vec<_> = std::fs::read_dir(state.path().join("worktrees"))
+        .expect("read metadata directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".capture-"))
+        .collect();
+    assert!(
+        capture_contexts.is_empty(),
+        "trusted capture context was not removed: {capture_contexts:?}"
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn capture_diff_rejects_config_change_after_boundary_validation() {
+fn capture_diff_ignores_config_change_after_trusted_context_creation() {
     const CHILD: &str = "AUTOSPEC_CONFIG_IMMUTABILITY_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = Command::new(std::env::current_exe().expect("current test executable"))
             .args([
                 "--exact",
-                "capture_diff_rejects_config_change_after_boundary_validation",
+                "capture_diff_ignores_config_change_after_trusted_context_creation",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -2077,13 +2121,94 @@ fn capture_diff_rejects_config_change_after_boundary_validation() {
     std::env::set_var("PATH", original_path);
 
     assert!(changed.exists(), "wrapper did not mutate repository config");
-    assert!(
-        matches!(
-            result,
-            Err(WorktreeError::Ownership(_)) | Err(WorktreeError::Diff(_))
+    let capture = result.expect("capture ignores mutable repository config");
+    assert!(capture.patch.contains("modified"));
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_diff_ignores_synchronized_hostile_config_and_attribute_mutation() {
+    const CHILD: &str = "AUTOSPEC_SYNCHRONIZED_FILTER_ATTACK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "capture_diff_ignores_synchronized_hostile_config_and_attribute_mutation",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated synchronized attack test");
+        assert!(
+            output.status.success(),
+            "synchronized attack child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-synchronized-attack", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-synchronized-attack",
+        )
+        .expect("create worktree");
+    let repository_path = Path::new(&worktree.path);
+    std::fs::write(repository_path.join("README.md"), "modified\n").expect("modify tracked file");
+    let config = repository_path.join(".git/config");
+    let attributes = repository_path.join(".gitattributes");
+    let attack_started = state.path().join("attack-started");
+    let helper_marker = state.path().join("filter-executed");
+    let helper = state.path().join("hostile-process-filter");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nsleep 1\nexit 1\n",
+            helper_marker.display()
         ),
-        "capture accepted a changing config boundary: {result:?}"
-    );
+    )
+    .expect("write hostile process filter");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+        .expect("make hostile filter executable");
+    let bin = tempfile::tempdir().expect("wrapper bin");
+    let wrapper = bin.path().join("git");
+    let real_git = real_git_program();
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *' diff '*)\n    if [ ! -e '{}' ]; then\n      printf '\\n[filter \"hostile\"]\\n\\tprocess = {}\\n\\trequired = true\\n' >> '{}'\n      printf 'README.md filter=hostile\\n' > '{}'\n      touch '{}'\n    fi\n    ;;\nesac\nexec '{}' \"$@\"\n",
+            attack_started.display(),
+            helper.display(),
+            config.display(),
+            attributes.display(),
+            attack_started.display(),
+            real_git.display()
+        ),
+    )
+    .expect("write synchronized attack wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+        .expect("make Git wrapper executable");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&original_path)),
+    )
+    .expect("wrapper PATH");
+    std::env::set_var("PATH", &path);
+
+    let result = manager.capture_diff(&worktree);
+    std::env::set_var("PATH", original_path);
+
+    assert!(attack_started.exists(), "attack did not overlap a Git diff");
+    assert!(!helper_marker.exists(), "hostile process filter executed");
+    let capture = result.expect("trusted capture ignores mutable agent Git config");
+    assert!(capture.changed_files.contains(&"README.md".to_owned()));
 }
 
 #[test]

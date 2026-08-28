@@ -94,6 +94,73 @@ impl SecureMetadataDirectory {
         self.directory.sync()
     }
 
+    /// Returns the canonical path of this descriptor-pinned metadata directory.
+    pub fn path(&self) -> &Path {
+        &self.directory.path
+    }
+
+    /// Creates and pins one owner-only direct child beneath this directory.
+    #[cfg(unix)]
+    pub fn create_subdirectory(&self, name: &str) -> Result<Self, StorageError> {
+        validate_metadata_name(name)?;
+        self.directory.verify("metadata directory")?;
+        if self.directory.child_metadata(name)?.is_some() {
+            return Err(StorageError::Journal(format!(
+                "metadata subdirectory already exists: {name}"
+            )));
+        }
+        self.directory.create_directory(name)?;
+        let expected = self.directory.child_metadata(name)?.ok_or_else(|| {
+            StorageError::IdentityMismatch("metadata subdirectory disappeared".to_owned())
+        })?;
+        let child = Self::new(self.directory.path.join(name))?;
+        let opened = child
+            .directory
+            .handle
+            .metadata()
+            .map_err(|error| journal_error("inspect", &child.directory.path, error))?;
+        if expected.dev() != opened.dev()
+            || expected.ino() != opened.ino()
+            || expected.uid() != opened.uid()
+        {
+            return Err(StorageError::IdentityMismatch(
+                "metadata subdirectory changed while pinning".to_owned(),
+            ));
+        }
+        self.directory.verify("metadata directory")?;
+        Ok(child)
+    }
+
+    /// Removes an empty direct child only when its retained pinned identity matches.
+    #[cfg(unix)]
+    pub fn remove_subdirectory(&self, name: &str, child: &Self) -> Result<(), StorageError> {
+        validate_metadata_name(name)?;
+        self.directory.verify("metadata directory")?;
+        child.directory.verify("metadata subdirectory")?;
+        if child.directory.path != self.directory.path.join(name) {
+            return Err(StorageError::IdentityMismatch(
+                "metadata subdirectory selector does not match pinned child".to_owned(),
+            ));
+        }
+        let expected = child
+            .directory
+            .handle
+            .metadata()
+            .map_err(|error| journal_error("inspect", &child.directory.path, error))?;
+        let current = self.directory.child_metadata(name)?.ok_or_else(|| {
+            StorageError::IdentityMismatch("metadata subdirectory disappeared".to_owned())
+        })?;
+        if current.dev() != expected.dev()
+            || current.ino() != expected.ino()
+            || current.uid() != expected.uid()
+        {
+            return Err(StorageError::IdentityMismatch(
+                "metadata subdirectory identity changed".to_owned(),
+            ));
+        }
+        self.directory.remove_directory(name)
+    }
+
     fn reconcile(&self, name: &str) -> Result<(), StorageError> {
         self.directory.verify("metadata directory")?;
         let temporary = metadata_temporary_name(name)?;

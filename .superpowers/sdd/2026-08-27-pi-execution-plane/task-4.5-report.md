@@ -83,12 +83,15 @@ consume a verified allocation receipt.
   a distinct `WorktreeError::StorageFull`, and restart removes only the exact
   partial repository before retrying.
 - Hardened host-side evidence capture against repository-controlled execution.
-  Every Git child starts from a cleared environment with isolated user/system
-  config and attributes, disabled optional locks and prompting, and a fixed
-  pager. Diff commands additionally disable external diffs and text conversion
-  and override hooks, fsmonitor, external diff, and include routing. A hostile
-  repository regression configures textconv, external diff, hooks, fsmonitor,
-  included config, and attributes and proves none of its marker helpers run.
+  Capture now snapshots the verified index into a unique owner-only Git
+  directory beneath pinned host metadata, uses a detached trusted HEAD, and
+  explicitly selects that Git directory plus the execution work tree. The
+  mutable execution `.git/config` is never read. Git reads objects through an
+  exact verified `GIT_OBJECT_DIRECTORY`; the trusted context contains no agent
+  config for SHA-1 repositories and only the allowlisted SHA-256 object-format
+  scalars when required. Every child still starts from a cleared environment
+  with system/global config and attributes disabled, and diff commands disable
+  external diffs and text conversion.
 - Reject `.git/commondir` during the filesystem-only preflight before every
   repository Git command. A PATH wrapper regression proves malformed linked
   common-directory metadata is rejected without starting Git.
@@ -104,17 +107,19 @@ consume a verified allocation receipt.
 - Changed both create-intent metadata and execution-storage journal recovery to
   discard uncommitted orphan temporary files after no-follow/opened-inode
   validation. Partial JSON is never promoted into authoritative state.
-- Evidence capture now establishes an immutable snapshot of the exact local
-  config and every worktree or Git-info attributes file before repository Git
-  commands begin. It parses local config with includes disabled, rejects
-  `filter.*`, `include.*`, `includeIf.*`, executable diff drivers,
-  `diff.external`, `core.fsmonitor`, `core.hooksPath`, `core.worktree`, and
-  external attributes files, and rejects attributes selecting `filter` or
-  `diff` drivers. The snapshot is revalidated before and after every evidence
-  command; any safe or unsafe config/attribute change aborts capture.
-- Added hostile `filter.clean` and long-running `filter.process` regressions.
-  The prior process filter started and held capture for five seconds; both are
-  now rejected before their marker programs start.
+- Evidence capture no longer performs the prior O(N*U) config-and-attribute
+  rescans around each Git invocation. The trusted Git context is established
+  once after the execution-stop boundary, its index is copied and fsynced, its
+  metadata directory and source object database remain inode-pinned, and its
+  exact files and directories are removed through the pinned metadata boundary
+  after capture. Safe boolean, unset, and unspecified `diff` attributes remain
+  supported because repository filter and diff commands are unavailable in the
+  trusted context.
+- Added hostile `filter.clean`, long-running `filter.process`, repository helper,
+  and synchronized config/attribute mutation regressions. Even when a Git PATH
+  wrapper changes the execution config and attributes immediately before the
+  first diff, no marker program starts and tracked/untracked evidence remains
+  complete.
 - Every non-bare repository Git command now receives the exact trusted
   `--git-dir executions/{execution_id}/repository/.git` and `--work-tree
   executions/{execution_id}/repository` selectors. Repository verification also
@@ -243,12 +248,12 @@ polling loops, or `du`/`df` accounting.
 
 ## Verification
 
-- `cargo test -p git-worktree` — 51 real temporary Git repository tests passed,
+- `cargo test -p git-worktree` — 53 real temporary Git repository tests passed,
   including hostile Git environments, independent Git-path containment, mirror
   immutability/substitution rejection, receipt binding, create-intent recovery,
   phase-specific ENOSPC rollback, safe diff capture, pre-Git commondir rejection,
   exact cleanup, foreign-resource survival, and stale discovery.
-- `cargo test -p execution-storage -- --nocapture` — 35 passed. The real Docker
+- `cargo test -p execution-storage -- --nocapture` — 36 passed. The real Docker
   bind verifier contract ran. The destructive aggregate quota lifecycle printed
   an explicit skip because no operator pool is configured on this host; when
   configured it performs create, identity proof, substantial successful writes,
@@ -260,7 +265,7 @@ polling loops, or `du`/`df` accounting.
   `cargo clippy --workspace --all-targets -- -D warnings` — passed, including
   all real-Docker runtime tests.
 - Rust 1.85 ran the same full fmt/build/test/clippy workspace matrix — passed,
-  including all 51 Git tests and all 13 real-Docker runtime tests.
+  including all 53 Git tests and all 13 real-Docker runtime tests.
 - The first current-toolchain workspace test attempt saw the existing
   five-second `harness-pi` drop-bound test exceed its timing threshold under
   concurrent Docker load. The isolated retry passed in 4.76 seconds, and the
