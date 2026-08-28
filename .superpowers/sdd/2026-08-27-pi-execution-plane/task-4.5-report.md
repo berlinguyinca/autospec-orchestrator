@@ -82,6 +82,28 @@ consume a verified allocation receipt.
   and index state and exit with ENOSPC during clone and checkout. ENOSPC is now
   a distinct `WorktreeError::StorageFull`, and restart removes only the exact
   partial repository before retrying.
+- Hardened host-side evidence capture against repository-controlled execution.
+  Every Git child starts from a cleared environment with isolated user/system
+  config and attributes, disabled optional locks and prompting, and a fixed
+  pager. Diff commands additionally disable external diffs and text conversion
+  and override hooks, fsmonitor, external diff, and include routing. A hostile
+  repository regression configures textconv, external diff, hooks, fsmonitor,
+  included config, and attributes and proves none of its marker helpers run.
+- Reject `.git/commondir` during the filesystem-only preflight before every
+  repository Git command. A PATH wrapper regression proves malformed linked
+  common-directory metadata is rejected without starting Git.
+- Require the live pinned execution-storage capability before reading or
+  mutating interrupted-create state, including when the repository child is
+  absent. The capability pins the execution mountpoint, pins the repository
+  when present, and permits an explicit exact-recovery repin only after the
+  deterministic journal-selected rollback.
+- Retain the original exact-base create intent while recovery runs. Its durable
+  replacement is committed atomically before clone resumes; a partial
+  replacement temporary is discarded while the original base remains the
+  recovery authority, so upstream movement cannot retarget the execution.
+- Changed both create-intent metadata and execution-storage journal recovery to
+  discard uncommitted orphan temporary files after no-follow/opened-inode
+  validation. Partial JSON is never promoted into authoritative state.
 
 ## Public Contract
 
@@ -202,12 +224,12 @@ polling loops, or `du`/`df` accounting.
 
 ## Verification
 
-- `cargo test -p git-worktree` — 43 real temporary Git repository tests passed,
+- `cargo test -p git-worktree` — 46 real temporary Git repository tests passed,
   including hostile Git environments, independent Git-path containment, mirror
   immutability/substitution rejection, receipt binding, create-intent recovery,
-  phase-specific ENOSPC rollback, exact cleanup, foreign-resource survival, and
-  stale discovery.
-- `cargo test -p execution-storage -- --nocapture` — 34 passed. The real Docker
+  phase-specific ENOSPC rollback, safe diff capture, pre-Git commondir rejection,
+  exact cleanup, foreign-resource survival, and stale discovery.
+- `cargo test -p execution-storage -- --nocapture` — 35 passed. The real Docker
   bind verifier contract ran. The destructive aggregate quota lifecycle printed
   an explicit skip because no operator pool is configured on this host; when
   configured it performs create, identity proof, substantial successful writes,
@@ -219,7 +241,12 @@ polling loops, or `du`/`df` accounting.
   `cargo clippy --workspace --all-targets -- -D warnings` — passed, including
   all real-Docker runtime tests.
 - Rust 1.85 ran the same full fmt/build/test/clippy workspace matrix — passed,
-  including all 43 Git tests and all 13 real-Docker runtime tests.
+  including all 46 Git tests and all 13 real-Docker runtime tests.
+- The first current-toolchain workspace test attempt saw the existing
+  five-second `harness-pi` drop-bound test exceed its timing threshold under
+  concurrent Docker load. The isolated retry passed in 4.76 seconds, and the
+  subsequent full current and Rust 1.85 workspace runs both passed all 20 Pi
+  harness tests.
 
 ## Remaining Integration Work
 

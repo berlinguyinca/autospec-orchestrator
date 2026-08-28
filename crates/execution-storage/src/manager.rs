@@ -11,7 +11,10 @@ use std::{
     fs,
     path::Path,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -111,6 +114,9 @@ pub trait DockerBindVerifier: Debug + Send + Sync {
 pub trait VerifiedExecutionStorage: Debug + Send + Sync {
     fn repository_path(&self) -> &Path;
     fn verify(&self) -> Result<(), StorageError>;
+    fn refresh_after_exact_recovery(&self) -> Result<(), StorageError> {
+        self.verify()
+    }
 }
 
 pub trait ReadyAllocationVerifier: Debug + Send + Sync {
@@ -123,27 +129,51 @@ pub trait ReadyAllocationVerifier: Debug + Send + Sync {
 #[derive(Debug)]
 struct LiveVerifiedExecutionStorage {
     root: PinnedDirectory,
-    repository: PinnedDirectory,
+    repository_path: PathBuf,
+    repository: Mutex<Option<PinnedDirectory>>,
 }
 
 impl VerifiedExecutionStorage for LiveVerifiedExecutionStorage {
     fn repository_path(&self) -> &Path {
-        &self.repository.path
+        &self.repository_path
     }
 
     fn verify(&self) -> Result<(), StorageError> {
         self.root.verify("execution mountpoint")?;
-        self.repository.verify("execution repository")?;
-        if self.repository.path.parent() != Some(self.root.path.as_path()) {
+        if self.repository_path.parent() != Some(self.root.path.as_path()) {
             return Err(StorageError::IdentityMismatch(
                 "execution repository is not a direct child of the mounted allocation".to_owned(),
             ));
+        }
+        let mut repository = self.repository.lock().map_err(|_| {
+            StorageError::IdentityMismatch("execution repository pin is poisoned".to_owned())
+        })?;
+        let metadata = match fs::symlink_metadata(&self.repository_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && repository.is_none() => {
+                return Ok(())
+            }
+            Err(error) => return Err(StorageError::IdentityMismatch(error.to_string())),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StorageError::IdentityMismatch(
+                "execution repository is not a real directory".to_owned(),
+            ));
+        }
+        match repository.as_ref() {
+            Some(repository) => repository.verify("execution repository")?,
+            None => {
+                *repository = Some(PinnedDirectory::capture(
+                    &self.repository_path,
+                    "execution repository",
+                )?);
+            }
         }
         #[cfg(unix)]
         if fs::symlink_metadata(&self.root.path)
             .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?
             .dev()
-            != fs::symlink_metadata(&self.repository.path)
+            != fs::symlink_metadata(&self.repository_path)
                 .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?
                 .dev()
         {
@@ -152,6 +182,31 @@ impl VerifiedExecutionStorage for LiveVerifiedExecutionStorage {
             ));
         }
         Ok(())
+    }
+
+    fn refresh_after_exact_recovery(&self) -> Result<(), StorageError> {
+        self.root.verify("execution mountpoint")?;
+        if self.repository_path.parent() != Some(self.root.path.as_path()) {
+            return Err(StorageError::IdentityMismatch(
+                "execution repository is not a direct child of the mounted allocation".to_owned(),
+            ));
+        }
+        let replacement = match fs::symlink_metadata(&self.repository_path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Some(
+                PinnedDirectory::capture(&self.repository_path, "execution repository")?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(_) => {
+                return Err(StorageError::IdentityMismatch(
+                    "execution repository is not a real directory".to_owned(),
+                ))
+            }
+            Err(error) => return Err(StorageError::IdentityMismatch(error.to_string())),
+        };
+        *self.repository.lock().map_err(|_| {
+            StorageError::IdentityMismatch("execution repository pin is poisoned".to_owned())
+        })? = replacement;
+        self.verify()
     }
 }
 
@@ -231,10 +286,10 @@ impl ExecutionStorage {
         }
         self.executions_directory.verify("executions directory")?;
         require_real_directory(&layout.root, "execution mountpoint")?;
-        require_real_directory(&layout.repository, "execution repository")?;
         let verified = LiveVerifiedExecutionStorage {
             root: PinnedDirectory::capture(&layout.root, "execution mountpoint")?,
-            repository: PinnedDirectory::capture(&layout.repository, "execution repository")?,
+            repository_path: layout.repository.clone(),
+            repository: Mutex::new(None),
         };
         verified.verify()?;
         Ok(Box::new(verified))

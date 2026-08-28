@@ -15,6 +15,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[derive(Debug)]
 struct FakeReadyAllocationVerifier;
 
@@ -1147,8 +1150,11 @@ fn create_intent_recovers_partial_clone_after_restart() {
             .and_then(|name| name.to_str())
             .expect("intent filename")
     ));
-    std::fs::rename(&intent, &temporary_intent)
-        .expect("simulate crash after synced temporary intent");
+    std::fs::write(&temporary_intent, b"{\"partial\":")
+        .expect("simulate interrupted replacement intent write");
+    #[cfg(unix)]
+    std::fs::set_permissions(&temporary_intent, std::fs::Permissions::from_mode(0o600))
+        .expect("secure temporary intent mode");
     repository.commit("upstream advanced after interrupted clone\n");
 
     let restarted = GitWorktreeManager::with_clone_base_and_verifier(
@@ -1172,6 +1178,57 @@ fn create_intent_recovers_partial_clone_after_restart() {
     assert!(Path::new(&worktree.path)
         .join(".autospec-owner.json")
         .is_file());
+}
+
+#[test]
+fn create_intent_recovery_requires_live_verification_before_mutation() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let filesystem = Arc::new(InjectedFilesystem::new(
+        InjectedFailure::CloneAndRollbackRemove,
+    ));
+    let manager = manager_with_filesystem(&state, &repository, filesystem);
+    let execution_id = "project-11-live-before-recovery";
+    let labels = labels(execution_id, repository.canonical());
+    let root = bounded_repository_root(&state, execution_id);
+    let receipt = allocation_receipt(state.path(), &labels);
+
+    manager
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-live-before-recovery",
+            &receipt,
+        )
+        .expect_err("leave durable partial clone and intent");
+    let intent = state
+        .path()
+        .join("worktrees/.create-project-11-live-before-recovery.json");
+    let intent_before = std::fs::read(&intent).expect("read durable intent");
+    assert!(root.join(".git").is_dir());
+
+    let unverified = GitWorktreeManager::with_clone_base_and_filesystem(
+        state.path(),
+        repository.clone_base.to_str().expect("utf-8 clone base"),
+        Arc::new(SystemWorktreeFilesystem),
+    );
+    let error = unverified
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-live-before-recovery",
+            &receipt,
+        )
+        .expect_err("reject recovery without live storage capability");
+
+    assert!(matches!(error, WorktreeError::Ownership(_)));
+    assert!(root.join(".git").is_dir());
+    assert_eq!(
+        std::fs::read(intent).expect("intent retained"),
+        intent_before
+    );
 }
 
 #[test]
@@ -1542,6 +1599,172 @@ fn capture_diff_includes_patch_and_all_changed_files() {
     assert_eq!(capture.changed_files, vec!["README.md", "evidence.txt"]);
     assert!(capture.patch.contains("+modified"));
     assert!(capture.patch.contains("+untracked evidence"));
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_diff_never_executes_repository_configured_helpers() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-hostile-diff", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-hostile-diff",
+        )
+        .expect("create worktree");
+    let worktree_path = Path::new(&worktree.path);
+    let marker = state.path().join("hostile-helper-ran");
+    let helper = state.path().join("hostile-helper");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )
+    .expect("write hostile helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+        .expect("make hostile helper executable");
+    let hooks = state.path().join("hostile-hooks");
+    std::fs::create_dir(&hooks).expect("create hostile hooks directory");
+    std::fs::write(
+        hooks.join("post-checkout"),
+        std::fs::read(&helper).expect("read helper"),
+    )
+    .expect("write hostile hook");
+    std::fs::set_permissions(
+        hooks.join("post-checkout"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make hostile hook executable");
+    let included = state.path().join("hostile-include.config");
+    std::fs::write(
+        &included,
+        format!("[diff]\n\texternal = {}\n", helper.display()),
+    )
+    .expect("write hostile included config");
+    git(
+        worktree_path,
+        &[
+            "config",
+            "diff.hostile.textconv",
+            helper.to_str().expect("helper path"),
+        ],
+    );
+    git(
+        worktree_path,
+        &[
+            "config",
+            "diff.external",
+            helper.to_str().expect("helper path"),
+        ],
+    );
+    git(
+        worktree_path,
+        &[
+            "config",
+            "core.fsmonitor",
+            helper.to_str().expect("helper path"),
+        ],
+    );
+    git(
+        worktree_path,
+        &[
+            "config",
+            "core.hooksPath",
+            hooks.to_str().expect("hooks path"),
+        ],
+    );
+    git(
+        worktree_path,
+        &[
+            "config",
+            "include.path",
+            included.to_str().expect("include path"),
+        ],
+    );
+    std::fs::write(
+        worktree_path.join(".gitattributes"),
+        "README.md diff=hostile\n",
+    )
+    .expect("write hostile attributes");
+    std::fs::write(
+        worktree_path.join("README.md"),
+        "modified without helpers\n",
+    )
+    .expect("modify tracked file");
+
+    let capture = manager.capture_diff(&worktree).expect("capture safe diff");
+
+    assert!(capture.patch.contains("modified without helpers"));
+    assert!(!marker.exists(), "repository-controlled helper executed");
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_diff_rejects_commondir_before_invoking_git() {
+    const CHILD: &str = "AUTOSPEC_COMMONDIR_PREFLIGHT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "capture_diff_rejects_commondir_before_invoking_git",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated commondir test");
+        assert!(
+            output.status.success(),
+            "commondir child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-commondir", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-commondir",
+        )
+        .expect("create worktree");
+    std::fs::write(
+        Path::new(&worktree.path).join(".git/commondir"),
+        "../foreign\n",
+    )
+    .expect("write forbidden commondir");
+    let marker = state.path().join("git-wrapper-ran");
+    let bin = tempfile::tempdir().expect("wrapper bin");
+    let wrapper = bin.path().join("git");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\ntouch '{}'\nexit 99\n", marker.display()),
+    )
+    .expect("write Git wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+        .expect("make Git wrapper executable");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&original_path)),
+    )
+    .expect("wrapper PATH");
+    std::env::set_var("PATH", &path);
+
+    let error = manager
+        .capture_diff(&worktree)
+        .expect_err("reject forbidden commondir");
+    std::env::set_var("PATH", original_path);
+
+    assert!(matches!(error, WorktreeError::Ownership(_)));
+    assert!(!marker.exists(), "Git ran before filesystem preflight");
 }
 
 #[test]

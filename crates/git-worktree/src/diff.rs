@@ -1,8 +1,7 @@
 use crate::cleanup::verified_path;
 use crate::command::git_command;
 use crate::manager::{
-    git_stdout, read_owner_record, verify_git_storage_preflight, verify_repository_storage,
-    GitWorktreeManager,
+    read_owner_record, verify_git_storage_preflight, verify_repository_storage, GitWorktreeManager,
 };
 use crate::{DiffCapture, Worktree, WorktreeError};
 use orchestrator_core::labels::{EXECUTION_ID, MANAGED, REPOSITORY};
@@ -29,15 +28,12 @@ pub(crate) fn capture(
         return Err(WorktreeError::Ownership(worktree.path.clone()));
     }
     verify_git_storage_preflight(path)?;
-    let current_branch = git_stdout(
-        [
-            OsStr::new("-C"),
-            path.as_os_str(),
-            OsStr::new("branch"),
-            OsStr::new("--show-current"),
-        ],
-        WorktreeError::Diff,
-    )?;
+    let current_branch = String::from_utf8(
+        git_success(path, [OsStr::new("branch"), OsStr::new("--show-current")])?.stdout,
+    )
+    .map_err(|error| WorktreeError::Diff(error.to_string()))?
+    .trim()
+    .to_owned();
     if current_branch != owner.branch {
         return Err(WorktreeError::Ownership(format!(
             "recorded branch {} does not match checkout {current_branch} at {}",
@@ -50,6 +46,8 @@ pub(crate) fn capture(
         path,
         [
             OsStr::new("diff"),
+            OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
             OsStr::new("--binary"),
             OsStr::new(&worktree.base_sha),
             OsStr::new("--"),
@@ -60,6 +58,8 @@ pub(crate) fn capture(
         path,
         [
             OsStr::new("diff"),
+            OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
             OsStr::new("--name-only"),
             OsStr::new("-z"),
             OsStr::new(&worktree.base_sha),
@@ -81,11 +81,12 @@ pub(crate) fn capture(
     let mut changed_files = parse_paths(&tracked)?;
     for file in parse_paths(&untracked)? {
         verify_git_storage_preflight(path)?;
-        let output = git_command()
-            .current_dir(path)
+        let output = safe_repository_git(path)
             .args([
                 OsString::from("diff"),
                 OsString::from("--no-index"),
+                OsString::from("--no-ext-diff"),
+                OsString::from("--no-textconv"),
                 OsString::from("--binary"),
                 OsString::from("--"),
                 OsString::from("/dev/null"),
@@ -114,8 +115,7 @@ where
     S: AsRef<OsStr>,
 {
     verify_git_storage_preflight(path)?;
-    let output = git_command()
-        .current_dir(path)
+    let output = safe_repository_git(path)
         .args(args)
         .output()
         .map_err(|error| WorktreeError::Diff(error.to_string()))?;
@@ -126,6 +126,21 @@ where
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ))
     }
+}
+
+fn safe_repository_git(path: &Path) -> std::process::Command {
+    let mut command = git_command();
+    command.current_dir(path).args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "include.path=/dev/null",
+    ]);
+    command
 }
 
 fn parse_paths(bytes: &[u8]) -> Result<BTreeSet<String>, WorktreeError> {

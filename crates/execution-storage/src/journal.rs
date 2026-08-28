@@ -105,12 +105,7 @@ impl SecureMetadataDirectory {
         }
         if self.directory.child_metadata(&temporary)?.is_some() {
             self.directory.open_file(&temporary)?;
-            if self.directory.child_metadata(name)?.is_some() {
-                self.directory.open_file(name)?;
-                self.directory.remove_file(&temporary)?;
-            } else {
-                self.directory.rename(&temporary, name)?;
-            }
+            self.directory.remove_file(&temporary)?;
             self.directory.sync()?;
         }
         self.directory.verify("metadata directory")
@@ -235,6 +230,12 @@ impl JournalStore {
                     Path::new(&name).display()
                 ))
             })?;
+            if is_journal_temporary_name(&name) {
+                self.journal_directory.open_file(&name)?;
+                self.journal_directory.remove_file(&name)?;
+                self.journal_directory.sync()?;
+                continue;
+            }
             let execution_id = name.strip_suffix(".json").ok_or_else(|| {
                 StorageError::Journal(format!("unexpected journal filename: {name}"))
             })?;
@@ -601,6 +602,25 @@ fn temporary_name(name: &str) -> Result<String, StorageError> {
         std::process::id(),
         OWNER_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+fn is_journal_temporary_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let mut components = rest.rsplitn(3, '.');
+    components.next() == Some("tmp")
+        && components
+            .next()
+            .is_some_and(|counter| counter.bytes().all(|byte| byte.is_ascii_digit()))
+        && components.next().is_some_and(|prefix| {
+            let Some((journal, process)) = prefix.rsplit_once('.') else {
+                return false;
+            };
+            journal.ends_with(".json")
+                && process.bytes().all(|byte| byte.is_ascii_digit())
+                && !journal.is_empty()
+        })
 }
 
 fn journal_error(action: &str, path: &Path, error: std::io::Error) -> StorageError {

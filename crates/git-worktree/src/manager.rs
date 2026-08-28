@@ -270,22 +270,25 @@ impl WorktreeManager for GitWorktreeManager {
         }
         let repository_root = &layout.repository;
         verify_repository_selector(self, &layout, repository_root)?;
-
-        let intent_path = create_intent_path(self, &labels.execution_id);
-        let recovered_base_sha = if let Some(existing) = read_create_intent(self, &intent_path)? {
-            verify_create_intent(&existing, labels, repo, base_ref, branch, repository_root)?;
-            rollback_independent_repository(self.filesystem.as_ref(), repository_root)
-                .map_err(WorktreeError::Create)?;
-            remove_create_intent(self, &intent_path)?;
-            Some(existing.base_sha)
-        } else {
-            None
-        };
-        let initial_storage = self
+        let verified_storage = self
             .storage_verifier
             .verify_ready(storage)
             .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
-        verify_live_storage(initial_storage.as_ref(), repository_root)?;
+        verify_live_storage(verified_storage.as_ref(), repository_root)?;
+
+        let intent_path = create_intent_path(self, &labels.execution_id);
+        let recovered_intent = read_create_intent(self, &intent_path)?;
+        let recovered_base_sha = if let Some(existing) = recovered_intent.as_ref() {
+            verify_create_intent(existing, labels, repo, base_ref, branch, repository_root)?;
+            rollback_independent_repository(self.filesystem.as_ref(), repository_root)
+                .map_err(WorktreeError::Create)?;
+            verified_storage
+                .refresh_after_exact_recovery()
+                .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
+            Some(existing.base_sha.clone())
+        } else {
+            None
+        };
 
         let mirror = PathBuf::from(self.ensure_mirror(repo)?);
         let mirror_lock = mirror.with_extension("git.lock");
@@ -351,17 +354,13 @@ impl WorktreeManager for GitWorktreeManager {
             repository_path: repository_root.to_string_lossy().into_owned(),
             phase: CreatePhase::Cloning,
         };
-        write_create_intent(self, &intent_path, &intent, false)?;
+        write_create_intent(self, &intent_path, &intent, recovered_intent.is_some())?;
         let setup_result = (|| {
             mirror_root
                 .verify()
                 .map_err(|error| WorktreeError::Create(error.to_string()))?;
             verify_mirror_repository(&mirror_root, &mirror, &clone_locator)
                 .map_err(|error| WorktreeError::Create(error.to_string()))?;
-            let verified_storage = self
-                .storage_verifier
-                .verify_ready(storage)
-                .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
             verify_live_storage(verified_storage.as_ref(), repository_root)?;
             self.filesystem
                 .clone_repository(&mirror, repository_root)
@@ -979,6 +978,17 @@ pub(crate) fn verify_repository_storage(path: &Path) -> Result<(), WorktreeError
 }
 
 pub(crate) fn verify_git_storage_preflight(path: &Path) -> Result<(), WorktreeError> {
+    let commondir = path.join(".git/commondir");
+    match fs::symlink_metadata(&commondir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(WorktreeError::Ownership(format!(
+                "linked Git common directory is forbidden: {}",
+                commondir.display()
+            )))
+        }
+        Err(error) => return Err(WorktreeError::Ownership(error.to_string())),
+    }
     for (purpose, candidate, expected_directory) in [
         ("repository", path.to_path_buf(), true),
         ("Git directory", path.join(".git"), true),

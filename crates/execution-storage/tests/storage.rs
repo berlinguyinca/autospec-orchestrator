@@ -31,26 +31,40 @@ fn storage_directories(root: &Path) {
 }
 
 #[test]
-fn secure_metadata_directory_recovers_synced_temporary_files() {
+fn secure_metadata_directory_discards_uncommitted_temporary_files() {
     let root = tempfile::tempdir().expect("temporary metadata root");
     #[cfg(unix)]
     mode(root.path(), 0o700);
     let metadata = SecureMetadataDirectory::new(root.path()).expect("secure metadata directory");
 
-    metadata
-        .create("intent.json", b"first")
-        .expect("create intent");
-    fs::rename(
-        root.path().join("intent.json"),
-        root.path().join("intent.json.tmp"),
-    )
-    .expect("simulate crash after durable temporary write");
+    fs::write(root.path().join("intent.json.tmp"), b"{\"partial\":")
+        .expect("simulate interrupted temporary write");
+    #[cfg(unix)]
+    mode(&root.path().join("intent.json.tmp"), 0o600);
 
     assert_eq!(
         metadata.read("intent.json").expect("reconcile intent"),
-        Some(b"first".to_vec())
+        None
     );
     assert!(!root.path().join("intent.json.tmp").exists());
+}
+
+#[test]
+fn journal_store_discards_partial_orphan_temporary_file() {
+    let root = tempfile::tempdir().expect("temporary state root");
+    storage_directories(root.path());
+    let state_root = root.path().canonicalize().expect("canonical state root");
+    let temporary = state_root.join("execution-storage/.node-417.json.123.7.tmp");
+    fs::write(&temporary, b"{\"phase\":").expect("write interrupted journal temporary");
+    #[cfg(unix)]
+    mode(&temporary, 0o600);
+    let store = JournalStore::new(&state_root).expect("journal store");
+
+    assert!(store
+        .list(&state_root)
+        .expect("reconcile journals")
+        .is_empty());
+    assert!(!temporary.exists());
 }
 
 fn labels() -> OwnershipLabels {
