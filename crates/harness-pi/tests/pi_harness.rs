@@ -1,7 +1,7 @@
 use execution_storage::{
     disk_gib_to_bytes, AllocationReceipt, BackendIdentity, DockerBindProof, ExecutionLayout,
-    ReadyAllocationVerifier, ReadyLease, StorageError, VerifiedExecutionStorage,
-    ALLOCATION_API_VERSION,
+    ExecutionLifecycleHoldStore, ReadyAllocationVerifier, ReadyLease, StorageError,
+    VerifiedExecutionStorage, ALLOCATION_API_VERSION,
 };
 use harness_pi::{PiHarness, PiHarnessConfig};
 use harness_traits::{AgentHarness, HarnessError};
@@ -1397,6 +1397,198 @@ async fn stale_container_fork_fails_before_torn_conversation_repair() {
         Err(HarnessError::Start(_))
     ));
     assert_eq!(fs::read(&durable).unwrap(), before);
+}
+
+#[test]
+fn crash_process_helper() {
+    let Ok(state_root) = std::env::var("AUTOSPEC_PI_CRASH_STATE_ROOT") else {
+        return;
+    };
+    let receipt_path = PathBuf::from(state_root).join("runtime/crash-receipt.json");
+    let receipt: AllocationReceipt =
+        serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+    let layout = ExecutionLayout::new(
+        receipt.mount_path.parent().unwrap().parent().unwrap(),
+        &receipt.labels.execution_id,
+    )
+    .unwrap();
+    let container_id = std::env::var("AUTOSPEC_PI_CRASH_CONTAINER_ID").unwrap();
+    let mut mounts = vec![
+        VerifiedBindMount {
+            source: fs::canonicalize(&layout.repository).unwrap(),
+            target: "/workspace".to_owned(),
+            writable: true,
+        },
+        VerifiedBindMount {
+            source: fs::canonicalize(&layout.conversation).unwrap(),
+            target: "/session".to_owned(),
+            writable: true,
+        },
+        VerifiedBindMount {
+            source: fs::canonicalize(layout.runtime.join("pi")).unwrap(),
+            target: "/usr/local/bin/pi".to_owned(),
+            writable: false,
+        },
+        VerifiedBindMount {
+            source: fs::canonicalize(layout.runtime.join("setsid")).unwrap(),
+            target: "/usr/local/bin/setsid".to_owned(),
+            writable: false,
+        },
+    ];
+    mounts.sort();
+    let capability = VerifiedAgentContainer {
+        container_id,
+        daemon_id: receipt.docker_bind.daemon_id.clone(),
+        labels: receipt.labels.clone(),
+        mounts,
+    };
+    let verifier = Arc::new(TestReadyVerifier {
+        expected: receipt.clone(),
+        layout,
+        reject: AtomicBool::new(false),
+        lease_state: Arc::new(LeaseState::default()),
+        verified_directories: Arc::new(Mutex::new(Vec::new())),
+    });
+    let mut config = PiHarnessConfig::for_ready_allocation(verifier, receipt, capability).unwrap();
+    config.pi_executable = "/usr/local/bin/pi".to_owned();
+    config.model_policy = Some(ModelPolicy {
+        provider: "inferweave".to_owned(),
+        preferred: vec!["qwen/code".to_owned()],
+        alternatives: vec!["qwen/fallback".to_owned()],
+        fallback_class: Some("coding".to_owned()),
+    });
+    config.tools = vec!["read".to_owned(), "bash".to_owned(), "edit".to_owned()];
+    config.skills = Vec::new();
+    let harness = PiHarness::new(config);
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async { harness.start(&packet()).await.unwrap() });
+    std::process::exit(86);
+}
+
+#[tokio::test]
+async fn worker_process_crash_leaves_hold_for_fresh_harness_recovery() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(
+        fixture
+            .receipt
+            .mount_path
+            .join("runtime/crash-receipt.json"),
+        serde_json::to_vec(&fixture.receipt).unwrap(),
+    )
+    .unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "crash_process_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("AUTOSPEC_PI_CRASH_STATE_ROOT", &fixture.receipt.mount_path)
+        .env(
+            "AUTOSPEC_PI_CRASH_CONTAINER_ID",
+            &fixture.capability.container_id,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let holds = ExecutionLifecycleHoldStore::new(
+        fixture
+            .receipt
+            .mount_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        holds
+            .list(&fixture.receipt.labels.execution_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(pi_is_alive(&fixture));
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    harness.stop(&session).await.unwrap();
+    assert!(holds
+        .list(&fixture.receipt.labels.execution_id)
+        .unwrap()
+        .is_empty());
+    assert!(!pi_is_alive(&fixture));
+}
+
+#[tokio::test]
+async fn crash_before_pgid_binding_leaves_token_recoverable_hold() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.worktree_dir().join("handshake-timeout"), "").unwrap();
+    fs::write(
+        fixture
+            .receipt
+            .mount_path
+            .join("runtime/crash-receipt.json"),
+        serde_json::to_vec(&fixture.receipt).unwrap(),
+    )
+    .unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "crash_process_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("AUTOSPEC_PI_CRASH_STATE_ROOT", &fixture.receipt.mount_path)
+        .env(
+            "AUTOSPEC_PI_CRASH_CONTAINER_ID",
+            &fixture.capability.container_id,
+        )
+        .spawn()
+        .unwrap();
+    let holds = ExecutionLifecycleHoldStore::new(
+        fixture
+            .receipt
+            .mount_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let hold = loop {
+        let current = holds.list(&fixture.receipt.labels.execution_id).unwrap();
+        if let Some(hold) = current.into_iter().next() {
+            break hold;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child did not persist its pre-PGID hold"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(hold.pgid, None);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    fs::remove_file(fixture.worktree_dir().join("handshake-timeout")).unwrap();
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    harness.stop(&session).await.unwrap();
+    assert!(holds
+        .list(&fixture.receipt.labels.execution_id)
+        .unwrap()
+        .is_empty());
+    assert!(!pi_is_alive(&fixture));
 }
 
 #[tokio::test]
