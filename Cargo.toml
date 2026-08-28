@@ -13,6 +13,7 @@ members = [
     "crates/autospec-orchestrator",
     "crates/autospec-worker",
     "crates/orchestrator-persistence",
+    "crates/execution-storage",
 ]
 
 [workspace.package]
