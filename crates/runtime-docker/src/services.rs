@@ -1,4 +1,4 @@
-use crate::{limits::host_limits, DockerRuntime};
+use crate::{limits::host_limits, provision::create_image_volumes, DockerRuntime};
 use bollard::{
     container::{Config, CreateContainerOptions, NetworkingConfig},
     models::EndpointSettings,
@@ -13,13 +13,17 @@ pub(crate) async fn create_services(
     requirement: &RuntimeRequirement,
     services: &[ServiceRequirement],
     network: &str,
-) -> Result<Vec<String>, RuntimeError> {
+) -> Result<ProvisionedServices, RuntimeError> {
     let mut containers = Vec::with_capacity(services.len());
+    let mut volumes = Vec::new();
     for service in services {
-        runtime.ensure_image(&service.image).await?;
+        let image = runtime.ensure_image(&service.image).await?;
         let name = DockerRuntime::service_container_name(&labels.execution_id, &service.name);
         let mut limits = host_limits(requirement);
         limits.network_mode = Some(network.to_owned());
+        let image_volumes = create_image_volumes(runtime, labels, &image, &service.name).await?;
+        limits.mounts = (!image_volumes.mounts.is_empty()).then_some(image_volumes.mounts);
+        volumes.extend(image_volumes.names);
         let config = Config {
             image: Some(service.image.clone()),
             env: (!service.env.is_empty()).then(|| {
@@ -56,7 +60,15 @@ pub(crate) async fn create_services(
             })?;
         containers.push(name);
     }
-    Ok(containers)
+    Ok(ProvisionedServices {
+        containers,
+        volumes,
+    })
+}
+
+pub(crate) struct ProvisionedServices {
+    pub(crate) containers: Vec<String>,
+    pub(crate) volumes: Vec<String>,
 }
 
 pub(crate) fn networking_config(network: &str, alias: &str) -> NetworkingConfig<String> {

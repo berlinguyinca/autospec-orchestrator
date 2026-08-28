@@ -10,7 +10,11 @@ pub type HostConfigLimits = HostConfig;
 /// Translate manifest resource requirements into daemon-enforced limits.
 ///
 /// CPU, memory, PID, and writable-layer disk quotas are runtime protections,
-/// not prompt guidance (spec sections 13 and 81).
+/// not prompt guidance (spec sections 13 and 81). Image-declared data paths are
+/// mounted from execution-owned named volumes so Docker never creates anonymous
+/// volumes outside label-scoped lifecycle control. Docker has no portable named-
+/// volume quota; the writable-layer quota remains the enforceable disk boundary,
+/// and daemons that cannot enforce it reject container creation.
 pub fn host_limits(requirement: &RuntimeRequirement) -> HostConfigLimits {
     let memory = requirement
         .memory_mib

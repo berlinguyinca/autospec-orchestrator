@@ -14,8 +14,9 @@ pub(crate) async fn destroy(
 ) -> Result<(), RuntimeError> {
     runtime.require_compatible_daemon().await?;
     let filters = label_filters(labels.selector());
+    let mut errors = Vec::new();
 
-    let containers = runtime
+    match runtime
         .client
         .list_containers(Some(ListContainersOptions {
             all: true,
@@ -23,57 +24,78 @@ pub(crate) async fn destroy(
             ..Default::default()
         }))
         .await
-        .map_err(|error| RuntimeError::Cleanup(format!("list owned containers: {error}")))?;
-    for container in containers {
-        if let Some(id) = container.id {
-            runtime
-                .client
-                .remove_container(
-                    &id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        v: false,
-                        link: false,
-                    }),
-                )
-                .await
-                .map_err(|error| {
-                    RuntimeError::Cleanup(format!("remove owned container {id}: {error}"))
-                })?;
+    {
+        Ok(containers) => {
+            for container in containers {
+                if let Some(id) = container.id {
+                    if let Err(error) = runtime
+                        .client
+                        .remove_container(
+                            &id,
+                            Some(RemoveContainerOptions {
+                                force: true,
+                                v: false,
+                                link: false,
+                            }),
+                        )
+                        .await
+                    {
+                        errors.push(format!("remove owned container {id}: {error}"));
+                    }
+                }
+            }
         }
+        Err(error) => errors.push(format!("list owned containers: {error}")),
     }
 
-    let volumes = runtime
+    match runtime
         .client
         .list_volumes(Some(ListVolumesOptions {
             filters: filters.clone(),
         }))
         .await
-        .map_err(|error| RuntimeError::Cleanup(format!("list owned volumes: {error}")))?;
-    for volume in volumes.volumes.unwrap_or_default() {
-        let name = volume.name;
-        runtime
-            .client
-            .remove_volume(&name, Some(RemoveVolumeOptions { force: true }))
-            .await
-            .map_err(|error| {
-                RuntimeError::Cleanup(format!("remove owned volume {name}: {error}"))
-            })?;
+    {
+        Ok(volumes) => {
+            for volume in volumes.volumes.unwrap_or_default() {
+                let name = volume.name;
+                if let Err(error) = runtime
+                    .client
+                    .remove_volume(&name, Some(RemoveVolumeOptions { force: true }))
+                    .await
+                {
+                    errors.push(format!("remove owned volume {name}: {error}"));
+                }
+            }
+        }
+        Err(error) => errors.push(format!("list owned volumes: {error}")),
     }
 
-    let networks = runtime
+    match runtime
         .client
         .list_networks(Some(ListNetworksOptions { filters }))
         .await
-        .map_err(|error| RuntimeError::Cleanup(format!("list owned networks: {error}")))?;
-    for network in networks {
-        if let Some(id) = network.id {
-            runtime.client.remove_network(&id).await.map_err(|error| {
-                RuntimeError::Cleanup(format!("remove owned network {id}: {error}"))
-            })?;
+    {
+        Ok(networks) => {
+            for network in networks {
+                if let Some(id) = network.id {
+                    if let Err(error) = runtime.client.remove_network(&id).await {
+                        errors.push(format!("remove owned network {id}: {error}"));
+                    }
+                }
+            }
         }
+        Err(error) => errors.push(format!("list owned networks: {error}")),
     }
-    Ok(())
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(RuntimeError::Cleanup(format!(
+            "execution_id={}: {}",
+            labels.execution_id,
+            errors.join("; ")
+        )))
+    }
 }
 
 pub(crate) async fn reconcile(

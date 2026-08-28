@@ -1,5 +1,6 @@
 use bollard::{
     container::{Config, CreateContainerOptions, RemoveContainerOptions},
+    models::{HostConfig, Mount, MountTypeEnum},
     network::CreateNetworkOptions,
     volume::{CreateVolumeOptions, RemoveVolumeOptions},
     Docker,
@@ -10,10 +11,22 @@ use orchestrator_core::{
 use runtime_docker::{host_limits, DockerRuntime, DEFAULT_PIDS_LIMIT};
 use runtime_traits::Runtime;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+async fn volume_names(docker: &Docker) -> BTreeSet<String> {
+    docker
+        .list_volumes::<String>(None)
+        .await
+        .expect("list Docker volumes")
+        .volumes
+        .unwrap_or_default()
+        .into_iter()
+        .map(|volume| volume.name)
+        .collect()
+}
 
 fn runtime_requirement() -> RuntimeRequirement {
     RuntimeRequirement {
@@ -97,6 +110,27 @@ async fn daemon_probe_reports_a_compatible_real_daemon() {
     };
 
     assert_eq!(runtime.name(), "docker");
+    let daemon_version = raw_client()
+        .expect("connect to probed daemon")
+        .version()
+        .await
+        .expect("read daemon version")
+        .api_version
+        .expect("daemon reports API version");
+    let mut expected = daemon_version
+        .split_once('.')
+        .map(|(major, minor)| {
+            (
+                major.parse::<usize>().expect("numeric daemon major"),
+                minor.parse::<usize>().expect("numeric daemon minor"),
+            )
+        })
+        .expect("daemon API is major.minor");
+    expected = expected.min((
+        bollard::API_DEFAULT_VERSION.major_version,
+        bollard::API_DEFAULT_VERSION.minor_version,
+    ));
+    assert_eq!(runtime.client_api_version(), expected);
 }
 
 #[tokio::test]
@@ -162,8 +196,22 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
             handle.service_containers,
             vec![format!("autospec-{}-cache", execution_labels.execution_id)]
         );
-        assert!(handle.volumes.is_empty());
+        assert_eq!(
+            handle.volumes,
+            vec![format!(
+                "autospec-{}-cache-data",
+                execution_labels.execution_id
+            )]
+        );
         assert!(handle.credentials_path.is_none());
+
+        let service_volume = docker
+            .inspect_volume(&handle.volumes[0])
+            .await
+            .expect("inspect execution-owned service volume");
+        for (key, value) in execution_labels.to_map() {
+            assert_eq!(service_volume.labels.get(&key), Some(&value));
+        }
 
         let network = docker
             .inspect_network::<String>(&handle.network, None)
@@ -216,6 +264,19 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
             .and_then(|endpoint| endpoint.aliases)
             .unwrap_or_default();
         assert!(aliases.iter().any(|alias| alias == "cache"));
+        let service_mounts = service_container.mounts.unwrap_or_default();
+        let data_mount = service_mounts
+            .iter()
+            .find(|mount| mount.destination.as_deref() == Some("/data"))
+            .expect("Redis image-declared /data volume is overridden");
+        assert_eq!(data_mount.name.as_deref(), Some(handle.volumes[0].as_str()));
+        assert!(service_mounts.iter().all(|mount| {
+            mount.typ != Some(bollard::models::MountPointTypeEnum::VOLUME)
+                || mount
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| handle.volumes.contains(name))
+        }));
 
         assert!(!runtime
             .reconcile(std::slice::from_ref(&execution_labels.execution_id))
@@ -231,6 +292,10 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
             .inspect_container(&handle.agent_container, None)
             .await
             .expect("reconciliation reports but does not delete containers");
+        docker
+            .inspect_volume(&handle.volumes[0])
+            .await
+            .expect("reconciliation reports but does not delete volumes");
 
         runtime.destroy(&execution_labels).await?;
         assert!(docker
@@ -245,6 +310,7 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
                 .await
                 .is_err());
         }
+        assert!(docker.inspect_volume(&handle.volumes[0]).await.is_err());
         docker
             .inspect_network::<String>(&unrelated_network, None)
             .await
@@ -295,4 +361,209 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
                 == Some(&execution_labels.execution_id.to_string())
         });
     assert!(!leaked, "test execution network must not leak");
+}
+
+#[tokio::test]
+async fn cleanup_aggregates_volume_failures_and_still_removes_the_network() {
+    let Some(runtime) =
+        runtime_or_skip("cleanup_aggregates_volume_failures_and_still_removes_the_network").await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    let execution_labels = labels_for(unique_execution_id());
+    let network = DockerRuntime::network_name(&execution_labels.execution_id);
+    docker
+        .create_network(CreateNetworkOptions {
+            name: network.clone(),
+            driver: "bridge".to_owned(),
+            labels: execution_labels.to_map().into_iter().collect(),
+            ..Default::default()
+        })
+        .await
+        .expect("create owned network");
+
+    let volumes = [
+        DockerRuntime::volume_name(&execution_labels.execution_id, "held-one"),
+        DockerRuntime::volume_name(&execution_labels.execution_id, "held-two"),
+    ];
+    let holders = [
+        format!("{network}-holder-one"),
+        format!("{network}-holder-two"),
+    ];
+    for (volume, holder) in volumes.iter().zip(&holders) {
+        docker
+            .create_volume(CreateVolumeOptions {
+                name: volume.clone(),
+                driver: "local".to_owned(),
+                labels: execution_labels.to_map().into_iter().collect(),
+                ..Default::default()
+            })
+            .await
+            .expect("create held owned volume");
+        docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: holder.clone(),
+                    platform: None,
+                }),
+                Config {
+                    image: Some("alpine:3.20"),
+                    cmd: Some(vec!["sleep", "infinity"]),
+                    host_config: Some(HostConfig {
+                        mounts: Some(vec![Mount {
+                            target: Some("/held".to_owned()),
+                            source: Some(volume.clone()),
+                            typ: Some(MountTypeEnum::VOLUME),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create unrelated holder container");
+    }
+
+    let error = runtime
+        .destroy(&execution_labels)
+        .await
+        .expect_err("in-use volumes make scoped cleanup report failure")
+        .to_string();
+    assert!(error.contains(&volumes[0]));
+    assert!(error.contains(&volumes[1]));
+    assert!(docker
+        .inspect_network::<String>(&network, None)
+        .await
+        .is_err());
+
+    for holder in &holders {
+        let _ = docker
+            .remove_container(
+                holder,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+    }
+    for volume in &volumes {
+        let _ = docker
+            .remove_volume(volume, Some(RemoveVolumeOptions { force: true }))
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_volume() {
+    let Some(runtime) = runtime_or_skip(
+        "provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_volume",
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    let execution_labels = labels_for(unique_execution_id());
+    let owned_volume = DockerRuntime::volume_name(&execution_labels.execution_id, "cache-data");
+    let holder = format!("autospec-{}-holder", execution_labels.execution_id);
+    let conflicting_agent = DockerRuntime::agent_container_name(&execution_labels.execution_id);
+    docker
+        .create_volume(CreateVolumeOptions {
+            name: owned_volume.clone(),
+            driver: "local".to_owned(),
+            labels: execution_labels.to_map().into_iter().collect(),
+            ..Default::default()
+        })
+        .await
+        .expect("create held execution volume");
+    for (name, mounts) in [
+        (
+            holder.clone(),
+            Some(vec![Mount {
+                target: Some("/held".to_owned()),
+                source: Some(owned_volume.clone()),
+                typ: Some(MountTypeEnum::VOLUME),
+                ..Default::default()
+            }]),
+        ),
+        (conflicting_agent.clone(), None),
+    ] {
+        docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name,
+                    platform: None,
+                }),
+                Config {
+                    image: Some("alpine:3.20"),
+                    cmd: Some(vec!["sleep", "infinity"]),
+                    host_config: Some(HostConfig {
+                        mounts,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create failure-injection container");
+    }
+    let service = ServiceRequirement {
+        name: "cache".to_owned(),
+        image: "redis:7-alpine".to_owned(),
+        env: BTreeMap::new(),
+    };
+    let volumes_before_failure = volume_names(&docker).await;
+
+    let error = runtime
+        .provision(&execution_labels, &runtime_requirement(), &[service])
+        .await
+        .expect_err("agent name conflict triggers provisioning rollback")
+        .to_string();
+    let volumes_after_failure = volume_names(&docker).await;
+    assert!(error.contains(execution_labels.execution_id.as_str()));
+    assert!(error.contains("create agent container"));
+    assert!(error.contains("rollback"));
+    assert!(error.contains(&owned_volume));
+    assert_eq!(
+        volumes_after_failure, volumes_before_failure,
+        "failed provisioning must not leave an anonymous image volume"
+    );
+    assert!(docker
+        .inspect_network::<String>(
+            &DockerRuntime::network_name(&execution_labels.execution_id),
+            None,
+        )
+        .await
+        .is_err());
+
+    let managed_mounts = docker
+        .list_containers(Some(bollard::container::ListContainersOptions {
+            all: true,
+            filters: HashMap::from([("label".to_owned(), execution_labels.selector())]),
+            ..Default::default()
+        }))
+        .await
+        .expect("list execution-labelled containers");
+    assert!(
+        managed_mounts.is_empty(),
+        "rollback removes service containers"
+    );
+
+    for container in [&holder, &conflicting_agent] {
+        let _ = docker
+            .remove_container(
+                container,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+    }
+    let _ = docker
+        .remove_volume(&owned_volume, Some(RemoveVolumeOptions { force: true }))
+        .await;
 }
