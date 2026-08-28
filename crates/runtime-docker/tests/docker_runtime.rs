@@ -1,11 +1,13 @@
 use bollard::{
     container::{Config, CreateContainerOptions},
     exec::{CreateExecOptions, StartExecOptions},
+    image::{CommitContainerOptions, CreateImageOptions, RemoveImageOptions},
     models::{HostConfig, Mount, MountTypeEnum},
     network::CreateNetworkOptions,
     volume::CreateVolumeOptions,
     Docker,
 };
+use futures_util::StreamExt;
 use orchestrator_core::{
     labels, ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement, WorkerId,
 };
@@ -34,9 +36,22 @@ impl TestStateRoot {
             labels.execution_id
         ));
         fs::create_dir(&path).expect("create unique test state root");
-        fs::create_dir_all(path.join("worktrees").join(labels.execution_id.as_str()))
-            .expect("create execution worktree");
-        let session = path.join("sessions").join(labels.execution_id.as_str());
+        let state = Self { path };
+        state.add_execution(labels);
+        state
+    }
+
+    fn add_execution(&self, labels: &OwnershipLabels) {
+        fs::create_dir_all(
+            self.path
+                .join("worktrees")
+                .join(labels.execution_id.as_str()),
+        )
+        .expect("create execution worktree");
+        let session = self
+            .path
+            .join("sessions")
+            .join(labels.execution_id.as_str());
         fs::create_dir_all(&session).expect("create host-private session root");
         for (name, contents) in [
             ("owner.json", "host owner\n"),
@@ -49,7 +64,6 @@ impl TestStateRoot {
         ] {
             fs::write(session.join(name), contents).expect("write host-private session metadata");
         }
-        Self { path }
     }
 
     fn worktree(&self, labels: &OwnershipLabels) -> PathBuf {
@@ -76,6 +90,86 @@ impl Drop for TestStateRoot {
         if is_owned_test_path {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+struct DockerImageGuard {
+    docker: Docker,
+    names: Vec<String>,
+    cleaned: bool,
+}
+
+impl DockerImageGuard {
+    fn new(docker: &Docker) -> Self {
+        Self {
+            docker: docker.clone(),
+            names: Vec::new(),
+            cleaned: false,
+        }
+    }
+
+    fn track(&mut self, name: String) {
+        self.names.push(name);
+    }
+
+    async fn cleanup(&mut self) -> Result<(), String> {
+        cleanup_test_images(&self.docker, &self.names).await?;
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for DockerImageGuard {
+    fn drop(&mut self) {
+        if self.cleaned || self.names.is_empty() {
+            return;
+        }
+        let docker = self.docker.clone();
+        let names = self.names.clone();
+        let cleanup_thread = std::thread::Builder::new()
+            .name("runtime-docker-image-cleanup".to_owned())
+            .spawn(move || {
+                let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("create image-cleanup Tokio runtime: {error}"))?;
+                tokio_runtime.block_on(cleanup_test_images(&docker, &names))
+            });
+        let cleanup = match cleanup_thread {
+            Ok(thread) => thread.join().map_err(thread_panic_message),
+            Err(error) => {
+                write_cleanup_diagnostic(&format!("create image-cleanup thread: {error}"));
+                return;
+            }
+        };
+        match cleanup {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) | Err(error) => write_cleanup_diagnostic(&error),
+        }
+    }
+}
+
+async fn cleanup_test_images(docker: &Docker, names: &[String]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for name in names {
+        if let Err(error) = docker
+            .remove_image(
+                name,
+                Some(RemoveImageOptions {
+                    force: true,
+                    noprune: false,
+                }),
+                None,
+            )
+            .await
+        {
+            errors.push(format!("remove test image {name}: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -352,6 +446,65 @@ async fn execution_runtime_or_skip(
     Some((state, runtime))
 }
 
+async fn ensure_alpine_image(docker: &Docker) {
+    match docker.inspect_image("alpine:3.20").await {
+        Ok(_) => return,
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {}
+        Err(error) => panic!("inspect Alpine test image: {error}"),
+    }
+    let mut pull = docker.create_image(
+        Some(CreateImageOptions {
+            from_image: "alpine:3.20",
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
+    while let Some(progress) = pull.next().await {
+        progress.expect("pull Alpine test image");
+    }
+}
+
+async fn commit_volume_image(
+    docker: &Docker,
+    source_container: &str,
+    labels: &OwnershipLabels,
+    target: &str,
+    index: usize,
+) -> String {
+    let repository = format!("autospec-reserved-volume-{}", labels.execution_id);
+    let tag = format!("case-{index}");
+    let image = format!("{repository}:{tag}");
+    docker
+        .commit_container(
+            CommitContainerOptions {
+                container: source_container,
+                repo: repository.as_str(),
+                tag: tag.as_str(),
+                pause: false,
+                ..Default::default()
+            },
+            Config::<String> {
+                labels: Some(labels.to_map().into_iter().collect()),
+                volumes: Some(HashMap::from([(target.to_owned(), HashMap::new())])),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("commit real image with reserved VOLUME metadata");
+    let inspect = docker
+        .inspect_image(&image)
+        .await
+        .expect("inspect committed VOLUME image");
+    assert!(inspect
+        .config
+        .and_then(|config| config.volumes)
+        .is_some_and(|volumes| volumes.contains_key(target)));
+    image
+}
+
 #[test]
 fn host_limits_enforce_cpu_memory_pid_and_disk_quotas() {
     let limits = host_limits(&runtime_requirement());
@@ -400,6 +553,115 @@ async fn daemon_probe_reports_a_compatible_real_daemon() {
         bollard::API_DEFAULT_VERSION.minor_version,
     ));
     assert_eq!(runtime.client_api_version(), expected);
+}
+
+#[tokio::test]
+async fn real_image_volume_collisions_fail_before_resources_and_preserve_another_execution() {
+    let execution_labels = labels_for(unique_execution_id());
+    let healthy_labels = labels_for(unique_execution_id());
+    let state = TestStateRoot::new(&execution_labels);
+    state.add_execution(&healthy_labels);
+    let Some(runtime) = runtime_at_state_root_or_skip(
+        "real_image_volume_collisions_fail_before_resources_and_preserve_another_execution",
+        &state.path,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let mut execution_scope = DockerTestScope::new(&runtime, &execution_labels);
+    let mut healthy_scope = DockerTestScope::new(&runtime, &healthy_labels);
+    let control_labels = control_labels_for(&execution_labels);
+    let source_container = format!("autospec-{}-image-source", control_labels.execution_id);
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: source_container.clone(),
+                platform: None,
+            }),
+            Config::<String> {
+                image: Some("alpine:3.20".to_owned()),
+                labels: Some(control_labels.to_map().into_iter().collect()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create labelled image source container");
+
+    let mut image_guard = DockerImageGuard::new(&docker);
+    let mut collision_images = Vec::new();
+    for (index, target) in ["/workspace", "/session/history", "/"]
+        .into_iter()
+        .enumerate()
+    {
+        let image =
+            commit_volume_image(&docker, &source_container, &execution_labels, target, index).await;
+        image_guard.track(image.clone());
+        collision_images.push((target, image));
+    }
+    runtime
+        .destroy(&control_labels)
+        .await
+        .expect("remove labelled image source container");
+
+    let healthy = runtime
+        .provision(&healthy_labels, &runtime_requirement(), &[])
+        .await
+        .expect("provision independent healthy execution");
+    for (target, image) in collision_images {
+        let requirement = RuntimeRequirement {
+            image: Some(image),
+            ..runtime_requirement()
+        };
+        let error = runtime
+            .provision(&execution_labels, &requirement, &[])
+            .await
+            .expect_err("reserved image VOLUME must fail closed");
+        assert!(
+            matches!(error, runtime_traits::RuntimeError::ResourceLimit(ref message)
+                if message.contains(target) && message.contains("reserved agent mount")),
+            "unexpected collision error: {error}"
+        );
+        assert!(docker
+            .inspect_network::<String>(
+                &DockerRuntime::network_name(&execution_labels.execution_id),
+                None,
+            )
+            .await
+            .is_err());
+        let containers = docker
+            .list_containers(Some(bollard::container::ListContainersOptions {
+                all: true,
+                filters: HashMap::from([("label".to_owned(), execution_labels.selector())]),
+                ..Default::default()
+            }))
+            .await
+            .expect("list rejected execution containers");
+        assert!(containers.is_empty());
+        let healthy_inspect = docker
+            .inspect_container(&healthy.agent_container, None)
+            .await
+            .expect("independent execution survives rejected provisioning");
+        assert_eq!(
+            healthy_inspect.state.and_then(|state| state.running),
+            Some(true)
+        );
+    }
+
+    execution_scope
+        .cleanup()
+        .await
+        .expect("cleanup rejected execution selector");
+    healthy_scope
+        .cleanup()
+        .await
+        .expect("cleanup healthy execution");
+    image_guard
+        .cleanup()
+        .await
+        .expect("cleanup committed images");
 }
 
 #[tokio::test]

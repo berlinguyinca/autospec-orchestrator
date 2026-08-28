@@ -50,6 +50,7 @@ async fn provision_inner(
     let image_inspects = std::iter::once(&image_inspect)
         .chain(service_images.iter())
         .collect::<Vec<_>>();
+    validate_reserved_image_volumes(&image_inspects)?;
     let disk_slot_bytes = execution_disk_slot_bytes(requirement, &image_inspects)?;
     let execution_mounts = execution_bind_mounts(runtime, labels)?;
 
@@ -259,6 +260,38 @@ fn image_volume_targets(image: &ImageInspect) -> Vec<String> {
     targets
 }
 
+fn validate_reserved_image_volumes(images: &[&ImageInspect]) -> Result<(), RuntimeError> {
+    for target in images.iter().flat_map(|image| image_volume_targets(image)) {
+        let mut components = Vec::new();
+        if !target.starts_with('/') {
+            return Err(RuntimeError::ResourceLimit(format!(
+                "image volume target is not an absolute container path: {target}"
+            )));
+        }
+        for component in target.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    if components.pop().is_none() {
+                        return Err(RuntimeError::ResourceLimit(format!(
+                            "image volume target escapes the container root: {target}"
+                        )));
+                    }
+                }
+                component => components.push(component),
+            }
+        }
+        let shadows_reserved_mount =
+            components.is_empty() || matches!(components.first(), Some(&"workspace" | &"session"));
+        if shadows_reserved_mount {
+            return Err(RuntimeError::ResourceLimit(format!(
+                "image volume target collides with reserved agent mount: {target}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn execution_disk_slot_bytes(
     requirement: &RuntimeRequirement,
     images: &[&ImageInspect],
@@ -383,5 +416,47 @@ mod tests {
                 "accepted unsafe execution id {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn reserved_agent_mounts_reject_equal_descendant_and_shadowing_image_volumes() {
+        for target in [
+            "/workspace",
+            "/workspace/cache",
+            "/session",
+            "/session/history",
+            "/",
+            "/workspace/../session",
+        ] {
+            let image = ImageInspect {
+                config: Some(ImageConfig {
+                    volumes: Some(HashMap::from([(target.to_owned(), HashMap::new())])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            assert!(
+                validate_reserved_image_volumes(&[&image]).is_err(),
+                "accepted image volume that collides with an agent bind: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_volumes_outside_reserved_agent_mounts_remain_supported() {
+        let image = ImageInspect {
+            config: Some(ImageConfig {
+                volumes: Some(HashMap::from([
+                    ("/cache".to_owned(), HashMap::new()),
+                    ("/workspace-cache".to_owned(), HashMap::new()),
+                    ("/sessions".to_owned(), HashMap::new()),
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(validate_reserved_image_volumes(&[&image]).is_ok());
     }
 }

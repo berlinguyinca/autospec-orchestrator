@@ -25,6 +25,10 @@ session metadata and the Docker socket remain outside the container boundary.
 - Service containers receive neither host bind. The host-private session root,
   `owner.json`, `.cursor`, `resume-count`, live-event files, and the Docker socket
   are never mounted.
+- Image-declared `VOLUME` metadata is normalized and rejected before disk-slot or
+  Docker resource creation when it equals, descends from, or shadows the reserved
+  `/workspace` and `/session` agent mounts. This check covers agent and service
+  images and fails closed as `RuntimeError::ResourceLimit`.
 - Added deterministic network, agent-container, and service-container naming from
   the shared contracts.
 - Added CPU, memory, swap, PID, and writable-layer disk limits to every agent and
@@ -123,6 +127,14 @@ previously absent conversation directory is created, private session siblings an
 the Docker socket are inaccessible, and conversation data survives container
 destruction.
 
+The reserved-mount regression first failed to compile because no image-volume
+collision validator existed. Unit cases then drove exact, descendant, normalized,
+and root-ancestor rejection while preserving non-colliding paths. A real-Docker
+test commits three ownership-labelled images carrying `/workspace`,
+`/session/history`, and `/` volume declarations. Each is rejected before an
+execution network or container appears, and an independently provisioned agent
+remains running throughout all three failures.
+
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
@@ -130,6 +142,9 @@ destruction.
 - `cargo test --workspace -- --nocapture` — passed with normal test concurrency;
   real Docker tests: 12 passed, 0 skipped. PostgreSQL tests printed their existing explicit
   skips because `AUTOSPEC_DATABASE_URL` was unset.
+- `cargo test -p runtime-docker -- --nocapture` and `cargo clippy -p
+  runtime-docker --all-targets -- -D warnings` after reserved-volume hardening —
+  10 unit and 13 real-Docker tests passed on current and Rust 1.85 toolchains.
 - Two simultaneous `cargo test -p runtime-docker --test docker_runtime --
   --nocapture` processes — both passed 12/12 with no name or state-root collisions.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed.
@@ -151,6 +166,13 @@ destruction.
 - Bounded image paths are intentionally ephemeral tmpfs state. Services that need
   persistence beyond an execution require a future explicitly budgeted storage
   contract rather than falling back to unbounded Docker volumes.
+- **Open architecture blocker:** Docker writable-layer quotas do not constrain
+  macOS host binds presented to LinuxKit through `fakeowner`; APFS provides
+  volume-level rather than cross-directory project quotas. Therefore writes to
+  `/workspace` and `/session` are not yet inside the execution-wide `disk_gib`
+  hard limit. A host execution-storage provisioner must create a quota-controlled
+  filesystem boundary before the worktree and Pi session are populated; no fake
+  accounting or prompt-level workaround was added in this round.
 - The configured state root, worktree, and harness-owned session root must exist
   as real directories before provisioning. The runtime deliberately refuses
   symlinked/missing roots and creates only the conversation child.
