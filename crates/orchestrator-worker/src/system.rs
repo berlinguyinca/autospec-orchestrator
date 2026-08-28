@@ -7,12 +7,15 @@ use execution_storage::{
 use git_worktree::{DiffCapture, Worktree, WorktreeManager};
 use harness_pi::{PiHarness, PiHarnessConfig};
 use harness_traits::{AgentHarness, SessionRef};
-use orchestrator_core::{Execution, ExecutionEvent, ExecutionId, TaskPacket};
+use orchestrator_core::{
+    Execution, ExecutionEvent, ExecutionId, OwnershipLabels, SessionId, TaskPacket,
+};
+use orchestrator_persistence::CleanupAuthority;
 use runtime_docker::{DockerRuntime, TrustedVerifierImage};
-use runtime_traits::{EnvironmentHandle, Runtime};
+use runtime_traits::{EnvironmentHandle, Runtime, VerifiedAgentContainer, VerifiedBindMount};
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -93,9 +96,11 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
 
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError> {
         let docker = self.docker_binary.clone();
+        let socket = self.socket.clone();
         let container = DockerRuntime::agent_container_name(&execution.id);
         tokio::task::spawn_blocking(move || {
-            let output = Command::new(&docker)
+            let mut command = docker_command(&docker, socket.as_deref());
+            let output = command
                 .args([
                     "stats",
                     "--no-stream",
@@ -126,6 +131,7 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
 #[derive(Debug, Clone)]
 pub struct VerifiedPiHarnessFactory {
     verifier: Arc<dyn ReadyAllocationVerifier>,
+    docker_socket: Option<String>,
     docker_binary: PathBuf,
     pi_executable: String,
     tools: Vec<String>,
@@ -135,6 +141,7 @@ pub struct VerifiedPiHarnessFactory {
 impl VerifiedPiHarnessFactory {
     pub fn new(
         verifier: Arc<dyn ReadyAllocationVerifier>,
+        docker_socket: Option<String>,
         docker_binary: PathBuf,
         pi_executable: String,
         tools: Vec<String>,
@@ -142,6 +149,7 @@ impl VerifiedPiHarnessFactory {
     ) -> Self {
         Self {
             verifier,
+            docker_socket,
             docker_binary,
             pi_executable,
             tools,
@@ -166,6 +174,7 @@ impl HarnessFactory for VerifiedPiHarnessFactory {
         )
         .map_err(|error| LifecycleError::Step(error.to_string()))?;
         config.docker_binary = self.docker_binary.clone();
+        config.docker_host = self.docker_socket.clone();
         config.pi_executable = self.pi_executable.clone();
         config.tools = self.tools.clone();
         config.skills = self.skills.clone();
@@ -272,6 +281,7 @@ pub struct SystemExecutionLifecycle {
     state_root: PathBuf,
     verifier: Arc<dyn ReadyAllocationVerifier>,
     docker_binary: PathBuf,
+    docker_socket: Option<String>,
     storage: Arc<dyn ExecutionStorageManager>,
     worktrees: Arc<dyn WorktreeManager>,
     runtimes: Arc<dyn RuntimeFactory>,
@@ -286,6 +296,7 @@ pub struct SystemRecoveryConfig {
     pub state_root: PathBuf,
     pub verifier: Arc<dyn ReadyAllocationVerifier>,
     pub docker_binary: PathBuf,
+    pub docker_socket: Option<String>,
 }
 
 impl SystemExecutionLifecycle {
@@ -301,6 +312,7 @@ impl SystemExecutionLifecycle {
             state_root: recovery.state_root,
             verifier: recovery.verifier,
             docker_binary: recovery.docker_binary,
+            docker_socket: recovery.docker_socket,
             storage,
             worktrees,
             runtimes,
@@ -338,6 +350,52 @@ struct DurableWorktreeOwner {
 }
 
 #[derive(Deserialize)]
+struct DurableCleanupHandles {
+    receipt: Option<AllocationReceipt>,
+    worktree: Option<DurableWorktreeHandle>,
+    runtime: Option<DurableRuntimeHandle>,
+    session: Option<DurableSessionHandle>,
+}
+
+#[derive(Deserialize)]
+struct DurableWorktreeHandle {
+    execution_id: ExecutionId,
+    path: String,
+    branch: String,
+    base_sha: String,
+    repository: String,
+}
+
+#[derive(Deserialize)]
+struct DurableRuntimeHandle {
+    execution_id: ExecutionId,
+    network: String,
+    agent_container: String,
+    container_id: String,
+    daemon_id: String,
+    labels: OwnershipLabels,
+    mounts: Vec<DurableMountHandle>,
+    service_containers: Vec<String>,
+    volumes: Vec<String>,
+    credentials_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct DurableMountHandle {
+    source: PathBuf,
+    target: String,
+    writable: bool,
+}
+
+#[derive(Deserialize)]
+struct DurableSessionHandle {
+    id: SessionId,
+    path: String,
+    execution_id: ExecutionId,
+    worktree_path: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct DockerContainerInspect {
     id: String,
@@ -372,11 +430,13 @@ struct DockerContainerMount {
 
 fn docker_container_capability(
     docker: &Path,
+    socket: Option<&str>,
     receipt: &AllocationReceipt,
     layout: &ExecutionLayout,
     container_id: &str,
+    execution: &Execution,
 ) -> Result<runtime_traits::VerifiedAgentContainer, LifecycleError> {
-    let daemon = Command::new(docker)
+    let daemon = docker_command(docker, socket)
         .args(["info", "--format={{.ID}}"])
         .output()
         .map_err(|error| LifecycleError::Step(error.to_string()))?;
@@ -387,7 +447,7 @@ fn docker_container_capability(
             "Docker daemon identity changed during restart adoption".into(),
         ));
     }
-    let output = Command::new(docker)
+    let output = docker_command(docker, socket)
         .args(["inspect", "--type", "container", container_id])
         .output()
         .map_err(|error| LifecycleError::Step(error.to_string()))?;
@@ -447,12 +507,156 @@ fn docker_container_capability(
             "adopted agent container mounts do not match durable execution layout".into(),
         ));
     }
+    let mut expected_containers =
+        BTreeSet::from([DockerRuntime::agent_container_name(&execution.id)]);
+    expected_containers.extend(
+        execution
+            .manifest
+            .services
+            .iter()
+            .map(|service| DockerRuntime::service_container_name(&execution.id, &service.name)),
+    );
+    let all_containers = docker_resource_names(
+        docker,
+        socket,
+        &["ps", "-a"],
+        &receipt.labels.execution_id,
+        "{{.Names}}",
+    )?;
+    let running_containers = docker_resource_names(
+        docker,
+        socket,
+        &["ps"],
+        &receipt.labels.execution_id,
+        "{{.Names}}",
+    )?;
+    if all_containers != expected_containers || running_containers != expected_containers {
+        return Err(LifecycleError::Step(
+            "durable runtime container set is incomplete, stopped, or contains extras".into(),
+        ));
+    }
+    for container in &expected_containers {
+        let labels = docker_resource_labels(
+            docker,
+            socket,
+            &[
+                "inspect",
+                "--type",
+                "container",
+                "--format={{json .Config.Labels}}",
+            ],
+            container,
+        )?;
+        if labels != receipt.labels.to_map() {
+            return Err(LifecycleError::Step(format!(
+                "durable runtime container {container} has foreign or incomplete labels"
+            )));
+        }
+    }
+    let expected_network = DockerRuntime::network_name(&receipt.labels.execution_id);
+    let networks = docker_resource_names(
+        docker,
+        socket,
+        &["network", "ls"],
+        &receipt.labels.execution_id,
+        "{{.Name}}",
+    )?;
+    if networks != BTreeSet::from([expected_network.clone()]) {
+        return Err(LifecycleError::Step(
+            "durable runtime network set differs from the manifest".into(),
+        ));
+    }
+    if docker_resource_labels(
+        docker,
+        socket,
+        &["network", "inspect", "--format={{json .Labels}}"],
+        &expected_network,
+    )? != receipt.labels.to_map()
+    {
+        return Err(LifecycleError::Step(
+            "durable runtime network has foreign or incomplete labels".into(),
+        ));
+    }
+    let volumes = docker_resource_names(
+        docker,
+        socket,
+        &["volume", "ls"],
+        &receipt.labels.execution_id,
+        "{{.Name}}",
+    )?;
+    if !volumes.is_empty() {
+        return Err(LifecycleError::Step(
+            "durable runtime contains unexpected Docker volumes".into(),
+        ));
+    }
     Ok(runtime_traits::VerifiedAgentContainer {
         container_id: container_id.into(),
         daemon_id: receipt.docker_bind.daemon_id.clone(),
         labels: receipt.labels.clone(),
         mounts,
     })
+}
+
+fn docker_resource_labels(
+    docker: &Path,
+    socket: Option<&str>,
+    prefix: &[&str],
+    resource: &str,
+) -> Result<BTreeMap<String, String>, LifecycleError> {
+    let output = docker_command(docker, socket)
+        .args(prefix)
+        .arg(resource)
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !output.status.success() {
+        return Err(LifecycleError::Step(format!(
+            "Docker resource label inspection failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    serde_json::from_slice(String::from_utf8_lossy(&output.stdout).trim().as_bytes())
+        .map_err(|error| LifecycleError::Step(format!("malformed Docker resource labels: {error}")))
+}
+
+fn docker_resource_names(
+    docker: &Path,
+    socket: Option<&str>,
+    prefix: &[&str],
+    execution_id: &ExecutionId,
+    format: &str,
+) -> Result<BTreeSet<String>, LifecycleError> {
+    let mut command = docker_command(docker, socket);
+    command.args(prefix).args([
+        "--filter",
+        "label=autospec.managed=true",
+        "--filter",
+        &format!("label=autospec.execution_id={execution_id}"),
+        "--format",
+        format,
+    ]);
+    let output = command
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !output.status.success() {
+        return Err(LifecycleError::Step(format!(
+            "Docker resource inventory failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn docker_command(binary: &Path, socket: Option<&str>) -> Command {
+    let mut command = Command::new(binary);
+    if let Some(socket) = socket {
+        command.env("DOCKER_HOST", socket);
+    }
+    command
 }
 
 #[async_trait]
@@ -656,6 +860,205 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             .map_err(|error| LifecycleError::Step(error.to_string()))
     }
 
+    async fn cleanup_authority(
+        &self,
+        authority: &CleanupAuthority,
+        execution: &Execution,
+    ) -> Result<(), LifecycleError> {
+        let handles: DurableCleanupHandles = serde_json::from_value(authority.handles.clone())
+            .map_err(|error| LifecycleError::Step(format!("decode cleanup authority: {error}")))?;
+        let layout = ExecutionLayout::new(&self.state_root, &authority.execution_id)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let mut receipt = handles.receipt;
+        if receipt.is_none() && layout.root.exists() {
+            let storage = Arc::clone(&self.storage);
+            let request = AllocationRequest {
+                labels: execution.labels.clone(),
+                disk_gib: execution.manifest.runtime.disk_gib,
+            };
+            receipt = Some(
+                tokio::task::spawn_blocking(move || storage.allocate(&request))
+                    .await
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?,
+            );
+        }
+        if let Some(receipt) = &receipt {
+            if receipt.labels.execution_id != authority.execution_id {
+                return Err(LifecycleError::Step(
+                    "cleanup receipt belongs to another execution".into(),
+                ));
+            }
+            self.verifier
+                .verify_ready(receipt)
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        }
+        let mut worktree = handles.worktree.map(|handle| Worktree {
+            execution_id: handle.execution_id,
+            path: handle.path,
+            branch: handle.branch,
+            base_sha: handle.base_sha,
+            repository: handle.repository,
+        });
+        if worktree
+            .as_ref()
+            .is_some_and(|worktree| worktree.execution_id != authority.execution_id)
+        {
+            return Err(LifecycleError::Step(
+                "cleanup worktree belongs to another execution".into(),
+            ));
+        }
+        if worktree.is_none() && layout.repository.join(".autospec-owner.json").is_file() {
+            let owner: DurableWorktreeOwner = serde_json::from_slice(
+                &std::fs::read(layout.repository.join(".autospec-owner.json"))
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?,
+            )
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+            if owner.labels != execution.labels.to_map() {
+                return Err(LifecycleError::Step(
+                    "recovered worktree owner differs from cleanup authority".into(),
+                ));
+            }
+            worktree = Some(Worktree {
+                execution_id: authority.execution_id.clone(),
+                path: layout.repository.to_string_lossy().into_owned(),
+                branch: owner.branch,
+                base_sha: owner.base_sha,
+                repository: execution.manifest.repository.repo.clone(),
+            });
+        }
+        let environment = handles.runtime.map(|handle| EnvironmentHandle {
+            execution_id: handle.execution_id,
+            network: handle.network,
+            agent_container: handle.agent_container,
+            verified_agent_container: VerifiedAgentContainer {
+                container_id: handle.container_id,
+                daemon_id: handle.daemon_id,
+                labels: handle.labels,
+                mounts: handle
+                    .mounts
+                    .into_iter()
+                    .map(|mount| VerifiedBindMount {
+                        source: mount.source,
+                        target: mount.target,
+                        writable: mount.writable,
+                    })
+                    .collect(),
+            },
+            service_containers: handle.service_containers,
+            volumes: handle.volumes,
+            credentials_path: handle.credentials_path,
+        });
+        if environment.as_ref().is_some_and(|environment| {
+            environment.execution_id != authority.execution_id
+                || environment.verified_agent_container.labels.execution_id
+                    != authority.execution_id
+        }) {
+            return Err(LifecycleError::Step(
+                "cleanup runtime belongs to another execution".into(),
+            ));
+        }
+        let mut session = handles.session.map(|handle| SessionRef {
+            id: handle.id,
+            path: handle.path,
+            execution_id: handle.execution_id,
+            worktree_path: handle.worktree_path,
+        });
+        if session
+            .as_ref()
+            .is_some_and(|session| session.execution_id != authority.execution_id)
+        {
+            return Err(LifecycleError::Step(
+                "cleanup session belongs to another execution".into(),
+            ));
+        }
+
+        if session.is_none() && environment.is_some() {
+            let holds = ExecutionLifecycleHoldStore::new(&self.state_root)
+                .and_then(|store| store.list(&authority.execution_id))
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+            let matching = holds
+                .into_iter()
+                .filter(|hold| hold.labels == execution.labels)
+                .collect::<Vec<_>>();
+            if matching.len() > 1 {
+                return Err(LifecycleError::Step(
+                    "cleanup authority has multiple durable Pi holds".into(),
+                ));
+            }
+            if let Some(hold) = matching.first() {
+                session = Some(SessionRef {
+                    id: SessionId::new(&hold.session_id),
+                    path: layout.session.to_string_lossy().into_owned(),
+                    execution_id: authority.execution_id.clone(),
+                    worktree_path: layout.repository.to_string_lossy().into_owned(),
+                });
+            }
+        }
+
+        let runtime_present = if let Some(receipt) = &receipt {
+            !docker_resource_names(
+                &self.docker_binary,
+                self.docker_socket.as_deref(),
+                &["ps", "-a"],
+                &receipt.labels.execution_id,
+                "{{.Names}}",
+            )?
+            .is_empty()
+                || !docker_resource_names(
+                    &self.docker_binary,
+                    self.docker_socket.as_deref(),
+                    &["network", "ls"],
+                    &receipt.labels.execution_id,
+                    "{{.Name}}",
+                )?
+                .is_empty()
+                || !docker_resource_names(
+                    &self.docker_binary,
+                    self.docker_socket.as_deref(),
+                    &["volume", "ls"],
+                    &receipt.labels.execution_id,
+                    "{{.Name}}",
+                )?
+                .is_empty()
+        } else {
+            false
+        };
+        if let Some(environment) = &environment {
+            let receipt = receipt.as_ref().ok_or_else(|| {
+                LifecycleError::Step("runtime cleanup lacks storage receipt".into())
+            })?;
+            if let (Some(worktree), Some(_session)) = (&worktree, &session) {
+                let harness = self
+                    .harnesses
+                    .build(execution, receipt, environment, worktree)
+                    .await?;
+                harness
+                    .recover_abandoned()
+                    .await
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?;
+            }
+        }
+        if runtime_present {
+            let receipt = receipt.as_ref().ok_or_else(|| {
+                LifecycleError::Step("runtime cleanup lacks storage receipt".into())
+            })?;
+            self.runtimes
+                .build(execution, receipt)
+                .await?
+                .destroy(&receipt.labels)
+                .await
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        }
+        if let Some(worktree) = worktree {
+            self.destroy_worktree(&worktree).await?;
+        }
+        if let Some(receipt) = receipt {
+            self.release_storage(&receipt).await?;
+        }
+        Ok(())
+    }
+
     async fn adopt(&self, execution: &Execution) -> Result<AdoptedExecution, LifecycleError> {
         let session_id = execution
             .session_id
@@ -731,14 +1134,25 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             )));
         }
         let container_id = matching[0].container_id.clone();
-        let container =
-            docker_container_capability(&self.docker_binary, &receipt, &layout, &container_id)?;
+        let container = docker_container_capability(
+            &self.docker_binary,
+            self.docker_socket.as_deref(),
+            &receipt,
+            &layout,
+            &container_id,
+            execution,
+        )?;
         let environment = EnvironmentHandle {
             execution_id: execution.id.clone(),
             network: DockerRuntime::network_name(&execution.id),
             agent_container: DockerRuntime::agent_container_name(&execution.id),
             verified_agent_container: container,
-            service_containers: Vec::new(),
+            service_containers: execution
+                .manifest
+                .services
+                .iter()
+                .map(|service| DockerRuntime::service_container_name(&execution.id, &service.name))
+                .collect(),
             volumes: Vec::new(),
             credentials_path: None,
         };
@@ -768,6 +1182,7 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         Ok(AdoptedExecution {
             receipt,
             worktree,
+            environment,
             session,
         })
     }

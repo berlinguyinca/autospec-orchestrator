@@ -1,4 +1,4 @@
-use crate::{verify_storage_paths, ManagedProcess, PiHarness, ReadyPiStorage};
+use crate::{verify_storage_paths, DockerCli, ManagedProcess, PiHarness, ReadyPiStorage};
 use execution_storage::{ExecutionLifecycleHold, ExecutionLifecycleHoldStore, ReadyLease};
 use harness_traits::{HarnessError, SessionRef};
 use orchestrator_core::{ModelPolicy, SessionId, TaskPacket};
@@ -60,12 +60,12 @@ done"#;
 
 enum QuarantinedProcess {
     Registered {
-        docker_binary: PathBuf,
+        docker: DockerCli,
         container: String,
         process: Arc<ManagedProcess>,
     },
     Startup {
-        docker_binary: PathBuf,
+        docker: DockerCli,
         container: String,
         child: Mutex<std::process::Child>,
         pgid: Option<u32>,
@@ -168,7 +168,7 @@ fn recover_lifecycle_holds(harness: &PiHarness) -> Result<(), HarnessError> {
             ));
         }
         cleanup_container_authority(
-            &harness.config.docker_binary,
+            &harness.processes.docker,
             &hold.container_id,
             hold.pgid,
             &hold.supervisor_token,
@@ -282,7 +282,7 @@ pub(crate) fn spawn(
     lifecycle_holds
         .create(&lifecycle_hold)
         .map_err(crate::storage_error)?;
-    let mut command = Command::new(&harness.config.docker_binary);
+    let mut command = harness.processes.docker.command();
     command
         .args(["exec", "--interactive", "--env"])
         .arg(format!("AUTOSPEC_SUPERVISOR_TOKEN={supervisor_token}"))
@@ -319,7 +319,7 @@ pub(crate) fn spawn(
         .ok_or_else(|| HarnessError::Start("docker exec stdin was not piped".to_owned()))?;
     let (control_tx, control_rx) = mpsc::sync_channel(1);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let pump_docker = harness.config.docker_binary.clone();
+    let pump_docker = harness.processes.docker.clone();
     let pump_container = harness.config.agent_container.clone();
     let expected_supervisor_token = supervisor_token.clone();
     let event_thread = thread::Builder::new().name(format!("pi-events-{}", session.id));
@@ -532,7 +532,7 @@ pub(crate) async fn stop(harness: &PiHarness, session: &SessionRef) -> Result<()
         return Ok(());
     }
     signal_container_group(
-        &harness.config.docker_binary,
+        &harness.processes.docker,
         &harness.config.agent_container,
         process.pgid,
         "TERM",
@@ -546,7 +546,7 @@ pub(crate) async fn stop(harness: &PiHarness, session: &SessionRef) -> Result<()
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     signal_container_group(
-        &harness.config.docker_binary,
+        &harness.processes.docker,
         &harness.config.agent_container,
         process.pgid,
         "KILL",
@@ -600,7 +600,10 @@ fn remove_registered_child(
 }
 
 fn ensure_docker_and_pi(harness: &PiHarness) -> Result<(), HarnessError> {
-    let inspect = Command::new(&harness.config.docker_binary)
+    let inspect = harness
+        .processes
+        .docker
+        .command()
         .args([
             "inspect",
             "--type",
@@ -621,7 +624,10 @@ fn ensure_docker_and_pi(harness: &PiHarness) -> Result<(), HarnessError> {
             harness.config.agent_container
         )));
     }
-    let output = Command::new(&harness.config.docker_binary)
+    let output = harness
+        .processes
+        .docker
+        .command()
         .args(["exec", &harness.config.agent_container, "test", "-x"])
         .arg(&harness.config.pi_executable)
         .output()
@@ -680,7 +686,10 @@ pub(crate) fn verify_live_agent_container(
     layout: &execution_storage::ExecutionLayout,
 ) -> Result<(), HarnessError> {
     let capability = harness.container_capability()?;
-    let daemon = Command::new(&harness.config.docker_binary)
+    let daemon = harness
+        .processes
+        .docker
+        .command()
         .args(["info", "--format={{.ID}}"])
         .output()
         .map_err(docker_start_error)?;
@@ -691,7 +700,10 @@ pub(crate) fn verify_live_agent_container(
             "live Docker daemon differs from the runtime-issued container capability".to_owned(),
         ));
     }
-    let output = Command::new(&harness.config.docker_binary)
+    let output = harness
+        .processes
+        .docker
+        .command()
         .args(["inspect", "--type", "container"])
         .arg(&capability.container_id)
         .output()
@@ -764,15 +776,15 @@ fn docker_start_error(error: io::Error) -> HarnessError {
 }
 
 pub(crate) fn signal_container_group(
-    docker_binary: &Path,
+    docker: &DockerCli,
     container: &str,
     pgid: u32,
     signal: &str,
 ) -> Result<(), HarnessError> {
-    let status = run_control_command(docker_binary, container, pgid, signal)?;
+    let status = run_control_command(docker, container, pgid, signal)?;
     if status.success() {
         Ok(())
-    } else if !container_group_alive_with(docker_binary, container, pgid)? {
+    } else if !container_group_alive_with(docker, container, pgid)? {
         // The group exited between the caller's check and signal delivery.
         Ok(())
     } else {
@@ -783,12 +795,12 @@ pub(crate) fn signal_container_group(
 }
 
 fn container_group_alive_with(
-    docker_binary: &Path,
+    docker: &DockerCli,
     container: &str,
     pgid: u32,
 ) -> Result<bool, HarnessError> {
     let token = supervisor_token()?;
-    let mut command = Command::new(docker_binary);
+    let mut command = docker.command();
     command
         .args([
             "exec",
@@ -835,12 +847,12 @@ fn container_group_alive_with(
 }
 
 fn run_control_command(
-    docker_binary: &Path,
+    docker: &DockerCli,
     container: &str,
     pgid: u32,
     signal: &str,
 ) -> Result<ExitStatus, HarnessError> {
-    let mut command = Command::new(docker_binary);
+    let mut command = docker.command();
     command
         .args([
             "exec",
@@ -871,7 +883,7 @@ fn cleanup_failed_start(
 ) {
     let client = terminate_host_child(&mut child, CONTROL_TIMEOUT);
     let cleanup = cleanup_container_authority(
-        &harness.config.docker_binary,
+        &harness.processes.docker,
         &harness.config.agent_container,
         pgid,
         token,
@@ -890,7 +902,7 @@ fn cleanup_failed_start(
         "startup cleanup was uncertain; quarantining its storage lease and process authority"
     );
     quarantine(QuarantinedProcess::Startup {
-        docker_binary: harness.config.docker_binary.clone(),
+        docker: harness.processes.docker.clone(),
         container: harness.config.agent_container.clone(),
         child: Mutex::new(child),
         pgid,
@@ -947,14 +959,14 @@ fn quarantine_reaper(receiver: mpsc::Receiver<QuarantinedProcess>) {
 }
 
 fn quarantine_reaped(process: &QuarantinedProcess) -> bool {
-    let (docker_binary, container, child, pgid, token, lifecycle_holds, hold_execution_id, hold_id) =
+    let (docker, container, child, pgid, token, lifecycle_holds, hold_execution_id, hold_id) =
         match process {
             QuarantinedProcess::Registered {
-                docker_binary,
+                docker,
                 container,
                 process,
             } => (
-                docker_binary,
+                docker,
                 container,
                 &process.child,
                 Some(process.pgid),
@@ -964,7 +976,7 @@ fn quarantine_reaped(process: &QuarantinedProcess) -> bool {
                 process.hold_id.as_str(),
             ),
             QuarantinedProcess::Startup {
-                docker_binary,
+                docker,
                 container,
                 child,
                 pgid,
@@ -974,7 +986,7 @@ fn quarantine_reaped(process: &QuarantinedProcess) -> bool {
                 hold_id,
                 ..
             } => (
-                docker_binary,
+                docker,
                 container,
                 child,
                 *pgid,
@@ -994,15 +1006,15 @@ fn quarantine_reaped(process: &QuarantinedProcess) -> bool {
     });
     let pgids = match pgid {
         Some(pgid) => vec![pgid],
-        None => match derive_token_pgids(docker_binary, container, token) {
+        None => match derive_token_pgids(docker, container, token) {
             Ok(pgids) => pgids,
             Err(_) => return false,
         },
     };
     let mut groups_reaped = true;
     for pgid in pgids {
-        let _ = run_control_command(docker_binary, container, pgid, "KILL");
-        match container_group_alive_with(docker_binary, container, pgid) {
+        let _ = run_control_command(docker, container, pgid, "KILL");
+        match container_group_alive_with(docker, container, pgid) {
             Ok(false) => {}
             Ok(true) | Err(_) => groups_reaped = false,
         }
@@ -1015,49 +1027,49 @@ fn quarantine_reaped(process: &QuarantinedProcess) -> bool {
 }
 
 pub(crate) fn quarantine_registered(
-    docker_binary: PathBuf,
+    docker: DockerCli,
     container: String,
     process: Arc<ManagedProcess>,
 ) {
     quarantine(QuarantinedProcess::Registered {
-        docker_binary,
+        docker,
         container,
         process,
     });
 }
 
 fn cleanup_container_authority(
-    docker_binary: &Path,
+    docker: &DockerCli,
     container: &str,
     pgid: Option<u32>,
     token: &str,
 ) -> Result<(), HarnessError> {
     if let Some(pgid) = pgid {
-        return cleanup_process_groups(docker_binary, container, &[pgid]);
+        return cleanup_process_groups(docker, container, &[pgid]);
     }
-    let pgids = derive_token_pgids(docker_binary, container, token)?;
+    let pgids = derive_token_pgids(docker, container, token)?;
     if pgids.is_empty() {
         Ok(())
     } else {
-        cleanup_process_groups(docker_binary, container, &pgids)
+        cleanup_process_groups(docker, container, &pgids)
     }
 }
 
 fn cleanup_process_groups(
-    docker_binary: &Path,
+    docker: &DockerCli,
     container: &str,
     pgids: &[u32],
 ) -> Result<(), HarnessError> {
     for pgid in pgids {
-        signal_container_group(docker_binary, container, *pgid, "TERM")?;
+        signal_container_group(docker, container, *pgid, "TERM")?;
     }
-    if wait_for_process_groups_reap(docker_binary, container, pgids, Duration::from_millis(250))? {
+    if wait_for_process_groups_reap(docker, container, pgids, Duration::from_millis(250))? {
         return Ok(());
     }
     for pgid in pgids {
-        signal_container_group(docker_binary, container, *pgid, "KILL")?;
+        signal_container_group(docker, container, *pgid, "KILL")?;
     }
-    if wait_for_process_groups_reap(docker_binary, container, pgids, KILL_REAP_TIMEOUT)? {
+    if wait_for_process_groups_reap(docker, container, pgids, KILL_REAP_TIMEOUT)? {
         Ok(())
     } else {
         Err(HarnessError::Crashed(
@@ -1067,7 +1079,7 @@ fn cleanup_process_groups(
 }
 
 fn wait_for_process_groups_reap(
-    docker_binary: &Path,
+    docker: &DockerCli,
     container: &str,
     pgids: &[u32],
     timeout: Duration,
@@ -1076,7 +1088,7 @@ fn wait_for_process_groups_reap(
     while Instant::now() < deadline {
         let mut any_alive = false;
         for pgid in pgids {
-            any_alive |= container_group_alive_with(docker_binary, container, *pgid)?;
+            any_alive |= container_group_alive_with(docker, container, *pgid)?;
         }
         if !any_alive {
             return Ok(true);
@@ -1087,11 +1099,11 @@ fn wait_for_process_groups_reap(
 }
 
 fn derive_token_pgids(
-    docker_binary: &Path,
+    docker: &DockerCli,
     container: &str,
     token: &str,
 ) -> Result<Vec<u32>, HarnessError> {
-    let mut command = Command::new(docker_binary);
+    let mut command = docker.command();
     command
         .args([
             "exec",
@@ -1125,35 +1137,35 @@ fn derive_token_pgids(
 
 fn container_group_alive(harness: &PiHarness, pgid: u32) -> Result<bool, HarnessError> {
     container_group_alive_with(
-        &harness.config.docker_binary,
+        &harness.processes.docker,
         &harness.config.agent_container,
         pgid,
     )
 }
 
 pub(crate) fn terminate_on_drop(
-    docker_binary: &Path,
+    docker: &DockerCli,
     container: &str,
     process: &ManagedProcess,
     stop_timeout: Duration,
 ) -> bool {
-    let _ = signal_container_group(docker_binary, container, process.pgid, "TERM");
-    if wait_for_reap_bounded(docker_binary, container, process, stop_timeout) {
+    let _ = signal_container_group(docker, container, process.pgid, "TERM");
+    if wait_for_reap_bounded(docker, container, process, stop_timeout) {
         return true;
     }
-    let _ = signal_container_group(docker_binary, container, process.pgid, "KILL");
-    if wait_for_reap_bounded(docker_binary, container, process, KILL_REAP_TIMEOUT) {
+    let _ = signal_container_group(docker, container, process.pgid, "KILL");
+    if wait_for_reap_bounded(docker, container, process, KILL_REAP_TIMEOUT) {
         return true;
     }
     if let Ok(mut child) = process.child.try_lock() {
         let _ = child.kill();
         let _ = child.try_wait();
     }
-    wait_for_reap_bounded(docker_binary, container, process, Duration::from_millis(50))
+    wait_for_reap_bounded(docker, container, process, Duration::from_millis(50))
 }
 
 fn wait_for_reap_bounded(
-    docker_binary: &Path,
+    docker: &DockerCli,
     container: &str,
     process: &ManagedProcess,
     timeout: Duration,
@@ -1167,7 +1179,7 @@ fn wait_for_reap_bounded(
             .and_then(|mut child| child.try_wait().ok().flatten())
             .is_some();
         let group_alive =
-            container_group_alive_with(docker_binary, container, process.pgid).unwrap_or(true);
+            container_group_alive_with(docker, container, process.pgid).unwrap_or(true);
         if child_exited && !group_alive {
             return true;
         }

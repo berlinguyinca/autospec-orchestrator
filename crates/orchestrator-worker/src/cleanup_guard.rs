@@ -3,6 +3,7 @@ use execution_storage::AllocationReceipt;
 use git_worktree::Worktree;
 use harness_traits::SessionRef;
 use orchestrator_core::Execution;
+use runtime_traits::EnvironmentHandle;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ pub(crate) struct CleanupGuard {
     execution: Execution,
     pub(crate) receipt: Option<AllocationReceipt>,
     pub(crate) worktree: Option<Worktree>,
+    pub(crate) environment: Option<EnvironmentHandle>,
     pub(crate) session: Option<SessionRef>,
     pub(crate) runtime_created: bool,
 }
@@ -24,6 +26,7 @@ impl CleanupGuard {
             execution: execution.clone(),
             receipt: None,
             worktree: None,
+            environment: None,
             session: None,
             runtime_created: false,
         }

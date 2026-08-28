@@ -11,8 +11,8 @@ use orchestrator_core::{
     WorkerRegistration, WorkerState,
 };
 use orchestrator_persistence::{
-    ExecutionStore, PgCleanupAuthorityStore, PgExecutionStore, PgReservationStore, PgWorkerStore,
-    ReservationStore, WorkerStore,
+    CleanupAuthorityStore, ExecutionStore, PgCleanupAuthorityStore, PgExecutionStore,
+    PgReservationStore, PgWorkerStore, ReservationStore, WorkerStore,
 };
 use orchestrator_worker::{
     FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
@@ -380,10 +380,15 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
     let replacement = Arc::new(Worker::new(
         build_system_lifecycle(&root, &remote_root, &daemon_id, &image_id),
         executions.clone(),
-        reservations,
-        cleanup,
+        reservations.clone(),
+        cleanup.clone(),
     ));
-    let result = replacement.spawn_adopted(adopted).join().await.unwrap();
+    let result = replacement
+        .clone()
+        .spawn_adopted(adopted)
+        .join()
+        .await
+        .unwrap();
 
     assert_eq!(result.state, ExecutionState::ReviewReady);
     assert!(result
@@ -406,6 +411,41 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
         original_session
     );
     let released_layout = ExecutionLayout::new(&root, &execution_id).unwrap();
+    assert!(released_layout.root.exists());
+    assert!(execution_storage::JournalStore::new(&root)
+        .unwrap()
+        .read(&released_layout)
+        .is_ok());
+    let retained = Command::new("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=autospec.execution_id={execution_id}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&retained.stdout).trim().is_empty());
+    assert_eq!(
+        reservations
+            .list_for_worker(&worker_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let authorities = cleanup.list_for_worker(&worker_id).await.unwrap();
+    assert_eq!(authorities.len(), 1);
+    assert_eq!(authorities[0].phase, "REVIEW_READY");
+    assert!(authorities[0].handles.get("receipt").is_some());
+    assert!(authorities[0].handles.get("runtime").is_some());
+    assert!(authorities[0].handles.get("session").is_some());
+
+    let retained_execution = executions.get(&execution_id).await.unwrap();
+    replacement
+        .recover_cleanup_authority(&authorities[0], &retained_execution)
+        .await
+        .unwrap();
     assert!(!released_layout.root.exists());
     assert!(execution_storage::JournalStore::new(&root)
         .unwrap()
@@ -421,6 +461,16 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&leaked.stdout).trim().is_empty());
+    assert!(reservations
+        .list_for_worker(&worker_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(cleanup
+        .list_for_worker(&worker_id)
+        .await
+        .unwrap()
+        .is_empty());
     let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
     sqlx::query("DELETE FROM cleanup_authorities WHERE execution_id = $1")
         .bind(execution_id.as_str())
@@ -519,6 +569,7 @@ fn build_system_lifecycle(
             state_root: root.into(),
             verifier: verifier.clone(),
             docker_binary: PathBuf::from("docker"),
+            docker_socket: None,
         },
         storage,
         Arc::new(GitWorktreeManager::with_clone_base_and_verifier(
@@ -534,6 +585,7 @@ fn build_system_lifecycle(
         )),
         Arc::new(VerifiedPiHarnessFactory::new(
             verifier,
+            None,
             PathBuf::from("docker"),
             "/workspace/pi".into(),
             Vec::new(),

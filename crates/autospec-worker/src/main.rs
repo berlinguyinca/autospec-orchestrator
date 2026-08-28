@@ -42,6 +42,23 @@ impl fmt::Debug for Secret {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlDisposition {
+    Registered,
+    ReRegister,
+    Retry,
+}
+
+fn control_disposition(registered: bool, status: reqwest::StatusCode) -> ControlDisposition {
+    if status.is_success() {
+        ControlDisposition::Registered
+    } else if registered && status == reqwest::StatusCode::NOT_FOUND {
+        ControlDisposition::ReRegister
+    } else {
+        ControlDisposition::Retry
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "autospec-worker", version, about)]
 struct Cli {
@@ -121,6 +138,7 @@ async fn main() -> Result<()> {
     ));
     let harnesses = Arc::new(VerifiedPiHarnessFactory::new(
         verifier.clone(),
+        cli.docker_socket.clone(),
         PathBuf::from(&cli.docker_binary),
         cli.pi_executable.clone(),
         vec!["read".into(), "bash".into(), "edit".into(), "write".into()],
@@ -131,6 +149,7 @@ async fn main() -> Result<()> {
             state_root: cli.state_root.clone(),
             verifier: verifier.clone(),
             docker_binary: PathBuf::from(&cli.docker_binary),
+            docker_socket: cli.docker_socket.clone(),
         },
         storage,
         worktrees,
@@ -164,26 +183,67 @@ async fn main() -> Result<()> {
     let mut heartbeat_due = tokio::time::Instant::now();
     let mut tasks: Vec<ExecutionTask> = Vec::new();
     for authority in cleanup.list_for_worker(&worker.id).await? {
-        let execution = executions.get(&authority.execution_id).await?;
-        if execution.worker_id.as_ref() != Some(&worker.id)
-            || execution.attempt_id.as_ref() != Some(&authority.attempt_id)
-            || execution.state != orchestrator_core::ExecutionState::Running
-            || authority.phase != "PI_STARTED"
+        let execution = match executions.get(&authority.execution_id).await {
+            Ok(execution) => execution,
+            Err(error) => {
+                tracing::error!(
+                    worker_id = %worker.id,
+                    execution_id = %authority.execution_id,
+                    attempt_id = %authority.attempt_id,
+                    %error,
+                    "cleanup authority has no reconstructable execution; retaining it for recovery"
+                );
+                continue;
+            }
+        };
+        let same_attempt = execution.worker_id.as_ref() == Some(&worker.id)
+            && execution.attempt_id.as_ref() == Some(&authority.attempt_id);
+        if same_attempt
+            && execution.state == orchestrator_core::ExecutionState::Running
+            && matches!(authority.phase.as_str(), "PI_STARTED" | "RUNNING")
         {
-            anyhow::bail!(
-                "unresolved cleanup authority for {} cannot be adopted safely at phase {}",
-                authority.execution_id,
-                authority.phase
+            tracing::info!(
+                worker_id = %worker.id,
+                execution_id = %execution.id,
+                attempt_id = %authority.attempt_id,
+                session_id = ?execution.session_id,
+                "adopting durable Pi execution after worker restart"
             );
+            tasks.push(execution_worker.clone().spawn_adopted(execution));
+            continue;
         }
-        tracing::info!(
-            worker_id = %worker.id,
-            execution_id = %execution.id,
-            attempt_id = %authority.attempt_id,
-            session_id = ?execution.session_id,
-            "adopting durable Pi execution after worker restart"
-        );
-        tasks.push(execution_worker.clone().spawn_adopted(execution));
+        if same_attempt
+            && execution.state == orchestrator_core::ExecutionState::ReviewReady
+            && authority.phase == "REVIEW_READY"
+        {
+            tracing::info!(
+                worker_id = %worker.id,
+                execution_id = %execution.id,
+                attempt_id = %authority.attempt_id,
+                "retaining resumable ReviewReady execution for later attach or explicit cleanup"
+            );
+            continue;
+        }
+        match execution_worker
+            .recover_cleanup_authority(&authority, &execution)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                worker_id = %worker.id,
+                execution_id = %authority.execution_id,
+                attempt_id = %authority.attempt_id,
+                phase = %authority.phase,
+                "recovered abandoned execution authority"
+            ),
+            Err(error) => tracing::error!(
+                worker_id = %worker.id,
+                execution_id = %authority.execution_id,
+                attempt_id = %authority.attempt_id,
+                phase = %authority.phase,
+                %error,
+                "abandoned authority recovery remains unresolved"
+            ),
+        }
     }
     loop {
         let mut index = tasks.len();
@@ -197,11 +257,22 @@ async fn main() -> Result<()> {
             }
         }
         while registered && tasks.len() < usize::try_from(cli.concurrency)? {
-            match reservations.reserve_next(&worker.id).await? {
-                Some(reservation) => {
+            match reservations.reserve_next(&worker.id).await {
+                Ok(Some(reservation)) => {
                     tasks.push(execution_worker.clone().spawn(reservation.execution));
                 }
-                None => break,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        worker_id = %worker.id,
+                        %error,
+                        retry_seconds = backoff.as_secs(),
+                        "reservation poll failed; active execution tasks remain supervised"
+                    );
+                    heartbeat_due = tokio::time::Instant::now() + backoff;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    break;
+                }
             }
         }
         if tokio::time::Instant::now() >= heartbeat_due {
@@ -210,17 +281,36 @@ async fn main() -> Result<()> {
             } else {
                 client.post(&workers_url)
             };
-            match request
-                .bearer_auth(&token.0)
-                .json(&worker)
-                .send()
-                .await
-                .and_then(reqwest::Response::error_for_status)
-            {
-                Ok(_) => {
+            match request.bearer_auth(&token.0).json(&worker).send().await {
+                Ok(response)
+                    if control_disposition(registered, response.status())
+                        == ControlDisposition::Registered =>
+                {
                     registered = true;
                     backoff = Duration::from_secs(1);
                     heartbeat_due = tokio::time::Instant::now() + Duration::from_secs(30);
+                }
+                Ok(response)
+                    if control_disposition(registered, response.status())
+                        == ControlDisposition::ReRegister =>
+                {
+                    registered = false;
+                    backoff = Duration::from_secs(1);
+                    heartbeat_due = tokio::time::Instant::now();
+                    tracing::warn!(
+                        worker_id = %worker.id,
+                        "controller forgot worker registration; re-registering"
+                    );
+                }
+                Ok(response) => {
+                    tracing::warn!(
+                        worker_id = %worker.id,
+                        status = %response.status(),
+                        retry_seconds = backoff.as_secs(),
+                        "worker control-plane request failed"
+                    );
+                    heartbeat_due = tokio::time::Instant::now() + backoff;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
                 Err(error) => {
                     tracing::warn!(worker_id = %worker.id, %error, retry_seconds = backoff.as_secs(), "worker control-plane request failed");
@@ -303,7 +393,7 @@ fn build_storage(cli: &Cli) -> Result<Arc<ExecutionStorage>> {
     };
     let verifier =
         TrustedVerifierImage::new(&cli.docker_verifier_image, &cli.docker_verifier_command)?;
-    let output = Command::new(&cli.docker_binary)
+    let output = docker_command(&cli.docker_binary, cli.docker_socket.as_deref())
         .args(["info", "--format", "{{.ID}}"])
         .output()
         .with_context(|| format!("execute {} info", cli.docker_binary))?;
@@ -322,6 +412,7 @@ fn build_storage(cli: &Cli) -> Result<Arc<ExecutionStorage>> {
         backend,
         Box::new(DockerCapabilityVerifier {
             docker: PathBuf::from(&cli.docker_binary),
+            docker_host: cli.docker_socket.clone(),
             daemon_id,
             verifier_image: cli.docker_verifier_image.clone(),
             verifier_command: cli.docker_verifier_command.clone(),
@@ -334,6 +425,7 @@ fn build_storage(cli: &Cli) -> Result<Arc<ExecutionStorage>> {
 #[derive(Debug)]
 struct DockerCapabilityVerifier {
     docker: PathBuf,
+    docker_host: Option<String>,
     daemon_id: String,
     verifier_image: String,
     verifier_command: String,
@@ -343,7 +435,7 @@ struct DockerCapabilityVerifier {
 
 impl DockerBindVerifier for DockerCapabilityVerifier {
     fn probe(&self) -> Result<DockerBindCapability, StorageError> {
-        let output = Command::new(&self.docker)
+        let output = docker_command(&self.docker, self.docker_host.as_deref())
             .args([
                 "image",
                 "inspect",
@@ -385,7 +477,7 @@ impl DockerBindVerifier for DockerCapabilityVerifier {
             issue: None,
         };
         let mount = format!("type=bind,src={},dst=/proof,readonly", canonical.display());
-        let mut command = Command::new(&self.docker);
+        let mut command = docker_command(&self.docker, self.docker_host.as_deref());
         command.args(["run", "--rm", "--network", "none", "--read-only"]);
         for (key, value) in labels.to_map() {
             command.args(["--label", &format!("{key}={value}")]);
@@ -424,6 +516,14 @@ impl DockerBindVerifier for DockerCapabilityVerifier {
             filesystem_id,
         })
     }
+}
+
+fn docker_command(binary: impl AsRef<Path>, host: Option<&str>) -> Command {
+    let mut command = Command::new(binary.as_ref());
+    if let Some(host) = host {
+        command.env("DOCKER_HOST", host);
+    }
+    command
 }
 
 #[cfg(test)]
@@ -473,5 +573,21 @@ mod tests {
         };
         let worker = advertisement(&cli(), Some(proof)).unwrap();
         assert_eq!(worker.capabilities.runtimes, vec![RuntimeKind::Docker]);
+    }
+
+    #[test]
+    fn heartbeat_not_found_forces_registration_without_backoff() {
+        assert_eq!(
+            control_disposition(true, reqwest::StatusCode::NOT_FOUND),
+            ControlDisposition::ReRegister
+        );
+        assert_eq!(
+            control_disposition(false, reqwest::StatusCode::NOT_FOUND),
+            ControlDisposition::Retry
+        );
+        assert_eq!(
+            control_disposition(true, reqwest::StatusCode::NO_CONTENT),
+            ControlDisposition::Registered
+        );
     }
 }

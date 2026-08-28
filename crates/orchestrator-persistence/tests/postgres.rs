@@ -10,7 +10,12 @@ use orchestrator_persistence::{
     WorkerStore,
 };
 use sqlx::postgres::PgPoolOptions;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+fn database_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 async fn stores() -> Option<(PgExecutionStore, PgEventLog)> {
     let Ok(url) = std::env::var("AUTOSPEC_DATABASE_URL") else {
@@ -35,6 +40,7 @@ async fn stores() -> Option<(PgExecutionStore, PgEventLog)> {
 
 #[tokio::test]
 async fn cleanup_authority_is_durable_until_explicit_resolution() {
+    let _database_test = database_test_lock().lock().await;
     let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
         eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real PostgreSQL test");
         return;
@@ -53,7 +59,16 @@ async fn cleanup_authority_is_durable_until_explicit_resolution() {
         .begin(&execution_id, &attempt_id, &worker_id)
         .await
         .unwrap();
-    store.advance(&execution_id, "PI_STARTED").await.unwrap();
+    let handles = serde_json::json!({
+        "receipt": {"mount_path": "/allocations/execution"},
+        "worktree": "/allocations/execution/repository",
+        "container_id": "sha256:container",
+        "session_id": "session-1"
+    });
+    store
+        .checkpoint(&execution_id, "PI_STARTED", &handles)
+        .await
+        .unwrap();
     drop(store);
 
     let reopened = PgCleanupAuthorityStore::connect(&database_url)
@@ -62,6 +77,7 @@ async fn cleanup_authority_is_durable_until_explicit_resolution() {
     let pending = reopened.list_for_worker(&worker_id).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].phase, "PI_STARTED");
+    assert_eq!(pending[0].handles, handles);
     reopened.resolve(&execution_id).await.unwrap();
     assert!(reopened
         .list_for_worker(&worker_id)
@@ -130,6 +146,7 @@ fn event(id: &ExecutionId) -> ExecutionEvent {
 
 #[tokio::test]
 async fn execution_round_trip_transition_and_live_filter_are_durable() {
+    let _database_test = database_test_lock().lock().await;
     let Some((store, _)) = stores().await else {
         return;
     };
@@ -164,6 +181,7 @@ async fn execution_round_trip_transition_and_live_filter_are_durable() {
 
 #[tokio::test]
 async fn illegal_and_concurrent_transitions_are_serialized() {
+    let _database_test = database_test_lock().lock().await;
     let Some((store, _)) = stores().await else {
         return;
     };
@@ -195,6 +213,7 @@ async fn illegal_and_concurrent_transitions_are_serialized() {
 
 #[tokio::test]
 async fn concurrent_events_are_gapless_and_replay_in_order() {
+    let _database_test = database_test_lock().lock().await;
     let Some((_, log)) = stores().await else {
         return;
     };
@@ -224,6 +243,7 @@ async fn concurrent_events_are_gapless_and_replay_in_order() {
 
 #[tokio::test]
 async fn event_replay_returns_the_complete_tail_without_a_pagination_contract() {
+    let _database_test = database_test_lock().lock().await;
     let Some((_, log)) = stores().await else {
         return;
     };
@@ -275,6 +295,7 @@ async fn worker_stores() -> Option<(PgExecutionStore, PgWorkerStore, PgReservati
 
 #[tokio::test]
 async fn worker_registration_requires_storage_and_docker_capability_proof() {
+    let _database_test = database_test_lock().lock().await;
     let Some((_, workers, _)) = worker_stores().await else {
         return;
     };
@@ -297,6 +318,7 @@ async fn worker_registration_requires_storage_and_docker_capability_proof() {
 
 #[tokio::test]
 async fn concurrent_reservation_assigns_each_execution_once_without_oversubscription() {
+    let _database_test = database_test_lock().lock().await;
     let Some((executions, workers, reservations)) = worker_stores().await else {
         return;
     };
@@ -366,7 +388,55 @@ async fn concurrent_reservation_assigns_each_execution_once_without_oversubscrip
 }
 
 #[tokio::test]
+async fn stale_attempt_cleanup_cannot_release_a_reassigned_reservation() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let worker = registered_worker(
+        &format!("worker-fenced-release-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    executions
+        .insert(&execution(ExecutionState::Queued))
+        .await
+        .unwrap();
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_attempt = reservation.attempt_id;
+    let replacement_attempt =
+        orchestrator_core::AttemptId::new(format!("attempt-{}", uuid::Uuid::new_v4().simple()));
+    let pool = PgPoolOptions::new()
+        .connect(&std::env::var("AUTOSPEC_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE reservations SET attempt_id = $2 WHERE execution_id = $1")
+        .bind(reservation.execution.id.as_str())
+        .bind(replacement_attempt.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(!reservations
+        .release_attempt(&reservation.execution.id, &stale_attempt)
+        .await
+        .unwrap());
+    let remaining = reservations.list_for_worker(&worker.id).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].attempt_id, replacement_attempt);
+    assert!(reservations
+        .release_attempt(&reservation.execution.id, &replacement_attempt)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
 async fn progress_commit_persists_execution_attempt_and_event_atomically() {
+    let _database_test = database_test_lock().lock().await;
     let Some((executions, workers, reservations)) = worker_stores().await else {
         return;
     };
@@ -415,7 +485,68 @@ async fn progress_commit_persists_execution_attempt_and_event_atomically() {
 }
 
 #[tokio::test]
+async fn append_and_progress_share_one_gapless_sequence_allocator() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let worker = registered_worker(
+        &format!("worker-sequence-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    let queued = execution(ExecutionState::Queued);
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut running = reservation.execution;
+    running.transition(ExecutionState::Provisioning).unwrap();
+    let log = Arc::new(
+        PgEventLog::connect(&std::env::var("AUTOSPEC_DATABASE_URL").unwrap())
+            .await
+            .unwrap(),
+    );
+    let executions = Arc::new(executions);
+    let barrier = Arc::new(tokio::sync::Barrier::new(64));
+    let mut tasks = Vec::new();
+    for index in 0..64 {
+        let barrier = barrier.clone();
+        if index % 2 == 0 {
+            let executions = executions.clone();
+            let running = running.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                executions
+                    .record_progress(
+                        &running,
+                        &progress_event(&running, ExecutionEventKind::EnvironmentReady),
+                    )
+                    .await
+            }));
+        } else {
+            let log = log.clone();
+            let event = progress_event(&running, ExecutionEventKind::EnvironmentReady);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                log.append(&event).await
+            }));
+        }
+    }
+    let mut sequences = Vec::new();
+    for task in tasks {
+        sequences.push(task.await.unwrap().unwrap());
+    }
+    sequences.sort_unstable();
+    assert_eq!(sequences, (1..=64).collect::<Vec<_>>());
+    assert_eq!(log.since(&running.id, 0).await.unwrap().len(), 64);
+}
+
+#[tokio::test]
 async fn progress_rejects_stale_cancelled_reassigned_and_forged_attempts() {
+    let _database_test = database_test_lock().lock().await;
     let Some((executions, workers, reservations)) = worker_stores().await else {
         return;
     };
@@ -498,6 +629,7 @@ fn progress_event(execution: &Execution, kind: ExecutionEventKind) -> ExecutionE
 
 #[tokio::test]
 async fn stale_worker_becomes_unreachable_and_fresh_proven_heartbeat_restores_ready() {
+    let _database_test = database_test_lock().lock().await;
     let Some((_, workers, _)) = worker_stores().await else {
         return;
     };
@@ -527,6 +659,7 @@ async fn stale_worker_becomes_unreachable_and_fresh_proven_heartbeat_restores_re
 
 #[tokio::test]
 async fn orphan_reservation_reconcile_is_idempotent() {
+    let _database_test = database_test_lock().lock().await;
     let Some((executions, workers, reservations)) = worker_stores().await else {
         return;
     };
@@ -547,7 +680,11 @@ async fn orphan_reservation_reconcile_is_idempotent() {
         .await
         .unwrap()
         .contains(&assigned.execution.id));
-    assert!(reservations.reconcile(&[]).await.unwrap().is_empty());
+    assert!(!reservations
+        .reconcile(&[])
+        .await
+        .unwrap()
+        .contains(&assigned.execution.id));
     assert!(reservations
         .list_for_worker(&worker.id)
         .await
@@ -557,6 +694,7 @@ async fn orphan_reservation_reconcile_is_idempotent() {
 
 #[tokio::test]
 async fn unreachable_worker_atomically_requeues_resumable_and_fails_ephemeral_attempts() {
+    let _database_test = database_test_lock().lock().await;
     let Some((executions, workers, reservations)) = worker_stores().await else {
         return;
     };
@@ -569,7 +707,7 @@ async fn unreachable_worker_atomically_requeues_resumable_and_fails_ephemeral_at
         .push(isolation_capability.clone());
     worker.capabilities.cpu = 2;
     worker.capabilities.memory_mib = 2048;
-    worker.capabilities.disk_gib = 1;
+    worker.capabilities.disk_gib = 2;
     workers.register(&worker).await.unwrap();
     let mut resumable = execution(ExecutionState::Queued);
     resumable.manifest.persistence = PersistenceMode::Resumable;
@@ -611,16 +749,14 @@ async fn unreachable_worker_atomically_requeues_resumable_and_fails_ephemeral_at
 
     let recovered = reservations.recover_unreachable(&worker.id).await.unwrap();
 
-    assert!(matches!(
-        recovered.as_slice(),
-        [
-            LostWorkerRecovery::Requeued(_),
-            LostWorkerRecovery::Failed(_)
-        ] | [
-            LostWorkerRecovery::Failed(_),
-            LostWorkerRecovery::Requeued(_)
-        ]
-    ));
+    assert!(recovered.iter().any(|item| matches!(
+        item,
+        LostWorkerRecovery::Requeued(id) if id == &resumable.execution.id
+    )));
+    assert!(recovered.iter().any(|item| matches!(
+        item,
+        LostWorkerRecovery::Failed(id) if id == &ephemeral.execution.id
+    )));
     let requeued = executions.get(&resumable.execution.id).await.unwrap();
     assert_eq!(requeued.state, ExecutionState::Queued);
     assert!(requeued.worker_id.is_none());
@@ -636,4 +772,54 @@ async fn unreachable_worker_atomically_requeues_resumable_and_fails_ephemeral_at
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn unreachable_reaper_skips_already_fenced_attempt_with_retained_cleanup_reservation() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let worker = registered_worker(
+        &format!("worker-fenced-reap-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    let queued = execution(ExecutionState::Queued);
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let pool = PgPoolOptions::new()
+        .connect(&std::env::var("AUTOSPEC_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE execution_attempts SET state = 'FAILED', finished_at = now() WHERE attempt_id = $1",
+    )
+    .bind(reservation.attempt_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE workers SET state = 'UNREACHABLE' WHERE id = $1")
+        .bind(worker.id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(reservations
+        .recover_unreachable(&worker.id)
+        .await
+        .unwrap()
+        .is_empty());
+    let retained = reservations.list_for_worker(&worker.id).await.unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].attempt_id, reservation.attempt_id);
+
+    assert!(reservations
+        .release_attempt(&reservation.execution.id, &reservation.attempt_id)
+        .await
+        .unwrap());
 }

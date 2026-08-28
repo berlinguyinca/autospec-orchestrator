@@ -6,7 +6,7 @@ use chrono::Utc;
 use futures_util::FutureExt;
 use orchestrator_core::{
     event::ExecutionEventKind, Execution, ExecutionEvent, ExecutionResult, ExecutionState,
-    FailureClass,
+    FailureClass, PersistenceMode,
 };
 use std::{
     any::Any,
@@ -35,11 +35,20 @@ pub(crate) async fn run_with_cancel(
         .worker_id
         .as_ref()
         .ok_or_else(|| WorkerError::Invalid("execution lacks worker authority".into()))?;
-    worker
+    if let Err(error) = worker
         .cleanup_authorities
         .begin(&execution.id, attempt_id, worker_id)
         .await
-        .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+    {
+        let authority = WorkerError::Persistence(error.to_string());
+        return match worker.reservations.release(&execution.id).await {
+            Ok(()) => Err(authority),
+            Err(release) => Err(WorkerError::ExecutionAndCleanup {
+                execution: authority.to_string(),
+                cleanup: format!("release conflicting reservation: {release}"),
+            }),
+        };
+    }
     let mut guard = CleanupGuard::new(worker.lifecycle.clone(), execution);
     let mut tracked = execution.clone();
     let attempted = AssertUnwindSafe(run_inner(worker, &mut tracked, &mut guard, cancelled))
@@ -61,6 +70,9 @@ pub(crate) async fn run_with_cancel(
         if let Err(error) = persist_failure(worker, &mut tracked, failure).await {
             cleanup_errors.push(error.to_string());
         }
+    }
+    if retain_for_resume(&tracked, &outcome) {
+        return outcome;
     }
     let cleanup_complete = match guard.cleanup().await {
         Ok(()) => true,
@@ -131,6 +143,32 @@ pub(crate) async fn run_adopted_with_cancel(
             cleanup_errors.push(error.to_string());
         }
     }
+    if outcome.is_err() && guard.receipt.is_none() {
+        let durable_recovery = match worker.cleanup_authorities.get(&execution.id).await {
+            Ok(authority) => worker
+                .recover_cleanup_authority(&authority, &tracked)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = durable_recovery {
+            cleanup_errors.push(format!(
+                "durable adoption cleanup remains unresolved: {error}"
+            ));
+        }
+        if cleanup_errors.is_empty() {
+            return outcome;
+        }
+        return Err(WorkerError::ExecutionAndCleanup {
+            execution: outcome
+                .expect_err("adoption recovery branch requires execution failure")
+                .to_string(),
+            cleanup: cleanup_errors.join("; "),
+        });
+    }
+    if retain_for_resume(&tracked, &outcome) {
+        return outcome;
+    }
     let cleanup_complete = match guard.cleanup().await {
         Ok(()) => true,
         Err(error) => {
@@ -158,6 +196,15 @@ pub(crate) async fn run_adopted_with_cancel(
     outcome
 }
 
+fn retain_for_resume(
+    execution: &Execution,
+    outcome: &Result<ExecutionResult, WorkerError>,
+) -> bool {
+    outcome.is_ok()
+        && execution.manifest.persistence == PersistenceMode::Resumable
+        && !execution.state.is_terminal()
+}
+
 async fn adopt_inner(
     worker: &Worker,
     execution: &mut Execution,
@@ -173,8 +220,10 @@ async fn adopt_inner(
     let adopted = worker.lifecycle.adopt(execution).await?;
     guard.receipt = Some(adopted.receipt);
     guard.worktree = Some(adopted.worktree.clone());
+    guard.environment = Some(adopted.environment);
     guard.runtime_created = true;
     guard.session = Some(adopted.session.clone());
+    checkpoint_cleanup(worker, execution, guard, "RUNNING").await?;
     drive_running(
         worker,
         execution,
@@ -204,14 +253,14 @@ async fn run_inner(
     }
     let receipt = worker.lifecycle.allocate(execution).await?;
     guard.receipt = Some(receipt.clone());
-    advance_cleanup(worker, execution, "STORAGE_ALLOCATED").await?;
+    checkpoint_cleanup(worker, execution, guard, "STORAGE_ALLOCATED").await?;
     let worktree = worker
         .lifecycle
         .create_worktree(execution, &receipt)
         .await?;
     execution.worktree_path = Some(worktree.path.clone());
     guard.worktree = Some(worktree.clone());
-    advance_cleanup(worker, execution, "WORKTREE_CREATED").await?;
+    checkpoint_cleanup(worker, execution, guard, "WORKTREE_CREATED").await?;
     execution
         .transition(ExecutionState::Provisioning)
         .map_err(|error| WorkerError::Invalid(error.to_string()))?;
@@ -219,8 +268,9 @@ async fn run_inner(
         .lifecycle
         .provision(execution, &receipt, &worktree)
         .await?;
+    guard.environment = Some(environment.clone());
     guard.runtime_created = true;
-    advance_cleanup(worker, execution, "RUNTIME_CREATED").await?;
+    checkpoint_cleanup(worker, execution, guard, "RUNTIME_CREATED").await?;
     record(worker, execution, ExecutionEventKind::EnvironmentReady).await?;
     let packet = execution.manifest.task_packet.as_ref().ok_or_else(|| {
         WorkerError::Invalid("execution manifest lacks compact TaskPacket".to_owned())
@@ -231,10 +281,11 @@ async fn run_inner(
         .await?;
     execution.session_id = Some(session.id.clone());
     guard.session = Some(session.clone());
-    advance_cleanup(worker, execution, "PI_STARTED").await?;
+    checkpoint_cleanup(worker, execution, guard, "PI_STARTED").await?;
     execution
         .transition(ExecutionState::Running)
         .map_err(|error| WorkerError::Invalid(error.to_string()))?;
+    checkpoint_cleanup(worker, execution, guard, "RUNNING").await?;
     drive_running(worker, execution, guard, cancelled, &worktree, &session).await
 }
 
@@ -327,19 +378,72 @@ async fn drive_running(
     };
     execution.result = Some(result.clone());
     record(worker, execution, ExecutionEventKind::ReviewReady).await?;
+    checkpoint_cleanup(worker, execution, guard, "REVIEW_READY").await?;
     Ok(result)
 }
 
-async fn advance_cleanup(
+async fn checkpoint_cleanup(
     worker: &Worker,
     execution: &Execution,
+    guard: &CleanupGuard,
     phase: &str,
 ) -> Result<(), WorkerError> {
+    let handles = cleanup_handles(guard);
     worker
         .cleanup_authorities
-        .advance(&execution.id, phase)
+        .checkpoint(&execution.id, phase, &handles)
         .await
         .map_err(|error| WorkerError::Persistence(error.to_string()))
+}
+
+fn cleanup_handles(guard: &CleanupGuard) -> serde_json::Value {
+    let receipt = guard
+        .receipt
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .unwrap_or(None);
+    let worktree = guard.worktree.as_ref().map(|worktree| {
+        serde_json::json!({
+            "execution_id": worktree.execution_id,
+            "path": worktree.path,
+            "branch": worktree.branch,
+            "base_sha": worktree.base_sha,
+            "repository": worktree.repository,
+        })
+    });
+    let runtime = guard.environment.as_ref().map(|environment| {
+        serde_json::json!({
+            "execution_id": environment.execution_id,
+            "network": environment.network,
+            "agent_container": environment.agent_container,
+            "container_id": environment.verified_agent_container.container_id,
+            "daemon_id": environment.verified_agent_container.daemon_id,
+            "labels": environment.verified_agent_container.labels,
+            "mounts": environment.verified_agent_container.mounts.iter().map(|mount| serde_json::json!({
+                "source": mount.source,
+                "target": mount.target,
+                "writable": mount.writable,
+            })).collect::<Vec<_>>(),
+            "service_containers": environment.service_containers,
+            "volumes": environment.volumes,
+            "credentials_path": environment.credentials_path,
+        })
+    });
+    let session = guard.session.as_ref().map(|session| {
+        serde_json::json!({
+            "id": session.id,
+            "path": session.path,
+            "execution_id": session.execution_id,
+            "worktree_path": session.worktree_path,
+        })
+    });
+    serde_json::json!({
+        "receipt": receipt,
+        "worktree": worktree,
+        "runtime": runtime,
+        "session": session,
+    })
 }
 
 async fn persist_cancelled(worker: &Worker, execution: &mut Execution) -> Result<(), WorkerError> {

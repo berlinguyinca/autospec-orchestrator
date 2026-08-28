@@ -2,6 +2,7 @@ use crate::{run_migrations, StoreError};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use orchestrator_core::{AttemptId, ExecutionId, WorkerId};
+use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +11,7 @@ pub struct CleanupAuthority {
     pub attempt_id: AttemptId,
     pub worker_id: WorkerId,
     pub phase: String,
+    pub handles: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -23,7 +25,19 @@ pub trait CleanupAuthorityStore: Send + Sync {
         worker_id: &WorkerId,
     ) -> Result<(), StoreError>;
     async fn advance(&self, execution_id: &ExecutionId, phase: &str) -> Result<(), StoreError>;
+    async fn checkpoint(
+        &self,
+        execution_id: &ExecutionId,
+        phase: &str,
+        handles: &Value,
+    ) -> Result<(), StoreError> {
+        let _ = handles;
+        self.advance(execution_id, phase).await
+    }
     async fn resolve(&self, execution_id: &ExecutionId) -> Result<(), StoreError>;
+    async fn get(&self, execution_id: &ExecutionId) -> Result<CleanupAuthority, StoreError> {
+        Err(StoreError::NotFound(execution_id.to_string()))
+    }
     async fn list_for_worker(
         &self,
         worker_id: &WorkerId,
@@ -93,6 +107,28 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
         }
     }
 
+    async fn checkpoint(
+        &self,
+        execution_id: &ExecutionId,
+        phase: &str,
+        handles: &Value,
+    ) -> Result<(), StoreError> {
+        let updated = sqlx::query(
+            "UPDATE cleanup_authorities SET phase = $2, handles = $3, updated_at = now() \
+             WHERE execution_id = $1",
+        )
+        .bind(execution_id.as_str())
+        .bind(phase)
+        .bind(handles)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound(execution_id.to_string()))
+        }
+    }
+
     async fn resolve(&self, execution_id: &ExecutionId) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM cleanup_authorities WHERE execution_id = $1")
             .bind(execution_id.as_str())
@@ -101,12 +137,32 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
         Ok(())
     }
 
+    async fn get(&self, execution_id: &ExecutionId) -> Result<CleanupAuthority, StoreError> {
+        let row = sqlx::query(
+            "SELECT execution_id, attempt_id, worker_id, phase, handles, created_at, updated_at \
+             FROM cleanup_authorities WHERE execution_id = $1",
+        )
+        .bind(execution_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(execution_id.to_string()))?;
+        Ok(CleanupAuthority {
+            execution_id: ExecutionId::new(row.try_get::<String, _>("execution_id")?),
+            attempt_id: AttemptId::new(row.try_get::<String, _>("attempt_id")?),
+            worker_id: WorkerId::new(row.try_get::<String, _>("worker_id")?),
+            phase: row.try_get("phase")?,
+            handles: row.try_get("handles")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+
     async fn list_for_worker(
         &self,
         worker_id: &WorkerId,
     ) -> Result<Vec<CleanupAuthority>, StoreError> {
         sqlx::query(
-            "SELECT execution_id, attempt_id, worker_id, phase, created_at, updated_at \
+            "SELECT execution_id, attempt_id, worker_id, phase, handles, created_at, updated_at \
              FROM cleanup_authorities WHERE worker_id = $1 ORDER BY updated_at, execution_id",
         )
         .bind(worker_id.as_str())
@@ -119,6 +175,7 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
                 attempt_id: AttemptId::new(row.try_get::<String, _>("attempt_id")?),
                 worker_id: WorkerId::new(row.try_get::<String, _>("worker_id")?),
                 phase: row.try_get("phase")?,
+                handles: row.try_get("handles")?,
                 created_at: row.try_get("created_at")?,
                 updated_at: row.try_get("updated_at")?,
             })

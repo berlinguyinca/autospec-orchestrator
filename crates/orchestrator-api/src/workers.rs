@@ -12,6 +12,8 @@ use orchestrator_persistence::{ReservationStore, StoreError, WorkerStore};
 use serde_json::json;
 use std::sync::Arc;
 
+use crate::auth::{authorize_bearer, ApiTokenValidator, StaticApiTokenValidator};
+
 const WORKER_BODY_LIMIT: usize = 1_048_576;
 const HEARTBEAT_DEADLINE_SECONDS: i64 = 90;
 
@@ -19,7 +21,7 @@ const HEARTBEAT_DEADLINE_SECONDS: i64 = 90;
 pub struct WorkerApiState {
     workers: Arc<dyn WorkerStore>,
     reservations: Arc<dyn ReservationStore>,
-    token: Arc<[u8]>,
+    token_validator: Arc<dyn ApiTokenValidator>,
 }
 
 impl WorkerApiState {
@@ -31,7 +33,19 @@ impl WorkerApiState {
         Self {
             workers,
             reservations,
-            token: Arc::from(token.into_bytes()),
+            token_validator: Arc::new(StaticApiTokenValidator::new(token)),
+        }
+    }
+
+    pub fn with_token_validator(
+        workers: Arc<dyn WorkerStore>,
+        reservations: Arc<dyn ReservationStore>,
+        token_validator: Arc<dyn ApiTokenValidator>,
+    ) -> Self {
+        Self {
+            workers,
+            reservations,
+            token_validator,
         }
     }
 
@@ -189,13 +203,7 @@ fn decode_payload(
 }
 
 fn authorize(state: &WorkerApiState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let supplied = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::as_bytes)
-        .unwrap_or_default();
-    if constant_time_eq(supplied, &state.token) {
+    if authorize_bearer(headers, state.token_validator.as_ref()) {
         Ok(())
     } else {
         Err(ApiError::new(
@@ -204,17 +212,6 @@ fn authorize(state: &WorkerApiState, headers: &HeaderMap) -> Result<(), ApiError
             "missing or invalid worker bearer token",
         ))
     }
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max = left.len().max(right.len());
-    let mut difference = left.len() ^ right.len();
-    for index in 0..max {
-        difference |= usize::from(
-            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
-        );
-    }
-    difference == 0
 }
 
 struct ApiError {
@@ -256,18 +253,5 @@ impl IntoResponse for ApiError {
             Json(json!({"error": {"code": self.code, "message": self.message}})),
         )
             .into_response()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::constant_time_eq;
-
-    #[test]
-    fn bearer_comparison_rejects_prefix_suffix_and_length_mismatch() {
-        assert!(constant_time_eq(b"secret", b"secret"));
-        assert!(!constant_time_eq(b"secre", b"secret"));
-        assert!(!constant_time_eq(b"secret-extra", b"secret"));
-        assert!(!constant_time_eq(b"Secret", b"secret"));
     }
 }

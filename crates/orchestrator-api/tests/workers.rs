@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use orchestrator_api::{router_with_workers, WorkerApiState};
+use orchestrator_api::{router, WorkerApiState};
 use orchestrator_core::{
     RuntimeKind, WorkerCapabilities, WorkerCapabilityProof, WorkerId, WorkerRegistration,
     WorkerState,
@@ -22,9 +22,7 @@ async fn authenticated_worker_routes_own_liveness_and_reap_after_ninety_seconds(
     let address = listener.local_addr().unwrap();
     let server_state = state.clone();
     tokio::spawn(async move {
-        axum::serve(listener, router_with_workers(server_state))
-            .await
-            .unwrap();
+        axum::serve(listener, router(server_state)).await.unwrap();
     });
     let client = reqwest::Client::new();
     let base = format!("http://{address}/api/v1/workers");
@@ -115,9 +113,7 @@ async fn worker_routes_reject_invalid_and_oversized_bodies() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, router_with_workers(state))
-            .await
-            .unwrap();
+        axum::serve(listener, router(state)).await.unwrap();
     });
     let client = reqwest::Client::new();
     let base = format!("http://{address}/api/v1/workers");

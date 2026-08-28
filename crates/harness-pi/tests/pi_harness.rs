@@ -1792,6 +1792,42 @@ async fn missing_docker_binary_is_not_installed() {
 }
 
 #[tokio::test]
+async fn configured_docker_endpoint_is_used_for_the_full_session_lifecycle() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let endpoint = Command::new("docker")
+        .args([
+            "context",
+            "inspect",
+            "--format",
+            "{{.Endpoints.docker.Host}}",
+        ])
+        .output()
+        .unwrap();
+    assert!(endpoint.status.success());
+    let endpoint = String::from_utf8(endpoint.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert!(!endpoint.is_empty());
+    let mut config = fixture.harness().config().clone();
+    config.docker_host = Some(endpoint);
+    let harness = PiHarness::new(config);
+
+    let session = harness.start(&packet()).await.unwrap();
+    wait_for_content(
+        &fixture
+            .session_dir()
+            .join(format!("pi.events-{}.jsonl", fixture.execution_id)),
+        "future_pi_record",
+    )
+    .await;
+    assert!(!harness.poll_events(&session).await.unwrap().is_empty());
+    harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
 async fn missing_pi_inside_the_agent_container_is_not_installed() {
     let Some(fixture) = DockerPi::create() else {
         return;

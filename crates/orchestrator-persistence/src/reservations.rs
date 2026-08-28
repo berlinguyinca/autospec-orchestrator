@@ -1,5 +1,6 @@
 use crate::{
-    decode_execution, enum_text, run_migrations, to_json, workers::decode_worker, StoreError,
+    decode_execution, enum_text, event_log::append_in_transaction, run_migrations, to_json,
+    workers::decode_worker, StoreError,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -29,6 +30,15 @@ pub enum LostWorkerRecovery {
 pub trait ReservationStore: Send + Sync {
     async fn reserve_next(&self, worker_id: &WorkerId) -> Result<Option<Reservation>, StoreError>;
     async fn release(&self, execution_id: &ExecutionId) -> Result<(), StoreError>;
+    async fn release_attempt(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_id: &AttemptId,
+    ) -> Result<bool, StoreError> {
+        let _ = attempt_id;
+        self.release(execution_id).await?;
+        Ok(true)
+    }
     async fn list_for_worker(&self, worker_id: &WorkerId) -> Result<Vec<Reservation>, StoreError>;
     async fn reconcile(&self, live: &[ExecutionId]) -> Result<Vec<ExecutionId>, StoreError>;
     async fn recover_unreachable(
@@ -97,7 +107,7 @@ impl ReservationStore for PgReservationStore {
         }
         let rows = sqlx::query(
             "SELECT * FROM executions WHERE state = 'QUEUED' \
-             ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT 64",
+             ORDER BY created_at, id FOR UPDATE SKIP LOCKED",
         )
         .fetch_all(&mut *transaction)
         .await?;
@@ -210,6 +220,33 @@ impl ReservationStore for PgReservationStore {
         Ok(())
     }
 
+    async fn release_attempt(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_id: &AttemptId,
+    ) -> Result<bool, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let worker = sqlx::query_scalar::<_, String>(
+            "DELETE FROM reservations WHERE execution_id = $1 AND attempt_id = $2 \
+             RETURNING worker_id",
+        )
+        .bind(execution_id.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(worker) = &worker {
+            sqlx::query(
+                "UPDATE workers SET running_executions = GREATEST(running_executions - 1, 0), \
+                 updated_at = now() WHERE id = $1",
+            )
+            .bind(worker)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(worker.is_some())
+    }
+
     async fn list_for_worker(&self, worker_id: &WorkerId) -> Result<Vec<Reservation>, StoreError> {
         let rows = sqlx::query(
             "SELECT e.*, r.worker_id AS reservation_worker_id, r.attempt_id AS reservation_attempt_id, \
@@ -303,10 +340,11 @@ impl ReservationStore for PgReservationStore {
             .execute(&mut *transaction)
             .await?;
             if attempt_updated.rows_affected() != 1 {
-                return Err(StoreError::Conflict(format!(
-                    "attempt {} was already fenced",
-                    attempt_id
-                )));
+                // A prior recovery may have fenced the attempt while durable
+                // cleanup authority intentionally retained its reservation.
+                // Leave that reservation untouched for exact resource recovery
+                // and continue reaping unrelated executions.
+                continue;
             }
             let (next, result) = if resumable {
                 (ExecutionState::Queued, None)
@@ -335,35 +373,17 @@ impl ReservationStore for PgReservationStore {
                     execution.id
                 )));
             }
-            let sequence = sqlx::query_scalar::<_, i64>(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM execution_events WHERE execution_id = $1",
-            )
-            .bind(execution.id.as_str())
-            .fetch_one(&mut *transaction)
-            .await?;
             let event = ExecutionEvent {
                 execution_id: execution.id.clone(),
                 attempt_id: Some(attempt_id),
-                sequence: u64::try_from(sequence).map_err(|_| {
-                    StoreError::Conflict("negative recovery event sequence".to_owned())
-                })?,
+                sequence: 0,
                 at: Utc::now(),
                 state: next,
                 kind: ExecutionEventKind::ExecutionFailed {
                     failure: FailureClass::WorkerLost,
                 },
             };
-            sqlx::query(
-                "INSERT INTO execution_events (execution_id, sequence, at, state, payload) \
-                 VALUES ($1, $2, $3, $4, $5)",
-            )
-            .bind(execution.id.as_str())
-            .bind(sequence)
-            .bind(event.at)
-            .bind(enum_text(&next)?)
-            .bind(to_json(&event)?)
-            .execute(&mut *transaction)
-            .await?;
+            append_in_transaction(&mut transaction, &event).await?;
             let deleted =
                 sqlx::query("DELETE FROM reservations WHERE execution_id = $1 AND worker_id = $2")
                     .bind(execution.id.as_str())

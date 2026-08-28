@@ -4,6 +4,7 @@
 //! no second execution engine anywhere in the ecosystem (spec invariant 14).
 
 use anyhow::Result;
+mod auth;
 mod workers;
 
 use axum::{routing::get, Router};
@@ -12,6 +13,7 @@ use orchestrator_persistence::{PgReservationStore, PgWorkerStore};
 use std::{env, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 
+pub use auth::{ApiTokenValidator, StaticApiTokenValidator};
 pub use workers::WorkerApiState;
 
 pub fn api_root() -> String {
@@ -29,12 +31,10 @@ pub fn api_root() -> String {
 /// `GET    /executions/{id}/artifacts`
 /// `GET    /workers`               registered workers and capacity
 /// `POST   /workers`               worker registration and heartbeat
-pub fn router() -> Router {
-    Router::new().route("/healthz", get(|| async { "ok" }))
-}
-
-pub fn router_with_workers(state: WorkerApiState) -> Router {
-    router().nest(&api_root(), workers::routes().with_state(state))
+pub fn router(state: WorkerApiState) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .nest(&api_root(), workers::routes().with_state(state))
 }
 
 /// Bind and serve the controller API.
@@ -61,7 +61,7 @@ pub async fn serve(addr: &str) -> Result<()> {
     });
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, api = %api_root(), "orchestrator controller listening");
-    axum::serve(listener, router_with_workers(state)).await?;
+    axum::serve(listener, router(state)).await?;
     Ok(())
 }
 

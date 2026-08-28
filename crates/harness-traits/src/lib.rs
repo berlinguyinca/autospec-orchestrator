@@ -46,6 +46,14 @@ pub trait AgentHarness: Send + Sync {
     /// (spec section 41).
     async fn resume(&self, session: &SessionRef) -> Result<(), HarnessError>;
 
+    /// Reaps durable process authority from an interrupted prior host process
+    /// without launching or replaying the agent conversation.
+    async fn recover_abandoned(&self) -> Result<(), HarnessError> {
+        Err(HarnessError::NotResumable(
+            "harness does not expose abandoned-process recovery".into(),
+        ))
+    }
+
     /// Fork the conversation without forking the workspace (spec section 39).
     async fn fork_conversation(&self, session: &SessionRef) -> Result<SessionRef, HarnessError>;
 

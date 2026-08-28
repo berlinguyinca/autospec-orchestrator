@@ -19,7 +19,9 @@ use execution_storage::AllocationReceipt;
 use git_worktree::{DiffCapture, Worktree};
 use harness_traits::SessionRef;
 use orchestrator_core::{Execution, ExecutionEvent, ExecutionResult, TaskPacket};
-use orchestrator_persistence::{CleanupAuthorityStore, ExecutionStore, ReservationStore};
+use orchestrator_persistence::{
+    CleanupAuthority, CleanupAuthorityStore, ExecutionStore, ReservationStore,
+};
 use runtime_traits::EnvironmentHandle;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -97,6 +99,15 @@ pub trait ExecutionLifecycle: Send + Sync {
     async fn destroy_runtime(&self, execution: &Execution) -> Result<(), LifecycleError>;
     async fn destroy_worktree(&self, worktree: &Worktree) -> Result<(), LifecycleError>;
     async fn release_storage(&self, receipt: &AllocationReceipt) -> Result<(), LifecycleError>;
+    async fn cleanup_authority(
+        &self,
+        _authority: &CleanupAuthority,
+        _execution: &Execution,
+    ) -> Result<(), LifecycleError> {
+        Err(LifecycleError::Step(
+            "execution lifecycle does not support durable authority cleanup".into(),
+        ))
+    }
 
     async fn adopt(&self, _execution: &Execution) -> Result<AdoptedExecution, LifecycleError> {
         Err(LifecycleError::Step(
@@ -109,6 +120,7 @@ pub trait ExecutionLifecycle: Send + Sync {
 pub struct AdoptedExecution {
     pub receipt: AllocationReceipt,
     pub worktree: Worktree,
+    pub environment: EnvironmentHandle,
     pub session: SessionRef,
 }
 
@@ -176,5 +188,23 @@ impl Worker {
             run::run_adopted_with_cancel(&self, &execution, task_cancelled.as_ref()).await
         });
         ExecutionTask { cancelled, join }
+    }
+
+    pub async fn recover_cleanup_authority(
+        &self,
+        authority: &CleanupAuthority,
+        execution: &Execution,
+    ) -> Result<(), WorkerError> {
+        self.lifecycle
+            .cleanup_authority(authority, execution)
+            .await?;
+        self.reservations
+            .release_attempt(&authority.execution_id, &authority.attempt_id)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        self.cleanup_authorities
+            .resolve(&authority.execution_id)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))
     }
 }

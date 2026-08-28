@@ -13,6 +13,7 @@ pub use reservations::{LostWorkerRecovery, PgReservationStore, Reservation, Rese
 pub use workers::{PgWorkerStore, WorkerStore};
 
 use async_trait::async_trait;
+use event_log::append_in_transaction;
 use orchestrator_core::{
     AttemptId, Execution, ExecutionId, ExecutionResult, ExecutionState, OwnershipLabels, Role,
     SessionId, WorkerId,
@@ -199,14 +200,6 @@ impl ExecutionStore for PgExecutionStore {
                 active_attempts.len()
             )));
         }
-        let sequence: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM execution_events WHERE execution_id = $1",
-        )
-        .bind(execution.id.as_str())
-        .fetch_one(&mut *transaction)
-        .await?;
-        let sequence = u64::try_from(sequence)
-            .map_err(|_| StoreError::Conflict("negative event sequence".to_owned()))?;
         let result = execution.result.as_ref().map(to_json).transpose()?;
         let updated = sqlx::query(
             "UPDATE executions SET state = $2, worker_id = $3, attempt_id = $4, session_id = $5, \
@@ -250,21 +243,7 @@ impl ExecutionStore for PgExecutionStore {
                 ));
             }
         }
-        let mut persisted = event.clone();
-        persisted.sequence = sequence;
-        sqlx::query(
-            "INSERT INTO execution_events (execution_id, sequence, at, state, payload) \
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(execution.id.as_str())
-        .bind(i64::try_from(sequence).map_err(|_| {
-            StoreError::Conflict("event sequence exceeds PostgreSQL BIGINT".to_owned())
-        })?)
-        .bind(event.at)
-        .bind(enum_text(&event.state)?)
-        .bind(to_json(&persisted)?)
-        .execute(&mut *transaction)
-        .await?;
+        let sequence = append_in_transaction(&mut transaction, event).await?;
         transaction.commit().await?;
         Ok(sequence)
     }

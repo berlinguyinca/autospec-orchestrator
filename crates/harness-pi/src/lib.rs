@@ -15,7 +15,7 @@ use runtime_traits::VerifiedAgentContainer;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    process::Child,
+    process::{Child, Command},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -28,6 +28,9 @@ pub struct PiHarnessConfig {
     pub state_root: PathBuf,
     pub worktree: PathBuf,
     pub docker_binary: PathBuf,
+    /// Optional Docker CLI endpoint propagated to every inspect, exec, stats,
+    /// signal, and recovery command without mutating process-global state.
+    pub docker_host: Option<String>,
     pub agent_container: String,
     pub pi_executable: String,
     pub labels: OwnershipLabels,
@@ -64,6 +67,7 @@ impl PiHarnessConfig {
             state_root,
             worktree,
             docker_binary: PathBuf::from("docker"),
+            docker_host: None,
             agent_container,
             pi_executable: "pi".to_owned(),
             labels,
@@ -108,6 +112,7 @@ impl PiHarnessConfig {
             state_root,
             worktree,
             docker_binary: PathBuf::from("docker"),
+            docker_host: None,
             agent_container,
             pi_executable: "pi".to_owned(),
             labels,
@@ -133,9 +138,29 @@ impl PiHarnessConfig {
 #[derive(Debug)]
 struct ProcessRegistry {
     children: Mutex<HashMap<String, Arc<ManagedProcess>>>,
-    docker_binary: PathBuf,
+    docker: DockerCli,
     agent_container: String,
     stop_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DockerCli {
+    binary: PathBuf,
+    host: Option<String>,
+}
+
+impl DockerCli {
+    pub(crate) fn new(binary: PathBuf, host: Option<String>) -> Self {
+        Self { binary, host }
+    }
+
+    pub(crate) fn command(&self) -> Command {
+        let mut command = Command::new(&self.binary);
+        if let Some(host) = &self.host {
+            command.env("DOCKER_HOST", host);
+        }
+        command
+    }
 }
 
 #[derive(Debug)]
@@ -161,13 +186,13 @@ impl Drop for ProcessRegistry {
         };
         for process in children.values() {
             if !session::terminate_on_drop(
-                &self.docker_binary,
+                &self.docker,
                 &self.agent_container,
                 process,
                 self.stop_timeout,
             ) {
                 session::quarantine_registered(
-                    self.docker_binary.clone(),
+                    self.docker.clone(),
                     self.agent_container.clone(),
                     Arc::clone(process),
                 );
@@ -185,14 +210,14 @@ pub struct PiHarness {
 
 impl PiHarness {
     pub fn new(config: PiHarnessConfig) -> Self {
-        let docker_binary = config.docker_binary.clone();
+        let docker = DockerCli::new(config.docker_binary.clone(), config.docker_host.clone());
         let agent_container = config.agent_container.clone();
         let stop_timeout = config.stop_timeout;
         Self {
             config,
             processes: Arc::new(ProcessRegistry {
                 children: Mutex::new(HashMap::new()),
-                docker_binary,
+                docker,
                 agent_container,
                 stop_timeout,
             }),
@@ -371,6 +396,11 @@ impl AgentHarness for PiHarness {
 
     async fn resume(&self, session: &SessionRef) -> Result<(), HarnessError> {
         resume::resume(self, session)
+    }
+
+    async fn recover_abandoned(&self) -> Result<(), HarnessError> {
+        let _storage = session::prepare_launch(self)?;
+        Ok(())
     }
 
     async fn fork_conversation(&self, session: &SessionRef) -> Result<SessionRef, HarnessError> {
