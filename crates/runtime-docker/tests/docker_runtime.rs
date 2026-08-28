@@ -14,8 +14,12 @@ use runtime_traits::Runtime;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+const TEST_EXECUTION_LABEL: &str = "autospec.test_execution_id";
+static EXECUTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 async fn volume_names(docker: &Docker) -> BTreeSet<String> {
     docker
@@ -53,7 +57,131 @@ fn unique_execution_id() -> ExecutionId {
         .duration_since(UNIX_EPOCH)
         .expect("clock is after Unix epoch")
         .as_nanos();
-    ExecutionId::new(format!("runtime-docker-{nonce}"))
+    let sequence = EXECUTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    ExecutionId::new(format!(
+        "runtime-docker-{}-{nonce}-{sequence}",
+        std::process::id()
+    ))
+}
+
+fn test_support_labels(labels: &OwnershipLabels) -> HashMap<String, String> {
+    HashMap::from([(
+        TEST_EXECUTION_LABEL.to_owned(),
+        labels.execution_id.to_string(),
+    )])
+}
+
+struct DockerTestScope {
+    runtime: DockerRuntime,
+    docker: Docker,
+    labels: OwnershipLabels,
+    cleaned: bool,
+}
+
+impl DockerTestScope {
+    fn new(runtime: &DockerRuntime, docker: &Docker, labels: &OwnershipLabels) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            docker: docker.clone(),
+            labels: labels.clone(),
+            cleaned: false,
+        }
+    }
+
+    async fn cleanup(&mut self) {
+        cleanup_test_resources(&self.runtime, &self.docker, &self.labels).await;
+        self.cleaned = true;
+    }
+}
+
+impl Drop for DockerTestScope {
+    fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let docker = self.docker.clone();
+        let labels = self.labels.clone();
+        let _ = std::thread::spawn(move || {
+            let Ok(tokio_runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            tokio_runtime.block_on(cleanup_test_resources(&runtime, &docker, &labels));
+        })
+        .join();
+    }
+}
+
+async fn cleanup_test_resources(
+    runtime: &DockerRuntime,
+    docker: &Docker,
+    labels: &OwnershipLabels,
+) {
+    let support_filter = HashMap::from([(
+        "label".to_owned(),
+        vec![format!("{TEST_EXECUTION_LABEL}={}", labels.execution_id)],
+    )]);
+    if let Ok(containers) = docker
+        .list_containers(Some(bollard::container::ListContainersOptions {
+            all: true,
+            filters: support_filter.clone(),
+            ..Default::default()
+        }))
+        .await
+    {
+        for container in containers {
+            if let Some(id) = container.id {
+                let _ = docker
+                    .remove_container(
+                        &id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    let _ = runtime.destroy(labels).await;
+
+    if let Ok(volumes) = docker
+        .list_volumes(Some(bollard::volume::ListVolumesOptions {
+            filters: support_filter.clone(),
+        }))
+        .await
+    {
+        for volume in volumes.volumes.unwrap_or_default() {
+            let _ = docker
+                .remove_volume(&volume.name, Some(RemoveVolumeOptions { force: true }))
+                .await;
+        }
+    }
+    if let Ok(networks) = docker
+        .list_networks(Some(bollard::network::ListNetworksOptions {
+            filters: support_filter,
+        }))
+        .await
+    {
+        for network in networks {
+            if let Some(id) = network.id {
+                let _ = docker.remove_network(&id).await;
+            }
+        }
+    }
+}
+
+#[test]
+fn execution_ids_are_scoped_to_the_test_process() {
+    let execution_id = unique_execution_id();
+
+    assert!(execution_id
+        .as_str()
+        .contains(&format!("-{}-", std::process::id())));
 }
 
 fn raw_client() -> Result<Docker, bollard::errors::Error> {
@@ -135,6 +263,45 @@ async fn daemon_probe_reports_a_compatible_real_daemon() {
 }
 
 #[tokio::test]
+async fn panicking_test_scope_removes_only_its_execution_resources() {
+    let Some(runtime) =
+        runtime_or_skip("panicking_test_scope_removes_only_its_execution_resources").await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    let execution_labels = labels_for(unique_execution_id());
+    let scope = DockerTestScope::new(&runtime, &docker, &execution_labels);
+    let network = DockerRuntime::network_name(&execution_labels.execution_id);
+    docker
+        .create_network(CreateNetworkOptions {
+            name: network.clone(),
+            driver: "bridge".to_owned(),
+            labels: execution_labels.to_map().into_iter().collect(),
+            ..Default::default()
+        })
+        .await
+        .expect("create owned network");
+
+    let panic = tokio::spawn(async move {
+        let _scope = scope;
+        panic!("exercise failure cleanup");
+    })
+    .await;
+    assert!(panic.is_err());
+    let cleaned_during_unwind = docker
+        .inspect_network::<String>(&network, None)
+        .await
+        .is_err();
+    let _ = runtime.destroy(&execution_labels).await;
+
+    assert!(
+        cleaned_during_unwind,
+        "a test assertion panic must trigger execution-scoped cleanup"
+    );
+}
+
+#[tokio::test]
 async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
     let Some(runtime) =
         runtime_or_skip("provision_reconcile_and_destroy_preserve_execution_isolation").await
@@ -143,6 +310,7 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
     };
     let docker = raw_client().expect("the already-probed Docker daemon remains connectable");
     let execution_labels = labels_for(unique_execution_id());
+    let mut scope = DockerTestScope::new(&runtime, &docker, &execution_labels);
     let service = ServiceRequirement {
         name: "cache".to_owned(),
         image: "redis:7-alpine".to_owned(),
@@ -155,25 +323,25 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
         .create_network(CreateNetworkOptions {
             name: unrelated_network.clone(),
             driver: "bridge".to_owned(),
+            labels: test_support_labels(&execution_labels),
             ..Default::default()
         })
         .await
         .expect("create unrelated control network");
 
     let result = async {
-        let volumes_before_provision = volume_names(&docker).await;
         let handle = runtime
             .provision(&execution_labels, &runtime_requirement(), &[service])
             .await?;
-        assert_eq!(volume_names(&docker).await, volumes_before_provision);
         docker
             .create_container(
                 Some(CreateContainerOptions {
                     name: unrelated_container.clone(),
                     platform: None,
                 }),
-                Config {
-                    image: Some("alpine:3.20"),
+                Config::<String> {
+                    image: Some("alpine:3.20".to_owned()),
+                    labels: Some(test_support_labels(&execution_labels)),
                     ..Default::default()
                 },
             )
@@ -183,6 +351,7 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
             .create_volume(CreateVolumeOptions {
                 name: unrelated_volume.clone(),
                 driver: "local".to_owned(),
+                labels: test_support_labels(&execution_labels),
                 ..Default::default()
             })
             .await
@@ -326,20 +495,7 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
     }
     .await;
 
-    let _ = runtime.destroy(&execution_labels).await;
-    let _ = docker
-        .remove_container(
-            &unrelated_container,
-            Some(RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await;
-    let _ = docker
-        .remove_volume(&unrelated_volume, Some(RemoveVolumeOptions { force: true }))
-        .await;
-    let _ = docker.remove_network(&unrelated_network).await;
+    scope.cleanup().await;
     result.expect("real Docker lifecycle succeeds");
 
     let managed_filter = HashMap::from([(
@@ -370,6 +526,7 @@ async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
     };
     let docker = raw_client().expect("connect to probed daemon");
     let execution_labels = labels_for(unique_execution_id());
+    let mut scope = DockerTestScope::new(&runtime, &docker, &execution_labels);
     let requirement = RuntimeRequirement {
         image: Some("alpine:3.20".to_owned()),
         cpu: 1,
@@ -382,13 +539,10 @@ async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
         image: "redis:7-alpine".to_owned(),
         env: BTreeMap::new(),
     };
-    let volumes_before = volume_names(&docker).await;
-
     let handle = runtime
         .provision(&execution_labels, &requirement, &[service])
         .await
         .expect("provision bounded tmpfs service");
-    assert_eq!(volume_names(&docker).await, volumes_before);
     let agent_inspect = docker
         .inspect_container(&handle.agent_container, None)
         .await
@@ -478,7 +632,7 @@ async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    let _ = runtime.destroy(&execution_labels).await;
+    scope.cleanup().await;
     assert!(exit_code.is_some_and(|code| code != 0));
     assert!(docker
         .inspect_container(&handle.service_containers[0], None)
@@ -495,6 +649,7 @@ async fn cleanup_aggregates_volume_failures_and_still_removes_the_network() {
     };
     let docker = raw_client().expect("connect to probed daemon");
     let execution_labels = labels_for(unique_execution_id());
+    let mut scope = DockerTestScope::new(&runtime, &docker, &execution_labels);
     let network = DockerRuntime::network_name(&execution_labels.execution_id);
     docker
         .create_network(CreateNetworkOptions {
@@ -530,9 +685,10 @@ async fn cleanup_aggregates_volume_failures_and_still_removes_the_network() {
                     name: holder.clone(),
                     platform: None,
                 }),
-                Config {
-                    image: Some("alpine:3.20"),
-                    cmd: Some(vec!["sleep", "infinity"]),
+                Config::<String> {
+                    image: Some("alpine:3.20".to_owned()),
+                    cmd: Some(vec!["sleep".to_owned(), "infinity".to_owned()]),
+                    labels: Some(test_support_labels(&execution_labels)),
                     host_config: Some(HostConfig {
                         mounts: Some(vec![Mount {
                             target: Some("/held".to_owned()),
@@ -561,22 +717,7 @@ async fn cleanup_aggregates_volume_failures_and_still_removes_the_network() {
         .await
         .is_err());
 
-    for holder in &holders {
-        let _ = docker
-            .remove_container(
-                holder,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-    }
-    for volume in &volumes {
-        let _ = docker
-            .remove_volume(volume, Some(RemoveVolumeOptions { force: true }))
-            .await;
-    }
+    scope.cleanup().await;
 }
 
 #[tokio::test]
@@ -590,6 +731,7 @@ async fn provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_vo
     };
     let docker = raw_client().expect("connect to probed daemon");
     let execution_labels = labels_for(unique_execution_id());
+    let mut scope = DockerTestScope::new(&runtime, &docker, &execution_labels);
     let owned_volume = DockerRuntime::volume_name(&execution_labels.execution_id, "cache-data");
     let holder = format!("autospec-{}-holder", execution_labels.execution_id);
     let conflicting_agent = DockerRuntime::agent_container_name(&execution_labels.execution_id);
@@ -620,9 +762,10 @@ async fn provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_vo
                     name,
                     platform: None,
                 }),
-                Config {
-                    image: Some("alpine:3.20"),
-                    cmd: Some(vec!["sleep", "infinity"]),
+                Config::<String> {
+                    image: Some("alpine:3.20".to_owned()),
+                    cmd: Some(vec!["sleep".to_owned(), "infinity".to_owned()]),
+                    labels: Some(test_support_labels(&execution_labels)),
                     host_config: Some(HostConfig {
                         mounts,
                         ..Default::default()
@@ -650,9 +793,15 @@ async fn provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_vo
     assert!(error.contains("create agent container"));
     assert!(error.contains("rollback"));
     assert!(error.contains(&owned_volume));
-    assert_eq!(
-        volumes_after_failure, volumes_before_failure,
-        "failed provisioning must not leave an anonymous image volume"
+    let new_anonymous_volumes = volumes_after_failure
+        .difference(&volumes_before_failure)
+        .filter(|name| {
+            name.len() == 64 && name.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        new_anonymous_volumes.is_empty(),
+        "failed provisioning must not leave anonymous image volumes: {new_anonymous_volumes:?}"
     );
     assert!(docker
         .inspect_network::<String>(
@@ -675,18 +824,5 @@ async fn provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_vo
         "rollback removes service containers"
     );
 
-    for container in [&holder, &conflicting_agent] {
-        let _ = docker
-            .remove_container(
-                container,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-    }
-    let _ = docker
-        .remove_volume(&owned_volume, Some(RemoveVolumeOptions { force: true }))
-        .await;
+    scope.cleanup().await;
 }

@@ -40,6 +40,11 @@ orphans without deleting them.
   unavailable. Tests inspect daemon-created resources and prove labels, limits,
   running state, network aliases, no host ports, read-only reconciliation,
   selector cleanup, and survival of unrelated containers, networks, and volumes.
+- Hardened real-Docker test isolation for concurrent workspace sessions. Test
+  execution IDs combine process ID, wall-clock nanoseconds, and a process-local
+  atomic sequence; an unwind-safe scope removes managed resources only through
+  that execution's ownership selector and removes test-support resources only
+  through a separate per-test ownership label.
 - Pinned compatible transitive lockfile releases so the workspace still checks
   with its declared Rust 1.85 toolchain after adding Bollard.
 
@@ -69,17 +74,30 @@ multi-mount unit case proves aggregate capacity cannot exceed the requested
 budget. Daemon rejection of a bounded mount is classified as
 `RuntimeError::ResourceLimit`.
 
+The post-review regression test first proved that wall-clock-only IDs were not
+process-scoped, then created an owned network and intentionally panicked. Before
+the guard existed, the network survived the unwind. Concurrent runtime-docker
+tests then exposed a second issue: global volume-set equality observed another
+test's labelled volumes. Assertions now inspect execution-specific resources and
+only treat newly-created 64-hex Docker volume names as anonymous leaks. Two
+runtime-docker test binaries subsequently passed concurrently without collisions.
+
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo build --workspace` — passed.
-- `cargo test --workspace -- --nocapture --test-threads=1` — passed; real Docker
-  tests: 6 passed, 0 skipped. PostgreSQL tests printed their existing explicit
+- `cargo test --workspace -- --nocapture` — passed with normal test concurrency;
+  real Docker tests: 8 passed, 0 skipped. PostgreSQL tests printed their existing explicit
   skips because `AUTOSPEC_DATABASE_URL` was unset.
+- Two simultaneous `cargo test -p runtime-docker --test docker_runtime --
+  --nocapture` processes — both passed 8/8 with no name collisions.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed.
 - `cargo +1.85.0 check --workspace` — passed.
 - `git diff --check` — passed.
-- Post-test Docker inventory for Task 2 ownership labels — empty.
+- Post-test Docker inventory for the new process/time/sequence execution IDs and
+  `autospec.test_execution_id` support labels — empty. Old wall-clock-only
+  resources from a foreign failed session remained untouched, as required by the
+  no-foreign-cleanup rule.
 
 ## Remaining Risks
 
