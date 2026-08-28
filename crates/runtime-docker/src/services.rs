@@ -1,15 +1,12 @@
 use crate::{
     limits::host_limits,
-    provision::{
-        container_create_error, verify_container_mount_devices, verify_container_mount_sources,
-    },
+    provision::{container_create_error, verify_container_mount_sources, ReadyStorageGuard},
     DockerRuntime,
 };
 use bollard::{
     container::{Config, CreateContainerOptions, NetworkingConfig},
     models::{EndpointSettings, Mount},
 };
-use execution_storage::VerifiedExecutionStorage;
 use orchestrator_core::{OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::RuntimeError;
 use std::{collections::HashMap, path::Path};
@@ -21,9 +18,9 @@ pub(crate) async fn create_services(
     services: &[ServiceRequirement],
     network: &str,
     service_mounts: &[Vec<Mount>],
-    storage: (&Path, &dyn VerifiedExecutionStorage),
+    storage: (&Path, &ReadyStorageGuard<'_>, &[Mount]),
 ) -> Result<Vec<String>, RuntimeError> {
-    let (execution_root, verified) = storage;
+    let (execution_root, storage, all_mounts) = storage;
     let mut containers = Vec::with_capacity(services.len());
     for (service, mounts) in services.iter().zip(service_mounts) {
         let name = DockerRuntime::service_container_name(&labels.execution_id, &service.name);
@@ -46,6 +43,7 @@ pub(crate) async fn create_services(
             networking_config: Some(networking_config(network, &service.name)),
             ..Default::default()
         };
+        storage.verify(all_mounts).await?;
         runtime
             .client
             .create_container(
@@ -59,24 +57,30 @@ pub(crate) async fn create_services(
             .map_err(|error| {
                 container_create_error(format!("create service container {name}"), error, true)
             })?;
-        verified.verify().map_err(|error| {
-            RuntimeError::ResourceLimit(format!("execution storage verification failed: {error}"))
-        })?;
-        verify_container_mount_sources(runtime, &name, execution_root).await?;
+        storage.verify(all_mounts).await?;
+        verify_container_mount_sources(runtime, &name, execution_root, mounts).await?;
+        containers.push(name);
+    }
+    Ok(containers)
+}
+
+pub(crate) async fn start_services(
+    runtime: &DockerRuntime,
+    containers: &[String],
+    storage: &ReadyStorageGuard<'_>,
+    all_mounts: &[Mount],
+) -> Result<(), RuntimeError> {
+    for name in containers {
+        storage.verify(all_mounts).await?;
         runtime
             .client
-            .start_container::<String>(&name, None)
+            .start_container::<String>(name, None)
             .await
             .map_err(|error| {
                 RuntimeError::Provisioning(format!("start service container {name}: {error}"))
             })?;
-        verified.verify().map_err(|error| {
-            RuntimeError::ResourceLimit(format!("execution storage verification failed: {error}"))
-        })?;
-        verify_container_mount_devices(runtime, &name).await?;
-        containers.push(name);
     }
-    Ok(containers)
+    Ok(())
 }
 
 pub(crate) fn networking_config(network: &str, alias: &str) -> NetworkingConfig<String> {

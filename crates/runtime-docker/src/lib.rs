@@ -10,9 +10,8 @@ mod provision;
 mod services;
 
 use async_trait::async_trait;
-use bollard::{image::CreateImageOptions, models::ImageInspect, Docker};
+use bollard::Docker;
 use execution_storage::{AllocationReceipt, ReadyAllocationVerifier};
-use futures_util::StreamExt;
 use orchestrator_core::{ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::{EnvironmentHandle, Runtime, RuntimeError};
 use std::{env, path::PathBuf, sync::Arc};
@@ -21,6 +20,44 @@ pub use limits::{host_limits, HostConfigLimits, DEFAULT_PIDS_LIMIT};
 
 const DEFAULT_MIN_API_VERSION: &str = "1.41";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedVerifierImage {
+    pub(crate) image_id: String,
+    pub(crate) stat_command: String,
+}
+
+impl TrustedVerifierImage {
+    pub fn new(
+        image_id: impl Into<String>,
+        stat_command: impl Into<String>,
+    ) -> Result<Self, RuntimeError> {
+        let image_id = image_id.into();
+        let digest = image_id.strip_prefix("sha256:").unwrap_or_default();
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(RuntimeError::ResourceLimit(
+                "trusted verifier image must be an immutable sha256 image ID".to_owned(),
+            ));
+        }
+        let stat_command = stat_command.into();
+        if !stat_command.starts_with('/') || stat_command.contains('\0') {
+            return Err(RuntimeError::ResourceLimit(
+                "trusted verifier command must be an absolute container path".to_owned(),
+            ));
+        }
+        Ok(Self {
+            image_id,
+            stat_command,
+        })
+    }
+
+    pub fn proof_method(&self) -> String {
+        format!(
+            "autospec.dev/docker-bind-stat/v2;image={};command={}",
+            self.image_id, self.stat_command
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DockerRuntime {
     pub(crate) client: Docker,
@@ -28,6 +65,7 @@ pub struct DockerRuntime {
     pub(crate) state_root: PathBuf,
     pub(crate) storage_verifier: Option<Arc<dyn ReadyAllocationVerifier>>,
     pub(crate) allocation: Option<AllocationReceipt>,
+    pub(crate) trusted_verifier: Option<TrustedVerifierImage>,
 }
 
 impl DockerRuntime {
@@ -61,6 +99,7 @@ impl DockerRuntime {
             state_root: state_root.into(),
             storage_verifier: None,
             allocation: None,
+            trusted_verifier: None,
         })
     }
 
@@ -84,6 +123,24 @@ impl DockerRuntime {
             .to_path_buf();
         runtime.storage_verifier = Some(verifier);
         runtime.allocation = Some(allocation);
+        Ok(runtime)
+    }
+
+    /// Connects provisioning to an exact Ready allocation and immutable verifier image.
+    pub fn connect_with_verified_execution_storage(
+        socket: Option<&str>,
+        verifier: Arc<dyn ReadyAllocationVerifier>,
+        allocation: AllocationReceipt,
+        trusted_verifier: TrustedVerifierImage,
+    ) -> Result<Self, RuntimeError> {
+        if allocation.docker_bind.method_version != trusted_verifier.proof_method() {
+            return Err(RuntimeError::ResourceLimit(
+                "trusted verifier image does not match the allocation Docker proof method"
+                    .to_owned(),
+            ));
+        }
+        let mut runtime = Self::connect_with_execution_storage(socket, verifier, allocation)?;
+        runtime.trusted_verifier = Some(trusted_verifier);
         Ok(runtime)
     }
 
@@ -136,34 +193,6 @@ impl DockerRuntime {
             .await
             .map_err(|error| RuntimeError::Unavailable(format!("negotiate Docker API: {error}")))?;
         Ok(())
-    }
-
-    async fn ensure_image(&self, image: &str) -> Result<ImageInspect, RuntimeError> {
-        match self.client.inspect_image(image).await {
-            Ok(inspect) => return Ok(inspect),
-            Err(error) if is_image_not_found(&error) => {}
-            Err(error) => {
-                return Err(RuntimeError::Provisioning(format!(
-                    "inspect image {image}: {error}"
-                )))
-            }
-        }
-        let mut pull = self.client.create_image(
-            Some(CreateImageOptions {
-                from_image: image,
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-        while let Some(progress) = pull.next().await {
-            progress.map_err(|error| {
-                RuntimeError::Provisioning(format!("pull image {image}: {error}"))
-            })?;
-        }
-        self.client.inspect_image(image).await.map_err(|error| {
-            RuntimeError::Provisioning(format!("image {image} unavailable after pull: {error}"))
-        })
     }
 }
 
@@ -295,5 +324,19 @@ mod tests {
 
         assert!(error.contains("requires API 1.48"));
         assert!(error.contains("supports 1.47"));
+    }
+
+    #[test]
+    fn trusted_mount_verifier_requires_an_immutable_image_and_absolute_command() {
+        assert!(TrustedVerifierImage::new("alpine:3.20", "/bin/stat").is_err());
+        let image_id = format!("sha256:{}", "a".repeat(64));
+        assert!(TrustedVerifierImage::new(&image_id, "stat").is_err());
+
+        let trusted =
+            TrustedVerifierImage::new(&image_id, "/bin/stat").expect("immutable trusted verifier");
+        assert_eq!(
+            trusted.proof_method(),
+            format!("autospec.dev/docker-bind-stat/v2;image={image_id};command=/bin/stat")
+        );
     }
 }

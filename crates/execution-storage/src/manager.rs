@@ -6,7 +6,7 @@ use crate::{
 };
 use orchestrator_core::{ExecutionId, OwnershipLabels};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     fs,
     path::Path,
@@ -114,6 +114,11 @@ pub trait DockerBindVerifier: Debug + Send + Sync {
 pub trait VerifiedExecutionStorage: Debug + Send + Sync {
     fn repository_path(&self) -> &Path;
     fn verify(&self) -> Result<(), StorageError>;
+    fn verify_directory(&self, _path: &Path) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "verified storage capability does not expose pinned bind directories".to_owned(),
+        ))
+    }
     fn refresh_after_exact_recovery(&self) -> Result<(), StorageError> {
         self.verify()
     }
@@ -131,6 +136,7 @@ struct LiveVerifiedExecutionStorage {
     root: PinnedDirectory,
     repository_path: PathBuf,
     repository: Mutex<Option<PinnedDirectory>>,
+    directories: Mutex<BTreeMap<PathBuf, PinnedDirectory>>,
 }
 
 impl VerifiedExecutionStorage for LiveVerifiedExecutionStorage {
@@ -182,6 +188,48 @@ impl VerifiedExecutionStorage for LiveVerifiedExecutionStorage {
             ));
         }
         Ok(())
+    }
+
+    fn verify_directory(&self, path: &Path) -> Result<(), StorageError> {
+        if path == self.repository_path {
+            return self.verify();
+        }
+        self.root.verify("execution mountpoint")?;
+        if !path.starts_with(&self.root.path) || path == self.root.path {
+            return Err(StorageError::IdentityMismatch(
+                "bind directory is outside the execution mountpoint".to_owned(),
+            ));
+        }
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StorageError::IdentityMismatch(
+                "bind path is not a real directory".to_owned(),
+            ));
+        }
+        #[cfg(unix)]
+        if metadata.dev()
+            != fs::symlink_metadata(&self.root.path)
+                .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?
+                .dev()
+        {
+            return Err(StorageError::IdentityMismatch(
+                "bind directory is outside the execution filesystem".to_owned(),
+            ));
+        }
+        let mut directories = self.directories.lock().map_err(|_| {
+            StorageError::IdentityMismatch("bind directory pins are poisoned".to_owned())
+        })?;
+        match directories.get(path) {
+            Some(directory) => directory.verify("execution bind directory"),
+            None => {
+                directories.insert(
+                    path.to_path_buf(),
+                    PinnedDirectory::capture(path, "execution bind directory")?,
+                );
+                Ok(())
+            }
+        }
     }
 
     fn refresh_after_exact_recovery(&self) -> Result<(), StorageError> {
@@ -290,6 +338,7 @@ impl ExecutionStorage {
             root: PinnedDirectory::capture(&layout.root, "execution mountpoint")?,
             repository_path: layout.repository.clone(),
             repository: Mutex::new(None),
+            directories: Mutex::new(BTreeMap::new()),
         };
         verified.verify()?;
         Ok(Box::new(verified))

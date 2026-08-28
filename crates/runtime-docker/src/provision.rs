@@ -1,8 +1,10 @@
 use crate::{limits::host_limits, services, DockerRuntime};
 use bollard::{
-    container::{Config, CreateContainerOptions, LogOutput},
-    exec::{CreateExecOptions, StartExecResults},
-    models::{ImageInspect, Mount, MountTypeEnum},
+    container::{
+        AttachContainerOptions, Config, CreateContainerOptions, LogOutput, RemoveContainerOptions,
+    },
+    image::CreateImageOptions,
+    models::{ImageInspect, Mount, MountPoint, MountPointTypeEnum, MountTypeEnum},
     network::CreateNetworkOptions,
 };
 use execution_storage::{disk_gib_to_bytes, ExecutionLayout, VerifiedExecutionStorage};
@@ -14,6 +16,49 @@ use std::{collections::BTreeSet, fs, io, path::Path};
 const CONTAINER_WORKTREE: &str = "/workspace";
 const CONTAINER_SESSION: &str = "/session";
 
+pub(crate) struct ReadyStorageGuard<'a> {
+    runtime: &'a DockerRuntime,
+    labels: &'a OwnershipLabels,
+    requirement: &'a RuntimeRequirement,
+    pinned: &'a dyn VerifiedExecutionStorage,
+}
+
+impl ReadyStorageGuard<'_> {
+    pub(crate) async fn verify(&self, mounts: &[Mount]) -> Result<(), RuntimeError> {
+        self.pinned.verify().map_err(storage_error)?;
+        verify_mount_directories(self.pinned, mounts)?;
+        let receipt = self.runtime.allocation.as_ref().ok_or_else(|| {
+            RuntimeError::ResourceLimit(
+                "Docker provisioning requires an exact Ready allocation receipt".to_owned(),
+            )
+        })?;
+        if &receipt.labels != self.labels
+            || receipt.reserved_bytes
+                != disk_gib_to_bytes(self.requirement.disk_gib).map_err(storage_error)?
+        {
+            return Err(RuntimeError::ResourceLimit(
+                "runtime request does not exactly match the Ready allocation".to_owned(),
+            ));
+        }
+        let fresh = self
+            .runtime
+            .storage_verifier
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::ResourceLimit(
+                    "Docker provisioning requires a live Ready execution-storage verifier"
+                        .to_owned(),
+                )
+            })?
+            .verify_ready(receipt)
+            .map_err(storage_error)?;
+        fresh.verify().map_err(storage_error)?;
+        verify_mount_directories(fresh.as_ref(), mounts)?;
+        validate_storage_daemon(self.runtime).await?;
+        validate_trusted_verifier(self.runtime).await
+    }
+}
+
 pub(crate) async fn provision(
     runtime: &DockerRuntime,
     labels: &OwnershipLabels,
@@ -22,13 +67,19 @@ pub(crate) async fn provision(
 ) -> Result<EnvironmentHandle, RuntimeError> {
     let (verified, layout) = verified_execution_layout(runtime, labels, requirement)?;
     runtime.require_compatible_daemon().await?;
-    validate_storage_daemon(runtime).await?;
+    let storage = ReadyStorageGuard {
+        runtime,
+        labels,
+        requirement,
+        pinned: verified.as_ref(),
+    };
+    storage.verify(&[]).await?;
     match provision_inner(
         runtime,
         labels,
         requirement,
         service_requirements,
-        verified.as_ref(),
+        &storage,
         &layout,
     )
     .await
@@ -74,22 +125,100 @@ async fn validate_storage_daemon(runtime: &DockerRuntime) -> Result<(), RuntimeE
     Ok(())
 }
 
+async fn validate_trusted_verifier(runtime: &DockerRuntime) -> Result<(), RuntimeError> {
+    let trusted = runtime.trusted_verifier.as_ref().ok_or_else(|| {
+        RuntimeError::ResourceLimit(
+            "Docker provisioning requires an immutable trusted verifier image".to_owned(),
+        )
+    })?;
+    let receipt = runtime.allocation.as_ref().ok_or_else(|| {
+        RuntimeError::ResourceLimit(
+            "Docker provisioning requires an exact Ready allocation receipt".to_owned(),
+        )
+    })?;
+    if receipt.docker_bind.method_version != trusted.proof_method() {
+        return Err(RuntimeError::ResourceLimit(
+            "trusted verifier image does not match the allocation Docker proof method".to_owned(),
+        ));
+    }
+    let inspect = runtime
+        .client
+        .inspect_image(&trusted.image_id)
+        .await
+        .map_err(|error| {
+            RuntimeError::ResourceLimit(format!("inspect trusted verifier image: {error}"))
+        })?;
+    if inspect.id.as_deref() != Some(trusted.image_id.as_str()) {
+        return Err(RuntimeError::ResourceLimit(
+            "trusted verifier image identity drifted".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_mount_directories(
+    verified: &dyn VerifiedExecutionStorage,
+    mounts: &[Mount],
+) -> Result<(), RuntimeError> {
+    let sources = mounts
+        .iter()
+        .filter_map(|mount| mount.source.as_deref())
+        .collect::<BTreeSet<_>>();
+    for source in sources {
+        verified
+            .verify_directory(Path::new(source))
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+async fn ensure_image(
+    runtime: &DockerRuntime,
+    storage: &ReadyStorageGuard<'_>,
+    image: &str,
+) -> Result<ImageInspect, RuntimeError> {
+    match runtime.client.inspect_image(image).await {
+        Ok(inspect) => return Ok(inspect),
+        Err(error) if crate::is_image_not_found(&error) => {}
+        Err(error) => {
+            return Err(RuntimeError::Provisioning(format!(
+                "inspect image {image}: {error}"
+            )))
+        }
+    }
+    storage.verify(&[]).await?;
+    let mut pull = runtime.client.create_image(
+        Some(CreateImageOptions {
+            from_image: image,
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
+    while let Some(progress) = pull.next().await {
+        progress
+            .map_err(|error| RuntimeError::Provisioning(format!("pull image {image}: {error}")))?;
+    }
+    runtime.client.inspect_image(image).await.map_err(|error| {
+        RuntimeError::Provisioning(format!("image {image} unavailable after pull: {error}"))
+    })
+}
+
 async fn provision_inner(
     runtime: &DockerRuntime,
     labels: &OwnershipLabels,
     requirement: &RuntimeRequirement,
     service_requirements: &[ServiceRequirement],
-    verified: &dyn VerifiedExecutionStorage,
+    storage: &ReadyStorageGuard<'_>,
     layout: &ExecutionLayout,
 ) -> Result<EnvironmentHandle, RuntimeError> {
-    verified.verify().map_err(storage_error)?;
     let image = requirement.image.as_deref().ok_or_else(|| {
         RuntimeError::Provisioning("runtime image is required for Docker provisioning".to_owned())
     })?;
-    let image_inspect = runtime.ensure_image(image).await?;
+    let image_inspect = ensure_image(runtime, storage, image).await?;
     let mut service_images = Vec::with_capacity(service_requirements.len());
     for service in service_requirements {
-        service_images.push(runtime.ensure_image(&service.image).await?);
+        service_images.push(ensure_image(runtime, storage, &service.image).await?);
     }
     let image_inspects = std::iter::once(&image_inspect)
         .chain(service_images.iter())
@@ -104,9 +233,15 @@ async fn provision_inner(
             writable_container_mounts(&layout.runtime, &format!("service-{}", service.name), image)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    verified.verify().map_err(storage_error)?;
+    let all_mounts = agent_mounts
+        .iter()
+        .chain(execution_mounts.iter())
+        .chain(service_mounts.iter().flatten())
+        .cloned()
+        .collect::<Vec<_>>();
 
     let network = DockerRuntime::network_name(&labels.execution_id);
+    storage.verify(&all_mounts).await?;
     runtime
         .client
         .create_network(CreateNetworkOptions {
@@ -129,7 +264,7 @@ async fn provision_inner(
         service_requirements,
         &network,
         &service_mounts,
-        (&layout.root, verified),
+        (&layout.root, storage, &all_mounts),
     )
     .await?;
 
@@ -138,8 +273,8 @@ async fn provision_inner(
     limits.network_mode = Some(network.clone());
     let mut mounts = agent_mounts;
     mounts.extend(execution_mounts);
-    limits.mounts = Some(mounts);
-    verified.verify().map_err(storage_error)?;
+    limits.mounts = Some(mounts.clone());
+    storage.verify(&all_mounts).await?;
     runtime
         .client
         .create_container(
@@ -168,8 +303,20 @@ async fn provision_inner(
                 true,
             )
         })?;
-    verified.verify().map_err(storage_error)?;
-    verify_container_mount_sources(runtime, &agent_container, &layout.root).await?;
+    storage.verify(&all_mounts).await?;
+    verify_container_mount_sources(runtime, &agent_container, &layout.root, &mounts).await?;
+
+    verify_with_trusted_container(
+        runtime,
+        labels,
+        requirement,
+        storage,
+        &layout.root,
+        &all_mounts,
+    )
+    .await?;
+    services::start_services(runtime, &service_containers, storage, &all_mounts).await?;
+    storage.verify(&all_mounts).await?;
     runtime
         .client
         .start_container::<String>(&agent_container, None)
@@ -177,8 +324,6 @@ async fn provision_inner(
         .map_err(|error| {
             RuntimeError::Provisioning(format!("start agent container {agent_container}: {error}"))
         })?;
-    verified.verify().map_err(storage_error)?;
-    verify_container_mount_devices(runtime, &agent_container).await?;
 
     Ok(EnvironmentHandle {
         execution_id: labels.execution_id.clone(),
@@ -294,10 +439,264 @@ fn bind_mount(source: &Path, target: &str) -> Result<Mount, RuntimeError> {
     })
 }
 
+fn validate_actual_mounts(requested: &[Mount], actual: &[MountPoint]) -> Result<(), RuntimeError> {
+    let requested = requested
+        .iter()
+        .map(|mount| {
+            let source = mount.source.as_deref().ok_or_else(|| {
+                RuntimeError::ResourceLimit("requested bind lacks source".to_owned())
+            })?;
+            let source = fs::canonicalize(source).map_err(|error| {
+                RuntimeError::ResourceLimit(format!("canonicalize requested bind: {error}"))
+            })?;
+            let target = mount.target.clone().ok_or_else(|| {
+                RuntimeError::ResourceLimit("requested bind lacks target".to_owned())
+            })?;
+            if mount.typ != Some(MountTypeEnum::BIND) {
+                return Err(RuntimeError::ResourceLimit(
+                    "requested mount is not a bind".to_owned(),
+                ));
+            }
+            Ok((source, target, mount.read_only == Some(true)))
+        })
+        .collect::<Result<BTreeSet<_>, RuntimeError>>()?;
+    let actual = actual
+        .iter()
+        .map(|mount| {
+            if mount.typ != Some(MountPointTypeEnum::BIND)
+                || mount.name.is_some()
+                || mount.rw.is_none()
+            {
+                return Err(RuntimeError::ResourceLimit(
+                    "daemon reported an unexpected or anonymous mount".to_owned(),
+                ));
+            }
+            let source = mount.source.as_deref().ok_or_else(|| {
+                RuntimeError::ResourceLimit("actual bind lacks source".to_owned())
+            })?;
+            let source = fs::canonicalize(source).map_err(|error| {
+                RuntimeError::ResourceLimit(format!("canonicalize actual bind: {error}"))
+            })?;
+            let target = mount.destination.clone().ok_or_else(|| {
+                RuntimeError::ResourceLimit("actual bind lacks target".to_owned())
+            })?;
+            Ok((source, target, mount.rw == Some(false)))
+        })
+        .collect::<Result<BTreeSet<_>, RuntimeError>>()?;
+    if actual != requested {
+        return Err(RuntimeError::ResourceLimit(
+            "daemon mounts do not exactly match requested binds".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_with_trusted_container(
+    runtime: &DockerRuntime,
+    labels: &OwnershipLabels,
+    requirement: &RuntimeRequirement,
+    storage: &ReadyStorageGuard<'_>,
+    execution_root: &Path,
+    workload_mounts: &[Mount],
+) -> Result<(), RuntimeError> {
+    let trusted = runtime.trusted_verifier.as_ref().ok_or_else(|| {
+        RuntimeError::ResourceLimit(
+            "Docker provisioning requires an immutable trusted verifier image".to_owned(),
+        )
+    })?;
+    let canonical_root = fs::canonicalize(execution_root).map_err(|error| {
+        RuntimeError::ResourceLimit(format!("canonicalize execution root: {error}"))
+    })?;
+    let mut sources = vec![canonical_root.clone()];
+    for source in workload_mounts
+        .iter()
+        .filter_map(|mount| mount.source.as_deref())
+        .map(Path::new)
+        .map(fs::canonicalize)
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| RuntimeError::ResourceLimit(format!("canonicalize proof bind: {error}")))?
+    {
+        if source != canonical_root {
+            sources.push(source);
+        }
+    }
+    let proof_mounts = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let mut mount = bind_mount(source, &format!("/autospec-proof/{index}"))?;
+            mount.read_only = Some(true);
+            Ok(mount)
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    let proof_targets = (0..sources.len())
+        .map(|index| format!("/autospec-proof/{index}"))
+        .collect::<Vec<_>>();
+    let name = format!("autospec-{}-mount-verifier", labels.execution_id);
+    let mut limits = host_limits(requirement);
+    limits.network_mode = Some("none".to_owned());
+    limits.mounts = Some(proof_mounts.clone());
+    let mut command = vec!["-c".to_owned(), "%d:%i".to_owned()];
+    command.extend(proof_targets);
+
+    storage.verify(workload_mounts).await?;
+    runtime
+        .client
+        .create_container(
+            Some(CreateContainerOptions {
+                name: name.clone(),
+                platform: None,
+            }),
+            Config {
+                image: Some(trusted.image_id.clone()),
+                entrypoint: Some(vec![trusted.stat_command.clone()]),
+                cmd: Some(command),
+                labels: Some(labels.to_map().into_iter().collect()),
+                host_config: Some(limits),
+                network_disabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| {
+            RuntimeError::ResourceLimit(format!("create trusted mount verifier: {error}"))
+        })?;
+
+    let verification = async {
+        verify_container_mount_sources(runtime, &name, execution_root, &proof_mounts).await?;
+        let mut attached = runtime
+            .client
+            .attach_container(
+                &name,
+                Some(AttachContainerOptions::<String> {
+                    stdout: Some(true),
+                    stderr: Some(true),
+                    stream: Some(true),
+                    logs: Some(false),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|error| {
+                RuntimeError::ResourceLimit(format!("attach trusted mount verifier: {error}"))
+            })?;
+        storage.verify(workload_mounts).await?;
+        runtime
+            .client
+            .start_container::<String>(&name, None)
+            .await
+            .map_err(|error| {
+                RuntimeError::ResourceLimit(format!("start trusted mount verifier: {error}"))
+            })?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        while let Some(output) = attached.output.next().await {
+            match output.map_err(|error| {
+                RuntimeError::ResourceLimit(format!("read trusted mount verifier: {error}"))
+            })? {
+                LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                    stdout.extend_from_slice(&message)
+                }
+                LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
+                _ => {}
+            }
+        }
+        let inspect = runtime
+            .client
+            .inspect_container(&name, None)
+            .await
+            .map_err(|error| {
+                RuntimeError::ResourceLimit(format!("inspect trusted mount verifier: {error}"))
+            })?;
+        if inspect.state.and_then(|state| state.exit_code) != Some(0) {
+            return Err(RuntimeError::ResourceLimit(format!(
+                "trusted mount verifier failed: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )));
+        }
+        let identities = String::from_utf8(stdout)
+            .map_err(|error| {
+                RuntimeError::ResourceLimit(format!(
+                    "trusted verifier output is not UTF-8: {error}"
+                ))
+            })?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if identities.len() != sources.len() {
+            return Err(RuntimeError::ResourceLimit(
+                "trusted verifier did not return one identity per bind source".to_owned(),
+            ));
+        }
+        let expected = &runtime
+            .allocation
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::ResourceLimit(
+                    "trusted verifier requires a Ready allocation receipt".to_owned(),
+                )
+            })?
+            .docker_bind
+            .filesystem_id;
+        if identities.first() != Some(expected) {
+            return Err(RuntimeError::ResourceLimit(
+                "trusted verifier execution-root identity differs from the Ready proof".to_owned(),
+            ));
+        }
+        let expected_device = expected.split(':').next().unwrap_or_default();
+        if identities
+            .iter()
+            .any(|identity| identity.split(':').next().unwrap_or_default() != expected_device)
+        {
+            return Err(RuntimeError::ResourceLimit(
+                "trusted verifier found a bind source on another filesystem".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    let ready_before_removal = storage.verify(workload_mounts).await;
+    let removal = runtime
+        .client
+        .remove_container(
+            &name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|error| {
+            RuntimeError::ResourceLimit(format!("remove trusted mount verifier: {error}"))
+        });
+    match (verification, ready_before_removal, removal) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (result, ready, removal) => Err(RuntimeError::ResourceLimit(format!(
+            "trusted mount verification failed: {}; readiness before cleanup: {}; cleanup: {}",
+            result
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_owned()),
+            ready
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_owned()),
+            removal
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_owned()),
+        ))),
+    }
+}
+
 pub(crate) async fn verify_container_mount_sources(
     runtime: &DockerRuntime,
     container: &str,
     execution_root: &Path,
+    requested: &[Mount],
 ) -> Result<(), RuntimeError> {
     let root = fs::canonicalize(execution_root).map_err(|error| {
         RuntimeError::ResourceLimit(format!("canonicalize execution root: {error}"))
@@ -318,6 +717,7 @@ pub(crate) async fn verify_container_mount_sources(
         .map_err(|error| {
             RuntimeError::Provisioning(format!("inspect container {container}: {error}"))
         })?;
+    validate_actual_mounts(requested, inspect.mounts.as_deref().unwrap_or_default())?;
     let host = inspect.host_config.ok_or_else(|| {
         RuntimeError::ResourceLimit(format!("container {container} lacks host configuration"))
     })?;
@@ -332,6 +732,8 @@ pub(crate) async fn verify_container_mount_sources(
             .as_ref()
             .is_some_and(|options| !options.is_empty())
         || host.tmpfs.as_ref().is_some_and(|mounts| !mounts.is_empty())
+        || host.ipc_mode.as_deref() != Some("none")
+        || host.shm_size != Some(crate::limits::DEFAULT_SHM_SIZE)
     {
         return Err(RuntimeError::ResourceLimit(format!(
             "container {container} does not use readonly rootfs, log none, and bind-only storage"
@@ -341,9 +743,9 @@ pub(crate) async fn verify_container_mount_sources(
         RuntimeError::ResourceLimit(format!("container {container} has no writable bind mounts"))
     })?;
     for mount in mounts {
-        if mount.typ != Some(MountTypeEnum::BIND) || mount.read_only == Some(true) {
+        if mount.typ != Some(MountTypeEnum::BIND) {
             return Err(RuntimeError::ResourceLimit(format!(
-                "container {container} has a non-bind or read-only writable-path mount"
+                "container {container} has a non-bind mount"
             )));
         }
         let target = mount.target.unwrap_or_default();
@@ -360,7 +762,7 @@ pub(crate) async fn verify_container_mount_sources(
                 "canonicalize daemon bind source {source}: {error}"
             ))
         })?;
-        if !canonical.starts_with(&root) || canonical == root {
+        if !canonical.starts_with(&root) {
             return Err(RuntimeError::ResourceLimit(format!(
                 "daemon bind source {} escapes execution root {}",
                 canonical.display(),
@@ -383,103 +785,6 @@ pub(crate) async fn verify_container_mount_sources(
                 )));
             }
         }
-    }
-    Ok(())
-}
-
-pub(crate) async fn verify_container_mount_devices(
-    runtime: &DockerRuntime,
-    container: &str,
-) -> Result<(), RuntimeError> {
-    let inspect = runtime
-        .client
-        .inspect_container(container, None)
-        .await
-        .map_err(|error| {
-            RuntimeError::Provisioning(format!("inspect running container {container}: {error}"))
-        })?;
-    let targets = inspect
-        .mounts
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|mount| mount.rw == Some(true))
-        .filter_map(|mount| mount.destination)
-        .collect::<Vec<_>>();
-    if targets.is_empty() {
-        return Err(RuntimeError::ResourceLimit(format!(
-            "container {container} has no daemon-inspected RW mounts"
-        )));
-    }
-    let mut command = vec!["stat".to_owned(), "-c".to_owned(), "%d".to_owned()];
-    command.extend(targets.iter().cloned());
-    let exec = runtime
-        .client
-        .create_exec(
-            container,
-            CreateExecOptions {
-                cmd: Some(command),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|error| {
-            RuntimeError::ResourceLimit(format!("create daemon-side mount proof: {error}"))
-        })?;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    match runtime
-        .client
-        .start_exec(&exec.id, None)
-        .await
-        .map_err(|error| {
-            RuntimeError::ResourceLimit(format!("start daemon-side mount proof: {error}"))
-        })? {
-        StartExecResults::Attached { mut output, .. } => {
-            while let Some(item) = output.next().await {
-                match item.map_err(|error| {
-                    RuntimeError::ResourceLimit(format!("read daemon-side mount proof: {error}"))
-                })? {
-                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
-                        stdout.extend_from_slice(&message)
-                    }
-                    LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
-                    _ => {}
-                }
-            }
-        }
-        StartExecResults::Detached => {
-            return Err(RuntimeError::ResourceLimit(
-                "daemon-side mount proof detached".to_owned(),
-            ))
-        }
-    }
-    let result = runtime
-        .client
-        .inspect_exec(&exec.id)
-        .await
-        .map_err(|error| {
-            RuntimeError::ResourceLimit(format!("inspect daemon-side mount proof: {error}"))
-        })?;
-    if result.exit_code != Some(0) {
-        return Err(RuntimeError::ResourceLimit(format!(
-            "daemon-side mount proof failed: {}",
-            String::from_utf8_lossy(&stderr).trim()
-        )));
-    }
-    let output = String::from_utf8(stdout).map_err(|error| {
-        RuntimeError::ResourceLimit(format!("daemon-side device proof is not UTF-8: {error}"))
-    })?;
-    let devices = output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<BTreeSet<_>>();
-    if devices.len() != 1 {
-        return Err(RuntimeError::ResourceLimit(format!(
-            "RW mounts do not share one daemon-observed device: {devices:?}"
-        )));
     }
     Ok(())
 }
@@ -628,7 +933,7 @@ pub(crate) fn container_create_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bollard::models::ImageConfig;
+    use bollard::models::{ImageConfig, MountPoint, MountPointTypeEnum};
     use std::collections::HashMap;
 
     #[test]
@@ -723,5 +1028,34 @@ mod tests {
         };
 
         assert!(validate_reserved_image_volumes(&[&image]).is_ok());
+    }
+
+    #[test]
+    fn actual_mounts_must_exactly_equal_requested_binds() {
+        let state = tempfile::tempdir().expect("state");
+        let source = state.path().canonicalize().expect("canonical source");
+        let requested = vec![bind_mount(&source, "/workspace").expect("requested bind")];
+        let exact = vec![MountPoint {
+            typ: Some(MountPointTypeEnum::BIND),
+            source: Some(source.display().to_string()),
+            destination: Some("/workspace".to_owned()),
+            rw: Some(true),
+            ..Default::default()
+        }];
+        assert!(validate_actual_mounts(&requested, &exact).is_ok());
+
+        let mut anonymous = exact.clone();
+        anonymous.push(MountPoint {
+            typ: Some(MountPointTypeEnum::VOLUME),
+            name: Some("anonymous".to_owned()),
+            destination: Some("/image-volume".to_owned()),
+            rw: Some(true),
+            ..Default::default()
+        });
+        assert!(validate_actual_mounts(&requested, &anonymous).is_err());
+
+        let mut wrong_source = exact;
+        wrong_source[0].source = Some(state.path().join("other").display().to_string());
+        assert!(validate_actual_mounts(&requested, &wrong_source).is_err());
     }
 }

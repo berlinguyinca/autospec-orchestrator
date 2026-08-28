@@ -849,6 +849,31 @@ fn live_ready_verification_requires_exact_ready_journal_and_mounted_identity() {
 }
 
 #[test]
+fn live_capability_pins_each_runtime_bind_directory_identity() {
+    let (_root, manager, _calls) = manager_fixture();
+    let request = AllocationRequest {
+        labels: labels(),
+        disk_gib: 3,
+    };
+    let receipt = manager.allocate(&request).expect("allocate storage");
+    let verified = manager.verify_ready(&receipt).expect("live capability");
+    let layout = ExecutionLayout::new(manager.state_root(), &request.labels.execution_id)
+        .expect("execution layout");
+
+    verified
+        .verify_directory(&layout.conversation)
+        .expect("pin conversation directory");
+    let displaced = layout.session.join("conversation-displaced");
+    fs::rename(&layout.conversation, &displaced).expect("displace pinned conversation");
+    fs::create_dir(&layout.conversation).expect("replace conversation directory");
+
+    assert!(matches!(
+        verified.verify_directory(&layout.conversation),
+        Err(StorageError::IdentityMismatch(_))
+    ));
+}
+
+#[test]
 fn release_refuses_label_or_backend_identity_mismatch_without_cleanup() {
     let (_root, manager, calls) = manager_fixture();
     let receipt = manager

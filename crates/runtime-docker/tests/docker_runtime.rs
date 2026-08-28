@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 use orchestrator_core::{
     labels, ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement, WorkerId,
 };
-use runtime_docker::{host_limits, DockerRuntime, DEFAULT_PIDS_LIMIT};
+use runtime_docker::{host_limits, DockerRuntime, TrustedVerifierImage, DEFAULT_PIDS_LIMIT};
 use runtime_traits::Runtime;
 use std::{
     any::Any,
@@ -135,6 +135,12 @@ impl TestStateRoot {
 struct TestReadyVerifier;
 
 #[derive(Debug)]
+struct RejectReadyAfterContainerCreate {
+    docker: PathBuf,
+    container: String,
+}
+
+#[derive(Debug)]
 struct TestVerifiedStorage {
     root: PathBuf,
     repository: PathBuf,
@@ -156,6 +162,20 @@ impl VerifiedExecutionStorage for TestVerifiedStorage {
         }
         Ok(())
     }
+
+    fn verify_directory(&self, path: &Path) -> Result<(), StorageError> {
+        self.verify()?;
+        let root = fs::canonicalize(&self.root)
+            .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?;
+        let directory = fs::canonicalize(path)
+            .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?;
+        if !directory.starts_with(&root) || directory == root {
+            return Err(StorageError::IdentityMismatch(
+                "bind directory escaped execution root".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl ReadyAllocationVerifier for TestReadyVerifier {
@@ -173,11 +193,32 @@ impl ReadyAllocationVerifier for TestReadyVerifier {
     }
 }
 
+impl ReadyAllocationVerifier for RejectReadyAfterContainerCreate {
+    fn verify_ready(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+        if Command::new(&self.docker)
+            .args(["container", "inspect", &self.container])
+            .output()
+            .map_err(|error| StorageError::Command(error.to_string()))?
+            .status
+            .success()
+        {
+            return Err(StorageError::IdentityMismatch(
+                "allocation transitioned away from Ready after container creation".to_owned(),
+            ));
+        }
+        TestReadyVerifier.verify_ready(receipt)
+    }
+}
+
 #[derive(Debug)]
 struct DockerCliBindVerifier {
     docker: PathBuf,
     labels: OwnershipLabels,
     daemon_id: String,
+    verifier_image_id: String,
 }
 
 impl DockerBindVerifier for DockerCliBindVerifier {
@@ -185,7 +226,10 @@ impl DockerBindVerifier for DockerCliBindVerifier {
         Ok(DockerBindCapability {
             daemon_id: self.daemon_id.clone(),
             verifier: "docker-cli-stat".to_owned(),
-            method_version: "autospec.dev/docker-bind-stat/v1".to_owned(),
+            method_version: format!(
+                "autospec.dev/docker-bind-stat/v2;image={};command=/bin/stat",
+                self.verifier_image_id
+            ),
         })
     }
 
@@ -212,7 +256,7 @@ impl DockerBindVerifier for DockerCliBindVerifier {
             .args([
                 "--mount",
                 &mount,
-                "alpine:3.20",
+                &self.verifier_image_id,
                 "stat",
                 "-c",
                 "%d:%i",
@@ -240,7 +284,10 @@ impl DockerBindVerifier for DockerCliBindVerifier {
         Ok(DockerBindProof {
             daemon_id: self.daemon_id.clone(),
             verifier: "docker-cli-stat".to_owned(),
-            method_version: "autospec.dev/docker-bind-stat/v1".to_owned(),
+            method_version: format!(
+                "autospec.dev/docker-bind-stat/v2;image={};command=/bin/stat",
+                self.verifier_image_id
+            ),
             source_path: canonical,
             filesystem_id,
         })
@@ -712,13 +759,34 @@ async fn runtime_at_state_root_or_skip(
         .expect("read probed daemon identity")
         .id
         .expect("Docker daemon reports an identity");
+    ensure_alpine_image(&daemon).await;
+    let verifier_image_id = daemon
+        .inspect_image("alpine:3.20")
+        .await
+        .expect("inspect trusted verifier image")
+        .id
+        .expect("trusted verifier image has immutable ID");
+    let trusted_verifier = TrustedVerifierImage::new(&verifier_image_id, "/bin/stat")
+        .expect("trusted verifier configuration");
     let mut receipt = state.receipt(labels, disk_gib);
-    receipt.docker_bind.daemon_id = daemon_id;
+    receipt.docker_bind = DockerCliBindVerifier {
+        docker: docker_cli().expect("real Docker tests require Docker CLI bind verification"),
+        labels: labels.clone(),
+        daemon_id,
+        verifier_image_id,
+    }
+    .verify(&receipt.mount_path)
+    .expect("derive immutable execution filesystem identity from the Docker daemon");
+    assert_eq!(
+        receipt.docker_bind.method_version,
+        trusted_verifier.proof_method()
+    );
     std::mem::forget(state);
-    let runtime = match DockerRuntime::connect_with_execution_storage(
+    let runtime = match DockerRuntime::connect_with_verified_execution_storage(
         None,
         Arc::new(TestReadyVerifier),
         receipt,
+        trusted_verifier,
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -1031,6 +1099,129 @@ async fn real_image_volume_collisions_fail_before_resources_and_preserve_another
         .cleanup()
         .await
         .expect("cleanup committed images");
+}
+
+#[tokio::test]
+async fn ready_transition_blocks_malicious_workload_entrypoint_before_marker_write() {
+    let Some(docker_bin) = docker_cli() else {
+        println!("SKIP malicious pre-start gate: Docker CLI is absent");
+        return;
+    };
+    let labels = labels_for(unique_execution_id());
+    let state = TestStateRoot::new(&labels);
+    let docker = raw_client().expect("connect Docker");
+    if let Err(error) = docker.version().await {
+        println!("SKIP malicious pre-start gate: Docker daemon unavailable: {error}");
+        return;
+    }
+    ensure_alpine_image(&docker).await;
+    let daemon_id = docker
+        .info()
+        .await
+        .expect("daemon info")
+        .id
+        .expect("daemon ID");
+    let verifier_image_id = docker
+        .inspect_image("alpine:3.20")
+        .await
+        .expect("trusted image")
+        .id
+        .expect("trusted image ID");
+    let trusted =
+        TrustedVerifierImage::new(&verifier_image_id, "/bin/stat").expect("trusted verifier");
+    let mut receipt = state.receipt(&labels, runtime_requirement().disk_gib);
+    receipt.docker_bind.daemon_id = daemon_id;
+    receipt.docker_bind.method_version = trusted.proof_method();
+    let agent_name = DockerRuntime::agent_container_name(&labels.execution_id);
+    let runtime = DockerRuntime::connect_with_verified_execution_storage(
+        None,
+        Arc::new(RejectReadyAfterContainerCreate {
+            docker: docker_bin,
+            container: agent_name,
+        }),
+        receipt,
+        trusted,
+    )
+    .expect("storage-backed runtime");
+    let mut scope = DockerTestScope::new(&runtime, &labels);
+
+    let source = format!("autospec-{}-malicious-source", labels.execution_id);
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: source.clone(),
+                platform: None,
+            }),
+            Config::<String> {
+                image: Some("alpine:3.20".to_owned()),
+                labels: Some(control_label_map(&labels)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create malicious image source");
+    let repository = format!("autospec-malicious-entrypoint-{}", labels.execution_id);
+    let image = format!("{repository}:test");
+    docker
+        .commit_container(
+            CommitContainerOptions {
+                container: source.as_str(),
+                repo: repository.as_str(),
+                tag: "test",
+                pause: false,
+                ..Default::default()
+            },
+            Config::<String> {
+                labels: Some(labels.to_map().into_iter().collect()),
+                entrypoint: Some(vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf started > /workspace/workload-entrypoint-started; exec /bin/sleep infinity"
+                        .to_owned(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("commit malicious workload image");
+    docker
+        .remove_container(
+            &source,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("remove malicious image source");
+    let mut image_guard = DockerImageGuard::new(&docker);
+    image_guard.track(image.clone());
+
+    let requirement = RuntimeRequirement {
+        image: Some(image),
+        ..runtime_requirement()
+    };
+    let error = runtime
+        .provision(&labels, &requirement, &[])
+        .await
+        .expect_err("Ready transition must stop workload startup");
+    assert!(error.to_string().contains("transitioned away from Ready"));
+    assert!(
+        !state
+            .worktree(&labels)
+            .join("workload-entrypoint-started")
+            .exists(),
+        "malicious workload entrypoint ran before the trusted gate"
+    );
+
+    scope
+        .cleanup()
+        .await
+        .expect("cleanup malicious gate resources");
+    image_guard
+        .cleanup()
+        .await
+        .expect("remove malicious workload image");
 }
 
 #[tokio::test]
@@ -1750,6 +1941,12 @@ async fn configured_storage_enforces_one_aggregate_quota_and_preserves_another_e
         .to_owned();
     let docker = raw_client().expect("connect to configured Docker daemon");
     ensure_alpine_image(&docker).await;
+    let verifier_image_id = docker
+        .inspect_image("alpine:3.20")
+        .await
+        .expect("inspect trusted verifier image")
+        .id
+        .expect("trusted verifier image ID");
 
     let state = tempfile::tempdir().expect("configured storage state root");
     secure_mode(state.path());
@@ -1769,6 +1966,7 @@ async fn configured_storage_enforces_one_aggregate_quota_and_preserves_another_e
                     docker: docker_bin.clone(),
                     labels: labels.clone(),
                     daemon_id: daemon_id.clone(),
+                    verifier_image_id: verifier_image_id.clone(),
                 }),
             )
             .expect("configured execution storage manager"),
@@ -1794,16 +1992,18 @@ async fn configured_storage_enforces_one_aggregate_quota_and_preserves_another_e
             })
             .expect("allocate isolated control execution"),
     );
-    let first_runtime = DockerRuntime::connect_with_execution_storage(
+    let first_runtime = DockerRuntime::connect_with_verified_execution_storage(
         None,
         first_manager,
         first_storage.receipt().clone(),
+        TrustedVerifierImage::new(&verifier_image_id, "/bin/stat").expect("trusted verifier"),
     )
     .expect("connect first storage-backed runtime");
-    let second_runtime = DockerRuntime::connect_with_execution_storage(
+    let second_runtime = DockerRuntime::connect_with_verified_execution_storage(
         None,
         second_manager,
         second_storage.receipt().clone(),
+        TrustedVerifierImage::new(&verifier_image_id, "/bin/stat").expect("trusted verifier"),
     )
     .expect("connect second storage-backed runtime");
     let mut first_scope = DockerTestScope::new(&first_runtime, &first_labels);
