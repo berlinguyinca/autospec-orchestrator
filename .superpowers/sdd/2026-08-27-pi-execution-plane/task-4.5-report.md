@@ -9,10 +9,40 @@ checked allocation sizing, durable phase journals, exact allocation receipts,
 fail-closed APFS and thick-LVM backends, and an explicit Docker bind-verification
 capability contract.
 
-The foundation slice intentionally stopped before consumer migration. The Git
-migration now consumes the deterministic bounded repository path; Pi, Docker,
-and worker lifecycle paths must not claim `disk_gib` enforcement until they
-consume a verified allocation receipt.
+The foundation slice initially stopped before consumer migration. Git, Docker,
+and Pi now consume deterministic bounded paths from a verified allocation
+receipt. Worker lifecycle orchestration must still carry these exact receipts
+and leases end to end before claiming complete `disk_gib` enforcement.
+
+## Pi Migration
+
+- Added `PiHarnessConfig::for_ready_allocation`, which accepts one exact
+  `AllocationReceipt` plus `Arc<dyn ReadyAllocationVerifier>` and derives the
+  repository, private session, and conversation paths solely from
+  `ExecutionLayout`. The legacy arbitrary `state_root`/`worktree` constructor is
+  retained for compatibility but fails closed before creating files or starting
+  a Docker process.
+- Revalidates the receipt, exact ownership labels, deterministic layout, live
+  Ready journal/backend/bind identity, repository path, and pinned repository,
+  session, conversation, and `.autospec` directories before mutation. Static
+  directory symlinks and file-level symlinks for event/control records are
+  rejected without following them outside the allocation.
+- Acquires a shared `ReadyLease` before task-packet/session mutation and moves it
+  into the registered Pi process. Stop and drop retain the lease through TERM,
+  KILL, and confirmed reap; resume and fork acquire their own live-session lease,
+  while cursor polling uses a temporary lease when it mutates durable reducer
+  state. Releasing therefore cannot race a running or mutating Pi session.
+- Moved the private session root from the legacy
+  `state_root/sessions/{execution_id}` path to exact `layout.session`. Owner,
+  cursor/reducer, resume count, live JSONL, and stderr stay there; Pi receives
+  only `layout.conversation` at `/session`. The compact packet is materialized
+  once at `layout.repository/.autospec/task-packet.json` and remains referenced
+  as `@/workspace/.autospec/task-packet.json`.
+- Hardened direct-child harness records with real-file identity checks,
+  owner-only permissions, collision-resistant create-new temporary files, and
+  atomic rename. Conversation discovery ignores symlink entries, and torn-tail
+  repair uses the same bounded atomic writer.
+- Implementation commit: `4a6487f`.
 
 ## Git Migration
 
@@ -263,6 +293,12 @@ polling loops, or `du`/`df` accounting.
 - The concrete Docker verifier no longer accepts a caller-supplied identity or
   marker. It starts an ownership-labelled, networkless, read-only container and
   constructs the proof from daemon-side `stat` device/inode identity.
+- Pi integration reds first failed because no receipt-backed constructor existed.
+  A forged-receipt verifier then proved rejection occurs before packet, owner,
+  cursor, or process creation. The lease test blocked a simulated Releasing
+  transition until `stop` reaped the in-container group. A file-level regression
+  initially followed a pre-planted live-event symlink outside the allocation;
+  append/read/atomic record paths now reject that escape before Pi starts.
 
 ## Verification
 
@@ -271,12 +307,18 @@ polling loops, or `du`/`df` accounting.
   immutability/substitution rejection, receipt binding, create-intent recovery,
   phase-specific ENOSPC rollback, safe diff capture, pre-Git commondir rejection,
   exact cleanup, foreign-resource survival, and stale discovery.
-- `cargo test -p execution-storage -- --nocapture` — 39 passed. The real Docker
+- `cargo test -p execution-storage -- --nocapture` — 41 passed. The real Docker
   bind verifier contract ran. The destructive aggregate quota lifecycle printed
   an explicit skip because no operator pool is configured on this host; when
   configured it performs create, identity proof, substantial successful writes,
   aggregate over-limit writes accepted only as ENOSPC/StorageFull,
   unmount, and exact release, and configuration failures are test failures.
+- `cargo test -p harness-pi --all-targets -- --nocapture` — 26 passed against
+  production-shaped labelled Docker containers without `--init`. New coverage
+  proves stale/forged receipt rejection before writes, fail-closed legacy paths,
+  Ready→Releasing exclusion through stop, exact allocation-root placement,
+  pinned directory verification, conversation-only `/session` exposure, and
+  directory/file symlink rejection without escaping private storage.
 - `cargo clippy -p execution-storage -p git-worktree --all-targets -- -D warnings`
   — passed.
 - Current toolchain `cargo fmt --all -- --check`, `cargo build --workspace`,
@@ -284,12 +326,13 @@ polling loops, or `du`/`df` accounting.
   `cargo clippy --workspace --all-targets -- -D warnings` — passed, including
   all real-Docker runtime tests.
 - Rust 1.85 ran the same full fmt/build/test/clippy workspace matrix — passed,
-  including all 58 Git tests and all 13 real-Docker runtime tests.
+  including all 58 Git tests, 26 Pi real-Docker tests, and 18 runtime-Docker
+  tests.
 - The first current-toolchain workspace test attempt saw the existing
   five-second `harness-pi` drop-bound test exceed its timing threshold under
   concurrent Docker load. The isolated retry passed in 4.76 seconds, and the
-  subsequent full current and Rust 1.85 workspace runs both passed all 20 Pi
-  harness tests.
+  subsequent full current and Rust 1.85 workspace runs both passed. The current
+  integration now passes all 26 Pi harness tests on both toolchains.
 
 ## Remaining Integration Work
 
@@ -301,9 +344,9 @@ polling loops, or `du`/`df` accounting.
   (already transitive in `Cargo.lock`) or a narrowly audited unsafe exception is
   required. No unsafe or `rustix` dependency was added in this round.
 
-- Pi, Docker, and worker lifecycle consumers remain on their old layouts by
-  design; later Task 4.5 slices must switch them only after receiving a verified
-  receipt and pass its repository path to Git `create_in`.
+- Worker lifecycle orchestration must still pass the same receipt/verifier
+  capability through Git, runtime, and Pi construction and release only after
+  every retained consumer lease is dropped.
 - Destructive real APFS/LVM allocation requires `AUTOSPEC_APFS_PROBE_PATH` or
   `AUTOSPEC_LVM_VOLUME_GROUP` plus appropriate privilege. Neither operator-pool
   configuration is present on this host, so only that test was skipped.
