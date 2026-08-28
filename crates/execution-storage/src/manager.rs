@@ -4,11 +4,12 @@ use crate::{
     DockerBindProof, ExecutionLayout, JournalStore, PhaseJournal, ReleasePhase, StorageError,
     ALLOCATION_API_VERSION,
 };
+use fs2::FileExt;
 use orchestrator_core::{ExecutionId, OwnershipLabels};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
-    fs,
+    fs::{self, File},
     path::Path,
     path::PathBuf,
     sync::{
@@ -129,6 +130,25 @@ pub trait ReadyAllocationVerifier: Debug + Send + Sync {
         &self,
         receipt: &AllocationReceipt,
     ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError>;
+
+    /// Acquires a shared lifecycle lease after revalidating the exact Ready allocation.
+    ///
+    /// The consumer must retain this lease across its complete mutation lifecycle;
+    /// release obtains the corresponding exclusive lease (spec sections 13 and 81).
+    fn acquire_ready_lease(
+        &self,
+        _receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn ReadyLease>, StorageError> {
+        Err(StorageError::Unavailable(
+            "Ready verifier does not provide a lifecycle lease".to_owned(),
+        ))
+    }
+}
+
+/// Object-safe, sendable guard preventing Ready storage from entering release.
+pub trait ReadyLease: Debug + Send + Sync {
+    /// Returns the path/device/inode capability bound to this lease.
+    fn verified(&self) -> &dyn VerifiedExecutionStorage;
 }
 
 #[derive(Debug)]
@@ -137,6 +157,18 @@ struct LiveVerifiedExecutionStorage {
     repository_path: PathBuf,
     repository: Mutex<Option<PinnedDirectory>>,
     directories: Mutex<BTreeMap<PathBuf, PinnedDirectory>>,
+}
+
+#[derive(Debug)]
+struct LiveReadyLease {
+    _lock: File,
+    verified: LiveVerifiedExecutionStorage,
+}
+
+impl ReadyLease for LiveReadyLease {
+    fn verified(&self) -> &dyn VerifiedExecutionStorage {
+        &self.verified
+    }
 }
 
 impl VerifiedExecutionStorage for LiveVerifiedExecutionStorage {
@@ -307,7 +339,7 @@ impl ExecutionStorage {
     fn verify_ready_allocation(
         &self,
         receipt: &AllocationReceipt,
-    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+    ) -> Result<LiveVerifiedExecutionStorage, StorageError> {
         let layout = ExecutionLayout::new(&self.state_root, &receipt.labels.execution_id)?;
         receipt.validate(&receipt.labels, &layout)?;
         let journal = self.journals.read(&layout)?;
@@ -341,7 +373,7 @@ impl ExecutionStorage {
             directories: Mutex::new(BTreeMap::new()),
         };
         verified.verify()?;
-        Ok(Box::new(verified))
+        Ok(verified)
     }
 
     fn create_mountpoint(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
@@ -558,7 +590,23 @@ impl ReadyAllocationVerifier for ExecutionStorage {
         &self,
         receipt: &AllocationReceipt,
     ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
-        self.verify_ready_allocation(receipt)
+        Ok(Box::new(self.verify_ready_allocation(receipt)?))
+    }
+
+    fn acquire_ready_lease(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn ReadyLease>, StorageError> {
+        let layout = ExecutionLayout::new(&self.state_root, &receipt.labels.execution_id)?;
+        let lock = self.journals.open_ready_lease(&layout)?;
+        FileExt::try_lock_shared(&lock).map_err(|error| {
+            StorageError::Unavailable(format!("execution Ready allocation is changing: {error}"))
+        })?;
+        let verified = self.verify_ready_allocation(receipt)?;
+        Ok(Box::new(LiveReadyLease {
+            _lock: lock,
+            verified,
+        }))
     }
 }
 
@@ -784,6 +832,7 @@ impl ExecutionStorageManager for ExecutionStorage {
                 docker_bind,
             };
             receipt.validate(&request.labels, &layout)?;
+            self.journals.ensure_ready_lease(&layout)?;
             self.journals
                 .write(&layout, &PhaseJournal::ready(receipt.clone()))?;
             Ok(receipt)
@@ -795,6 +844,12 @@ impl ExecutionStorageManager for ExecutionStorage {
 
     fn release(&self, receipt: &AllocationReceipt) -> Result<(), StorageError> {
         let layout = ExecutionLayout::new(&self.state_root, &receipt.labels.execution_id)?;
+        let release_lock = self.journals.open_ready_lease(&layout)?;
+        FileExt::try_lock_exclusive(&release_lock).map_err(|error| {
+            StorageError::Unavailable(format!(
+                "execution has an active Ready consumer lease: {error}"
+            ))
+        })?;
         receipt.validate(&receipt.labels, &layout)?;
         let journal = self.journals.read(&layout)?;
         if journal.receipt.as_ref() != Some(receipt)

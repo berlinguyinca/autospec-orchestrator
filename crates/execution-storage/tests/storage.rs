@@ -2,8 +2,8 @@ use execution_storage::{
     disk_gib_to_bytes, AllocationPhase, AllocationReceipt, AllocationRequest, BackendCapability,
     BackendIdentity, BackendState, DockerBindCapability, DockerBindProof, DockerBindVerifier,
     ExecutionLayout, ExecutionStorage, ExecutionStorageManager, JournalStore, PhaseJournal,
-    ReadyAllocationVerifier, ReleasePhase, SecureMetadataDirectory, StorageBackend, StorageError,
-    ALLOCATION_API_VERSION,
+    ReadyAllocationVerifier, ReadyLease, ReleasePhase, SecureMetadataDirectory, StorageBackend,
+    StorageError, ALLOCATION_API_VERSION,
 };
 use orchestrator_core::{ExecutionId, OwnershipLabels, WorkerId};
 use std::{
@@ -193,7 +193,7 @@ impl DockerBindVerifier for DockerCliBindVerifier {
         Ok(DockerBindCapability {
             daemon_id: self.daemon_id.clone(),
             verifier: "docker-cli-stat".to_owned(),
-            method_version: "autospec.dev/docker-bind-stat/v1".to_owned(),
+            method_version: "autospec.dev/docker-bind-stat/v1;command=/bin/stat".to_owned(),
         })
     }
 
@@ -212,7 +212,7 @@ impl DockerBindVerifier for DockerCliBindVerifier {
                 "--mount",
                 &mount,
                 "alpine:3.20",
-                "stat",
+                "/bin/stat",
                 "-c",
                 "%d:%i",
                 "/proof",
@@ -239,7 +239,7 @@ impl DockerBindVerifier for DockerCliBindVerifier {
         Ok(DockerBindProof {
             daemon_id: self.daemon_id.clone(),
             verifier: "docker-cli-stat".to_owned(),
-            method_version: "autospec.dev/docker-bind-stat/v1".to_owned(),
+            method_version: "autospec.dev/docker-bind-stat/v1;command=/bin/stat".to_owned(),
             source_path: canonical,
             filesystem_id,
         })
@@ -849,6 +849,37 @@ fn live_ready_verification_requires_exact_ready_journal_and_mounted_identity() {
 }
 
 #[test]
+fn ready_lease_prevents_concurrent_release_until_the_consumer_drops_it() {
+    let (_root, manager, _calls) = manager_fixture();
+    let manager = Arc::new(manager);
+    let receipt = manager
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 3,
+        })
+        .expect("allocate storage");
+    let lease: Box<dyn ReadyLease> = manager
+        .acquire_ready_lease(&receipt)
+        .expect("acquire exact Ready lease");
+    lease
+        .verified()
+        .verify()
+        .expect("leased allocation remains verified");
+
+    let releasing_manager = Arc::clone(&manager);
+    let releasing_receipt = receipt.clone();
+    let release = std::thread::spawn(move || releasing_manager.release(&releasing_receipt))
+        .join()
+        .expect("release thread");
+    assert!(matches!(release, Err(StorageError::Unavailable(_))));
+
+    drop(lease);
+    manager
+        .release(&receipt)
+        .expect("release succeeds after the Ready lease is dropped");
+}
+
+#[test]
 fn live_capability_pins_each_runtime_bind_directory_identity() {
     let (_root, manager, _calls) = manager_fixture();
     let request = AllocationRequest {
@@ -890,6 +921,17 @@ fn release_refuses_label_or_backend_identity_mismatch_without_cleanup() {
             .filter(|call| call.starts_with("remove:"))
             .count()
     };
+
+    let mut wrong_labels = receipt.clone();
+    wrong_labels.labels.execution_id = ExecutionId::new("foreign-execution");
+    assert!(manager.release(&wrong_labels).is_err());
+    assert!(
+        !manager
+            .state_root()
+            .join("execution-storage/foreign-execution.lease")
+            .exists(),
+        "invalid release must not create lease metadata"
+    );
 
     let mut wrong_labels = receipt.clone();
     wrong_labels.labels.worker_id = WorkerId::new("foreign-worker");

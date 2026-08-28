@@ -1,17 +1,22 @@
 use crate::{limits::host_limits, services, DockerRuntime};
 use bollard::{
     container::{
-        AttachContainerOptions, Config, CreateContainerOptions, LogOutput, RemoveContainerOptions,
+        AttachContainerOptions, Config, CreateContainerOptions, ListContainersOptions, LogOutput,
+        RemoveContainerOptions,
     },
     image::CreateImageOptions,
     models::{ImageInspect, Mount, MountPoint, MountPointTypeEnum, MountTypeEnum},
     network::CreateNetworkOptions,
 };
-use execution_storage::{disk_gib_to_bytes, ExecutionLayout, VerifiedExecutionStorage};
+use execution_storage::{disk_gib_to_bytes, ExecutionLayout, ReadyLease, VerifiedExecutionStorage};
 use futures_util::StreamExt;
 use orchestrator_core::{OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::{EnvironmentHandle, RuntimeError};
-use std::{collections::BTreeSet, fs, io, path::Path};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs, io,
+    path::Path,
+};
 
 const CONTAINER_WORKTREE: &str = "/workspace";
 const CONTAINER_SESSION: &str = "/session";
@@ -20,13 +25,13 @@ pub(crate) struct ReadyStorageGuard<'a> {
     runtime: &'a DockerRuntime,
     labels: &'a OwnershipLabels,
     requirement: &'a RuntimeRequirement,
-    pinned: &'a dyn VerifiedExecutionStorage,
+    lease: &'a dyn ReadyLease,
 }
 
 impl ReadyStorageGuard<'_> {
     pub(crate) async fn verify(&self, mounts: &[Mount]) -> Result<(), RuntimeError> {
-        self.pinned.verify().map_err(storage_error)?;
-        verify_mount_directories(self.pinned, mounts)?;
+        self.lease.verified().verify().map_err(storage_error)?;
+        verify_mount_directories(self.lease.verified(), mounts)?;
         let receipt = self.runtime.allocation.as_ref().ok_or_else(|| {
             RuntimeError::ResourceLimit(
                 "Docker provisioning requires an exact Ready allocation receipt".to_owned(),
@@ -65,13 +70,13 @@ pub(crate) async fn provision(
     requirement: &RuntimeRequirement,
     service_requirements: &[ServiceRequirement],
 ) -> Result<EnvironmentHandle, RuntimeError> {
-    let (verified, layout) = verified_execution_layout(runtime, labels, requirement)?;
+    let (lease, layout) = verified_execution_layout(runtime, labels, requirement)?;
     runtime.require_compatible_daemon().await?;
     let storage = ReadyStorageGuard {
         runtime,
         labels,
         requirement,
-        pinned: verified.as_ref(),
+        lease: lease.as_ref(),
     };
     storage.verify(&[]).await?;
     match provision_inner(
@@ -148,12 +153,98 @@ async fn validate_trusted_verifier(runtime: &DockerRuntime) -> Result<(), Runtim
         .map_err(|error| {
             RuntimeError::ResourceLimit(format!("inspect trusted verifier image: {error}"))
         })?;
+    validate_trusted_verifier_image(trusted, &inspect)
+}
+
+fn validate_trusted_verifier_image(
+    trusted: &crate::TrustedVerifierImage,
+    inspect: &ImageInspect,
+) -> Result<(), RuntimeError> {
     if inspect.id.as_deref() != Some(trusted.image_id.as_str()) {
         return Err(RuntimeError::ResourceLimit(
             "trusted verifier image identity drifted".to_owned(),
         ));
     }
+    if inspect
+        .config
+        .as_ref()
+        .and_then(|config| config.volumes.as_ref())
+        .is_some_and(|volumes| !volumes.is_empty())
+    {
+        return Err(RuntimeError::ResourceLimit(
+            "trusted verifier image declares writable volumes".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn exact_trusted_verifier_id(
+    containers: &[bollard::models::ContainerSummary],
+    expected_id: &str,
+    labels: &OwnershipLabels,
+) -> Result<String, RuntimeError> {
+    let expected_labels = labels
+        .to_map()
+        .into_iter()
+        .collect::<HashMap<String, String>>();
+    let container = containers
+        .iter()
+        .find(|container| container.id.as_deref() == Some(expected_id))
+        .ok_or_else(|| {
+            RuntimeError::ResourceLimit(
+                "captured trusted verifier container ID disappeared or was replaced".to_owned(),
+            )
+        })?;
+    let actual_labels = container.labels.as_ref().ok_or_else(|| {
+        RuntimeError::ResourceLimit(
+            "captured trusted verifier container lacks ownership labels".to_owned(),
+        )
+    })?;
+    let ownership_labels = actual_labels
+        .iter()
+        .filter(|(key, _)| key.starts_with("autospec."))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
+    if ownership_labels != expected_labels {
+        return Err(RuntimeError::ResourceLimit(
+            "captured trusted verifier container labels changed".to_owned(),
+        ));
+    }
+    Ok(expected_id.to_owned())
+}
+
+async fn remove_exact_trusted_verifier(
+    runtime: &DockerRuntime,
+    labels: &OwnershipLabels,
+    expected_id: &str,
+) -> Result<(), RuntimeError> {
+    let filters = HashMap::from([("label".to_owned(), labels.selector())]);
+    let containers = runtime
+        .client
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        }))
+        .await
+        .map_err(|error| {
+            RuntimeError::ResourceLimit(format!("list exact trusted verifier: {error}"))
+        })?;
+    let id = exact_trusted_verifier_id(&containers, expected_id, labels)?;
+    runtime
+        .client
+        .remove_container(
+            &id,
+            Some(RemoveContainerOptions {
+                force: true,
+                v: false,
+                link: false,
+            }),
+        )
+        .await
+        .map_err(|error| {
+            RuntimeError::ResourceLimit(format!("remove exact trusted verifier {id}: {error}"))
+        })
 }
 
 fn verify_mount_directories(
@@ -346,7 +437,7 @@ fn verified_execution_layout(
     runtime: &DockerRuntime,
     labels: &OwnershipLabels,
     requirement: &RuntimeRequirement,
-) -> Result<(Box<dyn VerifiedExecutionStorage>, ExecutionLayout), RuntimeError> {
+) -> Result<(Box<dyn ReadyLease>, ExecutionLayout), RuntimeError> {
     let verifier = runtime.storage_verifier.as_ref().ok_or_else(|| {
         RuntimeError::ResourceLimit(
             "Docker provisioning requires a live Ready execution-storage verifier".to_owned(),
@@ -365,7 +456,10 @@ fn verified_execution_layout(
             "runtime request does not exactly match the Ready allocation".to_owned(),
         ));
     }
-    let verified = verifier.verify_ready(receipt).map_err(storage_error)?;
+    let lease = verifier
+        .acquire_ready_lease(receipt)
+        .map_err(storage_error)?;
+    let verified = lease.verified();
     verified.verify().map_err(storage_error)?;
     let layout =
         ExecutionLayout::new(&runtime.state_root, &labels.execution_id).map_err(storage_error)?;
@@ -382,7 +476,7 @@ fn verified_execution_layout(
     ] {
         ensure_real_directory(path, false, purpose)?;
     }
-    Ok((verified, layout))
+    Ok((lease, layout))
 }
 
 fn storage_error(error: execution_storage::StorageError) -> RuntimeError {
@@ -540,7 +634,7 @@ async fn verify_with_trusted_container(
     command.extend(proof_targets);
 
     storage.verify(workload_mounts).await?;
-    runtime
+    let created = runtime
         .client
         .create_container(
             Some(CreateContainerOptions {
@@ -561,13 +655,15 @@ async fn verify_with_trusted_container(
         .map_err(|error| {
             RuntimeError::ResourceLimit(format!("create trusted mount verifier: {error}"))
         })?;
+    let verifier_id = created.id;
 
     let verification = async {
-        verify_container_mount_sources(runtime, &name, execution_root, &proof_mounts).await?;
+        verify_container_mount_sources(runtime, &verifier_id, execution_root, &proof_mounts)
+            .await?;
         let mut attached = runtime
             .client
             .attach_container(
-                &name,
+                &verifier_id,
                 Some(AttachContainerOptions::<String> {
                     stdout: Some(true),
                     stderr: Some(true),
@@ -583,7 +679,7 @@ async fn verify_with_trusted_container(
         storage.verify(workload_mounts).await?;
         runtime
             .client
-            .start_container::<String>(&name, None)
+            .start_container::<String>(&verifier_id, None)
             .await
             .map_err(|error| {
                 RuntimeError::ResourceLimit(format!("start trusted mount verifier: {error}"))
@@ -603,7 +699,7 @@ async fn verify_with_trusted_container(
         }
         let inspect = runtime
             .client
-            .inspect_container(&name, None)
+            .inspect_container(&verifier_id, None)
             .await
             .map_err(|error| {
                 RuntimeError::ResourceLimit(format!("inspect trusted mount verifier: {error}"))
@@ -659,19 +755,7 @@ async fn verify_with_trusted_container(
     .await;
 
     let ready_before_removal = storage.verify(workload_mounts).await;
-    let removal = runtime
-        .client
-        .remove_container(
-            &name,
-            Some(RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|error| {
-            RuntimeError::ResourceLimit(format!("remove trusted mount verifier: {error}"))
-        });
+    let removal = remove_exact_trusted_verifier(runtime, labels, &verifier_id).await;
     match (verification, ready_before_removal, removal) {
         (Ok(()), Ok(()), Ok(())) => Ok(()),
         (result, ready, removal) => Err(RuntimeError::ResourceLimit(format!(
@@ -933,7 +1017,7 @@ pub(crate) fn container_create_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bollard::models::{ImageConfig, MountPoint, MountPointTypeEnum};
+    use bollard::models::{ContainerSummary, ImageConfig, MountPoint, MountPointTypeEnum};
     use std::collections::HashMap;
 
     #[test]
@@ -1028,6 +1112,59 @@ mod tests {
         };
 
         assert!(validate_reserved_image_volumes(&[&image]).is_ok());
+    }
+
+    #[test]
+    fn trusted_verifier_image_rejects_every_declared_volume() {
+        let image_id = format!("sha256:{}", "a".repeat(64));
+        let trusted = crate::TrustedVerifierImage::new(&image_id, "/bin/stat")
+            .expect("trusted verifier config");
+        let image = ImageInspect {
+            id: Some(image_id),
+            config: Some(ImageConfig {
+                volumes: Some(HashMap::from([("/proof-cache".to_owned(), HashMap::new())])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(validate_trusted_verifier_image(&trusted, &image).is_err());
+    }
+
+    #[test]
+    fn trusted_verifier_teardown_requires_the_captured_id_and_exact_labels() {
+        let labels = OwnershipLabels {
+            execution_id: orchestrator_core::ExecutionId::new("node-417-impl-01"),
+            worker_id: orchestrator_core::WorkerId::new("worker-7"),
+            repository: "owner/repository".to_owned(),
+            issue: Some("417".to_owned()),
+        };
+        let expected = ContainerSummary {
+            id: Some("captured-id".to_owned()),
+            labels: Some(labels.to_map().into_iter().collect()),
+            ..Default::default()
+        };
+        assert_eq!(
+            exact_trusted_verifier_id(&[expected], "captured-id", &labels)
+                .expect("captured exact verifier"),
+            "captured-id"
+        );
+
+        let foreign_replacement = ContainerSummary {
+            id: Some("replacement-id".to_owned()),
+            labels: Some(labels.to_map().into_iter().collect()),
+            ..Default::default()
+        };
+        assert!(exact_trusted_verifier_id(&[foreign_replacement], "captured-id", &labels).is_err());
+
+        let mut incomplete = labels.to_map();
+        incomplete.remove(orchestrator_core::labels::WORKER_ID);
+        let incomplete = ContainerSummary {
+            id: Some("captured-id".to_owned()),
+            labels: Some(incomplete.into_iter().collect()),
+            ..Default::default()
+        };
+        assert!(exact_trusted_verifier_id(&[incomplete], "captured-id", &labels).is_err());
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub use journal::{JournalStore, SecureMetadataDirectory};
 pub use lvm::LvmBackend;
 pub use manager::{
     AllocationRequest, BackendCapability, DockerBindCapability, DockerBindVerifier,
-    ExecutionStorage, ExecutionStorageManager, ReadyAllocationVerifier, StorageBackend,
+    ExecutionStorage, ExecutionStorageManager, ReadyAllocationVerifier, ReadyLease, StorageBackend,
     StorageCapability, VerifiedExecutionStorage,
 };
 pub use model::{

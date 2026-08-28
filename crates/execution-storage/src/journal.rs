@@ -355,6 +355,37 @@ impl JournalStore {
         Ok(journal)
     }
 
+    pub(crate) fn ensure_ready_lease(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
+        self.verify_directories()?;
+        self.validate_path(layout)?;
+        let name = lease_name(layout)?;
+        match self.journal_directory.child_metadata(&name)? {
+            Some(_) => {
+                self.journal_directory.open_file(&name)?;
+                Ok(())
+            }
+            None => match self.journal_directory.create_file(&name) {
+                Ok(file) => {
+                    file.sync_all().map_err(|error| {
+                        journal_error("fsync Ready lease", &layout.journal, error)
+                    })?;
+                    self.journal_directory.sync()?;
+                    Ok(())
+                }
+                Err(_) => {
+                    self.journal_directory.open_file(&name)?;
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    pub(crate) fn open_ready_lease(&self, layout: &ExecutionLayout) -> Result<File, StorageError> {
+        self.verify_directories()?;
+        self.validate_path(layout)?;
+        self.journal_directory.open_file(&lease_name(layout)?)
+    }
+
     pub fn remove(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
         self.verify_directories()?;
         self.validate_path(layout)?;
@@ -399,6 +430,10 @@ impl JournalStore {
                     Path::new(&name).display()
                 ))
             })?;
+            if name.ends_with(".lease") {
+                self.journal_directory.open_file(&name)?;
+                continue;
+            }
             if is_journal_temporary_name(&name) {
                 self.journal_directory.open_file(&name)?;
                 self.journal_directory.remove_file(&name)?;
@@ -430,6 +465,13 @@ impl JournalStore {
         self.state_root.verify("state root")?;
         self.journal_directory.verify("journal directory")
     }
+}
+
+fn lease_name(layout: &ExecutionLayout) -> Result<String, StorageError> {
+    Ok(format!(
+        "{}.lease",
+        journal_name(layout)?.trim_end_matches(".json")
+    ))
 }
 
 #[derive(Debug, Clone)]

@@ -18,9 +18,11 @@ through them fails closed.
   provisioning because it cannot supply that trusted image contract.
 - Provisioning exact-matches allocation ownership labels and `disk_gib`, verifies
   the durable Ready journal/backend/mount/Docker proof through the capability,
-  pins that capability through provisioning, pins every bind directory's
-  filesystem identity, and obtains a fresh full Ready proof immediately before
-  each Docker mutation and container start.
+  acquires an execution-scoped shared Ready lease for the complete async
+  provisioning/rollback lifetime, pins every bind directory's filesystem
+  identity, and obtains a fresh full Ready proof immediately before each Docker
+  mutation and container start. Release requires the corresponding exclusive
+  lease and fails without transitioning the journal while a consumer is active.
 - The runtime compares the current Docker daemon's immutable daemon ID with the
   allocation's daemon-derived bind proof before creating a network or container.
   A foreign-daemon receipt fails as `RuntimeError::ResourceLimit`.
@@ -44,10 +46,16 @@ through them fails closed.
   so the runtime requests and verifies that bound explicitly.
 - Before any workload starts, a short-lived ownership-labelled verifier
   container uses only the configured immutable image ID and absolute command.
+  The image config is inspected immediately before creation and any nonempty
+  declared `VOLUME` set is rejected.
   It mounts every expected source read-only, returns exactly one device/inode
   identity per source, and must match the receipt's daemon-derived execution-root
   identity and device. The verifier is removed before services or the agent are
-  started. Workload entrypoints are never used as a trust probe.
+  started. Its returned immutable container ID is captured; teardown lists only
+  the exact execution selector, requires that ID and every Autospec ownership
+  label, then removes by ID with volume deletion disabled. A same-name foreign
+  replacement is never selected. Workload entrypoints are never used as a trust
+  probe.
 - Any gate failure rolls back through the execution-label selector. The verifier
   image ID and command are included in the versioned Docker proof method, so
   verifier or daemon drift invalidates the allocation.
@@ -68,6 +76,15 @@ through them fails closed.
   daemon-reported mount equality (including anonymous/unexpected rejection),
   bounded memory-only namespace configuration, and replacement of a pinned
   runtime bind directory.
+- Storage regressions prove an exact Ready lease validates the receipt/backend/
+  mount/daemon proof, prevents a concurrent release, and permits release after
+  drop. Invalid release input cannot create lease metadata. A real-Docker
+  observation proves the runtime retains the lease after agent creation through
+  the final workload-start gate, then drops it on successful return.
+- Verifier regressions prove declared verifier-image volumes fail before Docker
+  resource creation without an anonymous-volume leak, and teardown rejects a
+  missing/replaced captured ID or incomplete ownership labels. The configured
+  lifecycle proof executes the recorded absolute `/bin/stat`, never PATH lookup.
 - Real Docker inspection proves exact `/workspace` and `/session` sources,
   deterministic runtime bind sources, `ReadonlyRootfs=true`, log driver `none`,
   no tmpfs/storage options/volumes/socket/ports, and one daemon-observed device.
@@ -86,18 +103,16 @@ through them fails closed.
 
 ## Verification
 
-- Two simultaneous `cargo test -p runtime-docker --test docker_runtime --
-  --test-threads=8` runs — all 16 integration tests passed in both processes
-  against the real Docker daemon. The destructive aggregate quota test
+- `cargo test --workspace` — passed on the current toolchain, including all 14
+  runtime unit tests, 18 real-Docker integration tests, and 41
+  execution-storage unit/integration tests. The destructive aggregate quota test
   printed an explicit skip because no operator APFS/LVM pool is configured.
-- `cargo test -p runtime-docker --lib` — all 12 unit tests passed.
 - `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo test
   --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` —
   passed on the current toolchain.
-- `cargo +1.85.0 fmt --all -- --check`, `build --workspace`, and `clippy
-  --workspace --all-targets -- -D warnings` — passed. All 12 runtime unit, 16
-  real-Docker integration, and 40 execution-storage tests passed under Rust
-  1.85. The full workspace test run is recorded under Remaining concern.
+- `cargo +1.85.0 fmt --all -- --check`, `build --workspace`, `test --workspace`,
+  and `clippy --workspace --all-targets -- -D warnings` — passed, including all
+  14 runtime unit, 18 real-Docker integration, and 41 execution-storage tests.
 - `git diff --check` — passed.
 
 ## Remaining concern
@@ -107,12 +122,6 @@ through them fails closed.
   performing allocation. The execution-storage backend's own configured
   lifecycle test has the same operator gate. Production provisioning fails
   closed when the live Ready allocation or its daemon bind proof is unavailable.
-- The Rust 1.85 full workspace test was attempted twice. An unrelated
-  `harness-pi` process-cleanup timing test exceeded its five-second bound in both
-  full concurrent runs (the second overloaded run also timed out three sibling
-  process-control tests); the exact failing test passed alone in 4.17 seconds.
-  The current-toolchain full workspace test passed, and the complete owned
-  runtime/storage Rust 1.85 suites passed. No `harness-pi` files were changed.
 - The safe storage pin API rechecks captured path/device/inode identity at every
   gate, but it cannot eliminate the final macOS pathname-to-Docker bind race
   without the separately deferred descriptor-relative filesystem work. The

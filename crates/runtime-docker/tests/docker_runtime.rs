@@ -14,7 +14,7 @@ use execution_storage::LvmBackend;
 use execution_storage::{
     AllocationReceipt, AllocationRequest, BackendIdentity, CommandRunner, DockerBindCapability,
     DockerBindProof, DockerBindVerifier, ExecutionStorage, ExecutionStorageManager,
-    ProcessCommandRunner, ReadyAllocationVerifier, StorageBackend, StorageError,
+    ProcessCommandRunner, ReadyAllocationVerifier, ReadyLease, StorageBackend, StorageError,
     VerifiedExecutionStorage, ALLOCATION_API_VERSION,
 };
 use futures_util::StreamExt;
@@ -31,7 +31,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -141,9 +141,44 @@ struct RejectReadyAfterContainerCreate {
 }
 
 #[derive(Debug)]
+struct ObserveProvisionLease {
+    docker: PathBuf,
+    agent_container: String,
+    active: Arc<AtomicBool>,
+    observed_after_create: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct ObservedReadyLease {
+    verified: TestVerifiedStorage,
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for ObservedReadyLease {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+}
+
+impl ReadyLease for ObservedReadyLease {
+    fn verified(&self) -> &dyn VerifiedExecutionStorage {
+        &self.verified
+    }
+}
+
+#[derive(Debug)]
 struct TestVerifiedStorage {
     root: PathBuf,
     repository: PathBuf,
+}
+
+#[derive(Debug)]
+struct TestReadyLease(TestVerifiedStorage);
+
+impl ReadyLease for TestReadyLease {
+    fn verified(&self) -> &dyn VerifiedExecutionStorage {
+        &self.0
+    }
 }
 
 impl VerifiedExecutionStorage for TestVerifiedStorage {
@@ -191,6 +226,19 @@ impl ReadyAllocationVerifier for TestReadyVerifier {
         verified.verify()?;
         Ok(Box::new(verified))
     }
+
+    fn acquire_ready_lease(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn ReadyLease>, StorageError> {
+        let repository = receipt.mount_path.join("repository");
+        let verified = TestVerifiedStorage {
+            root: receipt.mount_path.clone(),
+            repository,
+        };
+        verified.verify()?;
+        Ok(Box::new(TestReadyLease(verified)))
+    }
 }
 
 impl ReadyAllocationVerifier for RejectReadyAfterContainerCreate {
@@ -210,6 +258,50 @@ impl ReadyAllocationVerifier for RejectReadyAfterContainerCreate {
             ));
         }
         TestReadyVerifier.verify_ready(receipt)
+    }
+
+    fn acquire_ready_lease(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn ReadyLease>, StorageError> {
+        TestReadyVerifier.acquire_ready_lease(receipt)
+    }
+}
+
+impl ReadyAllocationVerifier for ObserveProvisionLease {
+    fn verify_ready(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+        let exists = Command::new(&self.docker)
+            .args(["container", "inspect", &self.agent_container])
+            .output()
+            .map_err(|error| StorageError::Command(error.to_string()))?
+            .status
+            .success();
+        if exists {
+            self.observed_after_create.store(true, Ordering::SeqCst);
+            if !self.active.load(Ordering::SeqCst) {
+                return Err(StorageError::IdentityMismatch(
+                    "Ready lease was dropped before workload start".to_owned(),
+                ));
+            }
+        }
+        TestReadyVerifier.verify_ready(receipt)
+    }
+
+    fn acquire_ready_lease(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn ReadyLease>, StorageError> {
+        self.active.store(true, Ordering::SeqCst);
+        Ok(Box::new(ObservedReadyLease {
+            verified: TestVerifiedStorage {
+                root: receipt.mount_path.clone(),
+                repository: receipt.mount_path.join("repository"),
+            },
+            active: Arc::clone(&self.active),
+        }))
     }
 }
 
@@ -257,7 +349,7 @@ impl DockerBindVerifier for DockerCliBindVerifier {
                 "--mount",
                 &mount,
                 &self.verifier_image_id,
-                "stat",
+                "/bin/stat",
                 "-c",
                 "%d:%i",
                 "/proof",
@@ -1130,8 +1222,14 @@ async fn ready_transition_blocks_malicious_workload_entrypoint_before_marker_wri
     let trusted =
         TrustedVerifierImage::new(&verifier_image_id, "/bin/stat").expect("trusted verifier");
     let mut receipt = state.receipt(&labels, runtime_requirement().disk_gib);
-    receipt.docker_bind.daemon_id = daemon_id;
-    receipt.docker_bind.method_version = trusted.proof_method();
+    receipt.docker_bind = DockerCliBindVerifier {
+        docker: docker_bin.clone(),
+        labels: labels.clone(),
+        daemon_id,
+        verifier_image_id,
+    }
+    .verify(&receipt.mount_path)
+    .expect("derive daemon-side execution filesystem identity");
     let agent_name = DockerRuntime::agent_container_name(&labels.execution_id);
     let runtime = DockerRuntime::connect_with_verified_execution_storage(
         None,
@@ -1222,6 +1320,166 @@ async fn ready_transition_blocks_malicious_workload_entrypoint_before_marker_wri
         .cleanup()
         .await
         .expect("remove malicious workload image");
+}
+
+#[tokio::test]
+async fn ready_lease_remains_held_through_the_final_workload_start_gate() {
+    let Some(docker_bin) = docker_cli() else {
+        println!("SKIP Ready lease start gate: Docker CLI is absent");
+        return;
+    };
+    let labels = labels_for(unique_execution_id());
+    let state = TestStateRoot::new(&labels);
+    let docker = raw_client().expect("connect Docker");
+    if let Err(error) = docker.version().await {
+        println!("SKIP Ready lease start gate: Docker daemon unavailable: {error}");
+        return;
+    }
+    ensure_alpine_image(&docker).await;
+    let daemon_id = docker
+        .info()
+        .await
+        .expect("daemon info")
+        .id
+        .expect("daemon ID");
+    let verifier_image_id = docker
+        .inspect_image("alpine:3.20")
+        .await
+        .expect("trusted image")
+        .id
+        .expect("trusted image ID");
+    let trusted =
+        TrustedVerifierImage::new(&verifier_image_id, "/bin/stat").expect("trusted verifier");
+    let mut receipt = state.receipt(&labels, runtime_requirement().disk_gib);
+    receipt.docker_bind = DockerCliBindVerifier {
+        docker: docker_bin.clone(),
+        labels: labels.clone(),
+        daemon_id,
+        verifier_image_id,
+    }
+    .verify(&receipt.mount_path)
+    .expect("derive daemon-side execution filesystem identity");
+    let active = Arc::new(AtomicBool::new(false));
+    let observed_after_create = Arc::new(AtomicBool::new(false));
+    let runtime = DockerRuntime::connect_with_verified_execution_storage(
+        None,
+        Arc::new(ObserveProvisionLease {
+            docker: docker_bin,
+            agent_container: DockerRuntime::agent_container_name(&labels.execution_id),
+            active: Arc::clone(&active),
+            observed_after_create: Arc::clone(&observed_after_create),
+        }),
+        receipt,
+        trusted,
+    )
+    .expect("storage-backed runtime");
+    let mut scope = DockerTestScope::new(&runtime, &labels);
+
+    runtime
+        .provision(&labels, &runtime_requirement(), &[])
+        .await
+        .expect("provision while retaining Ready lease");
+    assert!(observed_after_create.load(Ordering::SeqCst));
+    assert!(
+        !active.load(Ordering::SeqCst),
+        "provisioning must drop its Ready lease after the final start succeeds"
+    );
+
+    scope.cleanup().await.expect("cleanup lease-gated runtime");
+}
+
+#[tokio::test]
+async fn verifier_image_volume_is_rejected_without_creating_anonymous_volumes() {
+    let labels = labels_for(unique_execution_id());
+    let state = TestStateRoot::new(&labels);
+    let docker = raw_client().expect("connect Docker");
+    if let Err(error) = docker.version().await {
+        println!("SKIP verifier image VOLUME rejection: Docker daemon unavailable: {error}");
+        return;
+    }
+    ensure_alpine_image(&docker).await;
+    let daemon_id = docker
+        .info()
+        .await
+        .expect("daemon info")
+        .id
+        .expect("daemon ID");
+    let source = format!("autospec-{}-verifier-volume-source", labels.execution_id);
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: source.clone(),
+                platform: None,
+            }),
+            Config::<String> {
+                image: Some("alpine:3.20".to_owned()),
+                labels: Some(control_label_map(&labels)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create verifier image source");
+    let image = commit_volume_image(&docker, &source, &labels, "/proof-cache", 0).await;
+    docker
+        .remove_container(
+            &source,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                v: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("remove verifier image source");
+    let verifier_image_id = docker
+        .inspect_image(&image)
+        .await
+        .expect("inspect verifier VOLUME image")
+        .id
+        .expect("verifier image ID");
+    let trusted =
+        TrustedVerifierImage::new(&verifier_image_id, "/bin/stat").expect("trusted verifier");
+    let mut receipt = state.receipt(&labels, runtime_requirement().disk_gib);
+    receipt.docker_bind.daemon_id = daemon_id;
+    receipt.docker_bind.method_version = trusted.proof_method();
+    let runtime = DockerRuntime::connect_with_verified_execution_storage(
+        None,
+        Arc::new(TestReadyVerifier),
+        receipt,
+        trusted,
+    )
+    .expect("storage-backed runtime");
+    let mut scope = DockerTestScope::new(&runtime, &labels);
+    let mut image_guard = DockerImageGuard::new(&docker);
+    image_guard.track(image);
+    let volumes_before = volume_names(&docker).await;
+
+    let error = runtime
+        .provision(&labels, &runtime_requirement(), &[])
+        .await
+        .expect_err("trusted verifier VOLUME must fail before Docker resources");
+    assert!(error.to_string().contains("declares writable volumes"));
+    let volumes_after = volume_names(&docker).await;
+    let new_anonymous = volumes_after
+        .difference(&volumes_before)
+        .filter(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .collect::<Vec<_>>();
+    assert!(
+        new_anonymous.is_empty(),
+        "verifier rejection leaked anonymous volumes: {new_anonymous:?}"
+    );
+    assert!(docker
+        .list_containers(Some(bollard::container::ListContainersOptions {
+            all: true,
+            filters: HashMap::from([("label".to_owned(), labels.selector())]),
+            ..Default::default()
+        }))
+        .await
+        .expect("list rejected verifier execution")
+        .is_empty());
+
+    scope.cleanup().await.expect("cleanup rejected execution");
+    image_guard.cleanup().await.expect("cleanup verifier image");
 }
 
 #[tokio::test]
