@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete after review fix round 5. The Pi 0.84.3 harness now launches only
+Complete after review fix round 6. The Pi 0.84.3 harness now launches only
 inside its provisioned agent container through argument-separated `docker exec`,
 using `/workspace` and `/session` container paths and one compact materialized
 `TaskPacket`. The authoritative live JSON event stream is captured durably on
@@ -37,10 +37,16 @@ in memory. Root `docker exec` control commands signal that trusted PGID, while
 bounded drop cleanup uses `try_wait`, TERM, and KILL without an indefinite wait.
 The supervisor now emits a token-bound PGID header and blocks before Pi exec on
 an interactive stdin acknowledgment. The host sends that ACK only after header
-validation and event-pump registration; invalid, unreadable, timed-out, or
-thread-spawn startup failures close the channel, so no accepted future launch can
-enter the Pi body. The removed token-free stability heuristic is no longer part
-of correctness. Group reap uses Linux `/proc` PGID and non-zombie membership
+validation and event-pump registration. The supervisor then emits a distinct
+READY record carrying the same unpredictable token before it can exec Pi, and
+the host does not register or report startup success until its trusted stdout
+reader validates that exact confirmation. A dropped ACK, malformed READY,
+wrong-token replay, timeout, or EOF therefore retains the trusted PGID and Docker
+client for bounded cleanup; those control records are consumed without losing
+the first byte of subsequent Pi JSON output. Invalid, unreadable, timed-out, or
+thread-spawn startup failures close the launch gate, so no accepted future launch
+can enter the Pi body. The removed token-free stability heuristic is no longer
+part of correctness. Group reap uses Linux `/proc` PGID and non-zombie membership
 rather than `kill -0`; zombie-only groups no longer block stop, drop, or startup
 cleanup, and the harness does not depend on a PID 1 reaper. The durable live event
 file, reducer/cursor, owner, and resume count all stay in the host-private session
@@ -58,11 +64,12 @@ root; only `session_root/conversation/` is mounted at `/session`.
 - `96d3a68` — widen delayed-start stability under parallel Docker load.
 - `65dc4ae` — replace startup heuristics with the token-bound ACK gate and remove
   public test injection controls.
+- `3e0acab` — require an exact token-bound READY proof before startup succeeds.
 - Report commit — this report.
 
 ## Tests
 
-- `cargo test -p harness-pi --test pi_harness` — 17 passed against a real Docker
+- `cargo test -p harness-pi --test pi_harness` — 20 passed against a real Docker
   daemon and isolated labelled Debian containers with a mounted stub Pi. Coverage
   includes container-only paths, absent model-selection flags, distinct live and
   conversation JSONL, incremental partial-line delivery, persistence after
@@ -81,7 +88,12 @@ root; only `session_root/conversation/` is mounted at `/session`.
   event-thread spawn failure, and verifies undeclared `message` records increase
   the unknown counter. Round-5 coverage delays Docker acceptance, injects a
   reader failure, and proves through a body marker that Pi never executes after
-  the host returns a startup error.
+  the host returns a startup error. Round-6 coverage adds a Docker proxy that
+  forwards the trusted header but consumes the ACK, plus malformed and replayed
+  wrong-token READY records; all three startup paths fail, reap their supervisor,
+  and leave the Pi body marker absent. The normal live-event test also proves
+  READY consumption preserves the first Pi JSON record without leaking either
+  control record into the durable event stream.
 - `cargo test -p orchestrator-worker --test health` — 3 passed; half-window
   inactivity warning/reset, inactivity and wall-clock failures, and sustained
   CPU saturation.
@@ -90,7 +102,7 @@ root; only `session_root/conversation/` is mounted at `/session`.
   `cargo fmt --all -- --check` — passed, including real Docker, PostgreSQL, and
   Git suites.
 - Rust 1.85: the same complete build/test/clippy/fmt gate — passed, including
-  the seventeen real-Docker Pi harness tests.
+  the twenty real-Docker Pi harness tests.
 
 ## Concerns
 
