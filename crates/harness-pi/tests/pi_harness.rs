@@ -4,7 +4,7 @@ use execution_storage::{
     VerifiedExecutionStorage, ALLOCATION_API_VERSION,
 };
 use harness_pi::{PiHarness, PiHarnessConfig};
-use harness_traits::{AgentHarness, HarnessError};
+use harness_traits::{AgentHarness, HarnessError, SessionRef};
 use orchestrator_core::{
     event::ExecutionEventKind, ExecutionId, FailureClass, ModelPolicy, OwnershipLabels, TaskPacket,
     WorkerId,
@@ -552,6 +552,23 @@ fn pi_is_alive(fixture: &DockerPi) -> bool {
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains("/usr/local/bin/pi")
         })
+}
+
+fn pi_process_count(fixture: &DockerPi) -> usize {
+    let output = Command::new("docker")
+        .args(["top", &fixture.container, "-eo", "pid,pgid,args"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("/usr/local/bin/pi"))
+        .count()
 }
 
 async fn wait_for_pi_pgid(fixture: &DockerPi) -> u32 {
@@ -1466,11 +1483,7 @@ fn crash_process_helper() {
     std::process::exit(86);
 }
 
-#[tokio::test]
-async fn worker_process_crash_leaves_hold_for_fresh_harness_recovery() {
-    let Some(fixture) = DockerPi::create() else {
-        return;
-    };
+async fn leave_crashed_pi(fixture: &DockerPi) -> SessionRef {
     fs::write(
         fixture
             .receipt
@@ -1499,6 +1512,25 @@ async fn worker_process_crash_leaves_hold_for_fresh_harness_recovery() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let durable = fixture
+        .conversation_dir()
+        .join(format!("session_{}.jsonl", fixture.execution_id));
+    wait_for_content(&durable, "\"type\":\"session\"").await;
+    assert!(pi_is_alive(fixture));
+    SessionRef {
+        id: orchestrator_core::SessionId::new(&fixture.execution_id),
+        path: fixture.session_dir().display().to_string(),
+        execution_id: fixture.receipt.labels.execution_id.clone(),
+        worktree_path: fixture.worktree_dir().display().to_string(),
+    }
+}
+
+#[tokio::test]
+async fn worker_process_crash_leaves_hold_for_fresh_harness_recovery() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let _crashed = leave_crashed_pi(&fixture).await;
     let holds = ExecutionLifecycleHoldStore::new(
         fixture
             .receipt
@@ -1524,6 +1556,72 @@ async fn worker_process_crash_leaves_hold_for_fresh_harness_recovery() {
         .list(&fixture.receipt.labels.execution_id)
         .unwrap()
         .is_empty());
+    assert!(!pi_is_alive(&fixture));
+}
+
+#[tokio::test]
+async fn crashed_pi_resume_recovers_before_any_session_mutation() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let session = leave_crashed_pi(&fixture).await;
+    let durable = fixture
+        .conversation_dir()
+        .join(format!("session_{}.jsonl", fixture.execution_id));
+    let count_path = fixture.session_dir().join("resume-count");
+    let durable_before = fs::read(&durable).unwrap();
+    let count_before = fs::read(&count_path).unwrap();
+    let blocked = fixture.root.path().join("block-recovery");
+    fs::write(&blocked, "1").unwrap();
+    let mut config = fixture.harness().config().clone();
+    config.docker_binary = fixture.controllable_cleanup_docker_proxy(&blocked);
+    let harness = PiHarness::new(config);
+
+    assert!(harness.resume(&session).await.is_err());
+    assert_eq!(fs::read(&durable).unwrap(), durable_before);
+    assert_eq!(fs::read(&count_path).unwrap(), count_before);
+    assert!(pi_is_alive(&fixture));
+    assert_eq!(pi_process_count(&fixture), 1);
+
+    fs::remove_file(blocked).unwrap();
+    harness.resume(&session).await.unwrap();
+    harness.stop(&session).await.unwrap();
+    assert_eq!(fs::read_to_string(count_path).unwrap(), "1\n");
+    assert!(!pi_is_alive(&fixture));
+}
+
+#[tokio::test]
+async fn crashed_pi_fork_recovers_before_any_conversation_mutation() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let session = leave_crashed_pi(&fixture).await;
+    let durable = fixture
+        .conversation_dir()
+        .join(format!("session_{}.jsonl", fixture.execution_id));
+    let mut durable_before = fs::read(&durable).unwrap();
+    durable_before.extend_from_slice(b"{\"type\":\"message_end\"");
+    fs::write(&durable, &durable_before).unwrap();
+    let owner_path = fixture.session_dir().join("owner.json");
+    let count_path = fixture.session_dir().join("resume-count");
+    let owner_before = fs::read(&owner_path).unwrap();
+    let count_before = fs::read(&count_path).unwrap();
+    let blocked = fixture.root.path().join("block-recovery");
+    fs::write(&blocked, "1").unwrap();
+    let mut config = fixture.harness().config().clone();
+    config.docker_binary = fixture.controllable_cleanup_docker_proxy(&blocked);
+    let harness = PiHarness::new(config);
+
+    assert!(harness.fork_conversation(&session).await.is_err());
+    assert_eq!(fs::read(&durable).unwrap(), durable_before);
+    assert_eq!(fs::read(&owner_path).unwrap(), owner_before);
+    assert_eq!(fs::read(&count_path).unwrap(), count_before);
+    assert!(pi_is_alive(&fixture));
+    assert_eq!(pi_process_count(&fixture), 1);
+
+    fs::remove_file(blocked).unwrap();
+    let fork = harness.fork_conversation(&session).await.unwrap();
+    harness.stop(&fork).await.unwrap();
     assert!(!pi_is_alive(&fixture));
 }
 

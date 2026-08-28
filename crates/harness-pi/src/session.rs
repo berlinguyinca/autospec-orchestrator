@@ -86,9 +86,7 @@ pub(crate) struct SessionOwner {
 }
 
 pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionRef, HarnessError> {
-    let storage = harness.acquire_ready_storage()?;
-    verify_live_agent_container(harness, &storage.layout)?;
-    recover_lifecycle_holds(harness)?;
+    let storage = prepare_launch(harness)?;
     ensure_docker_and_pi(harness)?;
     let execution_id = harness.config.labels.execution_id.clone();
     let session_id = SessionId::new(execution_id.to_string());
@@ -126,9 +124,29 @@ pub(crate) fn start(harness: &PiHarness, packet: &TaskPacket) -> Result<SessionR
     Ok(session)
 }
 
-fn recover_lifecycle_holds(harness: &PiHarness) -> Result<(), HarnessError> {
-    let store = ExecutionLifecycleHoldStore::new(&harness.config.state_root)
+pub(crate) fn prepare_launch(harness: &PiHarness) -> Result<ReadyPiStorage, HarnessError> {
+    let storage = harness.acquire_ready_storage()?;
+    verify_live_agent_container(harness, &storage.layout)?;
+    recover_lifecycle_holds(harness)?;
+    let unresolved = lifecycle_hold_store(harness)?
+        .list(&harness.config.labels.execution_id)
         .map_err(crate::storage_error)?;
+    if !unresolved.is_empty() {
+        return Err(HarnessError::Start(format!(
+            "{} unresolved Pi lifecycle hold(s) remain for execution {}",
+            unresolved.len(),
+            harness.config.labels.execution_id
+        )));
+    }
+    Ok(storage)
+}
+
+fn lifecycle_hold_store(harness: &PiHarness) -> Result<ExecutionLifecycleHoldStore, HarnessError> {
+    ExecutionLifecycleHoldStore::new(&harness.config.state_root).map_err(crate::storage_error)
+}
+
+fn recover_lifecycle_holds(harness: &PiHarness) -> Result<(), HarnessError> {
+    let store = lifecycle_hold_store(harness)?;
     for hold in store
         .list(&harness.config.labels.execution_id)
         .map_err(crate::storage_error)?
