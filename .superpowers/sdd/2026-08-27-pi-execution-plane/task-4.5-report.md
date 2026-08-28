@@ -387,6 +387,25 @@ polling loops, or `du`/`df` accounting.
   the same Docker, Git, and Postgres integration suites.
 - `git diff --check` — passed.
 
+## Pi/storage fix round 2
+
+- Replaced exit-code-based group absence with an unpredictable token-bound,
+  exact-schema root probe. Only a successful, correctly tokened parse with no
+  non-zombie members proves reap; status 1, malformed output, timeout, stopped
+  containers, and transport failures remain uncertain and retain authority.
+- Added fsynced lifecycle holds under `execution-storage/holds`, outside the
+  releasable allocation. Holds bind exact labels, container ID, session/token,
+  and PGID; release refuses them before entering Releasing. Pi creates the hold
+  before launch and removes it only after client and group reap. New harness
+  instances enumerate and recover matching abandoned holds after live container
+  verification.
+- Resume and fork now revalidate the live immutable container capability after
+  lease acquisition and before owner reads, JSONL repair, count updates, or
+  writes. Stopped-container tests prove count and torn JSONL remain unchanged.
+- Verification: current and Rust 1.85 full workspace build/test and warning-
+  denied Clippy passed; current Pi 32/32, storage 30/30, runtime-Docker 18/18,
+  Git 58/58, and Postgres 4/4 passed. Formatting and diff checks passed.
+
 ## Remaining Integration Work
 
 - Round-2 filesystem finding 3 is not fully closed on macOS. The exact missing
