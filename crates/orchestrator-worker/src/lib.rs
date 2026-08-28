@@ -4,6 +4,10 @@
 //! reports events upstream, and cleans up exactly what it created. It makes no
 //! project-level decisions.
 
+mod health;
+
+pub use health::{HealthAssessment, HealthMonitor};
+
 use anyhow::Result;
 use git_worktree::WorktreeManager;
 use harness_traits::AgentHarness;

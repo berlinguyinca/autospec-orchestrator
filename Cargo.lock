@@ -693,12 +693,16 @@ dependencies = [
 name = "harness-pi"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
+ "chrono",
  "harness-traits",
  "orchestrator-core",
+ "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

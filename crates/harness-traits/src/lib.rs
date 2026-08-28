@@ -4,7 +4,7 @@
 //! on Pi-specific process semantics.
 
 use async_trait::async_trait;
-use orchestrator_core::{ExecutionEvent, SessionId, TaskPacket};
+use orchestrator_core::{ExecutionEvent, ExecutionId, SessionId, TaskPacket};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -19,6 +19,10 @@ pub enum HarnessError {
     ModelFailed(String),
     #[error("session not resumable: {0}")]
     NotResumable(String),
+    #[error("invalid harness session: {0}")]
+    InvalidSession(String),
+    #[error("harness I/O failed: {0}")]
+    Io(String),
 }
 
 /// Where a harness session's durable state lives. Sessions persist independently
@@ -27,6 +31,8 @@ pub enum HarnessError {
 pub struct SessionRef {
     pub id: SessionId,
     pub path: String,
+    pub execution_id: ExecutionId,
+    pub worktree_path: String,
 }
 
 #[async_trait]
