@@ -1,4 +1,4 @@
-# Task 4.5 Slice A Report: Execution storage foundation
+# Task 4.5 Report: Execution storage foundation and Git migration
 
 ## Outcome
 
@@ -9,9 +9,32 @@ checked allocation sizing, durable phase journals, exact allocation receipts,
 fail-closed APFS and thick-LVM backends, and an explicit Docker bind-verification
 capability contract.
 
-This slice intentionally stops at the foundation. Existing Git, Pi, Docker, and
-worker paths are unchanged and must not claim `disk_gib` enforcement until they
+The foundation slice intentionally stopped before consumer migration. The Git
+migration now consumes the deterministic bounded repository path; Pi, Docker,
+and worker lifecycle paths must not claim `disk_gib` enforcement until they
 consume a verified allocation receipt.
+
+## Git Migration
+
+- Added `WorktreeManager::create_in` for the exact
+  `executions/{execution_id}/repository` directory supplied from verified
+  execution storage. The legacy unbounded `create` entry point fails closed.
+- Replaced linked `git worktree add` repositories with copy-producing
+  `git clone --no-local --no-hardlinks --no-checkout` materialization. The
+  execution repository resets `origin` to the configured canonical clone
+  locator, so no execution remote references the worker mirror.
+- Verified `.git`, the common directory, object database, refs, index, and lock
+  location all resolve beneath the bounded repository root.
+- Kept mirrors as locked, exact-origin-verified input/update infrastructure.
+  A large execution-only commit leaves mirror object and ref inventories
+  unchanged.
+- Preserved repository/branch ownership validation, injective mirror naming,
+  diff evidence, branch collision locks, stale discovery, owner-record safety,
+  and durable retryable cleanup journals on the new execution layout.
+- Added an injectable `WorktreeFilesystem` boundary. Real-Git regressions inject
+  ENOSPC after a partial clone and during owner-record commit, prove exact
+  rollback to an empty bounded repository directory, and prove cleanup retries
+  from durable exact ownership without touching foreign resources.
 
 ## Public Contract
 
@@ -132,6 +155,9 @@ polling loops, or `du`/`df` accounting.
 
 ## Verification
 
+- `cargo test -p git-worktree` — 31 real temporary Git repository tests passed,
+  including independent Git-path containment, mirror immutability, ENOSPC
+  rollback, exact cleanup, foreign-resource survival, and stale discovery.
 - `cargo test -p execution-storage -- --nocapture` — 32 passed. The real Docker
   bind verifier contract ran. The destructive aggregate quota lifecycle printed
   an explicit skip because no operator pool is configured on this host; when
@@ -144,7 +170,7 @@ polling loops, or `du`/`df` accounting.
   `cargo clippy --workspace --all-targets -- -D warnings` — passed, including
   all real-Docker runtime tests.
 - Rust 1.85 ran the same full fmt/build/test/clippy workspace matrix — passed,
-  including all real-Docker runtime tests.
+  including all 31 Git tests and all 13 real-Docker runtime tests.
 
 ## Remaining Integration Work
 
@@ -156,9 +182,9 @@ polling loops, or `du`/`df` accounting.
   (already transitive in `Cargo.lock`) or a narrowly audited unsafe exception is
   required. No unsafe or `rustix` dependency was added in this round.
 
-- Git, Pi, Docker, and worker lifecycle consumers remain on their old layouts by
+- Pi, Docker, and worker lifecycle consumers remain on their old layouts by
   design; later Task 4.5 slices must switch them only after receiving a verified
-  receipt.
+  receipt and pass its repository path to Git `create_in`.
 - Destructive real APFS/LVM allocation requires `AUTOSPEC_APFS_PROBE_PATH` or
   `AUTOSPEC_LVM_VOLUME_GROUP` plus appropriate privilege. Neither operator-pool
   configuration is present on this host, so only that test was skipped.

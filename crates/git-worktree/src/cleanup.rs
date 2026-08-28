@@ -1,7 +1,7 @@
 use crate::lock::FileLock;
 use crate::manager::{
     atomic_write_new, git_stdout, hex_component, normalized_repository_name, read_owner_record,
-    run_git, GitWorktreeManager, OwnerRecord,
+    GitWorktreeManager, OwnerRecord,
 };
 use crate::{Worktree, WorktreeError};
 use orchestrator_core::labels::{EXECUTION_ID, MANAGED, REPOSITORY};
@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CleanupJournal {
@@ -50,17 +49,7 @@ pub(crate) fn destroy(
         }
     };
     let repository = required_label(&journal.owner, REPOSITORY)?;
-
     let normalized = normalized_repository_name(repository)?;
-    let mirror = manager.mirrors_root().join(format!("{normalized}.git"));
-    if !mirror.is_dir() {
-        return Err(WorktreeError::Ownership(format!(
-            "missing owned mirror {}",
-            mirror.display()
-        )));
-    }
-    let mirror_lock = mirror.with_extension("git.lock");
-    let _mirror_lock = FileLock::acquire_with(&mirror_lock, WorktreeError::Cleanup)?;
     let lock_path = manager.mirrors_root().join(format!(
         "{normalized}.branch-{}.lock",
         hex_component(&worktree.branch)
@@ -72,33 +61,8 @@ pub(crate) fn destroy(
     }
 
     let path = Path::new(&journal.worktree_path);
-    let mut errors = Vec::new();
-    if let Err(error) = remove_worktree_if_present(&mirror, path, &journal.owner.branch) {
-        errors.push(format!("remove worktree: {error}"));
-    }
-    match branch_exists(&mirror, &journal.owner.branch) {
-        Ok(true) => {
-            if let Err(error) = run_git(
-                [
-                    OsStr::new("--git-dir"),
-                    mirror.as_os_str(),
-                    OsStr::new("branch"),
-                    OsStr::new("-D"),
-                    OsStr::new(&journal.owner.branch),
-                ],
-                WorktreeError::Cleanup,
-            ) {
-                errors.push(format!("delete branch: {error}"));
-            }
-        }
-        Ok(false) => {}
-        Err(error) => errors.push(format!("inspect branch: {error}")),
-    }
-    if errors.is_empty() {
-        fs::remove_file(&journal_path).map_err(|error| WorktreeError::Cleanup(error.to_string()))
-    } else {
-        Err(WorktreeError::Cleanup(errors.join("; ")))
-    }
+    remove_repository_if_present(manager, path, &journal.owner.branch)?;
+    fs::remove_file(&journal_path).map_err(|error| WorktreeError::Cleanup(error.to_string()))
 }
 
 fn cleanup_journal_path(manager: &GitWorktreeManager, execution_id: &ExecutionId) -> PathBuf {
@@ -130,6 +94,8 @@ fn write_cleanup_journal(
     final_path: &Path,
     journal: &CleanupJournal,
 ) -> Result<(), WorktreeError> {
+    fs::create_dir_all(manager.worktrees_root())
+        .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
     let temporary_path = final_path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(journal)
         .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
@@ -147,9 +113,7 @@ fn verify_journal(
     worktree: &Worktree,
     journal: &CleanupJournal,
 ) -> Result<(), WorktreeError> {
-    let expected = manager
-        .worktrees_root()
-        .join(worktree.execution_id.as_str());
+    let expected = manager.execution_repository_path(&worktree.execution_id);
     if journal.worktree_path == worktree.path
         && Path::new(&journal.worktree_path) == expected
         && journal.owner.labels.get(MANAGED).map(String::as_str) == Some("true")
@@ -169,8 +133,8 @@ fn verify_journal(
     }
 }
 
-fn remove_worktree_if_present(
-    mirror: &Path,
+fn remove_repository_if_present(
+    manager: &GitWorktreeManager,
     path: &Path,
     branch: &str,
 ) -> Result<(), WorktreeError> {
@@ -181,7 +145,7 @@ fn remove_worktree_if_present(
     };
     if !metadata.file_type().is_dir() {
         return Err(WorktreeError::Ownership(format!(
-            "worktree path is not a real directory: {}",
+            "repository path is not a real directory: {}",
             path.display()
         )));
     }
@@ -192,40 +156,11 @@ fn remove_worktree_if_present(
             path.display()
         )));
     }
-    run_git(
-        [
-            OsStr::new("--git-dir"),
-            mirror.as_os_str(),
-            OsStr::new("worktree"),
-            OsStr::new("remove"),
-            OsStr::new("--force"),
-            path.as_os_str(),
-        ],
-        WorktreeError::Cleanup,
-    )?;
-    Ok(())
-}
-
-fn branch_exists(mirror: &Path, branch: &str) -> Result<bool, WorktreeError> {
-    let reference = format!("refs/heads/{branch}");
-    let output = Command::new("git")
-        .args([
-            OsStr::new("--git-dir"),
-            mirror.as_os_str(),
-            OsStr::new("show-ref"),
-            OsStr::new("--verify"),
-            OsStr::new("--quiet"),
-            OsStr::new(&reference),
-        ])
-        .output()
-        .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(WorktreeError::Cleanup(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        )),
-    }
+    verify_git_storage_is_bounded(path)?;
+    manager
+        .filesystem
+        .remove_repository(path)
+        .map_err(|error| WorktreeError::Cleanup(error.to_string()))
 }
 
 pub(crate) fn find_stale(
@@ -233,34 +168,46 @@ pub(crate) fn find_stale(
     live: &[ExecutionId],
 ) -> Result<Vec<Worktree>, WorktreeError> {
     let live: BTreeSet<&ExecutionId> = live.iter().collect();
-    let entries = match fs::read_dir(manager.worktrees_root()) {
+    let entries = match fs::read_dir(manager.executions_root()) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(WorktreeError::Cleanup(error.to_string())),
     };
     let mut stale = Vec::new();
     for entry in entries {
-        let path = entry
+        let execution_root = entry
             .map_err(|error| WorktreeError::Cleanup(error.to_string()))?
             .path();
-        let metadata = fs::symlink_metadata(&path)
+        let metadata = fs::symlink_metadata(&execution_root)
             .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
         if metadata.file_type().is_symlink() {
             return Err(WorktreeError::Ownership(format!(
-                "symlinked worktree entry: {}",
-                path.display()
+                "symlinked execution entry: {}",
+                execution_root.display()
             )));
         }
         if !metadata.file_type().is_dir() {
             continue;
+        }
+        let path = execution_root.join("repository");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(WorktreeError::Cleanup(error.to_string())),
+        };
+        if !metadata.file_type().is_dir() {
+            return Err(WorktreeError::Ownership(format!(
+                "repository entry is not a real directory: {}",
+                path.display()
+            )));
         }
         let record = read_owner_record(&path)?;
         if record.labels.get(MANAGED).map(String::as_str) != Some("true") {
             continue;
         }
         let execution_id = ExecutionId::new(required_label(&record, EXECUTION_ID)?);
-        let expected = manager.worktrees_root().join(execution_id.as_str());
-        if path != expected {
+        let expected_execution_root = manager.executions_root().join(execution_id.as_str());
+        if execution_root != expected_execution_root {
             return Err(WorktreeError::Ownership(format!(
                 "owner record path mismatch: {}",
                 path.display()
@@ -295,9 +242,7 @@ pub(crate) fn verified_path(
     manager: &GitWorktreeManager,
     worktree: &Worktree,
 ) -> Result<PathBuf, WorktreeError> {
-    let expected = manager
-        .worktrees_root()
-        .join(worktree.execution_id.as_str());
+    let expected = manager.execution_repository_path(&worktree.execution_id);
     let is_real_directory = fs::symlink_metadata(&expected)
         .map(|metadata| metadata.file_type().is_dir())
         .unwrap_or(false);
@@ -341,4 +286,36 @@ fn current_branch(path: &Path) -> Result<String, WorktreeError> {
         ],
         WorktreeError::Cleanup,
     )
+}
+
+fn verify_git_storage_is_bounded(path: &Path) -> Result<(), WorktreeError> {
+    let canonical_root = path
+        .canonicalize()
+        .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
+    for argument in ["--git-dir", "--git-common-dir"] {
+        let reported = git_stdout(
+            [
+                OsStr::new("-C"),
+                path.as_os_str(),
+                OsStr::new("rev-parse"),
+                OsStr::new(argument),
+            ],
+            WorktreeError::Cleanup,
+        )?;
+        let reported = PathBuf::from(reported);
+        let resolved = if reported.is_absolute() {
+            reported
+        } else {
+            path.join(reported)
+        }
+        .canonicalize()
+        .map_err(|error| WorktreeError::Cleanup(error.to_string()))?;
+        if !resolved.starts_with(&canonical_root) {
+            return Err(WorktreeError::Ownership(format!(
+                "{argument} escapes repository root {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
