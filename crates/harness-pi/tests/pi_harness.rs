@@ -203,6 +203,38 @@ esac
         wrapper
     }
 
+    fn ack_dropping_docker_proxy(&self) -> PathBuf {
+        let docker = Command::new("sh")
+            .args(["-c", "command -v docker"])
+            .output()
+            .unwrap();
+        assert!(docker.status.success());
+        let docker = String::from_utf8(docker.stdout).unwrap();
+        let wrapper = self.root.path().join("ack-dropping-docker");
+        fs::write(
+            &wrapper,
+            format!(
+                r#"#!/bin/sh
+real_docker={docker:?}
+case "$1 $2 $3 $4" in
+  "exec --interactive --env AUTOSPEC_SUPERVISOR_TOKEN="*)
+    (IFS= read -r dropped; sleep 5) >/dev/null 2>&1 &
+    "$real_docker" "$@" </dev/null
+    status=$?
+    wait
+    exit "$status"
+    ;;
+  *) exec "$real_docker" "$@" ;;
+esac
+"#,
+                docker = docker.trim()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        wrapper
+    }
+
     fn remove_container(&mut self) {
         let _ = Command::new("docker")
             .args(["rm", "-f", &self.container])
@@ -564,6 +596,63 @@ async fn delayed_reader_failure_cannot_release_a_pi_body() {
     );
 }
 
+#[tokio::test]
+async fn docker_proxy_that_drops_ack_cannot_release_a_pi_body() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let mut config = fixture.harness().config().clone();
+    config.docker_binary = fixture.ack_dropping_docker_proxy();
+    let harness = PiHarness::new(config);
+    let started = Instant::now();
+    let result = harness.start(&packet()).await;
+    assert!(matches!(result, Err(HarnessError::Start(_))));
+    assert!(started.elapsed() < Duration::from_secs(20));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("worktree/pi-body-started")
+            .exists(),
+        "Pi body executed without a READY confirmation"
+    );
+    assert!(!pi_is_alive(&fixture));
+}
+
+#[tokio::test]
+async fn malformed_ready_confirmation_reaps_supervisor_without_running_pi() {
+    startup_ready_failure_reaps("handshake-ready-malformed").await;
+}
+
+#[tokio::test]
+async fn replayed_wrong_token_ready_reaps_supervisor_without_running_pi() {
+    startup_ready_failure_reaps("handshake-ready-wrong-token").await;
+}
+
+async fn startup_ready_failure_reaps(failure: &str) {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.root.path().join("worktree").join(failure), "").unwrap();
+    let harness = fixture.harness();
+    let started = Instant::now();
+    let result = harness.start(&packet()).await;
+    let pgid = wait_for_pi_pgid(&fixture).await;
+    assert!(matches!(result, Err(HarnessError::Start(_))));
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("worktree/pi-body-started")
+            .exists(),
+        "Pi body executed after invalid READY confirmation"
+    );
+    assert!(!pi_is_alive(&fixture));
+    assert_zombie_only_group(&fixture, pgid);
+}
+
 async fn startup_handshake_failure_reaps(failure: &str) {
     let Some(fixture) = DockerPi::create() else {
         return;
@@ -840,6 +929,26 @@ while :; do sleep 0.05; done
 "#;
 
 const STUB_SETSID: &str = r#"#!/bin/sh
+if [ -f /workspace/handshake-ready-malformed ] || [ -f /workspace/handshake-ready-wrong-token ]; then
+  token=$5
+  mode=malformed
+  [ -f /workspace/handshake-ready-wrong-token ] && mode=wrong-token
+  shift 5
+  exec /usr/bin/setsid /bin/sh -c '
+    token=$1; mode=$2
+    stat=$(cat /proc/$$/stat); rest=${stat##*) }; set -- $rest; printf "%s\n" "$3" > /session/test-pgid
+    printf "{\"type\":\"autospec_control\",\"token\":\"%s\",\"pgid\":%s}\n" "$token" "$3"
+    IFS= read -r ack || exit 125
+    [ "$ack" = "ACK $token" ] || exit 125
+    if [ "$mode" = malformed ]; then
+      printf "not-ready\n"
+    else
+      printf "{\"type\":\"autospec_ready\",\"token\":\"replayed-token\"}\n"
+    fi
+    IFS= read -r ignored || exit 125
+    exit 125
+  ' injected "$token" "$mode" "$@"
+fi
 if [ -f /workspace/handshake-invalid ]; then
   shift 5
   exec /usr/bin/setsid /bin/sh -c '

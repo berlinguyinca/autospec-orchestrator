@@ -7,10 +7,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc, Arc,
-    },
+    sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -29,6 +26,7 @@ shift
 printf '{"type":"autospec_control","token":"%s","pgid":%s}\n' "$token" "$$"
 IFS= read -r ack || exit 125
 [ "$ack" = "ACK $token" ] || exit 125
+printf '{"type":"autospec_ready","token":"%s"}\n' "$token"
 exec "$@""#;
 const GROUP_HAS_RUNNABLE: &str = r#"target=$1
 for stat_file in /proc/[0-9]*/stat; do
@@ -54,8 +52,6 @@ for environment in /proc/[0-9]*/environ; do
     [ "$state" = Z ] || printf '%s\n' "$pgid"
   fi
 done"#;
-static SUPERVISOR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionOwner {
     pub(crate) execution_id: String,
@@ -194,11 +190,7 @@ pub(crate) fn spawn(
         .append(true)
         .open(session_dir.join(format!("pi.stderr-{}.log", session.id)))
         .map_err(io_error)?;
-    let supervisor_token = format!(
-        "{}-{}",
-        std::process::id(),
-        SUPERVISOR_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    );
+    let supervisor_token = supervisor_token()?;
     let mut command = Command::new(&harness.config.docker_binary);
     command
         .args(["exec", "--interactive", "--env"])
@@ -234,6 +226,7 @@ pub(crate) fn spawn(
         .take()
         .ok_or_else(|| HarnessError::Start("docker exec stdin was not piped".to_owned()))?;
     let (control_tx, control_rx) = mpsc::sync_channel(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let pump_docker = harness.config.docker_binary.clone();
     let pump_container = harness.config.agent_container.clone();
     let expected_supervisor_token = supervisor_token.clone();
@@ -254,6 +247,21 @@ pub(crate) fn spawn(
         let valid = control.is_ok();
         let pgid = control.as_ref().ok().copied();
         if control_tx.send(control).is_ok() && valid {
+            let mut ready = String::new();
+            let confirmation = reader
+                .read_line(&mut ready)
+                .map_err(|error| error.to_string())
+                .and_then(|length| {
+                    if length == 0 {
+                        Err("supervisor exited before its READY confirmation".to_owned())
+                    } else {
+                        parse_supervisor_ready(&ready, &expected_supervisor_token)
+                    }
+                });
+            let confirmed = confirmation.is_ok();
+            if ready_tx.send(confirmation).is_err() || !confirmed {
+                return;
+            }
             let mut events = events;
             if let Err(error) = io::copy(&mut reader, &mut events) {
                 if let Some(pgid) = pgid {
@@ -305,6 +313,25 @@ pub(crate) fn spawn(
         )));
     }
     drop(supervisor_input);
+    match ready_rx.recv_timeout(SUPERVISOR_HEADER_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            cleanup_failed_start(harness, &supervisor_token, Some(pgid), &mut child)?;
+            return Err(HarnessError::Start(error));
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            cleanup_failed_start(harness, &supervisor_token, Some(pgid), &mut child)?;
+            return Err(HarnessError::Start(
+                "timed out waiting for trusted Pi supervisor READY confirmation".to_owned(),
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            cleanup_failed_start(harness, &supervisor_token, Some(pgid), &mut child)?;
+            return Err(HarnessError::Start(
+                "Pi supervisor READY channel disconnected".to_owned(),
+            ));
+        }
+    }
     children.insert(
         session.id.to_string(),
         Arc::new(ManagedProcess {
@@ -745,11 +772,20 @@ fn terminate_host_child(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SupervisorControl {
     #[serde(rename = "type")]
     record_type: String,
     token: String,
     pgid: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupervisorReady {
+    #[serde(rename = "type")]
+    record_type: String,
+    token: String,
 }
 
 fn parse_supervisor_header(header: &str, expected_token: &str) -> Result<u32, String> {
@@ -762,6 +798,31 @@ fn parse_supervisor_header(header: &str, expected_token: &str) -> Result<u32, St
         return Err("invalid supervisor control record".to_owned());
     }
     Ok(control.pgid)
+}
+
+fn parse_supervisor_ready(ready: &str, expected_token: &str) -> Result<(), String> {
+    let ready: SupervisorReady = serde_json::from_str(ready)
+        .map_err(|error| format!("invalid supervisor READY confirmation: {error}"))?;
+    if ready.record_type != "autospec_ready" || ready.token != expected_token {
+        return Err("invalid supervisor READY confirmation".to_owned());
+    }
+    Ok(())
+}
+
+fn supervisor_token() -> Result<String, HarnessError> {
+    let mut bytes = [0_u8; 32];
+    File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .map_err(|error| {
+            HarnessError::Start(format!("failed to create supervisor token: {error}"))
+        })?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        token.push(HEX[usize::from(byte >> 4)] as char);
+        token.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    Ok(token)
 }
 
 fn live_events_path(session: &SessionRef) -> PathBuf {
