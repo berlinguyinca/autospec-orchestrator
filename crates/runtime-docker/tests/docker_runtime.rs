@@ -1,5 +1,6 @@
 use bollard::{
     container::{Config, CreateContainerOptions, RemoveContainerOptions},
+    exec::{CreateExecOptions, StartExecOptions},
     models::{HostConfig, Mount, MountTypeEnum},
     network::CreateNetworkOptions,
     volume::{CreateVolumeOptions, RemoveVolumeOptions},
@@ -160,9 +161,11 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
         .expect("create unrelated control network");
 
     let result = async {
+        let volumes_before_provision = volume_names(&docker).await;
         let handle = runtime
             .provision(&execution_labels, &runtime_requirement(), &[service])
             .await?;
+        assert_eq!(volume_names(&docker).await, volumes_before_provision);
         docker
             .create_container(
                 Some(CreateContainerOptions {
@@ -196,22 +199,8 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
             handle.service_containers,
             vec![format!("autospec-{}-cache", execution_labels.execution_id)]
         );
-        assert_eq!(
-            handle.volumes,
-            vec![format!(
-                "autospec-{}-cache-data",
-                execution_labels.execution_id
-            )]
-        );
+        assert!(handle.volumes.is_empty());
         assert!(handle.credentials_path.is_none());
-
-        let service_volume = docker
-            .inspect_volume(&handle.volumes[0])
-            .await
-            .expect("inspect execution-owned service volume");
-        for (key, value) in execution_labels.to_map() {
-            assert_eq!(service_volume.labels.get(&key), Some(&value));
-        }
 
         let network = docker
             .inspect_network::<String>(&handle.network, None)
@@ -239,10 +228,24 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
             assert_eq!(host.memory, Some(384 * 1024 * 1024));
             assert_eq!(host.memory_swap, Some(384 * 1024 * 1024));
             assert_eq!(host.pids_limit, Some(DEFAULT_PIDS_LIMIT));
-            assert_eq!(
-                host.storage_opt.as_ref().and_then(|opts| opts.get("size")),
-                Some(&"3G".to_owned())
-            );
+            let writable_layer_bytes = host
+                .storage_opt
+                .as_ref()
+                .and_then(|opts| opts.get("size"))
+                .expect("writable layer has a byte quota")
+                .parse::<u64>()
+                .expect("writable layer quota is numeric bytes");
+            let tmpfs_bytes = host
+                .mounts
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter_map(|mount| mount.tmpfs_options.as_ref())
+                .filter_map(|options| options.size_bytes)
+                .map(|bytes| bytes as u64)
+                .sum::<u64>();
+            assert!(writable_layer_bytes > 0);
+            assert!(writable_layer_bytes + tmpfs_bytes <= 3 * 1024 * 1024 * 1024);
             assert!(host.port_bindings.as_ref().is_none_or(HashMap::is_empty));
             assert_eq!(host.publish_all_ports, Some(false));
             assert_eq!(host.network_mode.as_deref(), Some(handle.network.as_str()));
@@ -269,14 +272,14 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
             .iter()
             .find(|mount| mount.destination.as_deref() == Some("/data"))
             .expect("Redis image-declared /data volume is overridden");
-        assert_eq!(data_mount.name.as_deref(), Some(handle.volumes[0].as_str()));
-        assert!(service_mounts.iter().all(|mount| {
-            mount.typ != Some(bollard::models::MountPointTypeEnum::VOLUME)
-                || mount
-                    .name
-                    .as_ref()
-                    .is_some_and(|name| handle.volumes.contains(name))
-        }));
+        assert_eq!(
+            data_mount.typ,
+            Some(bollard::models::MountPointTypeEnum::TMPFS)
+        );
+        assert!(data_mount.name.is_none());
+        assert!(service_mounts
+            .iter()
+            .all(|mount| mount.typ != Some(bollard::models::MountPointTypeEnum::VOLUME)));
 
         assert!(!runtime
             .reconcile(std::slice::from_ref(&execution_labels.execution_id))
@@ -292,10 +295,6 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
             .inspect_container(&handle.agent_container, None)
             .await
             .expect("reconciliation reports but does not delete containers");
-        docker
-            .inspect_volume(&handle.volumes[0])
-            .await
-            .expect("reconciliation reports but does not delete volumes");
 
         runtime.destroy(&execution_labels).await?;
         assert!(docker
@@ -310,7 +309,6 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
                 .await
                 .is_err());
         }
-        assert!(docker.inspect_volume(&handle.volumes[0]).await.is_err());
         docker
             .inspect_network::<String>(&unrelated_network, None)
             .await
@@ -361,6 +359,131 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
                 == Some(&execution_labels.execution_id.to_string())
         });
     assert!(!leaked, "test execution network must not leak");
+}
+
+#[tokio::test]
+async fn image_tmpfs_rejects_writes_past_the_execution_disk_budget() {
+    let Some(runtime) =
+        runtime_or_skip("image_tmpfs_rejects_writes_past_the_execution_disk_budget").await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    let execution_labels = labels_for(unique_execution_id());
+    let requirement = RuntimeRequirement {
+        image: Some("alpine:3.20".to_owned()),
+        cpu: 1,
+        memory_mib: 2048,
+        disk_gib: 1,
+        ..RuntimeRequirement::default()
+    };
+    let service = ServiceRequirement {
+        name: "cache".to_owned(),
+        image: "redis:7-alpine".to_owned(),
+        env: BTreeMap::new(),
+    };
+    let volumes_before = volume_names(&docker).await;
+
+    let handle = runtime
+        .provision(&execution_labels, &requirement, &[service])
+        .await
+        .expect("provision bounded tmpfs service");
+    assert_eq!(volume_names(&docker).await, volumes_before);
+    let agent_inspect = docker
+        .inspect_container(&handle.agent_container, None)
+        .await
+        .expect("inspect bounded agent");
+    let service_inspect = docker
+        .inspect_container(&handle.service_containers[0], None)
+        .await
+        .expect("inspect bounded service");
+    let hosts = [
+        agent_inspect.host_config.expect("agent host config"),
+        service_inspect.host_config.expect("service host config"),
+    ];
+    let total_configured_bytes = hosts
+        .iter()
+        .map(|host| {
+            let root = host
+                .storage_opt
+                .as_ref()
+                .and_then(|options| options.get("size"))
+                .expect("root quota")
+                .parse::<u64>()
+                .expect("numeric root quota");
+            let mounts = host
+                .mounts
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter_map(|mount| mount.tmpfs_options.as_ref())
+                .filter_map(|options| options.size_bytes)
+                .map(|bytes| bytes as u64)
+                .sum::<u64>();
+            root + mounts
+        })
+        .sum::<u64>();
+    assert!(total_configured_bytes <= 1024 * 1024 * 1024);
+
+    let host_mount = hosts[1]
+        .mounts
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|mount| mount.target.as_deref() == Some("/data"))
+        .expect("bounded /data mount exists");
+    assert_eq!(host_mount.typ, Some(MountTypeEnum::TMPFS));
+    let mount_bytes = host_mount
+        .tmpfs_options
+        .and_then(|options| options.size_bytes)
+        .expect("tmpfs byte limit");
+    let overflow_mib = mount_bytes as u64 / (1024 * 1024) + 1;
+
+    let exec = docker
+        .create_exec(
+            &handle.service_containers[0],
+            CreateExecOptions {
+                cmd: Some(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    format!("dd if=/dev/zero of=/data/overflow bs=1M count={overflow_mib}"),
+                ]),
+                attach_stdout: Some(false),
+                attach_stderr: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create disk-boundary probe");
+    docker
+        .start_exec(
+            &exec.id,
+            Some(StartExecOptions {
+                detach: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("start disk-boundary probe");
+    let mut exit_code = None;
+    for _ in 0..300 {
+        let inspect = docker
+            .inspect_exec(&exec.id)
+            .await
+            .expect("inspect disk-boundary probe");
+        if inspect.running == Some(false) {
+            exit_code = inspect.exit_code;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let _ = runtime.destroy(&execution_labels).await;
+    assert!(exit_code.is_some_and(|code| code != 0));
+    assert!(docker
+        .inspect_container(&handle.service_containers[0], None)
+        .await
+        .is_err());
 }
 
 #[tokio::test]

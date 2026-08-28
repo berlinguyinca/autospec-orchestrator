@@ -1,7 +1,11 @@
-use crate::{limits::host_limits, provision::create_image_volumes, DockerRuntime};
+use crate::{
+    limits::{host_limits, set_writable_layer_limit},
+    provision::{bounded_image_mounts, container_create_error},
+    DockerRuntime,
+};
 use bollard::{
     container::{Config, CreateContainerOptions, NetworkingConfig},
-    models::EndpointSettings,
+    models::{EndpointSettings, ImageInspect},
 };
 use orchestrator_core::{OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::RuntimeError;
@@ -12,18 +16,19 @@ pub(crate) async fn create_services(
     labels: &OwnershipLabels,
     requirement: &RuntimeRequirement,
     services: &[ServiceRequirement],
+    images: &[ImageInspect],
     network: &str,
-) -> Result<ProvisionedServices, RuntimeError> {
+    disk_slot_bytes: u64,
+) -> Result<Vec<String>, RuntimeError> {
     let mut containers = Vec::with_capacity(services.len());
-    let mut volumes = Vec::new();
-    for service in services {
-        let image = runtime.ensure_image(&service.image).await?;
+    for (service, image) in services.iter().zip(images) {
         let name = DockerRuntime::service_container_name(&labels.execution_id, &service.name);
         let mut limits = host_limits(requirement);
         limits.network_mode = Some(network.to_owned());
-        let image_volumes = create_image_volumes(runtime, labels, &image, &service.name).await?;
-        limits.mounts = (!image_volumes.mounts.is_empty()).then_some(image_volumes.mounts);
-        volumes.extend(image_volumes.names);
+        let image_mounts = bounded_image_mounts(image, disk_slot_bytes);
+        set_writable_layer_limit(&mut limits, image_mounts.writable_layer_bytes);
+        let has_bounded_mounts = !image_mounts.mounts.is_empty();
+        limits.mounts = has_bounded_mounts.then_some(image_mounts.mounts);
         let config = Config {
             image: Some(service.image.clone()),
             env: (!service.env.is_empty()).then(|| {
@@ -49,7 +54,11 @@ pub(crate) async fn create_services(
             )
             .await
             .map_err(|error| {
-                RuntimeError::Provisioning(format!("create service container {name}: {error}"))
+                container_create_error(
+                    format!("create service container {name}"),
+                    error,
+                    has_bounded_mounts,
+                )
             })?;
         runtime
             .client
@@ -60,15 +69,7 @@ pub(crate) async fn create_services(
             })?;
         containers.push(name);
     }
-    Ok(ProvisionedServices {
-        containers,
-        volumes,
-    })
-}
-
-pub(crate) struct ProvisionedServices {
-    pub(crate) containers: Vec<String>,
-    pub(crate) volumes: Vec<String>,
+    Ok(containers)
 }
 
 pub(crate) fn networking_config(network: &str, alias: &str) -> NetworkingConfig<String> {

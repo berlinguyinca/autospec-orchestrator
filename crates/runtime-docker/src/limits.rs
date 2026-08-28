@@ -11,10 +11,9 @@ pub type HostConfigLimits = HostConfig;
 ///
 /// CPU, memory, PID, and writable-layer disk quotas are runtime protections,
 /// not prompt guidance (spec sections 13 and 81). Image-declared data paths are
-/// mounted from execution-owned named volumes so Docker never creates anonymous
-/// volumes outside label-scoped lifecycle control. Docker has no portable named-
-/// volume quota; the writable-layer quota remains the enforceable disk boundary,
-/// and daemons that cannot enforce it reject container creation.
+/// replaced by bounded tmpfs mounts so Docker never creates anonymous volumes.
+/// Every agent/service writable layer and tmpfs allocation shares one manifest
+/// disk budget; a daemon that cannot enforce either bound rejects provisioning.
 pub fn host_limits(requirement: &RuntimeRequirement) -> HostConfigLimits {
     let memory = requirement
         .memory_mib
@@ -39,4 +38,8 @@ pub fn host_limits(requirement: &RuntimeRequirement) -> HostConfigLimits {
         )])),
         ..Default::default()
     }
+}
+
+pub(crate) fn set_writable_layer_limit(limits: &mut HostConfigLimits, bytes: u64) {
+    limits.storage_opt = Some(HashMap::from([("size".to_owned(), bytes.to_string())]));
 }

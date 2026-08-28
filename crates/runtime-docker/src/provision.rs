@@ -1,9 +1,11 @@
-use crate::{limits::host_limits, services, DockerRuntime};
+use crate::{
+    limits::{host_limits, set_writable_layer_limit},
+    services, DockerRuntime,
+};
 use bollard::{
     container::{Config, CreateContainerOptions},
-    models::{ImageInspect, Mount, MountTypeEnum},
+    models::{ImageInspect, Mount, MountTmpfsOptions, MountTypeEnum},
     network::CreateNetworkOptions,
-    volume::CreateVolumeOptions,
 };
 use orchestrator_core::{OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::{EnvironmentHandle, RuntimeError};
@@ -33,6 +35,19 @@ async fn provision_inner(
     requirement: &RuntimeRequirement,
     service_requirements: &[ServiceRequirement],
 ) -> Result<EnvironmentHandle, RuntimeError> {
+    let image = requirement.image.as_deref().ok_or_else(|| {
+        RuntimeError::Provisioning("runtime image is required for Docker provisioning".to_owned())
+    })?;
+    let image_inspect = runtime.ensure_image(image).await?;
+    let mut service_images = Vec::with_capacity(service_requirements.len());
+    for service in service_requirements {
+        service_images.push(runtime.ensure_image(&service.image).await?);
+    }
+    let image_inspects = std::iter::once(&image_inspect)
+        .chain(service_images.iter())
+        .collect::<Vec<_>>();
+    let disk_slot_bytes = execution_disk_slot_bytes(requirement, &image_inspects)?;
+
     let network = DockerRuntime::network_name(&labels.execution_id);
     runtime
         .client
@@ -49,19 +64,24 @@ async fn provision_inner(
             RuntimeError::Provisioning(format!("create network {network}: {error}"))
         })?;
 
-    let provisioned_services =
-        services::create_services(runtime, labels, requirement, service_requirements, &network)
-            .await?;
+    let service_containers = services::create_services(
+        runtime,
+        labels,
+        requirement,
+        service_requirements,
+        &service_images,
+        &network,
+        disk_slot_bytes,
+    )
+    .await?;
 
-    let image = requirement.image.as_deref().ok_or_else(|| {
-        RuntimeError::Provisioning("runtime image is required for Docker provisioning".to_owned())
-    })?;
-    let image_inspect = runtime.ensure_image(image).await?;
     let agent_container = DockerRuntime::agent_container_name(&labels.execution_id);
     let mut limits = host_limits(requirement);
     limits.network_mode = Some(network.clone());
-    let agent_volumes = create_image_volumes(runtime, labels, &image_inspect, "agent").await?;
-    limits.mounts = (!agent_volumes.mounts.is_empty()).then_some(agent_volumes.mounts);
+    let agent_mounts = bounded_image_mounts(&image_inspect, disk_slot_bytes);
+    set_writable_layer_limit(&mut limits, agent_mounts.writable_layer_bytes);
+    let has_bounded_mounts = !agent_mounts.mounts.is_empty();
+    limits.mounts = has_bounded_mounts.then_some(agent_mounts.mounts);
     runtime
         .client
         .create_container(
@@ -80,7 +100,11 @@ async fn provision_inner(
         )
         .await
         .map_err(|error| {
-            RuntimeError::Provisioning(format!("create agent container {agent_container}: {error}"))
+            container_create_error(
+                format!("create agent container {agent_container}"),
+                error,
+                has_bounded_mounts,
+            )
         })?;
     runtime
         .client
@@ -94,22 +118,38 @@ async fn provision_inner(
         execution_id: labels.execution_id.clone(),
         network,
         agent_container,
-        service_containers: provisioned_services.containers,
-        volumes: provisioned_services
-            .volumes
-            .into_iter()
-            .chain(agent_volumes.names)
-            .collect(),
+        service_containers,
+        volumes: Vec::new(),
         credentials_path: None,
     })
 }
 
-pub(crate) async fn create_image_volumes(
-    runtime: &DockerRuntime,
-    labels: &OwnershipLabels,
+pub(crate) fn bounded_image_mounts(
     image: &ImageInspect,
-    purpose_prefix: &str,
-) -> Result<ImageVolumes, RuntimeError> {
+    disk_slot_bytes: u64,
+) -> BoundedImageMounts {
+    let targets = image_volume_targets(image);
+    let mounts = targets
+        .into_iter()
+        .map(|target| Mount {
+            target: Some(target),
+            source: None,
+            typ: Some(MountTypeEnum::TMPFS),
+            tmpfs_options: Some(MountTmpfsOptions {
+                size_bytes: Some(disk_slot_bytes as i64),
+                mode: Some(0o1777),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .collect();
+    BoundedImageMounts {
+        writable_layer_bytes: disk_slot_bytes,
+        mounts,
+    }
+}
+
+fn image_volume_targets(image: &ImageInspect) -> Vec<String> {
     let mut targets = image
         .config
         .as_ref()
@@ -117,71 +157,115 @@ pub(crate) async fn create_image_volumes(
         .map(|volumes| volumes.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     targets.sort();
-
-    let expected_labels = labels.to_map();
-    let mut names = Vec::with_capacity(targets.len());
-    let mut mounts = Vec::with_capacity(targets.len());
-    for (index, target) in targets.into_iter().enumerate() {
-        let target_purpose = volume_purpose(&target);
-        let suffix = if index == 0 {
-            String::new()
-        } else {
-            format!("-{}", index + 1)
-        };
-        let purpose = format!("{purpose_prefix}-{target_purpose}{suffix}");
-        let name = DockerRuntime::volume_name(&labels.execution_id, &purpose);
-        let volume = runtime
-            .client
-            .create_volume(CreateVolumeOptions {
-                name: name.clone(),
-                driver: "local".to_owned(),
-                driver_opts: Default::default(),
-                labels: expected_labels.clone().into_iter().collect(),
-            })
-            .await
-            .map_err(|error| {
-                RuntimeError::Provisioning(format!("create volume {name}: {error}"))
-            })?;
-        if !expected_labels
-            .iter()
-            .all(|(key, value)| volume.labels.get(key) == Some(value))
-        {
-            return Err(RuntimeError::Provisioning(format!(
-                "volume {name} exists without this execution's ownership labels"
-            )));
-        }
-        mounts.push(Mount {
-            target: Some(target),
-            source: Some(name.clone()),
-            typ: Some(MountTypeEnum::VOLUME),
-            ..Default::default()
-        });
-        names.push(name);
-    }
-    Ok(ImageVolumes { names, mounts })
+    targets
 }
 
-pub(crate) struct ImageVolumes {
-    pub(crate) names: Vec<String>,
+fn execution_disk_slot_bytes(
+    requirement: &RuntimeRequirement,
+    images: &[&ImageInspect],
+) -> Result<u64, RuntimeError> {
+    let total_bytes = requirement
+        .disk_gib
+        .checked_mul(1024 * 1024 * 1024)
+        .ok_or_else(|| RuntimeError::ResourceLimit("disk budget overflows bytes".to_owned()))?;
+    let slot_count = images
+        .iter()
+        .try_fold(images.len(), |count, image| {
+            count.checked_add(image_volume_targets(image).len())
+        })
+        .ok_or_else(|| RuntimeError::ResourceLimit("too many image volume paths".to_owned()))?;
+    let divisor = u64::try_from(slot_count)
+        .map_err(|_| RuntimeError::ResourceLimit("too many image volume paths".to_owned()))?;
+    let slot_bytes = total_bytes / divisor;
+    if slot_bytes == 0 || slot_bytes > i64::MAX as u64 {
+        return Err(RuntimeError::ResourceLimit(format!(
+            "disk budget {}GiB cannot bound {slot_count} execution storage slots",
+            requirement.disk_gib
+        )));
+    }
+    Ok(slot_bytes)
+}
+
+pub(crate) struct BoundedImageMounts {
+    pub(crate) writable_layer_bytes: u64,
     pub(crate) mounts: Vec<Mount>,
 }
 
-fn volume_purpose(target: &str) -> String {
-    let normalized = target
-        .trim_matches('/')
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let normalized = normalized.trim_matches('-');
-    if normalized.is_empty() {
-        "root".to_owned()
+pub(crate) fn container_create_error(
+    context: String,
+    error: bollard::errors::Error,
+    has_bounded_mounts: bool,
+) -> RuntimeError {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    if (has_bounded_mounts && (lower.contains("tmpfs") || lower.contains("mount")))
+        || lower.contains("quota")
+        || lower.contains("storage opt")
+    {
+        RuntimeError::ResourceLimit(format!("{context}: {message}"))
     } else {
-        normalized.to_owned()
+        RuntimeError::Provisioning(format!("{context}: {message}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bollard::models::ImageConfig;
+    use std::collections::HashMap;
+
+    #[test]
+    fn all_container_layers_and_tmpfs_mounts_share_one_execution_disk_budget() {
+        let agent_image = ImageInspect {
+            config: Some(ImageConfig {
+                volumes: Some(HashMap::from([
+                    ("/cache".to_owned(), HashMap::new()),
+                    ("/data".to_owned(), HashMap::new()),
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let service_image = ImageInspect::default();
+        let requirement = RuntimeRequirement {
+            disk_gib: 1,
+            ..RuntimeRequirement::default()
+        };
+
+        let slot_bytes = execution_disk_slot_bytes(&requirement, &[&agent_image, &service_image])
+            .expect("allocate disk budget");
+        let allocation = bounded_image_mounts(&agent_image, slot_bytes);
+        let mount_bytes = allocation
+            .mounts
+            .iter()
+            .map(|mount| {
+                mount
+                    .tmpfs_options
+                    .as_ref()
+                    .and_then(|options| options.size_bytes)
+                    .expect("every image path is bounded") as u64
+            })
+            .sum::<u64>();
+
+        assert_eq!(allocation.mounts.len(), 2);
+        assert_eq!(
+            allocation.writable_layer_bytes + mount_bytes + slot_bytes,
+            (1024 * 1024 * 1024 / 4) * 4
+        );
+        assert!(allocation.writable_layer_bytes + mount_bytes + slot_bytes <= 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn daemon_rejection_of_a_bounded_mount_is_a_resource_limit_error() {
+        let error = container_create_error(
+            "create service container".to_owned(),
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 400,
+                message: "invalid mount config for type tmpfs".to_owned(),
+            },
+            true,
+        );
+
+        assert!(matches!(error, RuntimeError::ResourceLimit(message) if message.contains("tmpfs")));
     }
 }
