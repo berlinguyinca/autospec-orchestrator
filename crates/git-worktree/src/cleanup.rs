@@ -1,8 +1,8 @@
 use crate::lock::FileLock;
 use crate::manager::{
-    git_stdout, hex_component, metadata_directory, metadata_name, normalized_repository_name,
-    read_owner_record, verify_git_storage_preflight, verify_repository_storage, GitWorktreeManager,
-    OwnerRecord,
+    hex_component, metadata_directory, metadata_name, normalized_repository_name,
+    read_owner_record, repository_git_stdout, verify_git_storage_preflight,
+    verify_repository_storage, GitWorktreeManager, OwnerRecord,
 };
 use crate::{Worktree, WorktreeError};
 use orchestrator_core::labels::{EXECUTION_ID, MANAGED, REPOSITORY};
@@ -273,13 +273,9 @@ fn required_label<'a>(record: &'a OwnerRecord, key: &str) -> Result<&'a str, Wor
 
 fn current_branch(path: &Path) -> Result<String, WorktreeError> {
     verify_git_storage_preflight(path)?;
-    git_stdout(
-        [
-            OsStr::new("-C"),
-            path.as_os_str(),
-            OsStr::new("branch"),
-            OsStr::new("--show-current"),
-        ],
+    repository_git_stdout(
+        path,
+        [OsStr::new("branch"), OsStr::new("--show-current")],
         WorktreeError::Cleanup,
     )
 }

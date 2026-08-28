@@ -1,4 +1,4 @@
-use crate::command::git_command;
+use crate::command::{git_command, repository_git_command};
 use crate::filesystem::{SystemWorktreeFilesystem, WorktreeFilesystem, WorktreeFilesystemPoint};
 use crate::lock::FileLock;
 use crate::{DiffCapture, Worktree, WorktreeError, WorktreeManager};
@@ -361,7 +361,11 @@ impl WorktreeManager for GitWorktreeManager {
                 .map_err(|error| WorktreeError::Create(error.to_string()))?;
             verify_mirror_repository(&mirror_root, &mirror, &clone_locator)
                 .map_err(|error| WorktreeError::Create(error.to_string()))?;
-            verify_live_storage(verified_storage.as_ref(), repository_root)?;
+            let current_storage = self
+                .storage_verifier
+                .verify_ready(storage)
+                .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
+            verify_live_storage(current_storage.as_ref(), repository_root)?;
             self.filesystem
                 .clone_repository(&mirror, repository_root)
                 .map_err(create_io_error)?;
@@ -377,10 +381,9 @@ impl WorktreeManager for GitWorktreeManager {
                 .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
             intent.phase = CreatePhase::Cloned;
             write_create_intent(self, &intent_path, &intent, true)?;
-            run_git(
+            run_repository_git(
+                repository_root,
                 [
-                    OsStr::new("-C"),
-                    repository_root.as_os_str(),
                     OsStr::new("remote"),
                     OsStr::new("set-url"),
                     OsStr::new("origin"),
@@ -388,10 +391,9 @@ impl WorktreeManager for GitWorktreeManager {
                 ],
                 WorktreeError::Create,
             )?;
-            run_git(
+            run_repository_git(
+                repository_root,
                 [
-                    OsStr::new("-C"),
-                    repository_root.as_os_str(),
                     OsStr::new("checkout"),
                     OsStr::new("-b"),
                     OsStr::new(branch),
@@ -501,13 +503,9 @@ impl GitWorktreeManager {
                 continue;
             }
             verify_git_storage_preflight(&path)?;
-            let current = git_stdout(
-                [
-                    OsStr::new("-C"),
-                    path.as_os_str(),
-                    OsStr::new("branch"),
-                    OsStr::new("--show-current"),
-                ],
+            let current = repository_git_stdout(
+                &path,
+                [OsStr::new("branch"), OsStr::new("--show-current")],
                 WorktreeError::Create,
             )?;
             if current != record.branch {
@@ -903,6 +901,21 @@ pub(crate) fn verify_repository_storage(path: &Path) -> Result<(), WorktreeError
     let canonical_root = path
         .canonicalize()
         .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
+    let top_level = repository_git_stdout(
+        path,
+        [OsStr::new("rev-parse"), OsStr::new("--show-toplevel")],
+        WorktreeError::Ownership,
+    )?;
+    let canonical_top_level = PathBuf::from(top_level)
+        .canonicalize()
+        .map_err(|error| WorktreeError::Ownership(error.to_string()))?;
+    if canonical_top_level != canonical_root {
+        return Err(WorktreeError::Ownership(format!(
+            "Git work tree {} is not repository root {}",
+            canonical_top_level.display(),
+            canonical_root.display()
+        )));
+    }
     for arguments in [
         &["rev-parse", "--git-dir"][..],
         &["rev-parse", "--git-common-dir"][..],
@@ -911,10 +924,9 @@ pub(crate) fn verify_repository_storage(path: &Path) -> Result<(), WorktreeError
         &["rev-parse", "--git-path", "index"][..],
     ] {
         verify_git_storage_preflight(path)?;
-        let reported = git_stdout(
-            std::iter::once(OsStr::new("-C"))
-                .chain(std::iter::once(path.as_os_str()))
-                .chain(arguments.iter().map(OsStr::new)),
+        let reported = repository_git_stdout(
+            path,
+            arguments.iter().map(OsStr::new),
             WorktreeError::Ownership,
         )?;
         let reported = PathBuf::from(reported);
@@ -952,10 +964,9 @@ pub(crate) fn verify_repository_storage(path: &Path) -> Result<(), WorktreeError
         }
     }
     verify_git_storage_preflight(path)?;
-    let alternates = PathBuf::from(git_stdout(
+    let alternates = PathBuf::from(repository_git_stdout(
+        path,
         [
-            OsStr::new("-C"),
-            path.as_os_str(),
             OsStr::new("rev-parse"),
             OsStr::new("--git-path"),
             OsStr::new("objects/info/alternates"),
@@ -1073,6 +1084,54 @@ where
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ))
     }
+}
+
+pub(crate) fn run_repository_git<I, S>(
+    path: &Path,
+    args: I,
+    error: fn(String) -> WorktreeError,
+) -> Result<Output, WorktreeError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    verify_git_storage_preflight(path)?;
+    let output = repository_git_command(path)
+        .args(args)
+        .output()
+        .map_err(|cause| {
+            if cause.raw_os_error() == Some(28) {
+                WorktreeError::StorageFull(cause.to_string())
+            } else {
+                error(cause.to_string())
+            }
+        })?;
+    if output.status.success() {
+        Ok(output)
+    } else if output.status.code() == Some(28)
+        || String::from_utf8_lossy(&output.stderr).contains("No space left on device")
+    {
+        Err(WorktreeError::StorageFull(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
+    } else {
+        Err(error(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
+    }
+}
+
+pub(crate) fn repository_git_stdout<I, S>(
+    path: &Path,
+    args: I,
+    error: fn(String) -> WorktreeError,
+) -> Result<String, WorktreeError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = run_repository_git(path, args, error)?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 pub(crate) fn git_stdout<I, S>(

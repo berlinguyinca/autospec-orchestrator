@@ -1,4 +1,5 @@
 use std::env;
+use std::path::Path;
 use std::process::Command;
 
 /// Construct the only Git process boundary used by this crate.
@@ -22,5 +23,15 @@ pub(crate) fn git_command() -> Command {
     if let Some(path) = path {
         command.env("PATH", path);
     }
+    command
+}
+
+pub(crate) fn repository_git_command(path: &Path) -> Command {
+    let mut command = git_command();
+    command
+        .arg("--git-dir")
+        .arg(path.join(".git"))
+        .arg("--work-tree")
+        .arg(path);
     command
 }

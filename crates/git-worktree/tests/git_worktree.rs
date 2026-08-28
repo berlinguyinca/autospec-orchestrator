@@ -22,6 +22,11 @@ use std::os::unix::fs::PermissionsExt;
 struct FakeReadyAllocationVerifier;
 
 #[derive(Debug)]
+struct StatefulReadyAllocationVerifier {
+    calls: Mutex<u8>,
+}
+
+#[derive(Debug)]
 struct FakeVerifiedExecutionStorage {
     repository: PathBuf,
 }
@@ -44,6 +49,25 @@ impl ReadyAllocationVerifier for FakeReadyAllocationVerifier {
         Ok(Box::new(FakeVerifiedExecutionStorage {
             repository: receipt.mount_path.join("repository"),
         }))
+    }
+}
+
+impl ReadyAllocationVerifier for StatefulReadyAllocationVerifier {
+    fn verify_ready(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+        let mut calls = self.calls.lock().expect("ready verifier calls");
+        *calls += 1;
+        if *calls == 1 {
+            Ok(Box::new(FakeVerifiedExecutionStorage {
+                repository: receipt.mount_path.join("repository"),
+            }))
+        } else {
+            Err(StorageError::IdentityMismatch(
+                "ready allocation transitioned before clone".to_owned(),
+            ))
+        }
     }
 }
 
@@ -697,6 +721,37 @@ fn create_in_rejects_receipt_without_live_ready_verification() {
     assert!(matches!(error, WorktreeError::Ownership(_)));
     assert_empty_repository_root(&state, execution_id);
     assert!(!state.path().join("mirrors").exists());
+}
+
+#[test]
+fn create_in_rechecks_live_ready_state_immediately_before_clone() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let verifier = Arc::new(StatefulReadyAllocationVerifier {
+        calls: Mutex::new(0),
+    });
+    let manager = GitWorktreeManager::with_clone_base_and_verifier(
+        state.path(),
+        repository.clone_base.to_str().expect("utf-8 clone base"),
+        verifier,
+    );
+    let execution_id = "project-11-ready-transition";
+    let labels = labels(execution_id, repository.canonical());
+    bounded_repository_root(&state, execution_id);
+    let receipt = allocation_receipt(state.path(), &labels);
+
+    let error = manager
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-ready-transition",
+            &receipt,
+        )
+        .expect_err("reject allocation that stopped being Ready before clone");
+
+    assert!(matches!(error, WorktreeError::Ownership(_)));
+    assert_empty_repository_root(&state, execution_id);
 }
 
 #[test]
@@ -1603,7 +1658,7 @@ fn capture_diff_includes_patch_and_all_changed_files() {
 
 #[cfg(unix)]
 #[test]
-fn capture_diff_never_executes_repository_configured_helpers() {
+fn capture_diff_rejects_repository_configured_helpers_without_execution() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");
     let manager = manager(&state, &repository);
@@ -1695,10 +1750,113 @@ fn capture_diff_never_executes_repository_configured_helpers() {
     )
     .expect("modify tracked file");
 
-    let capture = manager.capture_diff(&worktree).expect("capture safe diff");
+    let error = manager
+        .capture_diff(&worktree)
+        .expect_err("reject repository-configured helpers");
 
-    assert!(capture.patch.contains("modified without helpers"));
+    assert!(matches!(
+        error,
+        WorktreeError::Diff(_) | WorktreeError::Ownership(_)
+    ));
     assert!(!marker.exists(), "repository-controlled helper executed");
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_diff_rejects_clean_filter_without_executing_it() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-clean-filter", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-clean-filter",
+        )
+        .expect("create worktree");
+    let path = Path::new(&worktree.path);
+    let marker = state.path().join("clean-filter-ran");
+    let helper = state.path().join("clean-filter");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+    )
+    .expect("write clean filter");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+        .expect("make clean filter executable");
+    git(
+        path,
+        &[
+            "config",
+            "filter.hostile.clean",
+            helper.to_str().expect("filter path"),
+        ],
+    );
+    std::fs::write(path.join(".gitattributes"), "README.md filter=hostile\n")
+        .expect("select clean filter");
+    std::fs::write(path.join("README.md"), "modified\n").expect("modify tracked file");
+
+    let error = manager
+        .capture_diff(&worktree)
+        .expect_err("reject repository clean filter");
+
+    assert!(matches!(
+        error,
+        WorktreeError::Diff(_) | WorktreeError::Ownership(_)
+    ));
+    assert!(!marker.exists(), "clean filter executed on the host");
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_diff_rejects_long_running_process_filter_without_starting_it() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-process-filter", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-process-filter",
+        )
+        .expect("create worktree");
+    let path = Path::new(&worktree.path);
+    let marker = state.path().join("process-filter-ran");
+    let helper = state.path().join("process-filter");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\ntouch '{}'\nsleep 5\nexit 1\n", marker.display()),
+    )
+    .expect("write process filter");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+        .expect("make process filter executable");
+    git(
+        path,
+        &[
+            "config",
+            "filter.hostile.process",
+            helper.to_str().expect("filter path"),
+        ],
+    );
+    std::fs::write(path.join(".gitattributes"), "README.md filter=hostile\n")
+        .expect("select process filter");
+    std::fs::write(path.join("README.md"), "modified\n").expect("modify tracked file");
+
+    let started = std::time::Instant::now();
+    let error = manager
+        .capture_diff(&worktree)
+        .expect_err("reject repository process filter");
+
+    assert!(matches!(
+        error,
+        WorktreeError::Diff(_) | WorktreeError::Ownership(_)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(!marker.exists(), "process filter started on the host");
 }
 
 #[cfg(unix)]
@@ -1765,6 +1923,167 @@ fn capture_diff_rejects_commondir_before_invoking_git() {
 
     assert!(matches!(error, WorktreeError::Ownership(_)));
     assert!(!marker.exists(), "Git ran before filesystem preflight");
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_diff_targets_only_the_explicit_git_directory_and_work_tree() {
+    const CHILD: &str = "AUTOSPEC_EXPLICIT_REPOSITORY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "capture_diff_targets_only_the_explicit_git_directory_and_work_tree",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated explicit repository test");
+        assert!(
+            output.status.success(),
+            "explicit repository child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-explicit-repository", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-explicit-repository",
+        )
+        .expect("create worktree");
+    let repository_path = Path::new(&worktree.path);
+    std::fs::write(repository_path.join("README.md"), "modified\n").expect("modify tracked file");
+    let log = state.path().join("git-arguments.log");
+    let bin = tempfile::tempdir().expect("wrapper bin");
+    let wrapper = bin.path().join("git");
+    let real_git = real_git_program();
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nfor arg do printf '\\t%s' \"$arg\" >> '{}'; done\nprintf '\\n' >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            log.display(),
+            real_git.display()
+        ),
+    )
+    .expect("write Git argument wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+        .expect("make Git wrapper executable");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&original_path)),
+    )
+    .expect("wrapper PATH");
+    std::env::set_var("PATH", &path);
+
+    manager.capture_diff(&worktree).expect("capture diff");
+    std::env::set_var("PATH", original_path);
+
+    let expected = format!(
+        "\t--git-dir\t{}\t--work-tree\t{}",
+        repository_path.join(".git").display(),
+        repository_path.display()
+    );
+    let log = std::fs::read_to_string(log).expect("read Git argument log");
+    let repository_calls: Vec<_> = log
+        .lines()
+        .filter(|line| !line.starts_with("\tconfig\t--file"))
+        .collect();
+    assert!(!repository_calls.is_empty());
+    assert!(
+        repository_calls.iter().all(|line| line.contains(&expected)),
+        "repository Git invocation lacked exact selectors:\n{log}"
+    );
+    assert!(
+        repository_calls
+            .iter()
+            .any(|line| line.contains("\trev-parse\t--show-toplevel")),
+        "repository root was not verified:\n{log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_diff_rejects_config_change_after_boundary_validation() {
+    const CHILD: &str = "AUTOSPEC_CONFIG_IMMUTABILITY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "capture_diff_rejects_config_change_after_boundary_validation",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated config immutability test");
+        assert!(
+            output.status.success(),
+            "config immutability child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-13-config-immutable", repository.canonical());
+    let worktree = manager
+        .create(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-13-config-immutable",
+        )
+        .expect("create worktree");
+    let repository_path = Path::new(&worktree.path);
+    std::fs::write(repository_path.join("README.md"), "modified\n").expect("modify tracked file");
+    let config = repository_path.join(".git/config");
+    let changed = state.path().join("config-changed");
+    let bin = tempfile::tempdir().expect("wrapper bin");
+    let wrapper = bin.path().join("git");
+    let real_git = real_git_program();
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *' --show-toplevel '*)\n    if [ ! -e '{}' ]; then\n      printf '\\n[core]\\n\\tabbrev = 7\\n' >> '{}'\n      touch '{}'\n    fi\n    ;;\nesac\nexec '{}' \"$@\"\n",
+            changed.display(),
+            config.display(),
+            changed.display(),
+            real_git.display()
+        ),
+    )
+    .expect("write config mutation wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+        .expect("make Git wrapper executable");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&original_path)),
+    )
+    .expect("wrapper PATH");
+    std::env::set_var("PATH", &path);
+
+    let result = manager.capture_diff(&worktree);
+    std::env::set_var("PATH", original_path);
+
+    assert!(changed.exists(), "wrapper did not mutate repository config");
+    assert!(
+        matches!(
+            result,
+            Err(WorktreeError::Ownership(_)) | Err(WorktreeError::Diff(_))
+        ),
+        "capture accepted a changing config boundary: {result:?}"
+    );
 }
 
 #[test]

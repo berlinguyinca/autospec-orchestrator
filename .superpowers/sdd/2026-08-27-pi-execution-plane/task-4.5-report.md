@@ -104,6 +104,25 @@ consume a verified allocation receipt.
 - Changed both create-intent metadata and execution-storage journal recovery to
   discard uncommitted orphan temporary files after no-follow/opened-inode
   validation. Partial JSON is never promoted into authoritative state.
+- Evidence capture now establishes an immutable snapshot of the exact local
+  config and every worktree or Git-info attributes file before repository Git
+  commands begin. It parses local config with includes disabled, rejects
+  `filter.*`, `include.*`, `includeIf.*`, executable diff drivers,
+  `diff.external`, `core.fsmonitor`, `core.hooksPath`, `core.worktree`, and
+  external attributes files, and rejects attributes selecting `filter` or
+  `diff` drivers. The snapshot is revalidated before and after every evidence
+  command; any safe or unsafe config/attribute change aborts capture.
+- Added hostile `filter.clean` and long-running `filter.process` regressions.
+  The prior process filter started and held capture for five seconds; both are
+  now rejected before their marker programs start.
+- Every non-bare repository Git command now receives the exact trusted
+  `--git-dir executions/{execution_id}/repository/.git` and `--work-tree
+  executions/{execution_id}/repository` selectors. Repository verification also
+  requires `rev-parse --show-toplevel` to canonicalize to that exact root.
+- The storage manager's full `verify_ready(receipt)` transition check runs a
+  second time immediately before the first clone write. A stateful verifier
+  regression proves a receipt that leaves Ready after preparation cannot write
+  into the execution allocation.
 
 ## Public Contract
 
@@ -224,7 +243,7 @@ polling loops, or `du`/`df` accounting.
 
 ## Verification
 
-- `cargo test -p git-worktree` — 46 real temporary Git repository tests passed,
+- `cargo test -p git-worktree` — 51 real temporary Git repository tests passed,
   including hostile Git environments, independent Git-path containment, mirror
   immutability/substitution rejection, receipt binding, create-intent recovery,
   phase-specific ENOSPC rollback, safe diff capture, pre-Git commondir rejection,
@@ -241,7 +260,7 @@ polling loops, or `du`/`df` accounting.
   `cargo clippy --workspace --all-targets -- -D warnings` — passed, including
   all real-Docker runtime tests.
 - Rust 1.85 ran the same full fmt/build/test/clippy workspace matrix — passed,
-  including all 46 Git tests and all 13 real-Docker runtime tests.
+  including all 51 Git tests and all 13 real-Docker runtime tests.
 - The first current-toolchain workspace test attempt saw the existing
   five-second `harness-pi` drop-bound test exceed its timing threshold under
   concurrent Docker load. The isolated retry passed in 4.76 seconds, and the
