@@ -2,9 +2,13 @@
 
 mod error;
 mod event_log;
+mod reservations;
+mod workers;
 
 pub use error::StoreError;
 pub use event_log::{EventLog, PgEventLog};
+pub use reservations::{PgReservationStore, Reservation, ReservationStore};
+pub use workers::{PgWorkerStore, WorkerStore};
 
 use async_trait::async_trait;
 use orchestrator_core::{
@@ -26,6 +30,11 @@ pub trait ExecutionStore: Send + Sync {
         id: &ExecutionId,
         next: ExecutionState,
     ) -> Result<Execution, StoreError>;
+    async fn record_progress(
+        &self,
+        execution: &Execution,
+        event: &orchestrator_core::ExecutionEvent,
+    ) -> Result<u64, StoreError>;
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +138,82 @@ impl ExecutionStore for PgExecutionStore {
         transaction.commit().await?;
         Ok(execution)
     }
+
+    async fn record_progress(
+        &self,
+        execution: &Execution,
+        event: &orchestrator_core::ExecutionEvent,
+    ) -> Result<u64, StoreError> {
+        if execution.id != event.execution_id
+            || execution.state != event.state
+            || execution.attempt_id != event.attempt_id
+        {
+            return Err(StoreError::Conflict(
+                "execution progress and event identity do not match".to_owned(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(execution.id.as_str())
+            .fetch_one(&mut *transaction)
+            .await?;
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM execution_events WHERE execution_id = $1",
+        )
+        .bind(execution.id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let sequence = u64::try_from(sequence)
+            .map_err(|_| StoreError::Conflict("negative event sequence".to_owned()))?;
+        let result = execution.result.as_ref().map(to_json).transpose()?;
+        sqlx::query(
+            "UPDATE executions SET state = $2, worker_id = $3, attempt_id = $4, session_id = $5, \
+             worktree_path = $6, result = $7, updated_at = $8, version = version + 1 WHERE id = $1",
+        )
+        .bind(execution.id.as_str())
+        .bind(enum_text(&execution.state)?)
+        .bind(execution.worker_id.as_ref().map(WorkerId::as_str))
+        .bind(execution.attempt_id.as_ref().map(AttemptId::as_str))
+        .bind(execution.session_id.as_ref().map(SessionId::as_str))
+        .bind(execution.worktree_path.as_deref())
+        .bind(result.clone())
+        .bind(execution.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        if let Some(attempt_id) = &execution.attempt_id {
+            sqlx::query(
+                "UPDATE execution_attempts SET state = $2, worktree_path = $3, session_id = $4, \
+                 result = $5, updated_at = $6, finished_at = CASE WHEN $7 THEN $6 ELSE NULL END \
+                 WHERE attempt_id = $1",
+            )
+            .bind(attempt_id.as_str())
+            .bind(enum_text(&execution.state)?)
+            .bind(execution.worktree_path.as_deref())
+            .bind(execution.session_id.as_ref().map(SessionId::as_str))
+            .bind(result)
+            .bind(execution.updated_at)
+            .bind(execution.state.is_terminal())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        let mut persisted = event.clone();
+        persisted.sequence = sequence;
+        sqlx::query(
+            "INSERT INTO execution_events (execution_id, sequence, at, state, payload) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(execution.id.as_str())
+        .bind(i64::try_from(sequence).map_err(|_| {
+            StoreError::Conflict("event sequence exceeds PostgreSQL BIGINT".to_owned())
+        })?)
+        .bind(event.at)
+        .bind(enum_text(&event.state)?)
+        .bind(to_json(&persisted)?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(sequence)
+    }
 }
 
 pub(crate) async fn run_migrations(pool: &PgPool) -> Result<(), StoreError> {
@@ -147,21 +232,21 @@ pub(crate) fn enum_text<T: Serialize>(value: &T) -> Result<String, StoreError> {
     }
 }
 
-fn to_json<T: Serialize>(value: &T) -> Result<Value, StoreError> {
+pub(crate) fn to_json<T: Serialize>(value: &T) -> Result<Value, StoreError> {
     serde_json::to_value(value)
         .map_err(|error| StoreError::Conflict(format!("failed to serialize record: {error}")))
 }
 
-fn from_json<T: DeserializeOwned>(value: Value) -> Result<T, StoreError> {
+pub(crate) fn from_json<T: DeserializeOwned>(value: Value) -> Result<T, StoreError> {
     serde_json::from_value(value)
         .map_err(|error| StoreError::Conflict(format!("failed to deserialize record: {error}")))
 }
 
-fn enum_from_text<T: DeserializeOwned>(value: String) -> Result<T, StoreError> {
+pub(crate) fn enum_from_text<T: DeserializeOwned>(value: String) -> Result<T, StoreError> {
     from_json(Value::String(value))
 }
 
-fn decode_execution(row: &sqlx::postgres::PgRow) -> Result<Execution, StoreError> {
+pub(crate) fn decode_execution(row: &sqlx::postgres::PgRow) -> Result<Execution, StoreError> {
     Ok(Execution {
         id: ExecutionId::new(row.try_get::<String, _>("id")?),
         role: enum_from_text::<Role>(row.try_get("role")?)?,
@@ -201,8 +286,14 @@ fn map_conflict(error: sqlx::Error) -> StoreError {
 
 #[cfg(test)]
 mod contract_tests {
-    use super::{EventLog, ExecutionStore};
+    use super::{EventLog, ExecutionStore, ReservationStore, WorkerStore};
 
     #[allow(dead_code)]
-    fn traits_are_object_safe(_: &dyn ExecutionStore, _: &dyn EventLog) {}
+    fn traits_are_object_safe(
+        _: &dyn ExecutionStore,
+        _: &dyn EventLog,
+        _: &dyn WorkerStore,
+        _: &dyn ReservationStore,
+    ) {
+    }
 }

@@ -30,7 +30,7 @@ pub use manifest::{
 };
 pub use task_packet::TaskPacket;
 pub use telemetry::{execution_span, init_tracing};
-pub use worker::{WorkerCapabilities, WorkerRegistration, WorkerState};
+pub use worker::{WorkerCapabilities, WorkerCapabilityProof, WorkerRegistration, WorkerState};
 
 /// API version prefix for the orchestrator HTTP surface (spec section 75).
 pub const API_VERSION: &str = "v1";

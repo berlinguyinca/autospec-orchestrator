@@ -14,9 +14,37 @@ pub enum ScheduleError {
     NoEligibleWorker(String),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReservedResources {
+    pub slots: u32,
+    pub cpu: u32,
+    pub memory_mib: u64,
+}
+
 /// Whether a worker can host an execution with these requirements.
 pub fn worker_fits(worker: &WorkerRegistration, req: &RuntimeRequirement) -> bool {
-    if !worker.has_capacity() {
+    worker_fits_with_reservations(
+        worker,
+        req,
+        ReservedResources {
+            slots: worker.running_executions,
+            ..ReservedResources::default()
+        },
+    )
+}
+
+pub fn worker_fits_with_reservations(
+    worker: &WorkerRegistration,
+    req: &RuntimeRequirement,
+    reserved: ReservedResources,
+) -> bool {
+    if worker.state != orchestrator_core::WorkerState::Ready
+        || !worker
+            .capability_proof
+            .as_ref()
+            .is_some_and(orchestrator_core::WorkerCapabilityProof::is_complete)
+        || reserved.slots >= worker.capabilities.max_concurrent_executions
+    {
         return false;
     }
     if let Some(os) = &req.os {
@@ -24,8 +52,12 @@ pub fn worker_fits(worker: &WorkerRegistration, req: &RuntimeRequirement) -> boo
             return false;
         }
     }
-    if worker.capabilities.cpu < req.cpu
-        || worker.capabilities.memory_mib < req.memory_mib
+    if worker.capabilities.cpu.saturating_sub(reserved.cpu) < req.cpu
+        || worker
+            .capabilities
+            .memory_mib
+            .saturating_sub(reserved.memory_mib)
+            < req.memory_mib
         || worker.capabilities.disk_gib < req.disk_gib
     {
         return false;
@@ -54,7 +86,9 @@ pub fn select<'a>(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use orchestrator_core::{RuntimeKind, WorkerCapabilities, WorkerId, WorkerState};
+    use orchestrator_core::{
+        RuntimeKind, WorkerCapabilities, WorkerCapabilityProof, WorkerId, WorkerState,
+    };
 
     fn worker(id: &str, cpu: u32, caps: &[&str], running: u32) -> WorkerRegistration {
         WorkerRegistration {
@@ -72,6 +106,13 @@ mod tests {
             state: WorkerState::Ready,
             running_executions: running,
             last_heartbeat: Utc::now(),
+            capability_proof: Some(WorkerCapabilityProof {
+                storage_backend: "test".into(),
+                storage_pool_identity: "pool".into(),
+                docker_daemon_id: "daemon".into(),
+                docker_verifier: "probe".into(),
+                docker_method_version: "v1".into(),
+            }),
         }
     }
 
@@ -107,5 +148,20 @@ mod tests {
         let mut w = worker("full", 32, &["docker"], 4);
         w.running_executions = 4;
         assert!(!worker_fits(&w, &req(2, &[])));
+    }
+
+    #[test]
+    fn aggregate_reservations_reduce_cpu_and_memory_capacity() {
+        let w = worker("reserved", 32, &["docker"], 1);
+        let reserved = ReservedResources {
+            slots: 1,
+            cpu: 28,
+            memory_mib: 30_000,
+        };
+        assert!(!worker_fits_with_reservations(
+            &w,
+            &req(8, &["docker"]),
+            reserved
+        ));
     }
 }
