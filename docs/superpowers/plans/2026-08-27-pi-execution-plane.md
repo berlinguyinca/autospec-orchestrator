@@ -144,9 +144,9 @@
 **Files:**
 - Create: worker isolation tests, Docker credential broker, interactive API routes
 
-- [ ] Prove implementation and review executions share no network, volume, worktree, session, or credential state.
-- [ ] Mint short-lived execution-scoped credentials and revoke them during cleanup.
-- [ ] Implement pause/resume/attach and conversation fork while preserving the original worktree boundary.
+- [x] Prove implementation and review executions share no network, volume, worktree, session, or credential state.
+- [x] Mint short-lived execution-scoped credentials and revoke them during cleanup.
+- [x] Implement pause/resume/attach and conversation fork while preserving the original worktree boundary.
 
 ### Task 8: Operability and runtime conformance (#29–#31)
 
