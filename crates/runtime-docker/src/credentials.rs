@@ -3,6 +3,7 @@ use chrono::{DateTime, Duration, Utc};
 use orchestrator_core::{Execution, ExecutionId};
 use runtime_traits::{CredentialBroker, ExecutionCredentials, RuntimeError};
 use std::{
+    fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -122,10 +123,10 @@ impl LocalCredentialBroker {
             .map_err(|error| {
                 RuntimeError::Unavailable(format!("secure operating-system entropy: {error}"))
             })?;
-        let token = entropy
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let mut token = String::with_capacity(entropy.len() * 2);
+        for byte in entropy {
+            write!(token, "{byte:02x}").expect("writing to a String cannot fail");
+        }
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
