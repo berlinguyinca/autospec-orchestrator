@@ -99,3 +99,16 @@ async fn revoke_is_idempotent_and_cannot_remove_a_peer_credential() {
     assert!(broker.revoke(&ExecutionId::new("../peer")).await.is_err());
     assert!(right_credentials.path.exists());
 }
+
+#[tokio::test]
+async fn revoke_remains_idempotent_after_execution_storage_is_already_absent() {
+    let root = TempDir::new().unwrap();
+    let execution = execution("repo-7-recovery-01");
+    let execution_root = execution_root(&root, execution.id.as_str());
+    let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
+    broker.mint(&execution).await.unwrap();
+    fs::remove_dir_all(execution_root).unwrap();
+
+    broker.revoke(&execution.id).await.unwrap();
+    broker.revoke(&execution.id).await.unwrap();
+}

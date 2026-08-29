@@ -173,8 +173,15 @@ impl CredentialBroker for LocalCredentialBroker {
     }
 
     async fn revoke(&self, id: &ExecutionId) -> Result<(), RuntimeError> {
-        let parent = self.verified_parent(id)?;
-        let path = parent.join(CREDENTIAL_FILE);
+        let path = self.credential_path(id)?;
+        if self.read_live(&path)?.is_none() && !path.exists() {
+            return Ok(());
+        }
+        let parent = match self.verified_parent(id) {
+            Ok(parent) => parent,
+            Err(_error) if !path.exists() => return Ok(()),
+            Err(error) => return Err(error),
+        };
         match fs::remove_file(&path) {
             Ok(()) => File::open(&parent)
                 .and_then(|directory| directory.sync_all())
