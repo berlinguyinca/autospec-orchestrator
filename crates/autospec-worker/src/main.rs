@@ -12,8 +12,8 @@ use orchestrator_core::{
     WorkerCapabilityProof, WorkerId, API_VERSION,
 };
 use orchestrator_persistence::{
-    CleanupAuthorityStore, CleanupDisposition, CleanupStage, ExecutionStore, PgArtifactStore,
-    PgCleanupAuthorityStore, PgExecutionStore, PgReservationStore, ReservationStore,
+    ExecutionStore, PgArtifactStore, PgCleanupAuthorityStore, PgExecutionStore, PgReservationStore,
+    ReservationStore,
 };
 use orchestrator_worker::{
     ContentAddressedEvidenceStore, ExecutionTask, SystemExecutionLifecycle, SystemRecoveryConfig,
@@ -197,143 +197,7 @@ async fn main() -> Result<()> {
     let mut registered = false;
     let mut backoff = Duration::from_secs(1);
     let mut heartbeat_due = tokio::time::Instant::now();
-    let mut tasks: Vec<ExecutionTask> = Vec::new();
-    let startup_reservations = reservations.list_for_worker(&worker.id).await?;
-    for authority in cleanup.list_for_worker(&worker.id).await? {
-        let execution = match executions.get(&authority.execution_id).await {
-            Ok(execution) => execution,
-            Err(error) => {
-                tracing::error!(
-                    worker_id = %worker.id,
-                    execution_id = %authority.execution_id,
-                    attempt_id = %authority.attempt_id,
-                    %error,
-                    "cleanup authority has no reconstructable execution; retaining it for recovery"
-                );
-                continue;
-            }
-        };
-        let same_attempt = execution.worker_id.as_ref() == Some(&worker.id)
-            && execution.attempt_id.as_ref() == Some(&authority.attempt_id);
-        let disposition = match authority.disposition() {
-            Ok(disposition) => disposition,
-            Err(error) => {
-                tracing::error!(execution_id = %authority.execution_id, %error, "invalid cleanup disposition");
-                continue;
-            }
-        };
-        let cancellation_pending = match executions.cancellation_requested(&execution.id).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                tracing::error!(
-                    execution_id = %execution.id,
-                    attempt_id = %authority.attempt_id,
-                    %error,
-                    "cannot determine cancellation intent; refusing startup adoption"
-                );
-                continue;
-            }
-        };
-        if cancellation_pending {
-            match execution_worker
-                .recover_cleanup_authority(&authority, &execution)
-                .await
-            {
-                Ok(()) => tracing::info!(
-                    execution_id = %execution.id,
-                    attempt_id = %authority.attempt_id,
-                    "completed durable cancellation during startup recovery"
-                ),
-                Err(error) => tracing::error!(
-                    execution_id = %execution.id,
-                    attempt_id = %authority.attempt_id,
-                    %error,
-                    "startup cancellation recovery remains pending"
-                ),
-            }
-            continue;
-        }
-        if same_attempt
-            && execution.manifest.persistence == orchestrator_core::PersistenceMode::Resumable
-            && matches!(
-                execution.state,
-                orchestrator_core::ExecutionState::Provisioning
-                    | orchestrator_core::ExecutionState::Running
-                    | orchestrator_core::ExecutionState::PausedForHuman
-            )
-            && matches!(
-                disposition,
-                CleanupDisposition::Active(CleanupStage::PiStarted)
-                    | CleanupDisposition::Active(CleanupStage::Running)
-                    | CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent)
-            )
-        {
-            tracing::info!(
-                worker_id = %worker.id,
-                execution_id = %execution.id,
-                attempt_id = %authority.attempt_id,
-                session_id = ?execution.session_id,
-                "adopting durable Pi execution after worker restart"
-            );
-            tasks.push(execution_worker.clone().spawn_adopted(execution));
-            continue;
-        }
-        if same_attempt
-            && execution.state == orchestrator_core::ExecutionState::ReviewReady
-            && matches!(
-                disposition,
-                CleanupDisposition::RetainRequested | CleanupDisposition::Retained
-            )
-        {
-            reservations
-                .commit_retained_and_release_capacity(&execution.id, &authority.attempt_id)
-                .await?;
-            tracing::info!(
-                worker_id = %worker.id,
-                execution_id = %execution.id,
-                attempt_id = %authority.attempt_id,
-                "retaining resumable ReviewReady execution for later attach or explicit cleanup"
-            );
-            continue;
-        }
-        let has_live_reservation = startup_reservations.iter().any(|reservation| {
-            reservation.execution.id == execution.id
-                && reservation.attempt_id == authority.attempt_id
-                && reservation.worker_id == worker.id
-        });
-        if same_attempt
-            && !execution.state.is_terminal()
-            && has_live_reservation
-            && matches!(
-                disposition,
-                CleanupDisposition::Active(_) | CleanupDisposition::CleanupPending
-            )
-        {
-            reservations
-                .fence_lost_attempt(&execution.id, &authority.attempt_id)
-                .await?;
-        }
-        match execution_worker
-            .recover_cleanup_authority(&authority, &execution)
-            .await
-        {
-            Ok(()) => tracing::info!(
-                worker_id = %worker.id,
-                execution_id = %authority.execution_id,
-                attempt_id = %authority.attempt_id,
-                phase = %authority.phase,
-                "recovered abandoned execution authority"
-            ),
-            Err(error) => tracing::error!(
-                worker_id = %worker.id,
-                execution_id = %authority.execution_id,
-                attempt_id = %authority.attempt_id,
-                phase = %authority.phase,
-                %error,
-                "abandoned authority recovery remains unresolved"
-            ),
-        }
-    }
+    let mut tasks: Vec<ExecutionTask> = execution_worker.reconcile_startup(&worker.id).await?;
     loop {
         let mut index = tasks.len();
         while index > 0 {

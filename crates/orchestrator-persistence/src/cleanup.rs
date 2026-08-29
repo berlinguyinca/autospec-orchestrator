@@ -211,6 +211,11 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
         attempt_id: &AttemptId,
         worker_id: &WorkerId,
     ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(execution_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?;
         let inserted = sqlx::query(
             "INSERT INTO cleanup_authorities (execution_id, attempt_id, worker_id, phase) \
              VALUES ($1, $2, $3, 'ACTIVE:RESERVED') ON CONFLICT (execution_id) DO UPDATE \
@@ -220,9 +225,10 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
         .bind(execution_id.as_str())
         .bind(attempt_id.as_str())
         .bind(worker_id.as_str())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if inserted.rows_affected() == 1 {
+            transaction.commit().await?;
             Ok(())
         } else {
             Err(StoreError::Conflict(format!(
@@ -270,6 +276,17 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
                 "illegal cleanup transition {expected} -> {next}"
             )));
         }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(execution_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "SELECT execution_id FROM cleanup_authorities WHERE execution_id = $1 FOR UPDATE",
+        )
+        .bind(execution_id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
         let updated = sqlx::query(
             "UPDATE cleanup_authorities SET phase = $3, handles = $4, updated_at = now() \
              WHERE execution_id = $1 AND phase IN ($2, $3)",
@@ -278,12 +295,17 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
         .bind(expected.to_string())
         .bind(next.to_string())
         .bind(handles)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if updated.rows_affected() == 1 {
+            transaction.commit().await?;
             Ok(())
         } else {
-            let actual = self.get(execution_id).await?.disposition()?;
+            let actual: String =
+                sqlx::query_scalar("SELECT phase FROM cleanup_authorities WHERE execution_id = $1")
+                    .bind(execution_id.as_str())
+                    .fetch_one(&mut *transaction)
+                    .await?;
             Err(StoreError::Conflict(format!(
                 "cleanup authority is {actual}, expected {expected}"
             )))
@@ -295,6 +317,17 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
         execution_id: &ExecutionId,
         handles: &Value,
     ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(execution_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "SELECT execution_id FROM cleanup_authorities WHERE execution_id = $1 FOR UPDATE",
+        )
+        .bind(execution_id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
         let updated = sqlx::query(
             "UPDATE cleanup_authorities c SET phase = 'CLEANUP_PENDING', handles = $2, updated_at = now() \
              FROM executions e, execution_attempts a \
@@ -308,9 +341,10 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
         )
         .bind(execution_id.as_str())
         .bind(handles)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if updated.rows_affected() == 1 {
+            transaction.commit().await?;
             Ok(())
         } else {
             Err(StoreError::Conflict(format!(
@@ -320,14 +354,26 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
     }
 
     async fn resolve(&self, execution_id: &ExecutionId) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(execution_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "SELECT execution_id FROM cleanup_authorities WHERE execution_id = $1 FOR UPDATE",
+        )
+        .bind(execution_id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
         let resolved = sqlx::query(
             "UPDATE cleanup_authorities SET phase = 'RESOLVED', updated_at = now() \
              WHERE execution_id = $1 AND phase IN ('RESERVATION_RELEASED', 'RESOLVED')",
         )
         .bind(execution_id.as_str())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if resolved.rows_affected() == 1 {
+            transaction.commit().await?;
             Ok(())
         } else {
             Err(StoreError::Conflict(format!(

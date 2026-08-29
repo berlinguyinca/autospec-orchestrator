@@ -422,6 +422,210 @@ async fn attachment_snapshot_is_atomic_opaque_and_rejects_non_attachable_authori
         .unwrap()
         .contains("/secret/host/path"));
     assert!(snapshot.event_cursor > 0);
+
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").unwrap();
+    let cleanup = PgCleanupAuthorityStore::connect(&database_url)
+        .await
+        .unwrap();
+    cleanup
+        .begin(
+            &running.id,
+            running.attempt_id.as_ref().unwrap(),
+            &worker.id,
+        )
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+    sqlx::query("UPDATE executions SET state = 'REVIEW_READY' WHERE id = $1")
+        .bind(running.id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE cleanup_authorities SET phase = 'RETAINED' WHERE execution_id = $1")
+        .bind(running.id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut cleanup_transition = pool.begin().await.unwrap();
+    sqlx::query("SELECT execution_id FROM cleanup_authorities WHERE execution_id = $1 FOR UPDATE")
+        .bind(running.id.as_str())
+        .fetch_one(&mut *cleanup_transition)
+        .await
+        .unwrap();
+    let attach_store = executions.clone();
+    let attach_id = running.id.clone();
+    let attach = tokio::spawn(async move { attach_store.attachment_snapshot(&attach_id).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !attach.is_finished(),
+        "attach returned without locking retained cleanup authority"
+    );
+    sqlx::query("UPDATE cleanup_authorities SET phase = 'CLEANUP_PENDING' WHERE execution_id = $1")
+        .bind(running.id.as_str())
+        .execute(&mut *cleanup_transition)
+        .await
+        .unwrap();
+    cleanup_transition.commit().await.unwrap();
+    assert!(attach.await.unwrap().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_uses_execution_first_lock_order_at_every_control_phase() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").unwrap();
+    let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+
+    for phase in ["accepted", "applying", "side_effect_applied"] {
+        let worker = registered_worker(
+            &format!(
+                "worker-lock-order-{phase}-{}",
+                uuid::Uuid::new_v4().simple()
+            ),
+            1,
+        );
+        workers.register(&worker).await.unwrap();
+        let mut queued = execution(ExecutionState::Queued);
+        queued.manifest.persistence = PersistenceMode::Resumable;
+        executions.insert(&queued).await.unwrap();
+        let mut running = reservations
+            .reserve_next(&worker.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .execution;
+        running.transition(ExecutionState::Provisioning).unwrap();
+        running.worktree_path = Some(format!("/bounded/lock-order/{phase}"));
+        executions
+            .record_progress(
+                &running,
+                &progress_event(&running, ExecutionEventKind::EnvironmentReady),
+            )
+            .await
+            .unwrap();
+        running.transition(ExecutionState::Running).unwrap();
+        running.session_id = Some(SessionId::new(format!("session-{phase}")));
+        executions
+            .record_progress(
+                &running,
+                &progress_event(
+                    &running,
+                    ExecutionEventKind::AgentStarted {
+                        session_id: running.session_id.clone().unwrap(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let control = executions
+            .request_control(
+                &running.id,
+                ExecutionControlAction::Pause,
+                &format!("cancel-race-{phase}"),
+            )
+            .await
+            .unwrap();
+        if phase != "accepted" {
+            executions
+                .begin_control(
+                    control.request.request_id,
+                    &worker.id,
+                    running.attempt_id.as_ref().unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        if phase == "side_effect_applied" {
+            executions
+                .mark_control_side_effect_applied(control.request.request_id, None)
+                .await
+                .unwrap();
+        }
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(running.id.as_str())
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        let cancel_store = executions.clone();
+        let cancel_id = running.id.clone();
+        let cancellation =
+            tokio::spawn(async move { cancel_store.request_cancellation(&cancel_id).await });
+        for _ in 0..100 {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                 AND query LIKE 'SELECT%executions%FOR UPDATE%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if blocked >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let control_store = executions.clone();
+        let control_worker = worker.id.clone();
+        let control_attempt = running.attempt_id.clone().unwrap();
+        let request_id = control.request.request_id;
+        let mut paused = running.clone();
+        paused.transition(ExecutionState::PausedForHuman).unwrap();
+        let control_operation = tokio::spawn(async move {
+            match phase {
+                "accepted" => {
+                    control_store
+                        .begin_control(request_id, &control_worker, &control_attempt)
+                        .await
+                }
+                "applying" => {
+                    control_store
+                        .mark_control_side_effect_applied(request_id, None)
+                        .await
+                }
+                "side_effect_applied" => control_store
+                    .complete_control(
+                        request_id,
+                        &paused,
+                        &progress_event(&paused, ExecutionEventKind::ExecutionPaused),
+                    )
+                    .await
+                    .map(|_| ()),
+                _ => unreachable!(),
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !control_operation.is_finished(),
+            "{phase} operation bypassed the execution-first lock"
+        );
+        blocker.commit().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancellation)
+            .await
+            .expect("cancellation deadlocked")
+            .unwrap()
+            .expect("cancellation must win the queued lock");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), control_operation)
+                .await
+                .expect("control operation deadlocked")
+                .unwrap()
+                .is_err()
+        );
+        let persisted_phase: String = sqlx::query_scalar(
+            "SELECT phase FROM execution_control_requests WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted_phase, "STALE");
+    }
 }
 use orchestrator_persistence::{
     ArtifactStore, CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog,

@@ -179,14 +179,50 @@ Task 7 was implemented RED to GREEN:
     reused the current run's database, so a fixed-ID sequence test observed old
     events. No code change was made. Both full toolchain gates were restarted
     against distinct empty databases and passed.
+19. Round-three PostgreSQL barriers reproduced a real `40P01` deadlock between
+    cancellation and `begin_control`: cancellation locked the execution first
+    while the control path had locked the control row first. Every control,
+    cancellation, terminal-progress, and cleanup transition now acquires the
+    execution row first and then its exact control/cleanup row. Barriers at
+    `APPLYING`, `SIDE_EFFECT_APPLIED`, and completion prove cancellation wins
+    without a stranded row or native side effect.
+20. An attachment race initially returned metadata while retained cleanup had
+    already locked its authority row for transition. Attachment now locks the
+    execution and matching cleanup authority, in that order, before reading
+    state, retention, and event cursor. The deterministic race proves the
+    resulting snapshot is coherent or conflicts after cleanup begins.
+21. Credential publication now owns each temporary candidate with an RAII
+    guard from creation until successful publication. Mint and revoke scavenge
+    only exact `.inferweave.credential.<64-lowercase-hex>.tmp` regular files;
+    symlinks and other non-regular candidates fail closed and unrelated names
+    are never deleted. Error, crash-residue, revoke, and concurrent tests prove
+    bounded cleanup. If the filesystem refuses both guard cleanup and later
+    scavenging, the bounded candidate is deliberately retained rather than
+    risking an unsafe path deletion.
+22. The strengthened side-effect recovery test initially observed the exact
+    resumed Pi session but not the recovery boundary because `RunningRestored`
+    was emitted only by one resume branch. The checkpoint now follows both
+    branches. Each child asserts its shared observer saw the exact recovered
+    execution/session, no `ReviewReady` existed before the cut, and the later
+    terminal event has a post-recovery sequence.
+23. Startup authority reconciliation is now one public worker routine used by
+    the `autospec-worker` binary and the separate-process recovery fixtures.
+    Both control crash replacement and partial-Docker rollback replacement call
+    that exact production routine rather than reconstructing startup behavior
+    in the test. Secret containment directly scans the materialized task packet,
+    Pi stdout/stderr, remaining execution files, and these durable tables:
+    `artifact_blobs`, `execution_requests`, `execution_control_requests`,
+    `execution_cancellation_requests`, `reservations`, `workers`, `executions`,
+    `execution_attempts`, `execution_events`, `cleanup_authorities`, and
+    `artifacts`.
 
 ## Verification
 
-- `AUTOSPEC_DATABASE_URL=.../autospec_current_fresh cargo test --workspace -- --test-threads=1`
-  — passed on its own empty database, including 33 PostgreSQL tests, 5 execution
-  API tests, 40 Pi harness tests, all 11 real worker E2Es, 7 credential tests,
+- `AUTOSPEC_DATABASE_URL=.../autospec_current_round3_final cargo test --workspace -- --test-threads=1`
+  — passed on its own empty database, including 34 PostgreSQL tests, 5 execution
+  API tests, 40 Pi harness tests, all 11 real worker E2Es, 9 credential tests,
   and 18 Docker runtime tests.
-- `AUTOSPEC_DATABASE_URL=.../autospec_msrv_fresh rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
+- `AUTOSPEC_DATABASE_URL=.../autospec_msrv_round3_final rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
   — passed on a separate empty database with the same full serialized workspace
   coverage.
 - `cargo build --workspace` — passed.
@@ -213,7 +249,10 @@ Task 7 was implemented RED to GREEN:
 - `aee776b` — reviewer fix round: fenced control phases, crash reconciliation,
   fail-closed credential startup, secret containment, timer suspension, opaque
   attach snapshot, service-backed isolation, and 0011→0012 upgrade proof.
-- Fix round two is recorded with this updated report in the following commit.
+- `13b84ad` — fix round two: cancellation precedence, paused-health adoption,
+  exact post-side-effect liveness, broker serialization, atomic attachment, and
+  restart-safe partial-provision cleanup.
+- Fix round three is recorded with this updated report in the following commit.
 
 ## Concerns and follow-up
 

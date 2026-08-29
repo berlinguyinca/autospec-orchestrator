@@ -14,6 +14,28 @@ use std::{
 const CREDENTIAL_FILE: &str = "inferweave.credential";
 static CREDENTIAL_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
+struct CredentialCandidate {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl CredentialCandidate {
+    fn remove(mut self, operation: &str) -> Result<(), RuntimeError> {
+        fs::remove_file(&self.path)
+            .map_err(|error| RuntimeError::Provisioning(format!("{operation}: {error}")))?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for CredentialCandidate {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Local execution-scoped credential issuer used until an InferWeave issuance
 /// endpoint exists. It creates opaque, short-lived material only; it does not
 /// choose a model, serve inference, or define InferWeave authorization policy.
@@ -137,7 +159,7 @@ impl LocalCredentialBroker {
         &self,
         parent: &Path,
         expires_at: DateTime<Utc>,
-    ) -> Result<PathBuf, RuntimeError> {
+    ) -> Result<CredentialCandidate, RuntimeError> {
         let token = self.random_hex()?;
         let suffix = self.random_hex()?;
         let path = parent.join(format!(".{CREDENTIAL_FILE}.{suffix}.tmp"));
@@ -156,7 +178,47 @@ impl LocalCredentialBroker {
             .map_err(|error| {
                 RuntimeError::Provisioning(format!("persist execution credential: {error}"))
             })?;
-        Ok(path)
+        Ok(CredentialCandidate { path, armed: true })
+    }
+
+    fn scavenge_candidates(parent: &Path) -> Result<(), RuntimeError> {
+        let prefix = format!(".{CREDENTIAL_FILE}.");
+        for entry in fs::read_dir(parent).map_err(|error| {
+            RuntimeError::Provisioning(format!("enumerate credential candidates: {error}"))
+        })? {
+            let entry = entry.map_err(|error| {
+                RuntimeError::Provisioning(format!("read credential candidate entry: {error}"))
+            })?;
+            let name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+            let Some(entropy) = name
+                .strip_prefix(&prefix)
+                .and_then(|name| name.strip_suffix(".tmp"))
+            else {
+                continue;
+            };
+            if entropy.len() != 64
+                || !entropy
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                RuntimeError::Provisioning(format!("inspect credential candidate: {error}"))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(RuntimeError::ResourceLimit(
+                    "credential candidate authority is not a regular file".to_owned(),
+                ));
+            }
+            fs::remove_file(entry.path()).map_err(|error| {
+                RuntimeError::Cleanup(format!("remove credential crash candidate: {error}"))
+            })?;
+        }
+        Self::sync_directory(parent, "sync credential candidate cleanup")
     }
 
     fn sync_directory(parent: &Path, operation: &str) -> Result<(), RuntimeError> {
@@ -186,6 +248,7 @@ impl CredentialBroker for LocalCredentialBroker {
             .lock()
             .map_err(|_| RuntimeError::Unavailable("execution credential lock poisoned".into()))?;
         let parent = self.verified_parent(&execution.id)?;
+        Self::scavenge_candidates(&parent)?;
         let path = parent.join(CREDENTIAL_FILE);
         if let Some(expires_at) = self.read_live(&path)? {
             return Ok(ExecutionCredentials { path, expires_at });
@@ -197,22 +260,14 @@ impl CredentialBroker for LocalCredentialBroker {
         }
         let expires_at = Utc::now() + self.ttl;
         let candidate = self.create_candidate(&parent, expires_at)?;
-        match fs::hard_link(&candidate, &path) {
+        match fs::hard_link(&candidate.path, &path) {
             Ok(()) => {
-                fs::remove_file(&candidate).map_err(|error| {
-                    RuntimeError::Provisioning(format!(
-                        "remove linked credential candidate: {error}"
-                    ))
-                })?;
+                candidate.remove("remove linked credential candidate")?;
                 Self::sync_directory(&parent, "sync credential directory")?;
                 Ok(ExecutionCredentials { path, expires_at })
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                fs::remove_file(&candidate).map_err(|remove_error| {
-                    RuntimeError::Provisioning(format!(
-                        "remove losing credential candidate: {remove_error}"
-                    ))
-                })?;
+                candidate.remove("remove losing credential candidate")?;
                 let expires_at = self.read_live(&path)?.ok_or_else(|| {
                     RuntimeError::ResourceLimit(
                         "concurrent credential winner is expired".to_owned(),
@@ -244,6 +299,7 @@ impl CredentialBroker for LocalCredentialBroker {
             }
             Err(error) => return Err(error),
         };
+        Self::scavenge_candidates(&parent)?;
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),

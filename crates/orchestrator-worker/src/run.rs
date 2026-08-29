@@ -789,9 +789,6 @@ async fn handle_control(
                     .await?;
                 worker
                     .control_checkpoints
-                    .reached(ControlCheckpoint::RunningRestored);
-                worker
-                    .control_checkpoints
                     .reached(ControlCheckpoint::ResumeLaunched);
             } else {
                 // Adoption deliberately quiesces abandoned holds. Reapplying a
@@ -802,6 +799,9 @@ async fn handle_control(
                     .resume(execution, receipt, environment, session)
                     .await?;
             }
+            worker
+                .control_checkpoints
+                .reached(ControlCheckpoint::RunningRestored);
             health.resume(Instant::now());
             execution
                 .transition(ExecutionState::Running)

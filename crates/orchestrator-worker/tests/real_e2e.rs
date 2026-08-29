@@ -796,6 +796,19 @@ async fn control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_onc
             orchestrator_persistence::ExecutionControlPhase::SideEffectApplied,
             "crash phase: {stage}"
         );
+        let pre_recovery_events = PgEventLog::connect(&database_url)
+            .await
+            .unwrap()
+            .since(&execution_id, 0)
+            .await
+            .unwrap();
+        assert!(pre_recovery_events
+            .iter()
+            .all(|event| !matches!(event.kind, ExecutionEventKind::ReviewReady)));
+        let pre_recovery_cursor = pre_recovery_events
+            .last()
+            .map(|event| event.sequence)
+            .unwrap_or(0);
         let recovered = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "crash_process_helper", "--nocapture"])
             .env("AUTOSPEC_TASK5_CRASH_HELPER", "1")
@@ -847,6 +860,19 @@ async fn control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_onc
             })
             .count();
         assert_eq!(matching, 1, "control event must be exactly once: {stage}");
+        let review_ready = events
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ReviewReady))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            review_ready.len(),
+            1,
+            "recovery publishes one terminal event"
+        );
+        assert!(
+            review_ready[0].sequence > pre_recovery_cursor,
+            "ReviewReady must be produced by the replacement process"
+        );
 
         executions
             .request_cancellation(&execution_id)
@@ -1601,38 +1627,16 @@ async fn reaper_restart_process_helper() {
             .await
             .unwrap(),
     );
-    let authority = cleanup.get(&execution_id).await.unwrap();
-    let execution = executions.get(&execution_id).await.unwrap();
-    let disposition = authority.disposition().unwrap();
-    let has_live_reservation = reservations
-        .list_for_worker(&authority.worker_id)
-        .await
-        .unwrap()
-        .iter()
-        .any(|reservation| {
-            reservation.execution.id == execution_id
-                && reservation.attempt_id == authority.attempt_id
-        });
-    if has_live_reservation
-        && matches!(
-            disposition,
-            CleanupDisposition::Active(_) | CleanupDisposition::CleanupPending
-        )
-    {
-        reservations
-            .fence_lost_attempt(&execution_id, &authority.attempt_id)
-            .await
-            .expect("live startup authority is fenced exactly once");
-    }
-    Worker::new(
+    let worker_id = cleanup.get(&execution_id).await.unwrap().worker_id;
+    Arc::new(Worker::new(
         build_system_lifecycle(&root, &remote, &daemon, &image),
         executions,
         reservations,
         cleanup,
-    )
-    .recover_cleanup_authority(&authority, &execution)
+    ))
+    .reconcile_startup(&worker_id)
     .await
-    .expect("fresh worker cleans and atomically finalizes exact authority");
+    .expect("production startup reconciliation cleans exact authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2071,6 +2075,22 @@ async fn adversarial_agent_credential_echo_and_copy_are_not_durably_exfiltrated(
     assert!(!packet
         .windows(token.len())
         .any(|window| window == token.as_bytes()));
+    for log in [
+        layout
+            .session
+            .join(format!("pi.events-{execution_id}.jsonl")),
+        layout.session.join(format!("pi.stderr-{execution_id}.log")),
+    ] {
+        assert!(
+            log.is_file(),
+            "expected materialized Pi log: {}",
+            log.display()
+        );
+        let bytes = fs::read(log).unwrap();
+        assert!(!bytes
+            .windows(token.len())
+            .any(|window| window == token.as_bytes()));
+    }
     let error = tokio::time::timeout(std::time::Duration::from_secs(30), task.join())
         .await
         .expect("recognized terminal event must finish the execution")
@@ -2081,19 +2101,9 @@ async fn adversarial_agent_credential_echo_and_copy_are_not_durably_exfiltrated(
         "exfiltration must fail closed: {error}"
     );
     assert!(!error.contains(&token));
-    for log in [
-        layout
-            .session
-            .join(format!("pi.events-{execution_id}.jsonl")),
-        layout.session.join(format!("pi.stderr-{execution_id}.log")),
-    ] {
-        let bytes = fs::read(log).unwrap_or_default();
-        assert!(!bytes
-            .windows(token.len())
-            .any(|window| window == token.as_bytes()));
-    }
     assert_secret_absent_from_durable_records(&database_url, &token).await;
     assert!(!layout.root.exists(), "failed exfiltration must be cleaned");
+    assert_secret_absent_from_tree(&root, &token);
     assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
     delete_matrix_records(&database_url, &execution_id, &worker_id).await;
     if root.exists() {
@@ -2435,6 +2445,13 @@ async fn crash_process_helper() {
             stage.as_str(),
             "resume_side_effect" | "running_fork_side_effect"
         );
+        let observer = Arc::new(AssertRecoveryBoundary {
+            root: root.clone(),
+            execution_id: execution_id.clone(),
+            expected_session,
+            live,
+            seen: AtomicBool::new(false),
+        });
         let worker = Arc::new(
             Worker::new(
                 build_system_lifecycle(&root, &remote, &daemon, &image),
@@ -2442,19 +2459,15 @@ async fn crash_process_helper() {
                 reservations.clone(),
                 cleanup.clone(),
             )
-            .with_control_checkpoint_observer(Arc::new(AssertRecoveryBoundary {
-                root: root.clone(),
-                execution_id: execution_id.clone(),
-                expected_session,
-                live,
-                seen: AtomicBool::new(false),
-            })),
+            .with_control_checkpoint_observer(observer.clone()),
         );
-        let task = worker
-            .clone()
-            .spawn_adopted(executions.get(&execution_id).await.unwrap());
+        let mut tasks = worker
+            .reconcile_startup(&worker_id)
+            .await
+            .expect("production startup reconciliation adopts the exact control authority");
+        assert_eq!(tasks.len(), 1);
         worker
-            .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+            .reconcile_daemon_tick(&worker_id, &tasks)
             .await
             .unwrap();
         if matches!(
@@ -2481,15 +2494,22 @@ async fn crash_process_helper() {
                 .await
                 .unwrap();
             worker
-                .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+                .reconcile_daemon_tick(&worker_id, &tasks)
                 .await
                 .unwrap();
         }
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), task.join())
-            .await
-            .expect("fresh process must reconcile the control")
-            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tasks.pop().unwrap().join(),
+        )
+        .await
+        .expect("fresh process must reconcile the control")
+        .unwrap();
         assert_eq!(result.state, ExecutionState::ReviewReady);
+        assert!(
+            observer.seen.load(Ordering::SeqCst),
+            "fresh recovery must cross the asserted Pi liveness boundary"
+        );
         return;
     }
     let assigned = reservations
@@ -2640,6 +2660,12 @@ fn docker_resource_exists(kind: &str, name: &str) -> bool {
 async fn assert_secret_absent_from_durable_records(database_url: &str, secret: &str) {
     let pool = sqlx::PgPool::connect(database_url).await.unwrap();
     for table in [
+        "artifact_blobs",
+        "execution_requests",
+        "execution_control_requests",
+        "execution_cancellation_requests",
+        "reservations",
+        "workers",
         "executions",
         "execution_attempts",
         "execution_events",
@@ -2655,6 +2681,34 @@ async fn assert_secret_absent_from_durable_records(database_url: &str, secret: &
             .await
             .unwrap();
         assert!(!present, "credential material persisted in {table}");
+    }
+}
+
+fn assert_secret_absent_from_tree(root: &Path, secret: &str) {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            pending.extend(
+                fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+            continue;
+        }
+        if metadata.is_file() {
+            let bytes = fs::read(&path).unwrap();
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "credential material persisted in {}",
+                path.display()
+            );
+        }
     }
 }
 

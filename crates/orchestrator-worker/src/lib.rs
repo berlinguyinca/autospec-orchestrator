@@ -297,6 +297,145 @@ impl Worker {
         self
     }
 
+    /// Runs the same durable authority recovery used before the production
+    /// daemon enters its heartbeat/reservation loop.
+    pub async fn reconcile_startup(
+        self: &Arc<Self>,
+        worker_id: &WorkerId,
+    ) -> Result<Vec<ExecutionTask>, WorkerError> {
+        let startup_reservations = self
+            .reservations
+            .list_for_worker(worker_id)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        let authorities = self
+            .cleanup_authorities
+            .list_for_worker(worker_id)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        let mut tasks = Vec::new();
+        for authority in authorities {
+            let execution = match self.executions.get(&authority.execution_id).await {
+                Ok(execution) => execution,
+                Err(error) => {
+                    tracing::error!(
+                        worker_id = %worker_id,
+                        execution_id = %authority.execution_id,
+                        attempt_id = %authority.attempt_id,
+                        %error,
+                        "cleanup authority has no reconstructable execution; retaining it for recovery"
+                    );
+                    continue;
+                }
+            };
+            let same_attempt = execution.worker_id.as_ref() == Some(worker_id)
+                && execution.attempt_id.as_ref() == Some(&authority.attempt_id);
+            let disposition = match authority.disposition() {
+                Ok(disposition) => disposition,
+                Err(error) => {
+                    tracing::error!(
+                        execution_id = %authority.execution_id,
+                        %error,
+                        "invalid cleanup disposition"
+                    );
+                    continue;
+                }
+            };
+            let cancellation_pending = self
+                .executions
+                .cancellation_requested(&execution.id)
+                .await
+                .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+            if cancellation_pending {
+                match self.recover_cleanup_authority(&authority, &execution).await {
+                    Ok(()) => tracing::info!(
+                        execution_id = %execution.id,
+                        attempt_id = %authority.attempt_id,
+                        "completed durable cancellation during startup recovery"
+                    ),
+                    Err(error) => tracing::error!(
+                        execution_id = %execution.id,
+                        attempt_id = %authority.attempt_id,
+                        %error,
+                        "startup cancellation recovery remains pending"
+                    ),
+                }
+                continue;
+            }
+            if same_attempt
+                && execution.manifest.persistence == orchestrator_core::PersistenceMode::Resumable
+                && matches!(
+                    execution.state,
+                    orchestrator_core::ExecutionState::Provisioning
+                        | orchestrator_core::ExecutionState::Running
+                        | orchestrator_core::ExecutionState::PausedForHuman
+                )
+                && matches!(
+                    disposition,
+                    CleanupDisposition::Active(orchestrator_persistence::CleanupStage::PiStarted)
+                        | CleanupDisposition::Active(
+                            orchestrator_persistence::CleanupStage::Running
+                        )
+                        | CleanupDisposition::Active(
+                            orchestrator_persistence::CleanupStage::PostPiBeforeEvent
+                        )
+                )
+            {
+                tasks.push(self.clone().spawn_adopted(execution));
+                continue;
+            }
+            if same_attempt
+                && execution.state == orchestrator_core::ExecutionState::ReviewReady
+                && matches!(
+                    disposition,
+                    CleanupDisposition::RetainRequested | CleanupDisposition::Retained
+                )
+            {
+                self.reservations
+                    .commit_retained_and_release_capacity(&execution.id, &authority.attempt_id)
+                    .await
+                    .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+                continue;
+            }
+            let has_live_reservation = startup_reservations.iter().any(|reservation| {
+                reservation.execution.id == execution.id
+                    && reservation.attempt_id == authority.attempt_id
+                    && reservation.worker_id == *worker_id
+            });
+            if same_attempt
+                && !execution.state.is_terminal()
+                && has_live_reservation
+                && matches!(
+                    disposition,
+                    CleanupDisposition::Active(_) | CleanupDisposition::CleanupPending
+                )
+            {
+                self.reservations
+                    .fence_lost_attempt(&execution.id, &authority.attempt_id)
+                    .await
+                    .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+            }
+            match self.recover_cleanup_authority(&authority, &execution).await {
+                Ok(()) => tracing::info!(
+                    worker_id = %worker_id,
+                    execution_id = %authority.execution_id,
+                    attempt_id = %authority.attempt_id,
+                    phase = %authority.phase,
+                    "recovered abandoned execution authority"
+                ),
+                Err(error) => tracing::error!(
+                    worker_id = %worker_id,
+                    execution_id = %authority.execution_id,
+                    attempt_id = %authority.attempt_id,
+                    phase = %authority.phase,
+                    %error,
+                    "abandoned authority recovery remains unresolved"
+                ),
+            }
+        }
+        Ok(tasks)
+    }
+
     pub async fn run(&self, execution: &Execution) -> Result<ExecutionResult, WorkerError> {
         run::run(self, execution).await
     }

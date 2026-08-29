@@ -201,3 +201,49 @@ async fn revoke_removes_exact_malformed_file_but_rejects_symlink_authority() {
         assert_eq!(fs::read_to_string(target).unwrap(), "preserve");
     }
 }
+
+#[tokio::test]
+async fn mint_and_revoke_scavenge_only_exact_validated_crash_candidates() {
+    let root = TempDir::new().unwrap();
+    let execution = execution("repo-7-candidate-recovery-01");
+    let execution_root = execution_root(&root, execution.id.as_str());
+    let credentials = execution_root.join("credentials");
+    let crashed = credentials.join(format!(".inferweave.credential.{}.tmp", "a".repeat(64)));
+    let unrelated = credentials.join(".inferweave.credential.not-hex.tmp");
+    fs::write(&crashed, "orphan\n2026-08-29T00:00:00Z\n").unwrap();
+    fs::write(&unrelated, "preserve").unwrap();
+    let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
+
+    let minted = broker.mint(&execution).await.unwrap();
+    assert!(!crashed.exists());
+    assert!(unrelated.exists());
+    assert!(minted.path.exists());
+
+    let second_crash = credentials.join(format!(".inferweave.credential.{}.tmp", "b".repeat(64)));
+    fs::write(&second_crash, "orphan\n2026-08-29T00:00:00Z\n").unwrap();
+    broker.revoke(&execution.id).await.unwrap();
+    assert!(!second_crash.exists());
+    assert!(!minted.path.exists());
+    assert!(unrelated.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn candidate_scavenging_fails_closed_on_symlinks_and_irregular_files() {
+    let root = TempDir::new().unwrap();
+    let execution = execution("repo-7-candidate-adversarial-01");
+    let execution_root = execution_root(&root, execution.id.as_str());
+    let credentials = execution_root.join("credentials");
+    let target = root.path().join("foreign-candidate-target");
+    fs::write(&target, "preserve").unwrap();
+    let candidate = credentials.join(format!(".inferweave.credential.{}.tmp", "c".repeat(64)));
+    std::os::unix::fs::symlink(&target, &candidate).unwrap();
+    let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
+
+    assert!(broker.mint(&execution).await.is_err());
+    assert!(candidate.is_symlink());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "preserve");
+    assert!(broker.revoke(&execution.id).await.is_err());
+    assert!(candidate.is_symlink());
+    assert_eq!(fs::read_to_string(target).unwrap(), "preserve");
+}

@@ -710,14 +710,16 @@ impl ExecutionStore for PgExecutionStore {
         }
         let action_text = enum_text(&action)?;
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 2))")
+        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
             .bind(id.as_str())
-            .fetch_one(&mut *transaction)
-            .await?;
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let execution = decode_execution(&row)?;
         if let Some(row) = sqlx::query(
             "SELECT request_id, action, requested_at, completed_at \
              FROM execution_control_requests \
-             WHERE execution_id = $1 AND idempotency_key = $2",
+             WHERE execution_id = $1 AND idempotency_key = $2 FOR UPDATE",
         )
         .bind(id.as_str())
         .bind(idempotency_key)
@@ -737,12 +739,6 @@ impl ExecutionStore for PgExecutionStore {
                 created: false,
             });
         }
-        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
-            .bind(id.as_str())
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
-        let execution = decode_execution(&row)?;
         let cancellation_pending = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM execution_cancellation_requests \
              WHERE execution_id = $1 AND completed_at IS NULL)",
@@ -941,15 +937,21 @@ impl ExecutionStore for PgExecutionStore {
         attempt_id: &AttemptId,
     ) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await?;
+        let execution_id: String = sqlx::query_scalar(
+            "SELECT execution_id FROM execution_control_requests WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("control request {request_id}")))?;
+        let execution_row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(&execution_id)
+            .fetch_one(&mut *transaction)
+            .await?;
         let row = sqlx::query(
-            "SELECT c.phase, c.accepted_worker_id, c.accepted_attempt_id, \
-                    c.source_session_id, c.worktree_path, c.accepted_execution_version, \
-                    c.accepted_state, e.worker_id AS current_worker_id, \
-                    e.attempt_id AS current_attempt_id, e.session_id AS current_session_id, \
-                    e.worktree_path AS current_worktree_path, e.version AS current_version, \
-                    e.state AS current_state \
-             FROM execution_control_requests c JOIN executions e ON e.id = c.execution_id \
-             WHERE c.request_id = $1 FOR UPDATE OF c, e",
+            "SELECT phase, accepted_worker_id, accepted_attempt_id, source_session_id, \
+                    worktree_path, accepted_execution_version, accepted_state \
+             FROM execution_control_requests WHERE request_id = $1 FOR UPDATE",
         )
         .bind(request_id)
         .fetch_optional(&mut *transaction)
@@ -966,35 +968,33 @@ impl ExecutionStore for PgExecutionStore {
         }
         let accepted_worker: String = row.try_get("accepted_worker_id")?;
         let accepted_attempt: String = row.try_get("accepted_attempt_id")?;
+        let current = decode_execution(&execution_row)?;
         let fenced = accepted_worker == worker_id.as_str()
             && accepted_attempt == attempt_id.as_str()
-            && row
-                .try_get::<Option<String>, _>("current_worker_id")?
-                .as_deref()
-                == Some(accepted_worker.as_str())
-            && row
-                .try_get::<Option<String>, _>("current_attempt_id")?
-                .as_deref()
+            && current.worker_id.as_ref().map(WorkerId::as_str) == Some(accepted_worker.as_str())
+            && current.attempt_id.as_ref().map(AttemptId::as_str)
                 == Some(accepted_attempt.as_str())
-            && row
-                .try_get::<Option<String>, _>("current_session_id")?
-                .as_deref()
+            && current.session_id.as_ref().map(SessionId::as_str)
                 == Some(row.try_get::<String, _>("source_session_id")?.as_str())
-            && row
-                .try_get::<Option<String>, _>("current_worktree_path")?
-                .as_deref()
+            && current.worktree_path.as_deref()
                 == Some(row.try_get::<String, _>("worktree_path")?.as_str())
-            && row.try_get::<i64, _>("current_version")?
+            && execution_row.try_get::<i64, _>("version")?
                 == row.try_get::<i64, _>("accepted_execution_version")?
-            && row.try_get::<String, _>("current_state")?
-                == row.try_get::<String, _>("accepted_state")?;
-        if !fenced {
+            && enum_text(&current.state)? == row.try_get::<String, _>("accepted_state")?;
+        let cancellation =
+            cancellation_pending(&mut transaction, &ExecutionId::new(execution_id.clone())).await?;
+        if !fenced || cancellation {
             sqlx::query(
                 "UPDATE execution_control_requests SET phase = 'STALE', \
-                 stale_reason = 'accepted execution authority changed', completed_at = now() \
+                 stale_reason = $2, completed_at = now() \
                  WHERE request_id = $1",
             )
             .bind(request_id)
+            .bind(if cancellation {
+                "execution cancellation took precedence"
+            } else {
+                "accepted execution authority changed"
+            })
             .execute(&mut *transaction)
             .await?;
             transaction.commit().await?;
@@ -1020,6 +1020,17 @@ impl ExecutionStore for PgExecutionStore {
         session_id: Option<&SessionId>,
     ) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await?;
+        let execution_id: String = sqlx::query_scalar(
+            "SELECT execution_id FROM execution_control_requests WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("control request {request_id}")))?;
+        sqlx::query("SELECT id FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(&execution_id)
+            .fetch_one(&mut *transaction)
+            .await?;
         let row = sqlx::query(
             "SELECT action, phase, source_session_id, target_session_id, \
                     side_effect_session_id FROM execution_control_requests \
@@ -1029,6 +1040,20 @@ impl ExecutionStore for PgExecutionStore {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or_else(|| StoreError::NotFound(format!("control request {request_id}")))?;
+        if cancellation_pending(&mut transaction, &ExecutionId::new(execution_id)).await? {
+            sqlx::query(
+                "UPDATE execution_control_requests SET phase = 'STALE', \
+                 stale_reason = 'execution cancellation took precedence', completed_at = now() \
+                 WHERE request_id = $1 AND phase NOT IN ('COMPLETED', 'STALE')",
+            )
+            .bind(request_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Err(StoreError::Conflict(
+                "execution cancellation took precedence".to_owned(),
+            ));
+        }
         let phase: String = row.try_get("phase")?;
         let action = decode_control_action(row.try_get("action")?)?;
         let expected = match action {
@@ -1087,6 +1112,10 @@ impl ExecutionStore for PgExecutionStore {
             ));
         }
         let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(execution.id.as_str())
+            .fetch_one(&mut *transaction)
+            .await?;
         let control = sqlx::query(
             "SELECT execution_id, action, phase, completed_at, accepted_worker_id, \
                     accepted_attempt_id, source_session_id, worktree_path, \
@@ -1108,6 +1137,20 @@ impl ExecutionStore for PgExecutionStore {
         if phase == "COMPLETED" {
             transaction.commit().await?;
             return Ok(None);
+        }
+        if cancellation_pending(&mut transaction, &execution.id).await? {
+            sqlx::query(
+                "UPDATE execution_control_requests SET phase = 'STALE', \
+                 stale_reason = 'execution cancellation took precedence', completed_at = now() \
+                 WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Err(StoreError::Conflict(
+                "execution cancellation took precedence".to_owned(),
+            ));
         }
         if phase != "SIDE_EFFECT_APPLIED" {
             return Err(StoreError::Conflict(format!(
@@ -1167,10 +1210,6 @@ impl ExecutionStore for PgExecutionStore {
                 "completed {action:?} does not match its accepted state/session/worktree/event"
             )));
         }
-        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
-            .bind(execution.id.as_str())
-            .fetch_one(&mut *transaction)
-            .await?;
         let persisted = decode_execution(&row)?;
         let persisted_version: i64 = row.try_get("version")?;
         if persisted.worker_id.as_ref().map(WorkerId::as_str)
@@ -1242,12 +1281,16 @@ impl ExecutionStore for PgExecutionStore {
             .fetch_optional(&mut *transaction)
             .await?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let cleanup_phase = sqlx::query_scalar::<_, String>(
+            "SELECT phase FROM cleanup_authorities WHERE execution_id = $1 FOR SHARE",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
         let row = sqlx::query(
             "SELECT e.*, \
                     COALESCE((SELECT MAX(sequence) FROM execution_events \
-                              WHERE execution_id = e.id), 0) AS attachment_cursor, \
-                    EXISTS(SELECT 1 FROM cleanup_authorities c \
-                           WHERE c.execution_id = e.id AND c.phase = 'RETAINED') AS retained \
+                              WHERE execution_id = e.id), 0) AS attachment_cursor \
              FROM executions e WHERE e.id = $1",
         )
         .bind(id.as_str())
@@ -1260,8 +1303,8 @@ impl ExecutionStore for PgExecutionStore {
             ExecutionState::Running | ExecutionState::PausedForHuman
         ) && execution.worker_id.is_some()
             && execution.attempt_id.is_some();
-        let retained =
-            execution.state == ExecutionState::ReviewReady && row.try_get::<bool, _>("retained")?;
+        let retained = execution.state == ExecutionState::ReviewReady
+            && cleanup_phase.as_deref() == Some("RETAINED");
         if !active && !retained {
             return Err(StoreError::Conflict(format!(
                 "execution {id} has no live or retained attachment authority"
@@ -1373,6 +1416,9 @@ async fn record_progress(
             from: persisted.state,
             to: execution.state,
         });
+    }
+    if execution.state.is_terminal() {
+        lock_controls_for_execution(&mut transaction, &execution.id).await?;
     }
     let (attempt_id, worker_id) = execution
         .attempt_id
@@ -1489,6 +1535,7 @@ async fn stale_controls_for_execution(
     id: &ExecutionId,
     reason: &str,
 ) -> Result<(), StoreError> {
+    lock_controls_for_execution(transaction, id).await?;
     sqlx::query(
         "UPDATE execution_control_requests SET phase = 'STALE', stale_reason = $2, \
          completed_at = now() WHERE execution_id = $1 \
@@ -1497,6 +1544,21 @@ async fn stale_controls_for_execution(
     .bind(id.as_str())
     .bind(reason)
     .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn lock_controls_for_execution(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &ExecutionId,
+) -> Result<(), StoreError> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT request_id FROM execution_control_requests \
+         WHERE execution_id = $1 AND phase IN ('ACCEPTED', 'APPLYING', 'SIDE_EFFECT_APPLIED') \
+         ORDER BY request_id FOR UPDATE",
+    )
+    .bind(id.as_str())
+    .fetch_all(&mut **transaction)
     .await?;
     Ok(())
 }
