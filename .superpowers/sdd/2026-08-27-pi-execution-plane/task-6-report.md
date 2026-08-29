@@ -121,6 +121,38 @@ The second reviewer fix round closed the remaining restart boundaries:
    releases exact resources, clears the request, and publishes exactly one
    terminal cancellation event.
 
+The third reviewer fix round closed the post-resolution and peer-isolation
+gaps:
+
+The new E2E tests were first RED at compilation because the complete production
+daemon tick did not exist. Inspection of the prior query also confirmed that a
+post-resolution request was excluded after execution ownership was cleared;
+the peer regression exercised the prior single-pass starvation path, and the
+blocker-orchestrated concurrency fixture covers the inverted lock dependency.
+After implementation:
+
+1. Pending-cancellation discovery now joins durable cleanup authority and uses
+   its worker and attempt ownership after reservation finalization has cleared
+   those fields from the execution row. Resolved authorities remain eligible
+   while the cancellation request is pending.
+2. A true restart regression finalizes reservation cleanup, resolves cleanup
+   authority, re-opens the PostgreSQL stores in a new `Worker`, and invokes the
+   same production daemon reconciliation tick used by `autospec-worker`. The
+   request completes with exactly one terminal event and is no longer listed.
+3. Reconciliation is deliberately two-pass: every matching active task is
+   signalled before any fallible taskless recovery begins, then every taskless
+   record is recovered independently and failures are aggregated. A malformed
+   oldest record can no longer prevent a later hung peer from being stopped and
+   cleaned.
+4. Cancellation request and completion paths now acquire locks in the same
+   execution-row-then-cancellation-row order. A blocker-orchestrated concurrent
+   replay-versus-completion test proves both operations finish without a
+   deadlock and retain idempotent terminal state.
+5. Periodic cleanup recovery is part of `Worker::reconcile_daemon_tick`, so the
+   production binary and E2E tests exercise one complete reconciliation entry
+   point instead of duplicating daemon-only logic or calling a narrower
+   observer helper.
+
 ## Verification
 
 Final verification used newly created, labelled PostgreSQL 17 containers and
@@ -146,6 +178,9 @@ serialized workspace test runs on both toolchains:
 - `e774bef` — first reviewer-fix SDD evidence update.
 - `7baa69f` — cancellation authority across scheduler races, production worker
   observation, retained cleanup, and restart recovery.
+- `0b01d17` — second reviewer-fix SDD evidence update.
+- `a66ed9e` — post-resolution cancellation ownership, peer-safe two-pass daemon
+  reconciliation, and consistent cancellation lock order.
 - This updated report is recorded in the following documentation-only commit.
 
 ## Concerns and follow-up
@@ -165,3 +200,8 @@ serialized workspace test runs on both toolchains:
   race after final verification. Directory-fd-relative installation and pinned
   file-handle metadata would be the appropriate future hardening when the
   portability/dependency policy admits those primitives.
+- Each worker reconciliation tick currently reads the global pending-request
+  set and filters it by durable worker ownership. This is correct and keeps
+  ownership recovery explicit, but very large fleets may eventually benefit
+  from a worker-filtered persistence query without changing reconciliation
+  semantics.
