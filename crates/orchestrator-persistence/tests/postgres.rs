@@ -1182,6 +1182,109 @@ async fn migration_0011_to_0012_preserves_execution_authority_and_installs_contr
 }
 
 #[tokio::test]
+async fn migration_0012_to_0013_is_expand_only_for_mixed_controller_versions() {
+    let _database_test = database_test_lock().lock().await;
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        return;
+    };
+    let schema = format!("task9_upgrade_{}", uuid::Uuid::new_v4().simple());
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::raw_sql(&format!(
+        "CREATE SCHEMA {schema}; SET search_path TO {schema}"
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    let current = sqlx::migrate!();
+    let through_0012 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            current
+                .migrations
+                .iter()
+                .filter(|migration| migration.version <= 12)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: false,
+        no_tx: false,
+    };
+    through_0012.run(&mut connection).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO executions \
+         (id, role, state, manifest, labels, created_at, updated_at) \
+         VALUES ('legacy-execution', 'implementation', 'QUEUED', \
+                 '{\"task_packet\":{\"goal\":\"legacy-goal\"}}'::jsonb, '{}'::jsonb, now(), now()); \
+         INSERT INTO execution_requests \
+         (idempotency_key, request_scope, manifest, execution_id, created_at) \
+         VALUES ('legacy-key', 'legacy-scope', \
+                 '{\"task_packet\":{\"goal\":\"legacy-goal\"}}'::jsonb, 'legacy-execution', now())",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    current.run(&mut connection).await.unwrap();
+
+    let column: (String, String) = sqlx::query_as(
+        "SELECT is_nullable, data_type FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'execution_requests' \
+         AND column_name = 'manifest'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(column, ("YES".into(), "jsonb".into()));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT manifest->'task_packet'->>'goal' FROM execution_requests \
+             WHERE idempotency_key = 'legacy-key'",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap(),
+        "legacy-goal"
+    );
+    sqlx::raw_sql(
+        "INSERT INTO executions \
+         (id, role, state, manifest, labels, created_at, updated_at) \
+         VALUES ('old-writer', 'implementation', 'QUEUED', '{}'::jsonb, '{}'::jsonb, now(), now()), \
+                ('new-writer', 'implementation', 'QUEUED', '{}'::jsonb, '{}'::jsonb, now(), now()); \
+         INSERT INTO execution_requests \
+         (idempotency_key, request_scope, manifest, execution_id, created_at) \
+         VALUES ('old-key', 'scope', '{}'::jsonb, 'old-writer', now()); \
+         INSERT INTO execution_requests \
+         (idempotency_key, request_scope, execution_id, created_at) \
+         VALUES ('new-key', 'scope', 'new-writer', now())",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    assert!(sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT manifest FROM execution_requests WHERE idempotency_key = 'new-key'"
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap()
+    .is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT executions.manifest FROM execution_requests \
+             JOIN executions ON executions.id = execution_requests.execution_id \
+             WHERE idempotency_key = 'new-key'"
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap(),
+        serde_json::json!({})
+    );
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn event_batches_are_bounded_and_strictly_ordered() {
     let _database_test = database_test_lock().lock().await;
     let Some((executions, events)) = stores().await else {

@@ -1,7 +1,7 @@
 # Phase 5.5 completion audit
 
-Audit date: 2026-08-29  
-Baseline: `003ead7` on `feat/pi-execution-plane`  
+Audit date: 2026-08-29
+Baseline: `003ead7` on `feat/pi-execution-plane`
 Scope: the execution plane only; no AutoSpec planning policy or InferWeave
 model-serving behavior was added.
 
@@ -84,14 +84,18 @@ in-memory persistence substitute:
    `redis:7-alpine` service using the exact ownership labels.
 6. A deterministic Pi JSON-mode fixture consumes the serialized task packet
    exactly once inside that boundary and writes the execution result.
-7. PostgreSQL contains exactly four gapless lifecycle events: `Created`,
-   `EnvironmentReady`, `AgentStarted`, and `ReviewReady`.
+7. Before cleanup PostgreSQL contains exactly four gapless lifecycle events:
+   `Created`, `EnvironmentReady`, `AgentStarted`, and `ReviewReady`.
 8. The result is stored once as a SHA-256 content-addressed blob plus scoped
    artifact metadata.
 9. Cancellation drives exact reverse cleanup of the execution's Pi, Docker,
    worktree, and storage authorities.
-10. The execution record, event stream, artifact metadata, and artifact blob
-    remain durable after disposable resources are absent.
+10. The test captures the exact IDs, names, and complete five-label ownership
+    maps for both containers and the network (and any owned volumes), then proves
+    every captured resource and the label-scoped resource set are absent.
+11. The execution record, complete five-event gapless stream including the
+    single cancellation event, artifact metadata, and SHA-256-verified artifact
+    bytes remain durable after disposable resources are absent.
 
 The installed Pi CLI was inspected and versioned, but the deterministic E2E
 uses the repository's Pi-compatible fixture rather than issuing a paid or
@@ -106,11 +110,11 @@ boundary test while recording live inference as an explicit gap below.
 | 2. Conflicting executions get isolated runtime environments | Task 9 verifies execution-scoped agent, service, network, credentials, session, repository, and storage paths; Docker conformance checks distinct names and labels | Pass for Docker |
 | 3. Implementation and independent review share no mutable runtime state | `real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer` runs disjoint implementation/review executions and proves peer resources and progress survive the other's cleanup uncertainty | Pass |
 | 4. Harness sessions persist independently of containers | `durable_session_survives_agent_container_removal` and `paused_worker_is_adopted_across_a_separate_process_with_zero_live_pi_holds` prove session/adoption state survives container and worker-process loss | Pass |
-| 5. Resources are disposable; records and evidence are durable | Task 9 asserts all execution resources absent after cleanup while the execution, event stream, artifact metadata, and verified blob remain | Pass |
-| 6. Resources carry both labels; cleanup selects only those labels | Task 9 inspects agent/service/network labels; Docker cleanup/conformance and partial-provision recovery use the exact two-label selector | Pass |
-| 7. Global Docker prune and `git branch | grep ... | xargs` are forbidden | `repository_invariants::executable_sources_never_gain_global_cleanup_or_inference_placement` scans executable crate and deployment sources | Pass |
+| 5. Resources are disposable; records and evidence are durable | Task 9 re-checks every captured Docker ID/name and the label-scoped set after cleanup, then re-reads the complete event stream and SHA-256-verifies the retained artifact bytes | Pass |
+| 6. Resources carry both labels; cleanup selects only those labels | Task 9 compares each resource's complete ownership map, including worker/repository/issue metadata, and cleanup/conformance uses the exact managed+execution selector | Pass |
+| 7. Global Docker prune and `git branch | grep ... | xargs` are forbidden | `repository_invariants::executable_sources_never_gain_global_cleanup_or_inference_placement` scans crate production sources, build scripts, root Dockerfiles/executable scripts, deployment configuration, and CI workflows; committed fixtures exercise positive and negative cases | Pass |
 | 8. No unrestricted host Docker by default | `autospec-worker` operability tests render the constrained proxy topology and prove the worker has no host socket mount; startup fails closed without explicit proxy opt-in | Pass |
-| 9. One failure cannot destabilize a peer or worker | Independent peer cleanup test, full real failure-stage matrix, cancellation test, and configured aggregate-quota test's peer assertion | Pass for exercised Docker/Git paths |
+| 9. One failure cannot destabilize a peer or worker | Independent peer cleanup test, full real failure-stage matrix, and cancellation test | Pass for exercised Docker/Git paths; aggregate physical-pool proof blocked |
 | 10. Runtime, not prompts, enforces limits | Frozen Docker conformance proves CPU/memory/read-only-root constraints; Git ENOSPC tests prove exact rollback; configured storage tests require real quota/reserve proof or fail/skip explicitly | Pass except unavailable physical-pool exercise |
 
 ## Storage-exhaustion containment
@@ -148,26 +152,50 @@ task-packet invocation.
 
 The audit originally caught a duplicate full manifest in
 `execution_requests`. Migration
-`0013_remove_request_manifest_duplication.sql` removes that column. Idempotency
-replay now compares against the canonical `executions.manifest` in the same
-transaction, preserving conflict semantics without a second payload copy.
+`0013_prepare_request_manifest_contract.sql` is the safe expand phase: it
+makes the legacy column nullable, preserves populated pre-upgrade rows, and
+allows prior-version controllers to keep inserting during a mixed rollout. New
+controllers leave the legacy column `NULL`. Idempotency replay compares against
+the canonical `executions.manifest` in the same transaction, preserving same
+request and conflicting-request concurrency semantics without a second payload
+copy.
 Artifact bytes remain stored once by content hash, with metadata referring to
 the blob rather than duplicating it.
 
+Rollback has a deliberate stop boundary. Before starting an older controller,
+stop every new controller and backfill only the legacy compatibility column from
+the canonical execution row:
+
+```sql
+UPDATE execution_requests AS request
+SET manifest = execution.manifest
+FROM executions AS execution
+WHERE execution.id = request.execution_id
+  AND request.manifest IS NULL;
+```
+
+Only after that backfill may the older controller be started. Dropping the
+legacy column is a separate future contract migration after the rollback window
+closes; migration 0013 must not be changed into that contraction.
+
 ## Boundary scan
 
-`crates/orchestrator-core/tests/repository_invariants.rs` scans executable Rust
-and deployment sources and rejects:
+`crates/orchestrator-core/tests/repository_invariants.rs` scans production Rust,
+crate build scripts, root Dockerfiles and executable scripts, deployment
+configuration, and CI workflows. It rejects:
 
 - inference/model placement calls such as `selectGpu`, `loadModel`, `gpuQueue`,
   and `modelPlacement`;
 - global Docker `system`, `container`, `image`, `network`, or `volume` prune;
 - the forbidden `git branch` plus `grep` plus `xargs` cleanup pipeline.
 
-The scanner was proven red with a temporary forbidden-source probe before the
-probe was removed and the repository test passed. Neutral manifest model policy
-remains data transported to the harness boundary; this repository does not
-select hardware, load models, serve inference, or decide model placement.
+Committed positive fixtures cover shell continuations, constructed Docker
+commands, Git pipelines, and whitespace-separated model-placement calls;
+negative fixtures cover comments and label-scoped cleanup without making the
+scanner trigger on its own test implementation. Every violation retains file
+and line evidence. Neutral manifest model policy remains data transported to
+the harness boundary; this repository does not select hardware, load models,
+serve inference, or decide model placement.
 
 ## Explicit gaps and unavailable adapters
 

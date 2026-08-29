@@ -345,6 +345,27 @@ async fn task9_manifest_runs_through_real_worker_and_exact_cleanup_with_durable_
         &DockerRuntime::network_name(&created.id)
     ));
     assert_eq!(running.manifest.task_packet.as_ref().unwrap().goal, goal);
+    let owned_resources = capture_owned_docker_resources(&running.labels);
+    assert_eq!(
+        owned_resources
+            .iter()
+            .map(|resource| (resource.kind.as_str(), resource.name.as_str()))
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            (
+                "container",
+                DockerRuntime::agent_container_name(&created.id).as_str(),
+            ),
+            (
+                "container",
+                DockerRuntime::service_container_name(&created.id, "cache").as_str(),
+            ),
+            ("network", DockerRuntime::network_name(&created.id).as_str()),
+        ])
+    );
+    assert!(owned_resources
+        .iter()
+        .all(|resource| resource.labels == running.labels.to_map()));
 
     let result = task.join().await.unwrap();
     assert_eq!(result.state, ExecutionState::ReviewReady);
@@ -355,6 +376,15 @@ async fn task9_manifest_runs_through_real_worker_and_exact_cleanup_with_durable_
     assert!(root
         .join(format!("artifacts/{}/{}", &artifact_id[..2], artifact_id))
         .is_file());
+    let artifact_path = root.join(format!("artifacts/{}/{}", &artifact_id[..2], artifact_id));
+    let artifact_bytes = fs::read(&artifact_path).unwrap();
+    let artifact_text = String::from_utf8(artifact_bytes).unwrap();
+    let goal_derived_result = format!("task9-result:{goal}");
+    assert_eq!(
+        artifact_text.matches(&goal_derived_result).count(),
+        1,
+        "the single Pi task-packet argument must drive the durable artifact"
+    );
     assert_eq!(
         fs::read_to_string(layout.conversation.join("invocations")).unwrap(),
         "1\n"
@@ -412,8 +442,33 @@ async fn task9_manifest_runs_through_real_worker_and_exact_cleanup_with_durable_
         ExecutionState::Cancelled
     );
     assert!(!layout.root.exists());
+    assert_owned_docker_resources_absent(&owned_resources, &running.labels);
     assert_matrix_case_clean(&root, &created.id, &worker_id, &reservations, &cleanup).await;
     assert_eq!(artifacts.list(&created.id).await.unwrap().len(), 1);
+    let reopened_events = PgEventLog::connect(&database_url)
+        .await
+        .unwrap()
+        .since(&created.id, 0)
+        .await
+        .unwrap();
+    assert_eq!(reopened_events.len(), durable_events.len() + 1);
+    assert!(reopened_events
+        .windows(2)
+        .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+    assert_eq!(
+        reopened_events
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionCancelled))
+            .count(),
+        1
+    );
+    let reopened_artifact = fs::read(&artifact_path).unwrap();
+    assert_eq!(
+        sha256_file(&artifact_path),
+        artifact_id,
+        "durable artifact bytes must still verify after resource cleanup"
+    );
+    assert_eq!(String::from_utf8(reopened_artifact).unwrap(), artifact_text);
 
     server.abort();
     delete_matrix_records(&database_url, &created.id, &worker_id).await;
@@ -3139,9 +3194,106 @@ fn docker_resource_exists(kind: &str, name: &str) -> bool {
         "network" => {
             command.args(["network", "inspect", name]);
         }
+        "volume" => {
+            command.args(["volume", "inspect", name]);
+        }
         _ => panic!("unsupported Docker resource kind {kind}"),
     }
     command.output().is_ok_and(|output| output.status.success())
+}
+
+#[derive(Debug)]
+struct OwnedDockerResource {
+    kind: String,
+    id: String,
+    name: String,
+    labels: BTreeMap<String, String>,
+}
+
+fn capture_owned_docker_resources(labels: &OwnershipLabels) -> Vec<OwnedDockerResource> {
+    let mut resources = Vec::new();
+    for (kind, list_arguments, inspect_arguments) in [
+        (
+            "container",
+            vec!["ps", "-aq"],
+            vec!["inspect", "--type", "container"],
+        ),
+        (
+            "network",
+            vec!["network", "ls", "-q"],
+            vec!["network", "inspect"],
+        ),
+        (
+            "volume",
+            vec!["volume", "ls", "-q"],
+            vec!["volume", "inspect"],
+        ),
+    ] {
+        let mut list = Command::new("docker");
+        list.args(&list_arguments);
+        for selector in labels.selector() {
+            list.args(["--filter", &format!("label={selector}")]);
+        }
+        let output = list.output().unwrap();
+        assert!(output.status.success(), "list owned Docker {kind}s");
+        for id in String::from_utf8(output.stdout).unwrap().lines() {
+            let output = Command::new("docker")
+                .args(&inspect_arguments)
+                .arg(id)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "inspect owned Docker {kind} {id}");
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let value = &value[0];
+            let resource_labels = if kind == "container" {
+                &value["Config"]["Labels"]
+            } else {
+                &value["Labels"]
+            };
+            resources.push(OwnedDockerResource {
+                kind: kind.into(),
+                id: value["Id"].as_str().unwrap_or(id).to_owned(),
+                name: value["Name"]
+                    .as_str()
+                    .unwrap_or(id)
+                    .trim_start_matches('/')
+                    .to_owned(),
+                labels: serde_json::from_value(resource_labels.clone()).unwrap(),
+            });
+        }
+    }
+    resources.sort_by(|left, right| {
+        (&left.kind, &left.name, &left.id).cmp(&(&right.kind, &right.name, &right.id))
+    });
+    resources
+}
+
+fn assert_owned_docker_resources_absent(
+    resources: &[OwnedDockerResource],
+    labels: &OwnershipLabels,
+) {
+    for resource in resources {
+        assert!(!docker_resource_exists(&resource.kind, &resource.id));
+        assert!(!docker_resource_exists(&resource.kind, &resource.name));
+    }
+    assert!(capture_owned_docker_resources(labels).is_empty());
+}
+
+fn sha256_file(path: &Path) -> String {
+    for (program, arguments) in [("shasum", vec!["-a", "256"]), ("sha256sum", vec![])] {
+        let output = Command::new(program).args(arguments).arg(path).output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                return String::from_utf8(output.stdout)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .to_owned();
+            }
+        }
+    }
+    panic!("no SHA-256 verifier is available");
 }
 
 async fn assert_secret_absent_from_durable_records(database_url: &str, secret: &str) {

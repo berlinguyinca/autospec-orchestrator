@@ -421,6 +421,41 @@ async fn concurrent_create_and_retry_requests_preserve_idempotency_and_id_alloca
     let left: orchestrator_core::Execution = left.json().await.unwrap();
     let right: orchestrator_core::Execution = right.json().await.unwrap();
     assert_eq!(left.id, right.id);
+    let conflicting_key = format!("concurrent-conflict-{}", uuid::Uuid::new_v4());
+    let mut changed = manifest();
+    changed.repository.base_ref = "release".into();
+    let create_manifest = |request: ExecutionManifest| {
+        let client = client.clone();
+        let url = url.clone();
+        let token = api.token.clone();
+        let key = conflicting_key.clone();
+        async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .header("Idempotency-Key", key)
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let (original, changed) = tokio::join!(create_manifest(manifest()), create_manifest(changed));
+    let statuses = [original.status(), changed.status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::CREATED)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::CONFLICT)
+            .count(),
+        1
+    );
 
     let (first_collision, second_collision) = tokio::join!(
         create(format!("collision-a-{}", uuid::Uuid::new_v4())),
