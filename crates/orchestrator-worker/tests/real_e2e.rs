@@ -63,6 +63,7 @@ struct AssertRecoveryBoundary {
 
 struct PartialProvisionRuntime {
     fail_destroy_once: AtomicBool,
+    expected_authority: (String, ExecutionId),
 }
 
 #[async_trait::async_trait]
@@ -81,6 +82,18 @@ impl Runtime for PartialProvisionRuntime {
         _: &RuntimeRequirement,
         _: &[ServiceRequirement],
     ) -> Result<EnvironmentHandle, RuntimeError> {
+        let cleanup = PgCleanupAuthorityStore::connect(&self.expected_authority.0)
+            .await
+            .map_err(|error| RuntimeError::Provisioning(error.to_string()))?;
+        let authority = cleanup
+            .get(&self.expected_authority.1)
+            .await
+            .map_err(|error| RuntimeError::Provisioning(error.to_string()))?;
+        assert_eq!(
+            authority.disposition().unwrap(),
+            CleanupDisposition::Active(CleanupStage::Runtime),
+            "label-scoped cleanup authority must precede the first Docker side effect"
+        );
         let output = Command::new("docker")
             .args([
                 "network",
@@ -965,28 +978,22 @@ async fn partial_docker_provision_and_rollback_failure_recovers_by_exact_selecto
     );
     queued.manifest.repository.branch = Some(format!("branch-{suffix}"));
     executions.insert(&queued).await.unwrap();
-    let assigned = reservations
-        .reserve_next(&worker_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .execution;
-    let partial = Arc::new(PartialProvisionRuntime {
-        fail_destroy_once: AtomicBool::new(true),
-    });
-    let worker = Worker::new(
-        build_system_lifecycle_with_runtime(
-            &root,
-            &remote,
-            &daemon_id,
-            &image_id,
-            Some(Arc::new(PartialProvisionFactory(partial))),
-        ),
-        executions.clone(),
-        reservations.clone(),
-        cleanup.clone(),
+    let provision = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "partial_provision_process_helper", "--nocapture"])
+        .env("AUTOSPEC_TASK7_PARTIAL_HELPER", "provision")
+        .env("AUTOSPEC_DATABASE_URL", &database_url)
+        .env("AUTOSPEC_TASK7_PARTIAL_ROOT", &root)
+        .env("AUTOSPEC_TASK7_PARTIAL_REMOTE", &remote)
+        .env("AUTOSPEC_TASK7_PARTIAL_DAEMON", &daemon_id)
+        .env("AUTOSPEC_TASK7_PARTIAL_IMAGE", &image_id)
+        .env("AUTOSPEC_TASK7_PARTIAL_WORKER", worker_id.as_str())
+        .env("AUTOSPEC_TASK7_PARTIAL_EXECUTION", execution_id.as_str())
+        .status()
+        .unwrap();
+    assert!(
+        provision.success(),
+        "original provision process failed its assertions"
     );
-    assert!(worker.run(&assigned).await.is_err());
     assert!(docker_resource_exists(
         "network",
         &DockerRuntime::network_name(&execution_id)
@@ -1002,28 +1009,19 @@ async fn partial_docker_provision_and_rollback_failure_recovers_by_exact_selecto
         CleanupDisposition::RuntimeStopped
     );
 
-    let replacement = Worker::new(
-        build_system_lifecycle(&root, &remote, &daemon_id, &image_id),
-        executions.clone(),
-        reservations.clone(),
-        cleanup.clone(),
-    );
-    for _ in 0..10 {
-        replacement
-            .reconcile_daemon_tick(&worker_id, &[])
-            .await
-            .unwrap();
-        if cleanup
-            .get(&execution_id)
-            .await
-            .unwrap()
-            .disposition()
-            .unwrap()
-            == CleanupDisposition::Resolved
-        {
-            break;
-        }
-    }
+    let recovery = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "partial_provision_process_helper", "--nocapture"])
+        .env("AUTOSPEC_TASK7_PARTIAL_HELPER", "recover")
+        .env("AUTOSPEC_DATABASE_URL", &database_url)
+        .env("AUTOSPEC_TASK7_PARTIAL_ROOT", &root)
+        .env("AUTOSPEC_TASK7_PARTIAL_REMOTE", &remote)
+        .env("AUTOSPEC_TASK7_PARTIAL_DAEMON", &daemon_id)
+        .env("AUTOSPEC_TASK7_PARTIAL_IMAGE", &image_id)
+        .env("AUTOSPEC_TASK7_PARTIAL_WORKER", worker_id.as_str())
+        .env("AUTOSPEC_TASK7_PARTIAL_EXECUTION", execution_id.as_str())
+        .status()
+        .unwrap();
+    assert!(recovery.success(), "fresh startup recovery process failed");
     assert!(!docker_resource_exists(
         "network",
         &DockerRuntime::network_name(&execution_id)
@@ -1034,6 +1032,93 @@ async fn partial_docker_provision_and_rollback_failure_recovers_by_exact_selecto
     delete_matrix_records(&database_url, &execution_id, &worker_id).await;
     if root.exists() {
         fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn partial_provision_process_helper() {
+    let Some(mode) = std::env::var_os("AUTOSPEC_TASK7_PARTIAL_HELPER") else {
+        return;
+    };
+    let mode = mode.to_string_lossy();
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").unwrap();
+    let root = PathBuf::from(std::env::var_os("AUTOSPEC_TASK7_PARTIAL_ROOT").unwrap());
+    let remote = PathBuf::from(std::env::var_os("AUTOSPEC_TASK7_PARTIAL_REMOTE").unwrap());
+    let daemon = std::env::var("AUTOSPEC_TASK7_PARTIAL_DAEMON").unwrap();
+    let image = std::env::var("AUTOSPEC_TASK7_PARTIAL_IMAGE").unwrap();
+    let worker_id = WorkerId::new(std::env::var("AUTOSPEC_TASK7_PARTIAL_WORKER").unwrap());
+    let execution_id = ExecutionId::new(std::env::var("AUTOSPEC_TASK7_PARTIAL_EXECUTION").unwrap());
+    let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+
+    match mode.as_ref() {
+        "provision" => {
+            let assigned = reservations
+                .reserve_next(&worker_id)
+                .await
+                .unwrap()
+                .expect("original child should reserve the queued execution")
+                .execution;
+            assert_eq!(assigned.id, execution_id);
+            let partial = Arc::new(PartialProvisionRuntime {
+                fail_destroy_once: AtomicBool::new(true),
+                expected_authority: (database_url.clone(), execution_id.clone()),
+            });
+            let worker = Worker::new(
+                build_system_lifecycle_with_runtime(
+                    &root,
+                    &remote,
+                    &daemon,
+                    &image,
+                    Some(Arc::new(PartialProvisionFactory(partial))),
+                ),
+                executions,
+                reservations,
+                cleanup.clone(),
+            );
+            assert!(worker.run(&assigned).await.is_err());
+            assert!(docker_resource_exists(
+                "network",
+                &DockerRuntime::network_name(&execution_id)
+            ));
+            assert_eq!(
+                cleanup
+                    .get(&execution_id)
+                    .await
+                    .unwrap()
+                    .disposition()
+                    .unwrap(),
+                CleanupDisposition::RuntimeStopped
+            );
+        }
+        "recover" => {
+            let worker = Arc::new(Worker::new(
+                build_system_lifecycle(&root, &remote, &daemon, &image),
+                executions,
+                reservations,
+                cleanup.clone(),
+            ));
+            let tasks = worker
+                .reconcile_startup(&worker_id)
+                .await
+                .expect("fresh process must use production startup reconciliation");
+            assert!(tasks.is_empty());
+            assert_eq!(
+                cleanup
+                    .get(&execution_id)
+                    .await
+                    .unwrap()
+                    .disposition()
+                    .unwrap(),
+                CleanupDisposition::Resolved
+            );
+        }
+        other => panic!("unknown partial provision helper mode: {other}"),
     }
 }
 

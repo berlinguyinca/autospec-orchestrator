@@ -341,11 +341,23 @@ impl Worker {
                     continue;
                 }
             };
-            let cancellation_pending = self
+            let cancellation_pending = match self
                 .executions
                 .cancellation_requested(&execution.id)
                 .await
-                .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+            {
+                Ok(cancellation_pending) => cancellation_pending,
+                Err(error) => {
+                    tracing::error!(
+                        worker_id = %worker_id,
+                        execution_id = %authority.execution_id,
+                        attempt_id = %authority.attempt_id,
+                        %error,
+                        "cancellation lookup failed during startup recovery; retaining authority"
+                    );
+                    continue;
+                }
+            };
             if cancellation_pending {
                 match self.recover_cleanup_authority(&authority, &execution).await {
                     Ok(()) => tracing::info!(

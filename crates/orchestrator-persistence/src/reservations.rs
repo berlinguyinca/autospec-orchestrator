@@ -600,11 +600,16 @@ impl ReservationStore for PgReservationStore {
         attempt_id: &AttemptId,
     ) -> Result<LostWorkerRecovery, StoreError> {
         let mut transaction = self.pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT e.*, c.phase AS cleanup_phase, c.worker_id AS cleanup_worker_id \
-             FROM executions e JOIN cleanup_authorities c ON c.execution_id = e.id \
-             AND c.attempt_id = $2 WHERE e.id = $1 \
-             AND c.phase IN ('STORAGE_RELEASED', 'RESERVATION_RELEASED') FOR UPDATE OF e, c",
+        let execution_row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(execution_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(execution_id.to_string()))?;
+        let execution = decode_execution(&execution_row)?;
+        let authority = sqlx::query(
+            "SELECT phase, worker_id FROM cleanup_authorities \
+             WHERE execution_id = $1 AND attempt_id = $2 \
+             AND phase IN ('STORAGE_RELEASED', 'RESERVATION_RELEASED') FOR UPDATE",
         )
         .bind(execution_id.as_str())
         .bind(attempt_id.as_str())
@@ -615,9 +620,8 @@ impl ReservationStore for PgReservationStore {
                 "lost cleanup is not ready to finalize for {execution_id}/{attempt_id}"
             ))
         })?;
-        let execution = decode_execution(&row)?;
-        let phase = row.try_get::<String, _>("cleanup_phase")?;
-        let authority_worker = row.try_get::<String, _>("cleanup_worker_id")?;
+        let phase = authority.try_get::<String, _>("phase")?;
+        let authority_worker = authority.try_get::<String, _>("worker_id")?;
         let outcome = cleanup_outcome(&execution);
         let attempt = sqlx::query(
             "SELECT worker_id, finished_at FROM execution_attempts \

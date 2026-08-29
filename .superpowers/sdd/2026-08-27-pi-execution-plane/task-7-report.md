@@ -215,14 +215,42 @@ Task 7 was implemented RED to GREEN:
     `execution_cancellation_requests`, `reservations`, `workers`, `executions`,
     `execution_attempts`, `execution_events`, `cleanup_authorities`, and
     `artifacts`.
+24. Round four corrected an overstatement in the prior report: the
+    partial-Docker rollback fixture had used same-process
+    `reconcile_daemon_tick` even though the report described a fresh process
+    using production startup reconciliation. The original child now reserves
+    the execution, proves `ACTIVE:RUNTIME` authority exists before its first
+    labelled Docker side effect, fails provision and its first exact rollback,
+    and exits. A fresh replacement child invokes the exact public
+    `Worker::reconcile_startup`, resolves only that authority, removes its
+    labelled network, and leaves a labelled peer network intact.
+25. Cleanup finalization no longer relies on PostgreSQL's plan for a joined
+    multi-table row lock. It explicitly locks the execution row first and then
+    the exact cleanup-authority row. A real PostgreSQL barrier observes the
+    blocked finalizer query, races attachment against it, and proves both
+    finish without `40P01` while attachment sees the coherent post-finalization
+    conflict.
+26. Credential candidates are now armed for RAII removal immediately after
+    `create_new`, before either content write or `fsync`. Injected initial-write
+    and post-write fsync-boundary failures both prove zero candidate residue;
+    the existing exact-name, regular-file-only scavenging rules remain intact.
+27. Startup cancellation lookup failure is isolated per durable authority.
+    Structured logs carry `worker_id`, `execution_id`, and `attempt_id`; the
+    uncertain authority remains durable while later authorities continue
+    through recovery. The regression injects failure for the first record and
+    proves only the later record resolves.
+28. Credential race tests now cross actual operating-system threads. Barriers
+    release simultaneous mint/mint and mint/revoke calls, and deterministic
+    post-race assertions prove one complete authority with no temporary secret
+    residue.
 
 ## Verification
 
-- `AUTOSPEC_DATABASE_URL=.../autospec_current_round3_final cargo test --workspace -- --test-threads=1`
-  — passed on its own empty database, including 34 PostgreSQL tests, 5 execution
-  API tests, 40 Pi harness tests, all 11 real worker E2Es, 9 credential tests,
-  and 18 Docker runtime tests.
-- `AUTOSPEC_DATABASE_URL=.../autospec_msrv_round3_final rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
+- `AUTOSPEC_DATABASE_URL=.../autospec_task7_r4_current_final_20260829 cargo test --workspace -- --test-threads=1`
+  — passed on its own empty database, including 35 PostgreSQL tests, 5 execution
+  API tests, 40 Pi harness tests, all 12 real worker E2Es, 17 Docker runtime
+  unit tests, 9 credential tests, and 18 real Docker runtime tests.
+- `AUTOSPEC_DATABASE_URL=.../autospec_task7_r4_msrv_final_20260829 rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
   — passed on a separate empty database with the same full serialized workspace
   coverage.
 - `cargo build --workspace` — passed.
@@ -231,11 +259,11 @@ Task 7 was implemented RED to GREEN:
 - `rustup run 1.85.0 cargo clippy --workspace --all-targets -- -D warnings` — passed.
 - `cargo fmt --all -- --check` — passed.
 - `git diff --check` — passed.
-- Post-gate Docker audit removed the dedicated PostgreSQL fixture and only the
-  five exact Task 7 debug networks/three containers identified by their
-  execution labels. Reinspection found no Task 7 container, network, or volume;
-  older Task 5/runtime resources owned by other work were deliberately left
-  untouched.
+- Post-gate Docker audit found and removed one empty round-four `peer-task7`
+  network whose owning process had exited. Reinspection found no container,
+  network, or volume for that peer or any round-four partial-provision
+  execution; older Task 5/runtime resources owned by other work were
+  deliberately left untouched.
 
 ## Commits
 
@@ -252,7 +280,10 @@ Task 7 was implemented RED to GREEN:
 - `13b84ad` — fix round two: cancellation precedence, paused-health adoption,
   exact post-side-effect liveness, broker serialization, atomic attachment, and
   restart-safe partial-provision cleanup.
-- Fix round three is recorded with this updated report in the following commit.
+- `c4ab8b4` — fix round three: post-create candidate ownership, explicit
+  recovery-boundary proof, shared startup reconciliation, and execution-first
+  cleanup attachment locking.
+- Fix round four is recorded with this updated report in the following commit.
 
 ## Concerns and follow-up
 

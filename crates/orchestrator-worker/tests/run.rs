@@ -18,7 +18,10 @@ use orchestrator_persistence::{
 };
 use orchestrator_worker::{AdoptedExecution, ExecutionLifecycle, LifecycleError, Worker};
 use runtime_traits::{EnvironmentHandle, VerifiedAgentContainer};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Default)]
 struct FakeStore {
@@ -27,6 +30,92 @@ struct FakeStore {
     pending_cancellations: Mutex<Vec<PendingCancellation>>,
     pending_controls: Mutex<Vec<PendingExecutionControl>>,
     fail_record: bool,
+}
+
+struct StartupExecutionStore {
+    executions: BTreeMap<ExecutionId, Execution>,
+    cancellation_failure: ExecutionId,
+}
+
+#[async_trait]
+impl ExecutionStore for StartupExecutionStore {
+    async fn insert(&self, _: &Execution) -> Result<(), StoreError> {
+        unreachable!("startup regression is read-only")
+    }
+
+    async fn get(&self, id: &ExecutionId) -> Result<Execution, StoreError> {
+        self.executions
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    async fn list_live(&self) -> Result<Vec<Execution>, StoreError> {
+        Ok(self.executions.values().cloned().collect())
+    }
+
+    async fn cancellation_requested(&self, id: &ExecutionId) -> Result<bool, StoreError> {
+        if id == &self.cancellation_failure {
+            Err(StoreError::Conflict(
+                "injected cancellation lookup failure".into(),
+            ))
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn transition(
+        &self,
+        _: &ExecutionId,
+        _: ExecutionState,
+    ) -> Result<Execution, StoreError> {
+        unreachable!("startup regression does not transition executions directly")
+    }
+
+    async fn record_progress(&self, _: &Execution, _: &ExecutionEvent) -> Result<u64, StoreError> {
+        unreachable!("startup regression does not publish progress")
+    }
+}
+
+struct StartupCleanupAuthorities {
+    authorities: Vec<CleanupAuthority>,
+    resolved: Mutex<Vec<ExecutionId>>,
+}
+
+#[async_trait]
+impl CleanupAuthorityStore for StartupCleanupAuthorities {
+    async fn begin(&self, _: &ExecutionId, _: &AttemptId, _: &WorkerId) -> Result<(), StoreError> {
+        unreachable!("startup regression begins with durable authorities")
+    }
+
+    async fn advance(&self, _: &ExecutionId, _: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn resolve(&self, execution_id: &ExecutionId) -> Result<(), StoreError> {
+        self.resolved.lock().unwrap().push(execution_id.clone());
+        Ok(())
+    }
+
+    async fn get(&self, execution_id: &ExecutionId) -> Result<CleanupAuthority, StoreError> {
+        self.authorities
+            .iter()
+            .find(|authority| &authority.execution_id == execution_id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(execution_id.to_string()))
+    }
+
+    async fn list_for_worker(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Result<Vec<CleanupAuthority>, StoreError> {
+        Ok(self
+            .authorities
+            .iter()
+            .filter(|authority| &authority.worker_id == worker_id)
+            .cloned()
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -1364,6 +1453,84 @@ fn execution() -> Execution {
         updated_at: Utc::now(),
         result: None,
     }
+}
+
+#[tokio::test]
+async fn startup_keeps_a_failed_cancellation_lookup_and_recovers_later_authorities() {
+    let worker_id = WorkerId::new("worker-startup-isolation");
+    let failed_id = ExecutionId::new("startup-cancellation-store-failure");
+    let later_id = ExecutionId::new("startup-later-authority");
+    let mut failed = execution();
+    failed.id = failed_id.clone();
+    failed.labels.execution_id = failed_id.clone();
+    failed.labels.worker_id = worker_id.clone();
+    failed.worker_id = Some(worker_id.clone());
+    failed.attempt_id = Some(AttemptId::new("attempt-failed-lookup"));
+    let mut later = execution();
+    later.id = later_id.clone();
+    later.labels.execution_id = later_id.clone();
+    later.labels.worker_id = worker_id.clone();
+    later.worker_id = Some(worker_id.clone());
+    later.attempt_id = Some(AttemptId::new("attempt-later-authority"));
+    let authorities = vec![
+        CleanupAuthority {
+            execution_id: failed_id.clone(),
+            attempt_id: failed.attempt_id.clone().unwrap(),
+            worker_id: worker_id.clone(),
+            phase: CleanupDisposition::CleanupPending.to_string(),
+            handles: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+        CleanupAuthority {
+            execution_id: later_id.clone(),
+            attempt_id: later.attempt_id.clone().unwrap(),
+            worker_id: worker_id.clone(),
+            phase: CleanupDisposition::CleanupPending.to_string(),
+            handles: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    ];
+    let store = Arc::new(StartupExecutionStore {
+        executions: [(failed_id.clone(), failed), (later_id.clone(), later)]
+            .into_iter()
+            .collect(),
+        cancellation_failure: failed_id.clone(),
+    });
+    let cleanup = Arc::new(StartupCleanupAuthorities {
+        authorities,
+        resolved: Mutex::new(Vec::new()),
+    });
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: order.clone(),
+        fail_at: None,
+        poll_empty: false,
+        cleanup_fail: false,
+        hang_poll: false,
+    });
+    let worker = Arc::new(Worker::new(
+        lifecycle,
+        store,
+        Arc::new(FakeReservations::default()),
+        cleanup.clone(),
+    ));
+
+    let tasks = worker.reconcile_startup(&worker_id).await.unwrap();
+
+    assert!(tasks.is_empty());
+    assert_eq!(cleanup.resolved.lock().unwrap().as_slice(), &[later_id]);
+    assert_eq!(
+        order.lock().unwrap().as_slice(),
+        &[
+            "authority-cleanup",
+            "authority-cleanup",
+            "authority-cleanup",
+            "authority-cleanup"
+        ]
+    );
+    assert!(!cleanup.resolved.lock().unwrap().contains(&failed_id));
 }
 
 fn receipt(execution: &Execution) -> AllocationReceipt {

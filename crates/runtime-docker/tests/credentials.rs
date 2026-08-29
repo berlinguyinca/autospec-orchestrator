@@ -2,7 +2,11 @@ use chrono::{Duration, Utc};
 use orchestrator_core::{Execution, ExecutionId};
 use runtime_docker::LocalCredentialBroker;
 use runtime_traits::CredentialBroker;
-use std::fs;
+use std::{
+    fs,
+    sync::{Arc, Barrier},
+    thread,
+};
 use tempfile::TempDir;
 
 fn execution(id: &str) -> Execution {
@@ -113,44 +117,98 @@ async fn revoke_remains_idempotent_after_execution_storage_is_already_absent() {
     broker.revoke(&execution.id).await.unwrap();
 }
 
-#[tokio::test]
-async fn concurrent_mint_reuses_one_atomic_winner() {
+#[test]
+fn concurrent_mint_reuses_one_atomic_winner() {
     let root = TempDir::new().unwrap();
     let execution = execution("repo-7-race-01");
     execution_root(&root, execution.id.as_str());
     let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
-    let (left, right) = tokio::join!(broker.mint(&execution), broker.mint(&execution));
-    let left = left.unwrap();
-    let right = right.unwrap();
+    let start = Arc::new(Barrier::new(3));
+    let (left, right) = thread::scope(|scope| {
+        let left_start = start.clone();
+        let left_broker = broker.clone();
+        let left_execution = execution.clone();
+        let left = scope.spawn(move || {
+            left_start.wait();
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(left_broker.mint(&left_execution))
+        });
+        let right_start = start.clone();
+        let right_broker = broker.clone();
+        let right_execution = execution.clone();
+        let right = scope.spawn(move || {
+            right_start.wait();
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(right_broker.mint(&right_execution))
+        });
+        start.wait();
+        (
+            left.join().unwrap().unwrap(),
+            right.join().unwrap().unwrap(),
+        )
+    });
     assert_eq!(left.path, right.path);
     assert_eq!(left.expires_at, right.expires_at);
     assert_eq!(
         fs::read(&left.path).unwrap(),
         fs::read(&right.path).unwrap()
     );
+    let names = fs::read_dir(left.path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["inferweave.credential"]);
 }
 
-#[tokio::test]
-async fn concurrent_mint_and_revoke_are_linearized_per_execution() {
+#[test]
+fn concurrent_mint_and_revoke_are_linearized_per_execution() {
     let root = TempDir::new().unwrap();
     let execution = execution("repo-7-mint-revoke-race-01");
     execution_root(&root, execution.id.as_str());
     let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
-    broker.mint(&execution).await.unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(broker.mint(&execution)).unwrap();
+    let start = Arc::new(Barrier::new(3));
+    thread::scope(|scope| {
+        let mint_start = start.clone();
+        let mint_broker = broker.clone();
+        let mint_execution = execution.clone();
+        let mint = scope.spawn(move || {
+            mint_start.wait();
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(mint_broker.mint(&mint_execution))
+        });
+        let revoke_start = start.clone();
+        let revoke_broker = broker.clone();
+        let revoke_id = execution.id.clone();
+        let revoke = scope.spawn(move || {
+            revoke_start.wait();
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(revoke_broker.revoke(&revoke_id))
+        });
+        start.wait();
+        mint.join().unwrap().unwrap();
+        revoke.join().unwrap().unwrap();
+    });
 
-    let (minted, revoked) = tokio::join!(broker.mint(&execution), broker.revoke(&execution.id));
-    let minted = minted.unwrap();
-    revoked.unwrap();
-
-    // Either serialized order is safe: revoke removed the old authority, or a
-    // later mint published one complete private credential. No partial file is
-    // observable.
-    if minted.path.exists() {
-        let body = fs::read_to_string(&minted.path).unwrap();
-        assert_eq!(body.lines().count(), 2);
-    }
-    let reminted = broker.mint(&execution).await.unwrap();
-    assert!(reminted.path.exists());
+    let reminted = runtime.block_on(broker.mint(&execution)).unwrap();
+    let body = fs::read_to_string(&reminted.path).unwrap();
+    assert_eq!(body.lines().count(), 2);
+    let names = fs::read_dir(reminted.path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["inferweave.credential"]);
 }
 
 #[tokio::test]

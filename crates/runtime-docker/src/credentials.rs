@@ -160,6 +160,21 @@ impl LocalCredentialBroker {
         parent: &Path,
         expires_at: DateTime<Utc>,
     ) -> Result<CredentialCandidate, RuntimeError> {
+        self.create_candidate_with_persist(
+            parent,
+            expires_at,
+            |file, contents| file.write_all(contents),
+            File::sync_all,
+        )
+    }
+
+    fn create_candidate_with_persist(
+        &self,
+        parent: &Path,
+        expires_at: DateTime<Utc>,
+        write_candidate: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
+        sync_candidate: impl FnOnce(&File) -> std::io::Result<()>,
+    ) -> Result<CredentialCandidate, RuntimeError> {
         let token = self.random_hex()?;
         let suffix = self.random_hex()?;
         let path = parent.join(format!(".{CREDENTIAL_FILE}.{suffix}.tmp"));
@@ -173,12 +188,15 @@ impl LocalCredentialBroker {
         let mut file = options.open(&path).map_err(|error| {
             RuntimeError::Provisioning(format!("create execution credential: {error}"))
         })?;
-        write!(file, "{token}\n{}\n", expires_at.to_rfc3339())
-            .and_then(|()| file.sync_all())
-            .map_err(|error| {
-                RuntimeError::Provisioning(format!("persist execution credential: {error}"))
-            })?;
-        Ok(CredentialCandidate { path, armed: true })
+        let candidate = CredentialCandidate { path, armed: true };
+        let contents = format!("{token}\n{}\n", expires_at.to_rfc3339());
+        write_candidate(&mut file, contents.as_bytes()).map_err(|error| {
+            RuntimeError::Provisioning(format!("write execution credential: {error}"))
+        })?;
+        sync_candidate(&file).map_err(|error| {
+            RuntimeError::Provisioning(format!("persist execution credential: {error}"))
+        })?;
+        Ok(candidate)
     }
 
     fn scavenge_candidates(parent: &Path) -> Result<(), RuntimeError> {
@@ -339,4 +357,55 @@ fn validate_execution_id(id: &ExecutionId) -> Result<(), RuntimeError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use tempfile::TempDir;
+
+    fn candidate_count(parent: &Path) -> usize {
+        fs::read_dir(parent).unwrap().count()
+    }
+
+    #[test]
+    fn candidate_guard_removes_a_file_when_the_initial_write_fails() {
+        let root = TempDir::new().unwrap();
+        let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
+
+        let result = broker.create_candidate_with_persist(
+            root.path(),
+            Utc::now() + Duration::minutes(5),
+            |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "injected write failure",
+                ))
+            },
+            |_| panic!("fsync must not run after a failed write"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(candidate_count(root.path()), 0);
+    }
+
+    #[test]
+    fn candidate_guard_removes_a_file_when_fsync_fails_after_write() {
+        let root = TempDir::new().unwrap();
+        let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
+
+        let result = broker.create_candidate_with_persist(
+            root.path(),
+            Utc::now() + Duration::minutes(5),
+            |file, contents| {
+                file.write_all(contents)?;
+                Ok(())
+            },
+            |_| Err(io::Error::other("injected fsync failure")),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(candidate_count(root.path()), 0);
+    }
 }

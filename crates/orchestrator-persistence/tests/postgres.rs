@@ -470,6 +470,123 @@ async fn attachment_snapshot_is_atomic_opaque_and_rejects_non_attachable_authori
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cleanup_finalization_and_attachment_share_execution_first_lock_order() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").unwrap();
+    let cleanup = PgCleanupAuthorityStore::connect(&database_url)
+        .await
+        .unwrap();
+    let worker = registered_worker(
+        &format!("worker-finalize-attach-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    let queued = execution(ExecutionState::Queued);
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut running = reservation.execution.clone();
+    running.transition(ExecutionState::Provisioning).unwrap();
+    running.worktree_path = Some("/bounded/execution/repository".into());
+    executions
+        .record_progress(
+            &running,
+            &progress_event(&running, ExecutionEventKind::EnvironmentReady),
+        )
+        .await
+        .unwrap();
+    running.transition(ExecutionState::Running).unwrap();
+    running.session_id = Some(SessionId::new("finalize-attach-session"));
+    executions
+        .record_progress(
+            &running,
+            &progress_event(
+                &running,
+                ExecutionEventKind::AgentStarted {
+                    session_id: SessionId::new("finalize-attach-session"),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    cleanup
+        .begin(&running.id, &reservation.attempt_id, &worker.id)
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+    sqlx::query(
+        "UPDATE cleanup_authorities SET phase = 'STORAGE_RELEASED' WHERE execution_id = $1",
+    )
+    .bind(running.id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut cleanup_barrier = pool.begin().await.unwrap();
+    sqlx::query("SELECT execution_id FROM cleanup_authorities WHERE execution_id = $1 FOR UPDATE")
+        .bind(running.id.as_str())
+        .fetch_one(&mut *cleanup_barrier)
+        .await
+        .unwrap();
+    let finalize_store = reservations.clone();
+    let finalize_id = running.id.clone();
+    let finalize_attempt = reservation.attempt_id.clone();
+    let finalize = tokio::spawn(async move {
+        finalize_store
+            .finalize_cleanup(&finalize_id, &finalize_attempt)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !finalize.is_finished(),
+        "finalizer must wait at the cleanup-row barrier"
+    );
+    let blocked_finalizer = sqlx::query_scalar::<_, String>(
+        "SELECT query FROM pg_stat_activity \
+         WHERE wait_event_type = 'Lock' AND query LIKE '%cleanup_authorities%' \
+         AND query LIKE '%FOR UPDATE%' AND datname = current_database() \
+         AND pid <> pg_backend_pid() \
+         ORDER BY query_start DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !blocked_finalizer.contains(" JOIN "),
+        "cleanup row must be locked by its own query after the execution row: {blocked_finalizer}"
+    );
+
+    let attach_store = executions.clone();
+    let attach_id = running.id.clone();
+    let attach = tokio::spawn(async move { attach_store.attachment_snapshot(&attach_id).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !attach.is_finished(),
+        "attachment must wait behind execution-first finalization"
+    );
+    cleanup_barrier.commit().await.unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), finalize)
+        .await
+        .expect("cleanup finalization and attachment deadlocked")
+        .unwrap()
+        .expect("cleanup finalization returned a PostgreSQL lock error");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), attach)
+            .await
+            .expect("attachment remained blocked after finalization")
+            .unwrap()
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancellation_uses_execution_first_lock_order_at_every_control_phase() {
     let _database_test = database_test_lock().lock().await;
     let Some((executions, workers, reservations)) = worker_stores().await else {
