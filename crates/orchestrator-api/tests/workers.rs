@@ -351,6 +351,58 @@ async fn worker_routes_reject_invalid_and_oversized_bodies() {
     assert_eq!(oversized.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+#[tokio::test]
+async fn worker_api_registers_every_preparation_failure_as_safe_offline_health() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
+        return;
+    };
+    let store = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let token = format!("worker-token-{}", uuid::Uuid::new_v4());
+    let state = app_state(&database_url, store.clone(), reservations, token.clone()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/api/v1/workers");
+
+    for (kind, code) in [
+        ("configuration", "worker-configuration-invalid"),
+        ("persistence", "worker-preparation-unavailable"),
+        ("recovery", "worker-preparation-unavailable"),
+        ("storage", "storage-capability-unavailable"),
+        ("docker", "docker-capability-unavailable"),
+    ] {
+        let mut worker = registration(&format!(
+            "worker-api-{kind}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        worker.state = WorkerState::Offline;
+        worker.capability_proof = None;
+        worker.capabilities.runtimes.clear();
+        worker.capabilities.capabilities.clear();
+        worker.capabilities.health_errors = vec![code.to_owned()];
+        let response = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&worker)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED, "{kind}");
+        let registered: WorkerRegistration = response.json().await.unwrap();
+        assert_eq!(registered.state, WorkerState::Offline);
+        assert_eq!(registered.capabilities.health_errors, [code]);
+        assert_eq!(
+            store.get(&registered.id).await.unwrap().state,
+            WorkerState::Offline
+        );
+    }
+}
+
 fn registration(id: &str) -> WorkerRegistration {
     WorkerRegistration {
         id: WorkerId::new(id),

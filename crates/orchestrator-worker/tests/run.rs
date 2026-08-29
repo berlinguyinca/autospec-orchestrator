@@ -20,7 +20,10 @@ use orchestrator_worker::{AdoptedExecution, ExecutionLifecycle, LifecycleError, 
 use runtime_traits::{EnvironmentHandle, VerifiedAgentContainer};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 #[derive(Default)]
@@ -33,7 +36,7 @@ struct FakeStore {
 }
 
 struct StartupExecutionStore {
-    executions: BTreeMap<ExecutionId, Execution>,
+    executions: Mutex<BTreeMap<ExecutionId, Execution>>,
     cancellation_failure: ExecutionId,
 }
 
@@ -45,13 +48,15 @@ impl ExecutionStore for StartupExecutionStore {
 
     async fn get(&self, id: &ExecutionId) -> Result<Execution, StoreError> {
         self.executions
+            .lock()
+            .unwrap()
             .get(id)
             .cloned()
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
     async fn list_live(&self) -> Result<Vec<Execution>, StoreError> {
-        Ok(self.executions.values().cloned().collect())
+        Ok(self.executions.lock().unwrap().values().cloned().collect())
     }
 
     async fn cancellation_requested(&self, id: &ExecutionId) -> Result<bool, StoreError> {
@@ -66,14 +71,32 @@ impl ExecutionStore for StartupExecutionStore {
 
     async fn transition(
         &self,
-        _: &ExecutionId,
-        _: ExecutionState,
+        id: &ExecutionId,
+        next: ExecutionState,
     ) -> Result<Execution, StoreError> {
-        unreachable!("startup regression does not transition executions directly")
+        let mut executions = self.executions.lock().unwrap();
+        let execution = executions
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        execution
+            .transition(next)
+            .map_err(|_| StoreError::IllegalTransition {
+                from: execution.state,
+                to: next,
+            })?;
+        Ok(execution.clone())
     }
 
-    async fn record_progress(&self, _: &Execution, _: &ExecutionEvent) -> Result<u64, StoreError> {
-        unreachable!("startup regression does not publish progress")
+    async fn record_progress(
+        &self,
+        execution: &Execution,
+        _: &ExecutionEvent,
+    ) -> Result<u64, StoreError> {
+        self.executions
+            .lock()
+            .unwrap()
+            .insert(execution.id.clone(), execution.clone());
+        Ok(1)
     }
 }
 
@@ -85,7 +108,7 @@ struct StartupCleanupAuthorities {
 #[async_trait]
 impl CleanupAuthorityStore for StartupCleanupAuthorities {
     async fn begin(&self, _: &ExecutionId, _: &AttemptId, _: &WorkerId) -> Result<(), StoreError> {
-        unreachable!("startup regression begins with durable authorities")
+        Ok(())
     }
 
     async fn advance(&self, _: &ExecutionId, _: &str) -> Result<(), StoreError> {
@@ -209,6 +232,7 @@ impl ExecutionStore for FakeStore {
 struct FakeReservations {
     released: Mutex<Vec<ExecutionId>>,
     retained: Mutex<Vec<ExecutionId>>,
+    fail_retained: AtomicBool,
 }
 
 #[derive(Default)]
@@ -330,6 +354,11 @@ impl ReservationStore for FakeReservations {
         id: &ExecutionId,
         _: &AttemptId,
     ) -> Result<(), StoreError> {
+        if self.fail_retained.load(Ordering::SeqCst) {
+            return Err(StoreError::Conflict(
+                "injected retained reservation failure".into(),
+            ));
+        }
         self.released.lock().unwrap().push(id.clone());
         self.retained.lock().unwrap().push(id.clone());
         Ok(())
@@ -1493,9 +1522,11 @@ async fn startup_keeps_a_failed_cancellation_lookup_and_recovers_later_authoriti
         },
     ];
     let store = Arc::new(StartupExecutionStore {
-        executions: [(failed_id.clone(), failed), (later_id.clone(), later)]
-            .into_iter()
-            .collect(),
+        executions: Mutex::new(
+            [(failed_id.clone(), failed), (later_id.clone(), later)]
+                .into_iter()
+                .collect(),
+        ),
         cancellation_failure: failed_id.clone(),
     });
     let cleanup = Arc::new(StartupCleanupAuthorities {
@@ -1531,6 +1562,103 @@ async fn startup_keeps_a_failed_cancellation_lookup_and_recovers_later_authoriti
         ]
     );
     assert!(!cleanup.resolved.lock().unwrap().contains(&failed_id));
+}
+
+#[tokio::test]
+async fn startup_does_not_spawn_adoption_before_all_fallible_reconciliation_completes() {
+    let worker_id = WorkerId::new("worker-startup-two-phase");
+    let adopt_id = ExecutionId::new("startup-adopt-before-later-failure");
+    let fail_id = ExecutionId::new("startup-later-retained-failure");
+    let mut adoptable = execution();
+    adoptable.id = adopt_id.clone();
+    adoptable.labels.execution_id = adopt_id.clone();
+    adoptable.labels.worker_id = worker_id.clone();
+    adoptable.worker_id = Some(worker_id.clone());
+    adoptable.attempt_id = Some(AttemptId::new("attempt-adopt"));
+    adoptable.manifest.persistence = PersistenceMode::Resumable;
+    adoptable.state = ExecutionState::Running;
+    adoptable.session_id = Some(SessionId::new("session-adopt"));
+    adoptable.worktree_path = Some("/allocation/repository".into());
+    let mut retained = execution();
+    retained.id = fail_id.clone();
+    retained.labels.execution_id = fail_id.clone();
+    retained.labels.worker_id = worker_id.clone();
+    retained.worker_id = Some(worker_id.clone());
+    retained.attempt_id = Some(AttemptId::new("attempt-retained"));
+    retained.state = ExecutionState::ReviewReady;
+    let authorities = vec![
+        CleanupAuthority {
+            execution_id: adopt_id.clone(),
+            attempt_id: adoptable.attempt_id.clone().unwrap(),
+            worker_id: worker_id.clone(),
+            phase: CleanupDisposition::Active(orchestrator_persistence::CleanupStage::Running)
+                .to_string(),
+            handles: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+        CleanupAuthority {
+            execution_id: fail_id.clone(),
+            attempt_id: retained.attempt_id.clone().unwrap(),
+            worker_id: worker_id.clone(),
+            phase: CleanupDisposition::Retained.to_string(),
+            handles: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    ];
+    let store = Arc::new(StartupExecutionStore {
+        executions: Mutex::new(
+            [(adopt_id, adoptable), (fail_id, retained)]
+                .into_iter()
+                .collect(),
+        ),
+        cancellation_failure: ExecutionId::new("no-cancellation-failure"),
+    });
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let reservations = Arc::new(FakeReservations {
+        fail_retained: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let worker = Arc::new(Worker::new(
+        Arc::new(FakeLifecycle {
+            order: order.clone(),
+            fail_at: None,
+            poll_empty: false,
+            cleanup_fail: false,
+            hang_poll: false,
+        }),
+        store,
+        reservations.clone(),
+        Arc::new(StartupCleanupAuthorities {
+            authorities,
+            resolved: Mutex::new(Vec::new()),
+        }),
+    ));
+
+    assert!(worker.reconcile_startup(&worker_id).await.is_err());
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        order.lock().unwrap().is_empty(),
+        "a failed startup pass must not detach an already-planned adoption"
+    );
+
+    reservations.fail_retained.store(false, Ordering::SeqCst);
+    let tasks = worker.reconcile_startup(&worker_id).await.unwrap();
+    assert_eq!(tasks.len(), 1, "retry must own exactly one adoption");
+    for task in tasks {
+        task.join().await.unwrap();
+    }
+    assert_eq!(
+        order
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|step| **step == "adopt")
+            .count(),
+        1,
+        "retry must not duplicate execution"
+    );
 }
 
 fn receipt(execution: &Execution) -> AllocationReceipt {

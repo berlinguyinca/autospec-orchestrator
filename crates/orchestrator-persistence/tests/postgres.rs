@@ -1314,9 +1314,46 @@ async fn artifacts_are_content_addressed_deduplicated_and_execution_scoped() {
     ));
 }
 
-fn database_test_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+struct DatabaseTestIsolation {
+    mutex: tokio::sync::Mutex<()>,
+}
+
+impl DatabaseTestIsolation {
+    async fn lock(&'static self) -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = self.mutex.lock().await;
+        let Ok(database_url) = std::env::var("AUTOSPEC_DATABASE_URL") else {
+            return guard;
+        };
+        PgExecutionStore::connect(&database_url)
+            .await
+            .expect("migrate isolated PostgreSQL test database");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("connect isolated PostgreSQL test database");
+        for statement in [
+            "DROP TRIGGER IF EXISTS autospec_test_fail_finalize ON cleanup_authorities",
+            "DROP TRIGGER IF EXISTS autospec_test_fail_retained ON cleanup_authorities",
+            "DROP FUNCTION IF EXISTS autospec_test_fail_finalize()",
+            "DROP FUNCTION IF EXISTS autospec_test_fail_retained()",
+            "TRUNCATE TABLE workers, executions RESTART IDENTITY CASCADE",
+        ] {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("reset isolated PostgreSQL test database");
+        }
+        pool.close().await;
+        guard
+    }
+}
+
+fn database_test_lock() -> &'static DatabaseTestIsolation {
+    static LOCK: OnceLock<DatabaseTestIsolation> = OnceLock::new();
+    LOCK.get_or_init(|| DatabaseTestIsolation {
+        mutex: tokio::sync::Mutex::new(()),
+    })
 }
 
 async fn stores() -> Option<(PgExecutionStore, PgEventLog)> {
@@ -1706,6 +1743,36 @@ async fn worker_registration_requires_storage_and_docker_capability_proof() {
         workers.register(&missing_proof).await,
         Err(StoreError::Conflict(_))
     ));
+}
+
+#[tokio::test]
+async fn every_sanitized_preparation_failure_persists_as_offline_worker_health() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((_, workers, _)) = worker_stores().await else {
+        return;
+    };
+    for (kind, code) in [
+        ("configuration", "worker-configuration-invalid"),
+        ("persistence", "worker-preparation-unavailable"),
+        ("recovery", "worker-preparation-unavailable"),
+        ("storage", "storage-capability-unavailable"),
+        ("docker", "docker-capability-unavailable"),
+    ] {
+        let mut worker = registered_worker(
+            &format!("worker-{kind}-{}", uuid::Uuid::new_v4().simple()),
+            4,
+        );
+        worker.state = orchestrator_core::WorkerState::Offline;
+        worker.capability_proof = None;
+        worker.capabilities.runtimes.clear();
+        worker.capabilities.capabilities.clear();
+        worker.capabilities.health_errors = vec![code.to_owned()];
+        workers.register(&worker).await.unwrap();
+        let persisted = workers.get(&worker.id).await.unwrap();
+        assert_eq!(persisted.state, orchestrator_core::WorkerState::Offline);
+        assert_eq!(persisted.capabilities.health_errors, [code]);
+        assert!(persisted.capability_proof.is_none());
+    }
 }
 
 #[tokio::test]

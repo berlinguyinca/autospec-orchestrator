@@ -548,11 +548,13 @@ async fn cleanup_test_images(docker: &Docker, names: &[String]) -> Result<(), St
     }
 }
 
-async fn volume_names(docker: &Docker) -> BTreeSet<String> {
+async fn execution_volume_names(docker: &Docker, labels: &OwnershipLabels) -> BTreeSet<String> {
     docker
-        .list_volumes::<String>(None)
+        .list_volumes(Some(bollard::volume::ListVolumesOptions {
+            filters: HashMap::from([("label".to_owned(), labels.selector())]),
+        }))
         .await
-        .expect("list Docker volumes")
+        .expect("list exact execution volumes")
         .volumes
         .unwrap_or_default()
         .into_iter()
@@ -1462,7 +1464,7 @@ async fn ready_lease_remains_held_through_the_final_workload_start_gate() {
 }
 
 #[tokio::test]
-async fn verifier_image_volume_is_rejected_without_creating_anonymous_volumes() {
+async fn verifier_image_volume_is_rejected_before_creating_execution_resources() {
     let labels = labels_for(unique_execution_id());
     let state = TestStateRoot::new(&labels);
     let docker = raw_client().expect("connect Docker");
@@ -1525,22 +1527,11 @@ async fn verifier_image_volume_is_rejected_without_creating_anonymous_volumes() 
     let mut scope = DockerTestScope::new(&runtime, &labels);
     let mut image_guard = DockerImageGuard::new(&docker);
     image_guard.track(image);
-    let volumes_before = volume_names(&docker).await;
-
     let error = runtime
         .provision(&labels, &runtime_requirement(), &[])
         .await
         .expect_err("trusted verifier VOLUME must fail before Docker resources");
     assert!(error.to_string().contains("declares writable volumes"));
-    let volumes_after = volume_names(&docker).await;
-    let new_anonymous = volumes_after
-        .difference(&volumes_before)
-        .filter(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .collect::<Vec<_>>();
-    assert!(
-        new_anonymous.is_empty(),
-        "verifier rejection leaked anonymous volumes: {new_anonymous:?}"
-    );
     assert!(docker
         .list_containers(Some(bollard::container::ListContainersOptions {
             all: true,
@@ -1550,6 +1541,11 @@ async fn verifier_image_volume_is_rejected_without_creating_anonymous_volumes() 
         .await
         .expect("list rejected verifier execution")
         .is_empty());
+    assert!(docker
+        .inspect_network::<String>(&DockerRuntime::network_name(&labels.execution_id), None)
+        .await
+        .is_err());
+    assert!(execution_volume_names(&docker, &labels).await.is_empty());
 
     scope.cleanup().await.expect("cleanup rejected execution");
     image_guard.cleanup().await.expect("cleanup verifier image");
@@ -2303,6 +2299,12 @@ async fn image_volumes_are_bind_backed_and_container_roots_are_read_only() {
         .inspect_container(&handle.service_containers[0], None)
         .await
         .is_err());
+    assert!(
+        execution_volume_names(&docker, &execution_labels)
+            .await
+            .is_empty(),
+        "failed provisioning must not create Docker volumes for image-declared writable paths"
+    );
 }
 
 #[tokio::test]
@@ -2561,10 +2563,10 @@ async fn cleanup_aggregates_volume_failures_and_still_removes_the_network() {
 }
 
 #[tokio::test]
-async fn provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_volume() {
+async fn provisioning_failure_reports_rollback_failure_and_removes_attempt_resources() {
     let execution_labels = labels_for(unique_execution_id());
     let Some((_state, runtime)) = execution_runtime_or_skip(
-        "provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_volume",
+        "provisioning_failure_reports_rollback_failure_and_removes_attempt_resources",
         &execution_labels,
     )
     .await
@@ -2622,43 +2624,15 @@ async fn provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_vo
         image: "redis:7-alpine".to_owned(),
         env: BTreeMap::new(),
     };
-    let volumes_before_failure = volume_names(&docker).await;
-
     let error = runtime
         .provision(&execution_labels, &runtime_requirement(), &[service])
         .await
         .expect_err("agent name conflict triggers provisioning rollback")
         .to_string();
-    let mut volumes_after_failure = volume_names(&docker).await;
     assert!(error.contains(execution_labels.execution_id.as_str()));
     assert!(error.contains("create agent container"));
     assert!(error.contains("rollback"));
     assert!(error.contains(&owned_volume));
-    let mut new_anonymous_volumes = volumes_after_failure
-        .difference(&volumes_before_failure)
-        .filter(|name| {
-            name.len() == 64 && name.chars().all(|character| character.is_ascii_hexdigit())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for _ in 0..50 {
-        if new_anonymous_volumes.is_empty() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        volumes_after_failure = volume_names(&docker).await;
-        new_anonymous_volumes = volumes_after_failure
-            .difference(&volumes_before_failure)
-            .filter(|name| {
-                name.len() == 64 && name.chars().all(|character| character.is_ascii_hexdigit())
-            })
-            .cloned()
-            .collect();
-    }
-    assert!(
-        new_anonymous_volumes.is_empty(),
-        "failed provisioning must not leave anonymous image volumes: {new_anonymous_volumes:?}"
-    );
     assert!(docker
         .inspect_network::<String>(
             &DockerRuntime::network_name(&execution_labels.execution_id),

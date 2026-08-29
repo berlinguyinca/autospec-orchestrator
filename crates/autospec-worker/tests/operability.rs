@@ -41,13 +41,55 @@ struct ComposeScope {
     compose: PathBuf,
     project: String,
     proxy_port: u16,
+    cleaned: bool,
 }
 
 impl Drop for ComposeScope {
     fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
         let _ = compose_command(&self.compose, &self.project, self.proxy_port)
             .args(["down", "--volumes", "--remove-orphans"])
             .output();
+    }
+}
+
+impl ComposeScope {
+    fn cleanup(&mut self) {
+        let down = compose_command(&self.compose, &self.project, self.proxy_port)
+            .args(["down", "--volumes", "--remove-orphans"])
+            .output()
+            .expect("stop constrained Docker proxy");
+        assert!(
+            down.status.success(),
+            "docker compose down failed: {}",
+            String::from_utf8_lossy(&down.stderr)
+        );
+        let project_filter = format!("label=com.docker.compose.project={}", self.project);
+        for (resource, args) in [
+            (
+                "containers",
+                vec!["ps", "-aq", "--filter", project_filter.as_str()],
+            ),
+            (
+                "networks",
+                vec!["network", "ls", "-q", "--filter", project_filter.as_str()],
+            ),
+            (
+                "volumes",
+                vec!["volume", "ls", "-q", "--filter", project_filter.as_str()],
+            ),
+        ] {
+            let output = Command::new("docker").args(args).output().unwrap();
+            assert!(output.status.success(), "list exact Compose {resource}");
+            assert!(
+                output.stdout.is_empty(),
+                "Compose down left exact project {resource}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        self.cleaned = true;
     }
 }
 
@@ -69,6 +111,15 @@ fn storage_pool_provisioning_is_dry_run_first_and_requires_exact_confirmation() 
         .expect("execute rejected storage provisioning apply");
     assert!(!unconfirmed.status.success());
     assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains("AUTOSPEC_STORAGE_CONFIRM"));
+}
+
+#[test]
+fn host_worker_runbook_starts_the_profiled_proxy_before_the_worker() {
+    let readme = std::fs::read_to_string(root().join("deploy/README.md"))
+        .expect("read single-host deployment runbook");
+    assert!(readme.contains(
+        "docker compose -p \"$AUTOSPEC_DEPLOYMENT_ID\" -f deploy/docker-compose.yml --profile host-docker-worker up -d postgres controller docker-api"
+    ));
 }
 
 #[test]
@@ -148,10 +199,11 @@ fn compose_proxy_is_reachable_only_through_its_host_loopback_publication() {
     drop(listener);
     let compose = root().join("deploy/docker-compose.yml");
     let project = format!("autospec-proxy-test-{}-{proxy_port}", std::process::id());
-    let scope = ComposeScope {
+    let mut scope = ComposeScope {
         compose: compose.clone(),
         project: project.clone(),
         proxy_port,
+        cleaned: false,
     };
     let started = compose_command(&compose, &project, proxy_port)
         .args(["up", "-d", "--no-build", "docker-api"])
@@ -193,5 +245,5 @@ fn compose_proxy_is_reachable_only_through_its_host_loopback_publication() {
     let bindings = String::from_utf8(inspected.stdout).unwrap();
     assert!(bindings.contains("127.0.0.1"));
     assert!(!bindings.contains("0.0.0.0"));
-    drop(scope);
+    scope.cleanup();
 }

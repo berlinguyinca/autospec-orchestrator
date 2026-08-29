@@ -13,13 +13,14 @@ enforce disk reservations. The worker must not receive a raw host Docker socket.
    confirmation string. The script never creates or removes an APFS container,
    physical volume, or volume group; those destructive host operations remain
    an explicit operator responsibility.
-3. Start the controller with
-   `docker compose -f deploy/docker-compose.yml up -d postgres controller`.
+3. Start the controller and the constrained Docker proxy with the exact stable
+   project name and profile:
+   `docker compose -p "$AUTOSPEC_DEPLOYMENT_ID" -f deploy/docker-compose.yml --profile host-docker-worker up -d postgres controller docker-api`.
 4. Start `autospec-worker` on the storage host with the documented storage pool,
    immutable verifier image ID, `AUTOSPEC_WORKER_HOST_DOCKER=true`, and the
    constrained `tcp://127.0.0.1:${AUTOSPEC_DOCKER_PROXY_PORT:-2375}` Docker API
-endpoint published by `docker-api`. The worker validates that the configured
-port matches and rejects non-loopback endpoints. A failed
+   endpoint already published by `docker-api`. The worker validates that the
+   configured port matches and rejects non-loopback endpoints. A failed
 APFS/LVM or Docker bind probe registers the worker Offline with a sanitized
 `healthErrors` reason and zero advertised runtime capacity.
 

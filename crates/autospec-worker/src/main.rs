@@ -892,19 +892,41 @@ mod tests {
     #[test]
     fn preparation_failures_are_typed_and_diagnostics_never_echo_sources() {
         let secret = "postgres://user:password@database/private";
-        let failure = PreparationFailure::persistence(secret);
-        assert_eq!(failure.kind, PreparationFailureKind::Persistence);
-        assert_eq!(failure.health_code(), "worker-preparation-unavailable");
-        assert_eq!(failure.diagnostic(), "persistence connection failed");
-        assert!(!format!("{failure}").contains(secret));
-
-        let storage = PreparationFailure::storage(secret);
-        assert_eq!(storage.health_code(), "storage-capability-unavailable");
-        assert!(!format!("{storage:?}").contains(secret));
-
-        let docker = PreparationFailure::docker(secret);
-        assert_eq!(docker.health_code(), "docker-capability-unavailable");
-        assert!(!format!("{docker:?}").contains(secret));
+        for (failure, kind, code) in [
+            (
+                PreparationFailure::configuration(secret),
+                PreparationFailureKind::Configuration,
+                "worker-configuration-invalid",
+            ),
+            (
+                PreparationFailure::persistence(secret),
+                PreparationFailureKind::Persistence,
+                "worker-preparation-unavailable",
+            ),
+            (
+                PreparationFailure::recovery(secret),
+                PreparationFailureKind::Recovery,
+                "worker-preparation-unavailable",
+            ),
+            (
+                PreparationFailure::storage(secret),
+                PreparationFailureKind::Storage,
+                "storage-capability-unavailable",
+            ),
+            (
+                PreparationFailure::docker(secret),
+                PreparationFailureKind::Docker,
+                "docker-capability-unavailable",
+            ),
+        ] {
+            assert_eq!(failure.kind, kind);
+            assert_eq!(failure.health_code(), code);
+            assert!(!format!("{failure:?}").contains(secret));
+            let worker = advertisement(&cli(), None, vec![code.to_owned()]).unwrap();
+            assert!(worker.capability_proof.is_none());
+            assert!(worker.capabilities.runtimes.is_empty());
+            assert!(worker.capabilities.health_errors_are_sanitized());
+        }
     }
 
     #[test]

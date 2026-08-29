@@ -43,7 +43,10 @@ impl WorkerCapabilities {
             && self.health_errors.iter().all(|error| {
                 matches!(
                     error.as_str(),
-                    "storage-capability-unavailable" | "docker-capability-unavailable"
+                    "storage-capability-unavailable"
+                        | "docker-capability-unavailable"
+                        | "worker-configuration-invalid"
+                        | "worker-preparation-unavailable"
                 )
             })
     }
@@ -151,5 +154,33 @@ mod tests {
         let mut malicious = worker.capabilities.clone();
         malicious.health_errors = vec!["/secret/path?token=credential".to_owned()];
         assert!(!malicious.health_errors_are_sanitized());
+    }
+
+    #[test]
+    fn every_typed_worker_preparation_failure_code_is_sanitized() {
+        let capabilities = WorkerCapabilities {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            cpu: 4,
+            memory_mib: 4096,
+            disk_gib: 40,
+            runtimes: Vec::new(),
+            capabilities: Vec::new(),
+            max_concurrent_executions: 2,
+            health_errors: Vec::new(),
+        };
+        for code in [
+            "worker-configuration-invalid",
+            "worker-preparation-unavailable",
+            "storage-capability-unavailable",
+            "docker-capability-unavailable",
+        ] {
+            let mut advertised = capabilities.clone();
+            advertised.health_errors = vec![code.to_owned()];
+            assert!(
+                advertised.health_errors_are_sanitized(),
+                "typed preparation failure code {code} must be accepted"
+            );
+        }
     }
 }

@@ -313,7 +313,10 @@ impl Worker {
             .list_for_worker(worker_id)
             .await
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
-        let mut tasks = Vec::new();
+        // Reconcile every durable record before starting asynchronous work. If
+        // a later authority operation fails, returning early must not detach a
+        // previously spawned adoption that the caller cannot own or join.
+        let mut planned_adoptions = Vec::new();
         for authority in authorities {
             let execution = match self.executions.get(&authority.execution_id).await {
                 Ok(execution) => execution,
@@ -393,7 +396,7 @@ impl Worker {
                         )
                 )
             {
-                tasks.push(self.clone().spawn_adopted(execution));
+                planned_adoptions.push(execution);
                 continue;
             }
             if same_attempt
@@ -445,7 +448,10 @@ impl Worker {
                 ),
             }
         }
-        Ok(tasks)
+        Ok(planned_adoptions
+            .into_iter()
+            .map(|execution| self.clone().spawn_adopted(execution))
+            .collect())
     }
 
     pub async fn run(&self, execution: &Execution) -> Result<ExecutionResult, WorkerError> {
