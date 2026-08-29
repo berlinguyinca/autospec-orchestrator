@@ -8,10 +8,14 @@ async fn frozen_runtime_conformance_reports_every_adapter_and_explicit_unavailab
     let docker = DockerRuntime::connect(None).expect("construct Docker adapter");
     let podman = PodmanRuntime::default();
     let apptainer = ApptainerRuntime::default();
-    let runtimes: [&dyn Runtime; 3] = [&docker, &podman, &apptainer];
+    let runtimes: [(&dyn Runtime, runtime_traits::RuntimeConformanceMetadata); 3] = [
+        (&docker, runtime_docker::CONFORMANCE_METADATA),
+        (&podman, runtime_podman::CONFORMANCE_METADATA),
+        (&apptainer, runtime_apptainer::CONFORMANCE_METADATA),
+    ];
 
-    for runtime in runtimes {
-        let report = inspect_runtime(runtime).await;
+    for (runtime, metadata) in runtimes {
+        let report = inspect_runtime(runtime, metadata).await;
         assert_eq!(report.contract, RUNTIME_CONFORMANCE_VERSION);
         assert_eq!(report.runtime, runtime.name());
         match report.availability {

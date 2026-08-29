@@ -18,6 +18,8 @@ pub enum StorageError {
     Journal(String),
     #[error("storage command failed: {0}")]
     Command(String),
+    #[error("Docker capability unavailable: {0}")]
+    DockerCapability(String),
     #[error("storage cleanup failed: {0}")]
     Cleanup(String),
 }

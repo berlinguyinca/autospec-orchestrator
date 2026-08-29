@@ -100,6 +100,9 @@ struct Cli {
     clone_base: String,
     #[arg(long, env = "AUTOSPEC_DOCKER_SOCKET")]
     docker_socket: Option<String>,
+    /// Host-loopback port published by the constrained Docker API proxy.
+    #[arg(long, env = "AUTOSPEC_DOCKER_PROXY_PORT", default_value_t = 2375)]
+    docker_proxy_port: u16,
     /// Allows the worker to use only the deployment's constrained Docker API proxy.
     #[arg(long, env = "AUTOSPEC_WORKER_HOST_DOCKER", default_value_t = false)]
     host_docker: bool,
@@ -137,29 +140,157 @@ struct ExecutionPlane {
     reservations: Arc<PgReservationStore>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparationFailureKind {
+    Configuration,
+    Persistence,
+    Recovery,
+    Storage,
+    Docker,
+}
+
+struct PreparationFailure {
+    kind: PreparationFailureKind,
+    diagnostic: &'static str,
+}
+
+impl PreparationFailure {
+    fn configuration(_: impl fmt::Display) -> Self {
+        Self {
+            kind: PreparationFailureKind::Configuration,
+            diagnostic: "worker configuration is invalid or unavailable",
+        }
+    }
+
+    fn persistence(_: impl fmt::Display) -> Self {
+        Self {
+            kind: PreparationFailureKind::Persistence,
+            diagnostic: "persistence connection failed",
+        }
+    }
+
+    fn storage(_: impl fmt::Display) -> Self {
+        Self {
+            kind: PreparationFailureKind::Storage,
+            diagnostic: "execution storage capability probe failed",
+        }
+    }
+
+    fn recovery(_: impl fmt::Display) -> Self {
+        Self {
+            kind: PreparationFailureKind::Recovery,
+            diagnostic: "durable startup recovery failed",
+        }
+    }
+
+    fn docker(_: impl fmt::Display) -> Self {
+        Self {
+            kind: PreparationFailureKind::Docker,
+            diagnostic: "constrained Docker capability probe failed",
+        }
+    }
+
+    fn health_code(&self) -> &'static str {
+        match self.kind {
+            PreparationFailureKind::Storage => "storage-capability-unavailable",
+            PreparationFailureKind::Docker => "docker-capability-unavailable",
+            PreparationFailureKind::Configuration => "worker-configuration-invalid",
+            PreparationFailureKind::Persistence | PreparationFailureKind::Recovery => {
+                "worker-preparation-unavailable"
+            }
+        }
+    }
+
+    fn diagnostic(&self) -> &'static str {
+        self.diagnostic
+    }
+}
+
+impl fmt::Debug for PreparationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparationFailure")
+            .field("kind", &self.health_code())
+            .field("diagnostic", &self.diagnostic)
+            .finish()
+    }
+}
+
+impl fmt::Display for PreparationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.diagnostic)
+    }
+}
+
+impl std::error::Error for PreparationFailure {}
+
+type PreparationResult<T> = std::result::Result<T, PreparationFailure>;
+
+struct PreparationRetry {
+    backoff: Duration,
+}
+
+impl Default for PreparationRetry {
+    fn default() -> Self {
+        Self {
+            backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+impl PreparationRetry {
+    fn record_failure(&mut self) -> Duration {
+        let delay = self.backoff;
+        self.backoff = (self.backoff * 2).min(Duration::from_secs(30));
+        delay
+    }
+
+    fn record_success(&mut self) {
+        self.backoff = Duration::from_secs(1);
+    }
+}
+
 fn advertisement_from_preparation(
     cli: &Cli,
-    prepared: Result<(WorkerCapabilityProof, ExecutionPlane)>,
+    prepared: PreparationResult<(WorkerCapabilityProof, ExecutionPlane)>,
 ) -> Result<(WorkerAdvertisement, Option<ExecutionPlane>)> {
     match prepared {
         Ok((proof, plane)) => Ok((advertisement(cli, Some(proof), Vec::new())?, Some(plane))),
         Err(error) => {
-            let failure = capability_failure_code(&error);
-            tracing::error!(worker_id = %cli.worker_id, failure, "worker execution capability unavailable; advertising no runtime capacity");
+            let failure = error.health_code();
+            tracing::error!(worker_id = %cli.worker_id, failure, diagnostic = error.diagnostic(), "worker execution capability unavailable; advertising no runtime capacity");
             Ok((advertisement(cli, None, vec![failure.to_owned()])?, None))
         }
     }
 }
 
-async fn prepare_execution_plane(cli: &Cli) -> Result<(WorkerCapabilityProof, ExecutionPlane)> {
-    validate_host_docker_policy(cli)?;
-    ensure_local_development_credentials_allowed(cli)?;
+async fn prepare_execution_plane(
+    cli: &Cli,
+) -> PreparationResult<(WorkerCapabilityProof, ExecutionPlane)> {
+    validate_host_docker_policy(cli).map_err(PreparationFailure::configuration)?;
+    ensure_local_development_credentials_allowed(cli).map_err(PreparationFailure::configuration)?;
     let storage = build_storage(cli)?;
     let proof = probe_capabilities(cli, storage.as_ref())?;
-    let executions = Arc::new(PgExecutionStore::connect(&cli.database_url).await?);
-    let reservations = Arc::new(PgReservationStore::connect(&cli.database_url).await?);
-    let cleanup = Arc::new(PgCleanupAuthorityStore::connect(&cli.database_url).await?);
-    let artifacts = Arc::new(PgArtifactStore::connect(&cli.database_url, &cli.state_root).await?);
+    let executions = Arc::new(
+        PgExecutionStore::connect(&cli.database_url)
+            .await
+            .map_err(PreparationFailure::persistence)?,
+    );
+    let reservations = Arc::new(
+        PgReservationStore::connect(&cli.database_url)
+            .await
+            .map_err(PreparationFailure::persistence)?,
+    );
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&cli.database_url)
+            .await
+            .map_err(PreparationFailure::persistence)?,
+    );
+    let artifacts = Arc::new(
+        PgArtifactStore::connect(&cli.database_url, &cli.state_root)
+            .await
+            .map_err(PreparationFailure::persistence)?,
+    );
     let verifier: Arc<dyn execution_storage::ReadyAllocationVerifier> = storage.clone();
     let worktrees = Arc::new(GitWorktreeManager::with_clone_base_and_verifier(
         &cli.state_root,
@@ -167,11 +298,12 @@ async fn prepare_execution_plane(cli: &Cli) -> Result<(WorkerCapabilityProof, Ex
         verifier.clone(),
     ));
     let trusted_verifier =
-        TrustedVerifierImage::new(&cli.docker_verifier_image, &cli.docker_verifier_command)?;
-    let credential_broker: Arc<dyn CredentialBroker> = Arc::new(LocalCredentialBroker::new(
-        &cli.state_root,
-        chrono::Duration::minutes(15),
-    )?);
+        TrustedVerifierImage::new(&cli.docker_verifier_image, &cli.docker_verifier_command)
+            .map_err(PreparationFailure::configuration)?;
+    let credential_broker: Arc<dyn CredentialBroker> = Arc::new(
+        LocalCredentialBroker::new(&cli.state_root, chrono::Duration::minutes(15))
+            .map_err(PreparationFailure::configuration)?,
+    );
     let runtimes = Arc::new(VerifiedDockerRuntimeFactory::new(
         cli.docker_socket.clone(),
         PathBuf::from(&cli.docker_binary),
@@ -218,8 +350,8 @@ async fn prepare_execution_plane(cli: &Cli) -> Result<(WorkerCapabilityProof, Ex
 
 async fn run_control_loop(
     cli: &Cli,
-    worker: WorkerAdvertisement,
-    execution_plane: Option<ExecutionPlane>,
+    mut worker: WorkerAdvertisement,
+    mut execution_plane: Option<ExecutionPlane>,
     token: Secret,
     client: reqwest::Client,
 ) -> Result<()> {
@@ -237,11 +369,68 @@ async fn run_control_loop(
     let mut registered = false;
     let mut backoff = Duration::from_secs(1);
     let mut heartbeat_due = tokio::time::Instant::now();
-    let mut tasks: Vec<ExecutionTask> = match execution_plane.as_ref() {
-        Some(plane) => plane.worker.reconcile_startup(&worker.id).await?,
-        None => Vec::new(),
-    };
+    let mut preparation_retry = PreparationRetry::default();
+    let mut preparation_due = tokio::time::Instant::now();
+    let mut tasks: Vec<ExecutionTask> = Vec::new();
+    match execution_plane.as_ref() {
+        Some(plane) => match plane.worker.reconcile_startup(&worker.id).await {
+            Ok(recovered) => tasks = recovered,
+            Err(error) => {
+                let failure = PreparationFailure::recovery(error);
+                worker = advertisement(cli, None, vec![failure.health_code().to_owned()])?;
+                execution_plane = None;
+                preparation_due += preparation_retry.record_failure();
+                tracing::warn!(
+                    worker_id = %worker.id,
+                    failure = failure.health_code(),
+                    diagnostic = failure.diagnostic(),
+                    "startup recovery is unavailable; advertising no runtime capacity"
+                );
+            }
+        },
+        None => preparation_due += preparation_retry.record_failure(),
+    }
     loop {
+        if execution_plane.is_none() && tokio::time::Instant::now() >= preparation_due {
+            match prepare_execution_plane(cli).await {
+                Ok((proof, plane)) => match plane.worker.reconcile_startup(&worker.id).await {
+                    Ok(recovered) => {
+                        tasks = recovered;
+                        worker = advertisement(cli, Some(proof), Vec::new())?;
+                        execution_plane = Some(plane);
+                        preparation_retry.record_success();
+                        registered = false;
+                        heartbeat_due = tokio::time::Instant::now();
+                        tracing::info!(worker_id = %worker.id, "worker execution capability recovered; re-registering ready");
+                    }
+                    Err(error) => {
+                        let failure = PreparationFailure::recovery(error);
+                        let delay = preparation_retry.record_failure();
+                        preparation_due = tokio::time::Instant::now() + delay;
+                        worker = advertisement(cli, None, vec![failure.health_code().to_owned()])?;
+                        tracing::warn!(
+                            worker_id = %worker.id,
+                            failure = failure.health_code(),
+                            diagnostic = failure.diagnostic(),
+                            retry_seconds = delay.as_secs(),
+                            "startup recovery remains unavailable"
+                        );
+                    }
+                },
+                Err(error) => {
+                    let delay = preparation_retry.record_failure();
+                    preparation_due = tokio::time::Instant::now() + delay;
+                    worker = advertisement(cli, None, vec![error.health_code().to_owned()])?;
+                    tracing::warn!(
+                        worker_id = %worker.id,
+                        failure = error.health_code(),
+                        diagnostic = error.diagnostic(),
+                        retry_seconds = delay.as_secs(),
+                        "worker execution capability remains unavailable"
+                    );
+                }
+            }
+        }
         let mut index = tasks.len();
         while index > 0 {
             index -= 1;
@@ -357,7 +546,15 @@ fn validate_host_docker_policy(cli: &Cli) -> Result<()> {
         "Docker execution requires AUTOSPEC_WORKER_HOST_DOCKER=true"
     );
     anyhow::ensure!(
-        cli.docker_socket.as_deref() == Some("tcp://docker-api:2375"),
+        cli.docker_proxy_port != 0,
+        "Docker proxy port must be between 1 and 65535"
+    );
+    let host_endpoint = format!("tcp://127.0.0.1:{}", cli.docker_proxy_port);
+    let supported_endpoint = cli.docker_socket.as_deref() == Some(host_endpoint.as_str())
+        || (cli.docker_proxy_port == 2375
+            && cli.docker_socket.as_deref() == Some("tcp://docker-api:2375"));
+    anyhow::ensure!(
+        supported_endpoint,
         "Docker execution requires the constrained deployment proxy"
     );
     Ok(())
@@ -409,19 +606,14 @@ fn advertisement(
     })
 }
 
-fn capability_failure_code(error: &anyhow::Error) -> &'static str {
-    if error.to_string().to_ascii_lowercase().contains("docker") {
-        "docker-capability-unavailable"
-    } else {
-        "storage-capability-unavailable"
-    }
-}
-
 fn probe_capabilities(
     cli: &Cli,
     storage: &dyn ExecutionStorageManager,
-) -> Result<WorkerCapabilityProof> {
-    let capability = storage.probe(cli.disk_gib)?;
+) -> PreparationResult<WorkerCapabilityProof> {
+    let capability = storage.probe(cli.disk_gib).map_err(|error| match error {
+        StorageError::DockerCapability(_) => PreparationFailure::docker(error),
+        _ => PreparationFailure::storage(error),
+    })?;
     Ok(WorkerCapabilityProof {
         storage_backend: capability.backend.backend,
         storage_pool_identity: capability.backend.pool_identity,
@@ -431,41 +623,54 @@ fn probe_capabilities(
     })
 }
 
-fn build_storage(cli: &Cli) -> Result<Arc<ExecutionStorage>> {
+fn build_storage(cli: &Cli) -> PreparationResult<Arc<ExecutionStorage>> {
     let runner = Arc::new(ProcessCommandRunner);
     let backend: Box<dyn StorageBackend> = match cli.storage_kind {
-        StorageKind::Apfs => Box::new(ApfsBackend::new(&cli.storage_pool, runner)?),
-        StorageKind::Lvm => Box::new(LvmBackend::new(&cli.storage_pool, runner)?),
+        StorageKind::Apfs => Box::new(
+            ApfsBackend::new(&cli.storage_pool, runner).map_err(PreparationFailure::storage)?,
+        ),
+        StorageKind::Lvm => Box::new(
+            LvmBackend::new(&cli.storage_pool, runner).map_err(PreparationFailure::storage)?,
+        ),
     };
     let verifier =
-        TrustedVerifierImage::new(&cli.docker_verifier_image, &cli.docker_verifier_command)?;
+        TrustedVerifierImage::new(&cli.docker_verifier_image, &cli.docker_verifier_command)
+            .map_err(PreparationFailure::configuration)?;
     let output = docker_command(&cli.docker_binary, cli.docker_socket.as_deref())
         .args(["info", "--format", "{{.ID}}"])
         .output()
-        .with_context(|| format!("execute {} info", cli.docker_binary))?;
+        .with_context(|| format!("execute {} info", cli.docker_binary))
+        .map_err(PreparationFailure::docker)?;
     if !output.status.success() {
-        anyhow::bail!(
-            "Docker daemon identity probe failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        return Err(PreparationFailure::docker(
+            "Docker daemon identity probe failed",
+        ));
     }
-    let daemon_id = String::from_utf8(output.stdout)?.trim().to_owned();
+    let daemon_id = String::from_utf8(output.stdout)
+        .map_err(PreparationFailure::docker)?
+        .trim()
+        .to_owned();
     if daemon_id.is_empty() {
-        anyhow::bail!("Docker daemon identity probe returned empty ID");
+        return Err(PreparationFailure::docker(
+            "Docker daemon identity probe returned empty ID",
+        ));
     }
-    Ok(Arc::new(ExecutionStorage::new(
-        &cli.state_root,
-        backend,
-        Box::new(DockerCapabilityVerifier {
-            docker: PathBuf::from(&cli.docker_binary),
-            docker_host: cli.docker_socket.clone(),
-            daemon_id,
-            verifier_image: cli.docker_verifier_image.clone(),
-            verifier_command: cli.docker_verifier_command.clone(),
-            method_version: verifier.proof_method(),
-            worker_id: WorkerId::new(&cli.worker_id),
-        }),
-    )?))
+    Ok(Arc::new(
+        ExecutionStorage::new(
+            &cli.state_root,
+            backend,
+            Box::new(DockerCapabilityVerifier {
+                docker: PathBuf::from(&cli.docker_binary),
+                docker_host: cli.docker_socket.clone(),
+                daemon_id,
+                verifier_image: cli.docker_verifier_image.clone(),
+                verifier_command: cli.docker_verifier_command.clone(),
+                method_version: verifier.proof_method(),
+                worker_id: WorkerId::new(&cli.worker_id),
+            }),
+        )
+        .map_err(PreparationFailure::storage)?,
+    ))
 }
 
 #[derive(Debug)]
@@ -597,6 +802,7 @@ mod tests {
             state_root: "/tmp".into(),
             clone_base: "https://github.com".into(),
             docker_socket: None,
+            docker_proxy_port: 2375,
             host_docker: false,
             pi_executable: "pi".into(),
             allow_local_development_credentials: false,
@@ -668,10 +874,50 @@ mod tests {
         assert!(validate_host_docker_policy(&cli).is_err());
         cli.host_docker = true;
         validate_host_docker_policy(&cli).unwrap();
+        cli.docker_socket = Some("tcp://127.0.0.1:2375".into());
+        validate_host_docker_policy(&cli).unwrap();
+        cli.docker_proxy_port = 42375;
+        assert!(validate_host_docker_policy(&cli).is_err());
+        cli.docker_socket = Some("tcp://127.0.0.1:42375".into());
+        validate_host_docker_policy(&cli).unwrap();
         cli.docker_socket = Some("unix:///var/run/docker.sock".into());
         assert!(validate_host_docker_policy(&cli).is_err());
-        cli.docker_socket = Some("tcp://127.0.0.1:2375".into());
+        cli.docker_socket = Some("tcp://192.0.2.10:42375".into());
         assert!(validate_host_docker_policy(&cli).is_err());
+        cli.docker_proxy_port = 0;
+        cli.docker_socket = Some("tcp://127.0.0.1:0".into());
+        assert!(validate_host_docker_policy(&cli).is_err());
+    }
+
+    #[test]
+    fn preparation_failures_are_typed_and_diagnostics_never_echo_sources() {
+        let secret = "postgres://user:password@database/private";
+        let failure = PreparationFailure::persistence(secret);
+        assert_eq!(failure.kind, PreparationFailureKind::Persistence);
+        assert_eq!(failure.health_code(), "worker-preparation-unavailable");
+        assert_eq!(failure.diagnostic(), "persistence connection failed");
+        assert!(!format!("{failure}").contains(secret));
+
+        let storage = PreparationFailure::storage(secret);
+        assert_eq!(storage.health_code(), "storage-capability-unavailable");
+        assert!(!format!("{storage:?}").contains(secret));
+
+        let docker = PreparationFailure::docker(secret);
+        assert_eq!(docker.health_code(), "docker-capability-unavailable");
+        assert!(!format!("{docker:?}").contains(secret));
+    }
+
+    #[test]
+    fn preparation_retry_backoff_is_bounded_and_resets_after_recovery() {
+        let mut retry = PreparationRetry::default();
+        assert_eq!(retry.record_failure(), Duration::from_secs(1));
+        assert_eq!(retry.record_failure(), Duration::from_secs(2));
+        for _ in 0..10 {
+            retry.record_failure();
+        }
+        assert_eq!(retry.record_failure(), Duration::from_secs(30));
+        retry.record_success();
+        assert_eq!(retry.record_failure(), Duration::from_secs(1));
     }
 
     #[tokio::test]

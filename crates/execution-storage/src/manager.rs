@@ -761,8 +761,13 @@ fn valid_prepared_transition(created: &BackendIdentity, prepared: &BackendIdenti
 impl ExecutionStorageManager for ExecutionStorage {
     fn probe(&self, disk_gib: u64) -> Result<StorageCapability, StorageError> {
         let backend = self.backend.probe(disk_gib_to_bytes(disk_gib)?)?;
-        let docker_bind = self.docker.probe()?;
-        docker_bind.validate()?;
+        let docker_bind = self
+            .docker
+            .probe()
+            .map_err(|error| StorageError::DockerCapability(error.to_string()))?;
+        docker_bind
+            .validate()
+            .map_err(|error| StorageError::DockerCapability(error.to_string()))?;
         Ok(StorageCapability {
             backend,
             docker_bind,

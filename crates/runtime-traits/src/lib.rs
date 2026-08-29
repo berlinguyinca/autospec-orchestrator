@@ -28,16 +28,43 @@ pub struct RuntimeConformanceReport {
     pub availability: RuntimeAvailability,
 }
 
+/// Adapter-owned eligibility metadata kept outside the frozen runtime trait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeConformanceMetadata {
+    pub runtime: &'static str,
+    pub lifecycle_conformant: bool,
+}
+
+impl RuntimeConformanceMetadata {
+    pub const fn eligible(runtime: &'static str) -> Self {
+        Self {
+            runtime,
+            lifecycle_conformant: true,
+        }
+    }
+
+    pub const fn detected_unsupported(runtime: &'static str) -> Self {
+        Self {
+            runtime,
+            lifecycle_conformant: false,
+        }
+    }
+}
+
 /// Runs the frozen host-independent portion of the runtime contract. Lifecycle
 /// conformance remains adapter-owned because provisioning requires a real,
 /// runtime-specific image and an execution-storage allocation.
-pub async fn inspect_runtime(runtime: &dyn Runtime) -> RuntimeConformanceReport {
+pub async fn inspect_runtime(
+    runtime: &dyn Runtime,
+    metadata: RuntimeConformanceMetadata,
+) -> RuntimeConformanceReport {
+    let metadata_matches = metadata.runtime == runtime.name();
     RuntimeConformanceReport {
         contract: RUNTIME_CONFORMANCE_VERSION,
         runtime: runtime.name(),
         availability: match (
             runtime.available().await,
-            runtime.supports_frozen_conformance(),
+            metadata_matches && metadata.lifecycle_conformant,
         ) {
             (true, true) => RuntimeAvailability::Available,
             (true, false) => RuntimeAvailability::DetectedUnsupported,
@@ -113,12 +140,6 @@ pub trait CredentialBroker: Send + Sync {
 pub trait Runtime: Send + Sync {
     fn name(&self) -> &'static str;
 
-    /// True only after this adapter has a frozen lifecycle/limits/storage/cleanup
-    /// conformance test. Detection alone must never advertise conformance.
-    fn supports_frozen_conformance(&self) -> bool {
-        false
-    }
-
     /// True when this runtime is usable on the current host.
     async fn available(&self) -> bool;
 
@@ -148,9 +169,6 @@ mod conformance_tests {
         fn name(&self) -> &'static str {
             "fixture"
         }
-        fn supports_frozen_conformance(&self) -> bool {
-            true
-        }
         async fn available(&self) -> bool {
             true
         }
@@ -172,9 +190,26 @@ mod conformance_tests {
 
     #[tokio::test]
     async fn frozen_conformance_report_names_version_and_availability() {
-        let report = inspect_runtime(&AvailableRuntime).await;
+        let report = inspect_runtime(
+            &AvailableRuntime,
+            RuntimeConformanceMetadata::eligible("fixture"),
+        )
+        .await;
         assert_eq!(report.contract, RUNTIME_CONFORMANCE_VERSION);
         assert_eq!(report.runtime, "fixture");
         assert_eq!(report.availability, RuntimeAvailability::Available);
+    }
+
+    #[tokio::test]
+    async fn adapter_metadata_not_the_runtime_trait_controls_eligibility() {
+        let report = inspect_runtime(
+            &AvailableRuntime,
+            RuntimeConformanceMetadata::detected_unsupported("fixture"),
+        )
+        .await;
+        assert_eq!(
+            report.availability,
+            RuntimeAvailability::DetectedUnsupported
+        );
     }
 }

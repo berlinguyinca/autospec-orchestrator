@@ -14,13 +14,17 @@ use async_trait::async_trait;
 use bollard::Docker;
 use execution_storage::{AllocationReceipt, ExecutionLayout, ReadyAllocationVerifier};
 use orchestrator_core::{ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement};
-use runtime_traits::{EnvironmentHandle, ExecutionCredentials, Runtime, RuntimeError};
+use runtime_traits::{
+    EnvironmentHandle, ExecutionCredentials, Runtime, RuntimeConformanceMetadata, RuntimeError,
+};
 use std::{env, path::PathBuf, sync::Arc};
 
 pub use credentials::LocalCredentialBroker;
 pub use limits::{host_limits, HostConfigLimits, DEFAULT_PIDS_LIMIT};
 
 const DEFAULT_MIN_API_VERSION: &str = "1.41";
+pub const CONFORMANCE_METADATA: RuntimeConformanceMetadata =
+    RuntimeConformanceMetadata::eligible("docker");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedVerifierImage {
@@ -351,10 +355,6 @@ fn validate_daemon_api(
 impl Runtime for DockerRuntime {
     fn name(&self) -> &'static str {
         "docker"
-    }
-
-    fn supports_frozen_conformance(&self) -> bool {
-        true
     }
 
     async fn available(&self) -> bool {

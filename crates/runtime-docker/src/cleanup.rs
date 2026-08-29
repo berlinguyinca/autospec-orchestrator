@@ -158,10 +158,36 @@ fn collect_orphan(
     live: &BTreeSet<&ExecutionId>,
     orphans: &mut BTreeSet<ExecutionId>,
 ) {
-    if let Some(value) = resource_labels.get(labels::EXECUTION_ID) {
+    let complete_execution_labels = resource_labels.get(labels::MANAGED).map(String::as_str)
+        == Some("true")
+        && resource_labels.contains_key(labels::WORKER_ID)
+        && resource_labels.contains_key(labels::REPOSITORY);
+    if complete_execution_labels {
+        let Some(value) = resource_labels.get(labels::EXECUTION_ID) else {
+            return;
+        };
         let execution_id = ExecutionId::new(value.clone());
         if !live.contains(&execution_id) {
             orphans.insert(execution_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_labels_are_not_execution_orphans() {
+        let deployment = HashMap::from([
+            (labels::MANAGED.to_owned(), "true".to_owned()),
+            (
+                labels::EXECUTION_ID.to_owned(),
+                "deployment-test".to_owned(),
+            ),
+        ]);
+        let mut orphans = BTreeSet::new();
+        collect_orphan(&deployment, &BTreeSet::new(), &mut orphans);
+        assert!(orphans.is_empty());
     }
 }

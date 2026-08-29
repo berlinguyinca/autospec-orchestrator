@@ -17,9 +17,16 @@ enforce disk reservations. The worker must not receive a raw host Docker socket.
    `docker compose -f deploy/docker-compose.yml up -d postgres controller`.
 4. Start `autospec-worker` on the storage host with the documented storage pool,
    immutable verifier image ID, `AUTOSPEC_WORKER_HOST_DOCKER=true`, and the
-   constrained `tcp://docker-api:2375` Docker API endpoint. A failed
-   APFS/LVM or Docker bind probe registers the worker Offline with a sanitized
-   `healthErrors` reason and zero advertised runtime capacity.
+   constrained `tcp://127.0.0.1:${AUTOSPEC_DOCKER_PROXY_PORT:-2375}` Docker API
+endpoint published by `docker-api`. The worker validates that the configured
+port matches and rejects non-loopback endpoints. A failed
+APFS/LVM or Docker bind probe registers the worker Offline with a sanitized
+`healthErrors` reason and zero advertised runtime capacity.
+
+The proxy alone also joins `host-publish`, which lets Docker Desktop realize
+the loopback publication. The worker is not attached to that network; its
+container example reaches the proxy only through the internal `runtime-api`
+network, and the supported host worker reaches only the loopback publication.
 
 The optional `host-docker-worker` profile demonstrates container wiring through
 an internal Docker socket proxy. It is disabled by default, never mounts the

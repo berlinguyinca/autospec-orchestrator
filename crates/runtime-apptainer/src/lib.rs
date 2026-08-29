@@ -6,8 +6,11 @@
 
 use async_trait::async_trait;
 use orchestrator_core::{ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement};
-use runtime_traits::{EnvironmentHandle, Runtime, RuntimeError};
+use runtime_traits::{EnvironmentHandle, Runtime, RuntimeConformanceMetadata, RuntimeError};
 use std::{path::PathBuf, process::Command};
+
+pub const CONFORMANCE_METADATA: RuntimeConformanceMetadata =
+    RuntimeConformanceMetadata::detected_unsupported("apptainer");
 
 #[derive(Debug, Clone)]
 pub struct ApptainerRuntime {
@@ -77,7 +80,7 @@ mod tests {
         let binary = directory.path().join("apptainer");
         std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let report = inspect_runtime(&ApptainerRuntime::new(&binary)).await;
+        let report = inspect_runtime(&ApptainerRuntime::new(&binary), CONFORMANCE_METADATA).await;
         assert_eq!(report.runtime, "apptainer");
         assert_eq!(
             report.availability,

@@ -1874,6 +1874,7 @@ async fn frozen_conformance_requires_docker_and_proves_lifecycle_limits_storage_
     let unrelated_network = format!("unrelated-{}", execution_labels.execution_id);
     let unrelated_container = format!("unrelated-{}", execution_labels.execution_id);
     let unrelated_volume = format!("unrelated-{}", execution_labels.execution_id);
+    let deployment_network = format!("deployment-{}", execution_labels.execution_id);
     docker
         .create_network(CreateNetworkOptions {
             name: unrelated_network.clone(),
@@ -1883,6 +1884,21 @@ async fn frozen_conformance_requires_docker_and_proves_lifecycle_limits_storage_
         })
         .await
         .expect("create unrelated control network");
+    docker
+        .create_network(CreateNetworkOptions {
+            name: deployment_network.clone(),
+            driver: "bridge".to_owned(),
+            labels: HashMap::from([
+                (labels::MANAGED.to_owned(), "true".to_owned()),
+                (
+                    labels::EXECUTION_ID.to_owned(),
+                    "deployment-rendered-equivalent".to_owned(),
+                ),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .expect("create deployment-labelled network");
 
     let result = async {
         let handle = runtime
@@ -2019,6 +2035,7 @@ async fn frozen_conformance_requires_docker_and_proves_lifecycle_limits_storage_
             .contains(&execution_labels.execution_id));
         let orphans = runtime.reconcile(&[]).await?;
         assert!(orphans.contains(&execution_labels.execution_id));
+        assert!(!orphans.contains(&ExecutionId::new("deployment-rendered-equivalent")));
         docker
             .inspect_network::<String>(&handle.network, None)
             .await
@@ -2046,6 +2063,10 @@ async fn frozen_conformance_requires_docker_and_proves_lifecycle_limits_storage_
             .await
             .expect("selector cleanup preserves unrelated Docker resources");
         docker
+            .inspect_network::<String>(&deployment_network, None)
+            .await
+            .expect("reconciliation preserves deployment infrastructure");
+        docker
             .inspect_container(&unrelated_container, None)
             .await
             .expect("selector cleanup preserves unrelated containers");
@@ -2059,6 +2080,10 @@ async fn frozen_conformance_requires_docker_and_proves_lifecycle_limits_storage_
     .await;
 
     scope.cleanup().await.expect("cleanup lifecycle resources");
+    docker
+        .remove_network(&deployment_network)
+        .await
+        .expect("remove deployment-labelled fixture network");
     result.expect("real Docker lifecycle succeeds");
 
     for scoped_labels in [
@@ -2604,17 +2629,32 @@ async fn provisioning_failure_reports_rollback_failure_and_leaks_no_anonymous_vo
         .await
         .expect_err("agent name conflict triggers provisioning rollback")
         .to_string();
-    let volumes_after_failure = volume_names(&docker).await;
+    let mut volumes_after_failure = volume_names(&docker).await;
     assert!(error.contains(execution_labels.execution_id.as_str()));
     assert!(error.contains("create agent container"));
     assert!(error.contains("rollback"));
     assert!(error.contains(&owned_volume));
-    let new_anonymous_volumes = volumes_after_failure
+    let mut new_anonymous_volumes = volumes_after_failure
         .difference(&volumes_before_failure)
         .filter(|name| {
             name.len() == 64 && name.chars().all(|character| character.is_ascii_hexdigit())
         })
+        .cloned()
         .collect::<Vec<_>>();
+    for _ in 0..50 {
+        if new_anonymous_volumes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        volumes_after_failure = volume_names(&docker).await;
+        new_anonymous_volumes = volumes_after_failure
+            .difference(&volumes_before_failure)
+            .filter(|name| {
+                name.len() == 64 && name.chars().all(|character| character.is_ascii_hexdigit())
+            })
+            .cloned()
+            .collect();
+    }
     assert!(
         new_anonymous_volumes.is_empty(),
         "failed provisioning must not leave anonymous image volumes: {new_anonymous_volumes:?}"
