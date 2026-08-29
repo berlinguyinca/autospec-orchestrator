@@ -195,6 +195,26 @@ async fn interactive_intents_are_ordered_restart_visible_and_complete_exactly_on
         .unwrap()
         .iter()
         .all(|control| control.execution.id != running.id));
+
+    let cancelled_control = executions
+        .request_control(&running.id, ExecutionControlAction::Pause, "cancel-wins")
+        .await
+        .unwrap();
+    executions.request_cancellation(&running.id).await.unwrap();
+    assert!(executions
+        .request_control(
+            &running.id,
+            ExecutionControlAction::ForkConversation,
+            "after-cancel"
+        )
+        .await
+        .is_err());
+    assert!(executions
+        .list_pending_controls(&worker.id)
+        .await
+        .unwrap()
+        .iter()
+        .all(|control| control.request.request_id != cancelled_control.request.request_id));
 }
 
 #[tokio::test]
@@ -303,6 +323,18 @@ async fn interactive_control_is_fenced_phased_and_completion_matrix_is_exact() {
         .unwrap();
     let pool = PgPoolOptions::new()
         .connect(&std::env::var("AUTOSPEC_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    executions
+        .begin_control(
+            resume.request.request_id,
+            &worker.id,
+            paused.attempt_id.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    executions
+        .mark_control_side_effect_applied(resume.request.request_id, None)
         .await
         .unwrap();
     sqlx::query("UPDATE executions SET version = version + 1 WHERE id = $1")

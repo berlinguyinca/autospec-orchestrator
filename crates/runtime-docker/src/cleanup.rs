@@ -34,7 +34,7 @@ pub(crate) async fn destroy(
                             &id,
                             Some(RemoveContainerOptions {
                                 force: true,
-                                v: false,
+                                v: true,
                                 link: false,
                             }),
                         )

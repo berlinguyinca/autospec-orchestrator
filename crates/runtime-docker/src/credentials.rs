@@ -3,13 +3,16 @@ use chrono::{DateTime, Duration, Utc};
 use orchestrator_core::{Execution, ExecutionId};
 use runtime_traits::{CredentialBroker, ExecutionCredentials, RuntimeError};
 use std::{
+    collections::BTreeMap,
     fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 const CREDENTIAL_FILE: &str = "inferweave.credential";
+static CREDENTIAL_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
 /// Local execution-scoped credential issuer used until an InferWeave issuance
 /// endpoint exists. It creates opaque, short-lived material only; it does not
@@ -161,11 +164,27 @@ impl LocalCredentialBroker {
             .and_then(|directory| directory.sync_all())
             .map_err(|error| RuntimeError::Provisioning(format!("{operation}: {error}")))
     }
+
+    fn execution_lock(&self, id: &ExecutionId) -> Result<Arc<Mutex<()>>, RuntimeError> {
+        let path = self.credential_path(id)?;
+        let mut locks = CREDENTIAL_LOCKS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .map_err(|_| RuntimeError::Unavailable("credential lock registry poisoned".into()))?;
+        Ok(locks
+            .entry(path)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
+    }
 }
 
 #[async_trait]
 impl CredentialBroker for LocalCredentialBroker {
     async fn mint(&self, execution: &Execution) -> Result<ExecutionCredentials, RuntimeError> {
+        let lock = self.execution_lock(&execution.id)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| RuntimeError::Unavailable("execution credential lock poisoned".into()))?;
         let parent = self.verified_parent(&execution.id)?;
         let path = parent.join(CREDENTIAL_FILE);
         if let Some(expires_at) = self.read_live(&path)? {
@@ -208,10 +227,21 @@ impl CredentialBroker for LocalCredentialBroker {
     }
 
     async fn revoke(&self, id: &ExecutionId) -> Result<(), RuntimeError> {
+        let lock = self.execution_lock(id)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| RuntimeError::Unavailable("execution credential lock poisoned".into()))?;
         let path = self.credential_path(id)?;
         let parent = match self.verified_parent(id) {
             Ok(parent) => parent,
-            Err(_error) if fs::symlink_metadata(&path).is_err() => return Ok(()),
+            Err(_error)
+                if matches!(
+                    fs::symlink_metadata(&path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ) =>
+            {
+                return Ok(())
+            }
             Err(error) => return Err(error),
         };
         let metadata = match fs::symlink_metadata(&path) {

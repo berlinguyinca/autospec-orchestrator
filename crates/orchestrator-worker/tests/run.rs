@@ -659,7 +659,8 @@ async fn successful_run_uses_exact_order_and_persists_result_before_cleanup() {
     );
     assert!(checkpoints[0].1["receipt"].is_object());
     assert!(checkpoints[1].1["worktree"].is_object());
-    assert!(checkpoints[2].1["runtime"].is_object());
+    assert!(checkpoints[2].1["runtime"].is_null());
+    assert!(checkpoints[2].1["runtime_selector"].is_object());
     assert!(checkpoints[3].1["session"].is_object());
 }
 
@@ -817,6 +818,7 @@ async fn provisioning_failure_runs_reverse_cleanup_and_returns_worker_lost_peer_
             "allocate",
             "git-create",
             "docker-provision",
+            "docker-destroy",
             "git-destroy",
             "storage-release"
         ]
@@ -834,6 +836,7 @@ async fn every_creation_and_result_phase_failure_cleans_only_acquired_lower_laye
                 "allocate",
                 "git-create",
                 "docker-provision",
+                "docker-destroy",
                 "git-destroy",
                 "storage-release",
             ],
@@ -982,7 +985,8 @@ async fn execution_and_reverse_cleanup_failures_are_all_reported() {
     let worker = worker(lifecycle, store, Arc::new(FakeReservations::default()));
     let error = worker.run(&execution).await.unwrap_err().to_string();
     assert!(error.contains("docker-provision"), "{error}");
-    assert!(error.contains("git cleanup"), "{error}");
+    assert!(error.contains("docker cleanup"), "{error}");
+    assert!(!error.contains("git cleanup"), "{error}");
     assert!(!error.contains("storage cleanup"), "{error}");
 }
 

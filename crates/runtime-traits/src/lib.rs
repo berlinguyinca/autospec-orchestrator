@@ -63,6 +63,10 @@ pub struct ExecutionCredentials {
 
 /// Issuance boundary for short-lived execution credentials (spec section 36).
 /// InferWeave policy and validation remain outside the orchestrator.
+/// Repeated minting for an adopted execution must return the same unexpired
+/// path and authority. A caller must reject an expired or rotated mounted
+/// credential and recreate the runtime; replacing a bind-mounted inode is not
+/// a valid adoption strategy.
 #[async_trait]
 pub trait CredentialBroker: Send + Sync {
     async fn mint(&self, execution: &Execution) -> Result<ExecutionCredentials, RuntimeError>;

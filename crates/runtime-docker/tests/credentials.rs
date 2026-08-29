@@ -131,6 +131,29 @@ async fn concurrent_mint_reuses_one_atomic_winner() {
 }
 
 #[tokio::test]
+async fn concurrent_mint_and_revoke_are_linearized_per_execution() {
+    let root = TempDir::new().unwrap();
+    let execution = execution("repo-7-mint-revoke-race-01");
+    execution_root(&root, execution.id.as_str());
+    let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
+    broker.mint(&execution).await.unwrap();
+
+    let (minted, revoked) = tokio::join!(broker.mint(&execution), broker.revoke(&execution.id));
+    let minted = minted.unwrap();
+    revoked.unwrap();
+
+    // Either serialized order is safe: revoke removed the old authority, or a
+    // later mint published one complete private credential. No partial file is
+    // observable.
+    if minted.path.exists() {
+        let body = fs::read_to_string(&minted.path).unwrap();
+        assert_eq!(body.lines().count(), 2);
+    }
+    let reminted = broker.mint(&execution).await.unwrap();
+    assert!(reminted.path.exists());
+}
+
+#[tokio::test]
 async fn expired_bound_credential_is_rejected_without_replacing_its_inode() {
     let root = TempDir::new().unwrap();
     let execution = execution("repo-7-expired-01");

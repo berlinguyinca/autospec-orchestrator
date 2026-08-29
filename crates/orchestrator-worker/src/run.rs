@@ -78,7 +78,7 @@ pub(crate) async fn run_with_cancel_and_controls(
         cleanup_errors.push(format!("read durable cancellation request: {error}"));
     }
     if outcome.is_err() && !tracked.state.is_terminal() && !cancellation {
-        let failure = if !guard.runtime_created {
+        let failure = if guard.environment.is_none() {
             FailureClass::EnvironmentFailed
         } else if guard.session.is_some() {
             FailureClass::HarnessFailed
@@ -318,7 +318,7 @@ async fn cleanup_phases(
     if disposition != CleanupDisposition::CleanupPending {
         worker
             .cleanup_authorities
-            .fence_for_cleanup(&execution.id, &cleanup_handles(guard))
+            .fence_for_cleanup(&execution.id, &cleanup_handles(execution, guard))
             .await
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
     }
@@ -370,7 +370,12 @@ async fn transition_authority(
 ) -> Result<(), WorkerError> {
     worker
         .cleanup_authorities
-        .transition(&execution.id, expected, next, &cleanup_handles(guard))
+        .transition(
+            &execution.id,
+            expected,
+            next,
+            &cleanup_handles(execution, guard),
+        )
         .await
         .map_err(|error| WorkerError::Persistence(error.to_string()))
 }
@@ -498,11 +503,8 @@ async fn run_inner(
     execution
         .transition(ExecutionState::Provisioning)
         .map_err(|error| WorkerError::Invalid(error.to_string()))?;
-    let environment = worker
-        .lifecycle
-        .provision(execution, &receipt, &worktree)
-        .await?;
-    guard.environment = Some(environment.clone());
+    // Label-scoped cleanup authority must be durable before a runtime can
+    // create even its first network/container/volume.
     guard.runtime_created = true;
     transition_cleanup(
         worker,
@@ -512,6 +514,11 @@ async fn run_inner(
         CleanupDisposition::Active(CleanupStage::Runtime),
     )
     .await?;
+    let environment = worker
+        .lifecycle
+        .provision(execution, &receipt, &worktree)
+        .await?;
+    guard.environment = Some(environment.clone());
     record(worker, execution, ExecutionEventKind::EnvironmentReady).await?;
     let packet = execution.manifest.task_packet.as_ref().ok_or_else(|| {
         WorkerError::Invalid("execution manifest lacks compact TaskPacket".to_owned())
@@ -556,7 +563,13 @@ async fn drive_running(
     mut session: harness_traits::SessionRef,
     mut controls: tokio::sync::mpsc::UnboundedReceiver<PendingExecutionControl>,
 ) -> Result<ExecutionResult, WorkerError> {
-    let mut health = HealthMonitor::default_at(Instant::now());
+    let started_at = Instant::now();
+    let mut health = HealthMonitor::default_at(started_at);
+    if execution.state == ExecutionState::PausedForHuman {
+        // An adopted human pause begins paused at the monitor's epoch; no wall
+        // or inactivity time may accrue between process start and adoption.
+        health.pause(started_at);
+    }
     'events: loop {
         if cancelled.load(Ordering::SeqCst) {
             return Err(WorkerError::Cancelled);
@@ -694,7 +707,7 @@ async fn drive_running(
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
         worker
             .cleanup_authorities
-            .fence_for_cleanup(&execution.id, &cleanup_handles(guard))
+            .fence_for_cleanup(&execution.id, &cleanup_handles(execution, guard))
             .await
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
     }
@@ -776,7 +789,18 @@ async fn handle_control(
                     .await?;
                 worker
                     .control_checkpoints
+                    .reached(ControlCheckpoint::RunningRestored);
+                worker
+                    .control_checkpoints
                     .reached(ControlCheckpoint::ResumeLaunched);
+            } else {
+                // Adoption deliberately quiesces abandoned holds. Reapplying a
+                // persisted side effect must restore the exact native session,
+                // never replay the task packet.
+                worker
+                    .lifecycle
+                    .resume(execution, receipt, environment, session)
+                    .await?;
             }
             health.resume(Instant::now());
             execution
@@ -789,7 +813,7 @@ async fn handle_control(
             let target = control.target_session_id.as_ref().ok_or_else(|| {
                 WorkerError::Invalid("conversation fork lacks fenced target".into())
             })?;
-            let was_running = execution.state == ExecutionState::Running;
+            let was_running = control.accepted_state == ExecutionState::Running;
             let forked = if already_applied {
                 harness_traits::SessionRef {
                     id: target.clone(),
@@ -825,6 +849,22 @@ async fn handle_control(
                 }
                 forked
             };
+            if already_applied && was_running {
+                let receipt = guard.receipt.as_ref().ok_or_else(|| {
+                    WorkerError::Invalid("fork resume lacks storage authority".into())
+                })?;
+                let environment = guard.environment.as_ref().ok_or_else(|| {
+                    WorkerError::Invalid("fork resume lacks runtime authority".into())
+                })?;
+                worker
+                    .lifecycle
+                    .resume(execution, receipt, environment, &forked)
+                    .await?;
+                worker
+                    .control_checkpoints
+                    .reached(ControlCheckpoint::RunningRestored);
+                health.resume(Instant::now());
+            }
             if forked.execution_id != execution.id
                 || forked.worktree_path != original_worktree
                 || forked.id == session.id
@@ -876,7 +916,7 @@ async fn transition_cleanup(
     expected: CleanupDisposition,
     next: CleanupDisposition,
 ) -> Result<(), WorkerError> {
-    let handles = cleanup_handles(guard);
+    let handles = cleanup_handles(execution, guard);
     worker
         .cleanup_authorities
         .transition(&execution.id, expected, next, &handles)
@@ -884,7 +924,7 @@ async fn transition_cleanup(
         .map_err(|error| WorkerError::Persistence(error.to_string()))
 }
 
-fn cleanup_handles(guard: &CleanupGuard) -> serde_json::Value {
+fn cleanup_handles(execution: &Execution, guard: &CleanupGuard) -> serde_json::Value {
     let receipt = guard
         .receipt
         .as_ref()
@@ -930,6 +970,7 @@ fn cleanup_handles(guard: &CleanupGuard) -> serde_json::Value {
         "receipt": receipt,
         "worktree": worktree,
         "runtime": runtime,
+        "runtime_selector": guard.runtime_created.then(|| execution.labels.clone()),
         "session": session,
     })
 }

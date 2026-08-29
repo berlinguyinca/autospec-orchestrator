@@ -32,6 +32,15 @@ pub trait RuntimeFactory: Send + Sync {
         execution: &Execution,
         receipt: &AllocationReceipt,
     ) -> Result<Arc<dyn Runtime>, LifecycleError>;
+    async fn build_for_adoption(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+        environment: &EnvironmentHandle,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        let _ = environment;
+        self.build(execution, receipt).await
+    }
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError>;
     async fn revoke_credentials(&self, execution_id: &ExecutionId) -> Result<(), LifecycleError>;
 }
@@ -125,6 +134,29 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
                 }))
             }
         }
+    }
+
+    async fn build_for_adoption(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+        environment: &EnvironmentHandle,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        let runtime = self.build(execution, receipt).await?;
+        let credentials = self
+            .credentials
+            .mint(execution)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        if credentials.expires_at <= chrono::Utc::now()
+            || environment.credentials_path.as_ref() != Some(&credentials.path)
+        {
+            return Err(LifecycleError::Step(
+                "adopted runtime credential differs from broker authority; runtime recreation is required"
+                    .into(),
+            ));
+        }
+        Ok(runtime)
     }
 
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError> {
@@ -527,6 +559,8 @@ struct DurableCleanupHandles {
     receipt: Option<AllocationReceipt>,
     worktree: Option<DurableWorktreeHandle>,
     runtime: Option<DurableRuntimeHandle>,
+    #[serde(default)]
+    runtime_selector: Option<OwnershipLabels>,
     session: Option<DurableSessionHandle>,
 }
 
@@ -937,6 +971,10 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         _: &Worktree,
     ) -> Result<EnvironmentHandle, LifecycleError> {
         let runtime = self.runtimes.build(execution, receipt).await?;
+        self.active_runtimes
+            .lock()
+            .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
+            .insert(execution.id.clone(), Arc::clone(&runtime));
         let environment = match runtime
             .provision(
                 &execution.labels,
@@ -954,10 +992,6 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
                 }));
             }
         };
-        self.active_runtimes
-            .lock()
-            .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
-            .insert(execution.id.clone(), runtime);
         Ok(environment)
     }
 
@@ -1436,6 +1470,15 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             .map_err(|error| LifecycleError::Step(error.to_string()))?;
         match disposition {
             CleanupDisposition::CleanupPending => {
+                if handles
+                    .runtime_selector
+                    .as_ref()
+                    .is_some_and(|labels| labels != &execution.labels)
+                {
+                    return Err(LifecycleError::Step(
+                        "runtime cleanup selector differs from execution authority".into(),
+                    ));
+                }
                 if let (Some(receipt), Some(runtime), Some(worktree)) =
                     (handles.receipt, handles.runtime, handles.worktree)
                 {
@@ -1714,7 +1757,10 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             volumes: Vec::new(),
             credentials_path,
         };
-        let runtime = self.runtimes.build(execution, &receipt).await?;
+        let runtime = self
+            .runtimes
+            .build_for_adoption(execution, &receipt, &environment)
+            .await?;
         let harness = self
             .harnesses
             .build(execution, &receipt, &environment, &worktree)

@@ -1,7 +1,8 @@
 use chrono::Utc;
 use execution_storage::{
     BackendCapability, BackendIdentity, BackendState, DockerBindCapability, DockerBindProof,
-    DockerBindVerifier, ExecutionLayout, ExecutionStorage, StorageBackend, StorageError,
+    DockerBindVerifier, ExecutionLayout, ExecutionLifecycleHoldStore, ExecutionStorage,
+    StorageBackend, StorageError,
 };
 use git_worktree::{GitWorktreeManager, Worktree};
 use harness_traits::SessionRef;
@@ -20,27 +21,152 @@ use orchestrator_persistence::{
 };
 use orchestrator_worker::{
     ControlCheckpoint, ControlCheckpointObserver, ExecutionLifecycle, FilesystemEvidenceStore,
-    SystemExecutionLifecycle, SystemRecoveryConfig, VerifiedDockerRuntimeFactory,
-    VerifiedPiHarnessFactory, Worker,
+    LifecycleError, RuntimeFactory, SystemExecutionLifecycle, SystemRecoveryConfig,
+    VerifiedDockerRuntimeFactory, VerifiedPiHarnessFactory, Worker,
 };
 use runtime_docker::{DockerRuntime, LocalCredentialBroker, TrustedVerifierImage};
-use runtime_traits::{CredentialBroker, EnvironmentHandle};
+use runtime_traits::{CredentialBroker, EnvironmentHandle, Runtime, RuntimeError};
 use sqlx::{Connection, PgConnection};
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
 };
 use tokio::net::TcpListener;
 
-struct ExitAtControlCheckpoint(ControlCheckpoint);
+struct ExitAtNthControlCheckpoint {
+    checkpoint: ControlCheckpoint,
+    skip: usize,
+    seen: AtomicUsize,
+}
 
-impl ControlCheckpointObserver for ExitAtControlCheckpoint {
+impl ControlCheckpointObserver for ExitAtNthControlCheckpoint {
     fn reached(&self, checkpoint: ControlCheckpoint) {
-        if checkpoint == self.0 {
+        if checkpoint == self.checkpoint && self.seen.fetch_add(1, Ordering::SeqCst) == self.skip {
             std::process::exit(77);
+        }
+    }
+}
+
+struct AssertRecoveryBoundary {
+    root: PathBuf,
+    execution_id: ExecutionId,
+    expected_session: String,
+    live: bool,
+    seen: AtomicBool,
+}
+
+struct PartialProvisionRuntime {
+    fail_destroy_once: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Runtime for PartialProvisionRuntime {
+    fn name(&self) -> &'static str {
+        "partial-provision-test"
+    }
+
+    async fn available(&self) -> bool {
+        true
+    }
+
+    async fn provision(
+        &self,
+        labels: &OwnershipLabels,
+        _: &RuntimeRequirement,
+        _: &[ServiceRequirement],
+    ) -> Result<EnvironmentHandle, RuntimeError> {
+        let output = Command::new("docker")
+            .args([
+                "network",
+                "create",
+                "--label",
+                "autospec.managed=true",
+                "--label",
+                &format!("autospec.execution_id={}", labels.execution_id),
+                &DockerRuntime::network_name(&labels.execution_id),
+            ])
+            .output()
+            .map_err(|error| RuntimeError::Provisioning(error.to_string()))?;
+        assert!(output.status.success());
+        Err(RuntimeError::Provisioning(
+            "injected failure after partial Docker creation".into(),
+        ))
+    }
+
+    async fn destroy(&self, labels: &OwnershipLabels) -> Result<(), RuntimeError> {
+        if self.fail_destroy_once.swap(false, Ordering::SeqCst) {
+            return Err(RuntimeError::Cleanup(
+                "injected first rollback failure".into(),
+            ));
+        }
+        let output = Command::new("docker")
+            .args([
+                "network",
+                "rm",
+                &DockerRuntime::network_name(&labels.execution_id),
+            ])
+            .output()
+            .map_err(|error| RuntimeError::Cleanup(error.to_string()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Cleanup(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ))
+        }
+    }
+
+    async fn reconcile(&self, _: &[ExecutionId]) -> Result<Vec<ExecutionId>, RuntimeError> {
+        Ok(Vec::new())
+    }
+}
+
+struct PartialProvisionFactory(Arc<PartialProvisionRuntime>);
+
+#[async_trait::async_trait]
+impl RuntimeFactory for PartialProvisionFactory {
+    async fn build(
+        &self,
+        _: &Execution,
+        _: &execution_storage::AllocationReceipt,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        Ok(self.0.clone())
+    }
+
+    async fn cpu_percent(&self, _: &Execution) -> Result<f64, LifecycleError> {
+        Ok(0.0)
+    }
+
+    async fn revoke_credentials(&self, _: &ExecutionId) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+}
+
+impl ControlCheckpointObserver for AssertRecoveryBoundary {
+    fn reached(&self, checkpoint: ControlCheckpoint) {
+        let expected_checkpoint = if self.live {
+            ControlCheckpoint::RunningRestored
+        } else {
+            ControlCheckpoint::SideEffectPersisted
+        };
+        if checkpoint != expected_checkpoint || self.seen.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let holds = ExecutionLifecycleHoldStore::new(&self.root)
+            .unwrap()
+            .list(&self.execution_id)
+            .unwrap();
+        if self.live {
+            assert_eq!(holds.len(), 1, "exactly one restored session must be live");
+            assert_eq!(holds[0].session_id, self.expected_session);
+        } else {
+            assert!(holds.is_empty(), "paused control must remain quiescent");
         }
     }
 }
@@ -590,9 +716,21 @@ async fn control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_onc
         eprintln!("skipping real Task7 control crash cuts: Docker is unavailable");
         return;
     };
-    for stage in ["pause", "resume", "fork", "completion"] {
+    for stage in [
+        "pause_side_effect",
+        "resume_side_effect",
+        "paused_fork_side_effect",
+        "running_fork_side_effect",
+    ] {
+        let stage_tag = match stage {
+            "pause_side_effect" => "pse",
+            "resume_side_effect" => "rse",
+            "paused_fork_side_effect" => "pfse",
+            "running_fork_side_effect" => "rfse",
+            _ => unreachable!(),
+        };
         let suffix = format!(
-            "control-crash-{stage}-{}-{}",
+            "cc-{stage_tag}-{}-{}",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap()
         );
@@ -653,53 +791,41 @@ async fn control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_onc
         assert_eq!(crashed.code(), Some(77), "stage {stage}");
         let pending = executions.list_pending_controls(&worker_id).await.unwrap();
         assert_eq!(pending.len(), 1, "stage {stage}");
-        let expected_phase = if stage == "completion" {
-            orchestrator_persistence::ExecutionControlPhase::SideEffectApplied
-        } else {
-            orchestrator_persistence::ExecutionControlPhase::Applying
-        };
-        assert_eq!(pending[0].phase, expected_phase, "crash phase: {stage}");
-
-        let replacement = Arc::new(Worker::new(
-            build_system_lifecycle(&root, &remote, &daemon_id, &image_id),
-            executions.clone(),
-            reservations.clone(),
-            cleanup.clone(),
-        ));
-        let adopted = executions.get(&execution_id).await.unwrap();
-        let task = replacement.clone().spawn_adopted(adopted);
-        let tick = replacement
-            .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
-            .await;
-        if let Err(error) = tick {
-            let task_error = task.join().await.unwrap_err();
-            panic!("fresh {stage} tick failed: {error}; adopted task: {task_error}");
-        }
-        if matches!(stage, "pause" | "completion") {
-            wait_for_exact_state(
-                executions.as_ref(),
-                &execution_id,
-                ExecutionState::PausedForHuman,
+        assert_eq!(
+            pending[0].phase,
+            orchestrator_persistence::ExecutionControlPhase::SideEffectApplied,
+            "crash phase: {stage}"
+        );
+        let recovered = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_process_helper", "--nocapture"])
+            .env("AUTOSPEC_TASK5_CRASH_HELPER", "1")
+            .env("AUTOSPEC_TASK7_CONTROL_RECOVERY", stage)
+            .env("AUTOSPEC_TASK7_EXECUTION", execution_id.as_str())
+            .env(
+                "AUTOSPEC_TASK7_EXPECTED_SESSION",
+                pending[0]
+                    .side_effect_session_id
+                    .as_ref()
+                    .expect("persisted side effect has a session")
+                    .as_str(),
             )
-            .await;
-            executions
-                .request_control(
-                    &execution_id,
-                    ExecutionControlAction::Resume,
-                    "finish-after-pause-cut",
-                )
-                .await
-                .unwrap();
-            replacement
-                .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
-                .await
-                .unwrap();
-        }
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), task.join())
-            .await
-            .expect("fresh process must reconcile the control")
+            .env("AUTOSPEC_DATABASE_URL", &database_url)
+            .env("AUTOSPEC_TASK5_ROOT", &root)
+            .env("AUTOSPEC_TASK5_REMOTE", &remote)
+            .env("AUTOSPEC_TASK5_DAEMON", &daemon_id)
+            .env("AUTOSPEC_TASK5_IMAGE", &image_id)
+            .env("AUTOSPEC_TASK5_WORKER", worker_id.as_str())
+            .status()
             .unwrap();
-        assert_eq!(result.state, ExecutionState::ReviewReady, "stage {stage}");
+        assert!(
+            recovered.success(),
+            "fresh recovery process failed: {stage}"
+        );
+        assert_eq!(
+            executions.get(&execution_id).await.unwrap().state,
+            ExecutionState::ReviewReady,
+            "stage {stage}"
+        );
         let events = PgEventLog::connect(&database_url)
             .await
             .unwrap()
@@ -711,9 +837,12 @@ async fn control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_onc
             .filter(|event| {
                 matches!(
                     (&event.kind, stage),
-                    (ExecutionEventKind::ExecutionPaused, "pause" | "completion")
-                        | (ExecutionEventKind::ExecutionResumed, "resume")
-                        | (ExecutionEventKind::ConversationForked { .. }, "fork")
+                    (ExecutionEventKind::ExecutionPaused, "pause_side_effect")
+                        | (ExecutionEventKind::ExecutionResumed, "resume_side_effect")
+                        | (
+                            ExecutionEventKind::ConversationForked { .. },
+                            "paused_fork_side_effect" | "running_fork_side_effect"
+                        )
                 )
             })
             .count();
@@ -723,6 +852,12 @@ async fn control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_onc
             .request_cancellation(&execution_id)
             .await
             .unwrap();
+        let replacement = Worker::new(
+            build_system_lifecycle(&root, &remote, &daemon_id, &image_id),
+            executions.clone(),
+            reservations.clone(),
+            cleanup.clone(),
+        );
         replacement
             .reconcile_daemon_tick(&worker_id, &[])
             .await
@@ -732,6 +867,147 @@ async fn control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_onc
         if root.exists() {
             fs::remove_dir_all(&root).unwrap();
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_docker_provision_and_rollback_failure_recovers_by_exact_selector_after_restart() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("skipping real partial provision rollback: AUTOSPEC_DATABASE_URL is unset");
+        return;
+    };
+    let _serial = acquire_real_test_lock(&database_url).await;
+    let Some((daemon_id, image_id)) = docker_capability() else {
+        eprintln!("skipping real partial provision rollback: Docker is unavailable");
+        return;
+    };
+    let suffix = format!(
+        "partial-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    let root = std::env::temp_dir().join(format!("autospec-task7-{suffix}"));
+    initialize_state_root(&root);
+    let root = root.canonicalize().unwrap();
+    let remote = root.join("remotes");
+    create_stub_repository(&remote);
+    let worker_id = WorkerId::new(format!("worker-{suffix}"));
+    let execution_id = ExecutionId::new(format!("execution-{suffix}"));
+    let peer_network = format!("autospec-peer-{suffix}");
+    let peer = Command::new("docker")
+        .args([
+            "network",
+            "create",
+            "--label",
+            "autospec.managed=true",
+            "--label",
+            "autospec.execution_id=peer-task7",
+            &peer_network,
+        ])
+        .output()
+        .unwrap();
+    assert!(peer.status.success());
+    let capability = format!("cap-{suffix}");
+    PgWorkerStore::connect(&database_url)
+        .await
+        .unwrap()
+        .register(&matrix_worker_registration(
+            worker_id.clone(),
+            capability.clone(),
+            &daemon_id,
+            &image_id,
+        ))
+        .await
+        .unwrap();
+    let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+    let mut queued = queued_execution(
+        execution_id.clone(),
+        OwnershipLabels {
+            execution_id: execution_id.clone(),
+            worker_id: worker_id.clone(),
+            repository: "owner/repo".into(),
+            issue: Some("partial-provision".into()),
+        },
+        image_id.clone(),
+        capability,
+    );
+    queued.manifest.repository.branch = Some(format!("branch-{suffix}"));
+    executions.insert(&queued).await.unwrap();
+    let assigned = reservations
+        .reserve_next(&worker_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .execution;
+    let partial = Arc::new(PartialProvisionRuntime {
+        fail_destroy_once: AtomicBool::new(true),
+    });
+    let worker = Worker::new(
+        build_system_lifecycle_with_runtime(
+            &root,
+            &remote,
+            &daemon_id,
+            &image_id,
+            Some(Arc::new(PartialProvisionFactory(partial))),
+        ),
+        executions.clone(),
+        reservations.clone(),
+        cleanup.clone(),
+    );
+    assert!(worker.run(&assigned).await.is_err());
+    assert!(docker_resource_exists(
+        "network",
+        &DockerRuntime::network_name(&execution_id)
+    ));
+    assert!(docker_resource_exists("network", &peer_network));
+    assert_eq!(
+        cleanup
+            .get(&execution_id)
+            .await
+            .unwrap()
+            .disposition()
+            .unwrap(),
+        CleanupDisposition::RuntimeStopped
+    );
+
+    let replacement = Worker::new(
+        build_system_lifecycle(&root, &remote, &daemon_id, &image_id),
+        executions.clone(),
+        reservations.clone(),
+        cleanup.clone(),
+    );
+    for _ in 0..10 {
+        replacement
+            .reconcile_daemon_tick(&worker_id, &[])
+            .await
+            .unwrap();
+        if cleanup
+            .get(&execution_id)
+            .await
+            .unwrap()
+            .disposition()
+            .unwrap()
+            == CleanupDisposition::Resolved
+        {
+            break;
+        }
+    }
+    assert!(!docker_resource_exists(
+        "network",
+        &DockerRuntime::network_name(&execution_id)
+    ));
+    assert!(docker_resource_exists("network", &peer_network));
+    assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
+    run(Command::new("docker").args(["network", "rm", &peer_network]));
+    delete_matrix_records(&database_url, &execution_id, &worker_id).await;
+    if root.exists() {
+        fs::remove_dir_all(&root).unwrap();
     }
 }
 
@@ -1791,6 +2067,10 @@ async fn adversarial_agent_credential_echo_and_copy_are_not_durably_exfiltrated(
         fs::read_to_string(layout.repository.join("leaked.txt")).unwrap(),
         token
     );
+    let packet = fs::read(layout.repository.join(".autospec/task-packet.json")).unwrap();
+    assert!(!packet
+        .windows(token.len())
+        .any(|window| window == token.as_bytes()));
     let error = tokio::time::timeout(std::time::Duration::from_secs(30), task.join())
         .await
         .expect("recognized terminal event must finish the execution")
@@ -1801,6 +2081,17 @@ async fn adversarial_agent_credential_echo_and_copy_are_not_durably_exfiltrated(
         "exfiltration must fail closed: {error}"
     );
     assert!(!error.contains(&token));
+    for log in [
+        layout
+            .session
+            .join(format!("pi.events-{execution_id}.jsonl")),
+        layout.session.join(format!("pi.stderr-{execution_id}.log")),
+    ] {
+        let bytes = fs::read(log).unwrap_or_default();
+        assert!(!bytes
+            .windows(token.len())
+            .any(|window| window == token.as_bytes()));
+    }
     assert_secret_absent_from_durable_records(&database_url, &token).await;
     assert!(!layout.root.exists(), "failed exfiltration must be cleaned");
     assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
@@ -2137,6 +2428,70 @@ async fn crash_process_helper() {
             .await
             .unwrap(),
     );
+    if let Ok(stage) = std::env::var("AUTOSPEC_TASK7_CONTROL_RECOVERY") {
+        let execution_id = ExecutionId::new(std::env::var("AUTOSPEC_TASK7_EXECUTION").unwrap());
+        let expected_session = std::env::var("AUTOSPEC_TASK7_EXPECTED_SESSION").unwrap();
+        let live = matches!(
+            stage.as_str(),
+            "resume_side_effect" | "running_fork_side_effect"
+        );
+        let worker = Arc::new(
+            Worker::new(
+                build_system_lifecycle(&root, &remote, &daemon, &image),
+                executions.clone(),
+                reservations.clone(),
+                cleanup.clone(),
+            )
+            .with_control_checkpoint_observer(Arc::new(AssertRecoveryBoundary {
+                root: root.clone(),
+                execution_id: execution_id.clone(),
+                expected_session,
+                live,
+                seen: AtomicBool::new(false),
+            })),
+        );
+        let task = worker
+            .clone()
+            .spawn_adopted(executions.get(&execution_id).await.unwrap());
+        worker
+            .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+            .await
+            .unwrap();
+        if matches!(
+            stage.as_str(),
+            "pause_side_effect" | "paused_fork_side_effect"
+        ) {
+            wait_for_exact_state(
+                executions.as_ref(),
+                &execution_id,
+                ExecutionState::PausedForHuman,
+            )
+            .await;
+            assert!(execution_storage::ExecutionLifecycleHoldStore::new(&root)
+                .unwrap()
+                .list(&execution_id)
+                .unwrap()
+                .is_empty());
+            executions
+                .request_control(
+                    &execution_id,
+                    ExecutionControlAction::Resume,
+                    &format!("finish-{stage}"),
+                )
+                .await
+                .unwrap();
+            worker
+                .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), task.join())
+            .await
+            .expect("fresh process must reconcile the control")
+            .unwrap();
+        assert_eq!(result.state, ExecutionState::ReviewReady);
+        return;
+    }
     let assigned = reservations
         .reserve_next(&worker_id)
         .await
@@ -2152,14 +2507,21 @@ async fn crash_process_helper() {
     );
     if let Ok(stage) = std::env::var("AUTOSPEC_TASK7_CONTROL_CRASH") {
         let checkpoint = match stage.as_str() {
-            "pause" => ControlCheckpoint::PauseStopped,
-            "resume" => ControlCheckpoint::ResumeLaunched,
-            "fork" => ControlCheckpoint::ForkLaunched,
-            "completion" => ControlCheckpoint::BeforeCompletion,
+            "pause_side_effect"
+            | "resume_side_effect"
+            | "paused_fork_side_effect"
+            | "running_fork_side_effect" => ControlCheckpoint::SideEffectPersisted,
             other => panic!("unknown control crash stage {other}"),
         };
-        worker =
-            worker.with_control_checkpoint_observer(Arc::new(ExitAtControlCheckpoint(checkpoint)));
+        let skip = usize::from(matches!(
+            stage.as_str(),
+            "resume_side_effect" | "paused_fork_side_effect"
+        ));
+        worker = worker.with_control_checkpoint_observer(Arc::new(ExitAtNthControlCheckpoint {
+            checkpoint,
+            skip,
+            seen: AtomicUsize::new(0),
+        }));
     }
     let worker = Arc::new(worker);
     let task = worker.clone().spawn(assigned);
@@ -2167,7 +2529,10 @@ async fn crash_process_helper() {
         let execution = executions.get(&execution_id).await.unwrap();
         if execution.state == ExecutionState::Running && execution.session_id.is_some() {
             if let Ok(stage) = std::env::var("AUTOSPEC_TASK7_CONTROL_CRASH") {
-                if stage == "resume" {
+                if matches!(
+                    stage.as_str(),
+                    "resume_side_effect" | "paused_fork_side_effect"
+                ) {
                     executions
                         .request_control(
                             &execution_id,
@@ -2188,9 +2553,11 @@ async fn crash_process_helper() {
                     .await;
                 }
                 let action = match stage.as_str() {
-                    "pause" | "completion" => ExecutionControlAction::Pause,
-                    "resume" => ExecutionControlAction::Resume,
-                    "fork" => ExecutionControlAction::ForkConversation,
+                    "pause_side_effect" => ExecutionControlAction::Pause,
+                    "resume_side_effect" => ExecutionControlAction::Resume,
+                    "paused_fork_side_effect" | "running_fork_side_effect" => {
+                        ExecutionControlAction::ForkConversation
+                    }
                     _ => unreachable!(),
                 };
                 executions
@@ -2274,6 +2641,7 @@ async fn assert_secret_absent_from_durable_records(database_url: &str, secret: &
     let pool = sqlx::PgPool::connect(database_url).await.unwrap();
     for table in [
         "executions",
+        "execution_attempts",
         "execution_events",
         "cleanup_authorities",
         "artifacts",
@@ -2455,6 +2823,16 @@ fn build_system_lifecycle(
     daemon_id: &str,
     image_id: &str,
 ) -> Arc<SystemExecutionLifecycle> {
+    build_system_lifecycle_with_runtime(root, remote_root, daemon_id, image_id, None)
+}
+
+fn build_system_lifecycle_with_runtime(
+    root: &Path,
+    remote_root: &Path,
+    daemon_id: &str,
+    image_id: &str,
+    runtime_override: Option<Arc<dyn RuntimeFactory>>,
+) -> Arc<SystemExecutionLifecycle> {
     let trusted = TrustedVerifierImage::new(image_id, "/bin/stat").unwrap();
     let method = trusted.proof_method();
     let storage = Arc::new(
@@ -2483,14 +2861,16 @@ fn build_system_lifecycle(
             format!("file://{}", remote_root.display()),
             verifier.clone(),
         )),
-        Arc::new(VerifiedDockerRuntimeFactory::new(
-            None,
-            PathBuf::from("docker"),
-            verifier.clone(),
-            trusted,
-            Arc::new(LocalCredentialBroker::new(root, chrono::Duration::minutes(15)).unwrap())
-                as Arc<dyn CredentialBroker>,
-        )),
+        runtime_override.unwrap_or_else(|| {
+            Arc::new(VerifiedDockerRuntimeFactory::new(
+                None,
+                PathBuf::from("docker"),
+                verifier.clone(),
+                trusted,
+                Arc::new(LocalCredentialBroker::new(root, chrono::Duration::minutes(15)).unwrap())
+                    as Arc<dyn CredentialBroker>,
+            ))
+        }),
         Arc::new(VerifiedPiHarnessFactory::new(
             verifier,
             None,

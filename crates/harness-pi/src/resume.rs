@@ -52,8 +52,18 @@ fn resume_with_budget(
     }
     let source = match find_session_file(&conversation_dir, session.id.as_str())? {
         Some(path) => validate_and_repair(&path)?,
-        None => DurableSession::Empty,
+        None if consume_automatic_budget => DurableSession::Empty,
+        None => {
+            return Err(HarnessError::NotResumable(
+                "interactive resume requires an existing native Pi conversation".to_owned(),
+            ))
+        }
     };
+    if !consume_automatic_budget && matches!(source, DurableSession::Empty) {
+        return Err(HarnessError::NotResumable(
+            "interactive resume requires a non-empty native Pi conversation".to_owned(),
+        ));
+    }
     if consume_automatic_budget {
         let next = current + 1;
         atomic_write(&count_path, format!("{next}\n").as_bytes())?;

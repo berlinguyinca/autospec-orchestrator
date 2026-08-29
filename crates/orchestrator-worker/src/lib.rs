@@ -194,6 +194,7 @@ pub enum ControlCheckpoint {
     ApplyingPersisted,
     PauseStopped,
     ResumeLaunched,
+    RunningRestored,
     ForkLaunched,
     SideEffectPersisted,
     BeforeCompletion,
@@ -371,6 +372,12 @@ impl Worker {
             .await
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
         for control in controls {
+            if pending
+                .iter()
+                .any(|request| request.execution.id == control.execution.id)
+            {
+                continue;
+            }
             if let Some(task) = tasks
                 .iter()
                 .find(|task| task.execution_id() == &control.execution.id)

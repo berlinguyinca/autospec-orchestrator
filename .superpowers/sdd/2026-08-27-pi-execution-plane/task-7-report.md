@@ -141,21 +141,65 @@ Task 7 was implemented RED to GREEN:
     network membership, execution-bounded binds, and absence of the credential
     mount from services. After cleanup of one execution it reinspects the peer
     service, runtime, session, credential, evidence, and cleanup authority.
+12. Fix-round-two RED tests proved that a control left at
+    `SIDE_EFFECT_APPLIED` needs post-side-effect liveness reconciliation, not
+    another native side effect. Four separate-process cuts now cover pause,
+    resume, paused fork, and running fork. Resume and running fork relaunch the
+    exact already-persisted target session; pause and paused fork remain
+    quiescent. Each reaches one eventual action event without replaying the
+    native fork or task packet.
+13. Cancellation/control races now resolve inside the same locked transaction:
+    pending cancellation rejects a new control, cancellation and terminal
+    progress stale every nonterminal control phase, and `begin_control`
+    revalidates authority even after a row reached `APPLYING` or
+    `SIDE_EFFECT_APPLIED`. The daemon gives cancellation precedence and cannot
+    enqueue a control in the same tick.
+14. Adopted paused executions initialize their health monitor in the paused
+    epoch. Fake-clock tests exceed both wall and inactivity limits over long and
+    repeated pauses, then resume without consuming automatic crash-resume
+    budget.
+15. Provisioning now persists label-scoped cleanup authority before Docker
+    provision starts. A real Docker fixture creates a partial resource, injects
+    both provision and first rollback failure, restarts through the production
+    worker entrypoint, removes the failed execution by its exact selector, and
+    proves the peer remains live. This test exposed an anonymous image-volume
+    leak: exact container removal used Docker's `v=false`. Changing only that
+    exact removal to `v=true` makes the regression pass without broad cleanup.
+16. Broker mint/revoke operations are serialized per execution within the
+    local process. Concurrent tests prove one mint winner and deterministic
+    mint/revoke ordering; only `NotFound` means absent. Adoption requires the
+    same unexpired path and authority and rejects rotation or expiry rather than
+    replacing a bind-mounted inode.
+17. Attachment now locks the execution before reading authority and cursor in
+    one transaction. Secret containment scans the materialized task-packet file,
+    Pi event and stderr logs, artifacts, evidence, cleanup/control rows,
+    executions, and `execution_attempts`; the adversarial credential is absent
+    from every durable surface.
+18. The first post-fix MSRV rerun intentionally failed the freshness gate: it
+    reused the current run's database, so a fixed-ID sequence test observed old
+    events. No code change was made. Both full toolchain gates were restarted
+    against distinct empty databases and passed.
 
 ## Verification
 
-- `AUTOSPEC_DATABASE_URL=... cargo test --workspace -- --test-threads=1`
-  — passed on a fresh database, including 33 PostgreSQL tests, 5 execution API
-  tests, 39 Pi harness tests, all 10 real worker E2Es, 6 credential tests, and
-  18 Docker runtime tests.
-- `AUTOSPEC_DATABASE_URL=... cargo +1.85.0 test --workspace -- --test-threads=1`
-  — passed with the same full serialized workspace coverage.
+- `AUTOSPEC_DATABASE_URL=.../autospec_current_fresh cargo test --workspace -- --test-threads=1`
+  — passed on its own empty database, including 33 PostgreSQL tests, 5 execution
+  API tests, 40 Pi harness tests, all 11 real worker E2Es, 7 credential tests,
+  and 18 Docker runtime tests.
+- `AUTOSPEC_DATABASE_URL=.../autospec_msrv_fresh rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
+  — passed on a separate empty database with the same full serialized workspace
+  coverage.
 - `cargo build --workspace` — passed.
-- `cargo +1.85.0 build --workspace` — passed.
+- `rustup run 1.85.0 cargo build --workspace` — passed.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed.
-- `cargo +1.85.0 clippy --workspace --all-targets -- -D warnings` — passed.
+- `rustup run 1.85.0 cargo clippy --workspace --all-targets -- -D warnings` — passed.
 - `cargo fmt --all -- --check` — passed.
 - `git diff --check` — passed.
+- Post-gate Docker audit removed the dedicated PostgreSQL fixture and only the
+  five exact Task 7 debug networks/three containers identified by their
+  execution labels. Reinspection found no Task 7 container, network, or volume;
+  older Task 5/runtime resources owned by other work were deliberately left
+  untouched.
 
 ## Commits
 
@@ -169,7 +213,7 @@ Task 7 was implemented RED to GREEN:
 - `aee776b` — reviewer fix round: fenced control phases, crash reconciliation,
   fail-closed credential startup, secret containment, timer suspension, opaque
   attach snapshot, service-backed isolation, and 0011→0012 upgrade proof.
-- This report is recorded in the following documentation-only commit.
+- Fix round two is recorded with this updated report in the following commit.
 
 ## Concerns and follow-up
 
@@ -179,6 +223,11 @@ Task 7 was implemented RED to GREEN:
   should preserve the same injected broker boundary, path containment, expiry,
   agent-only read-only mount, and cleanup proof; it must not introduce model or
   inference policy here.
+- The local broker's safe-Rust per-execution lock is process-local. There is no
+  dependency-free portable `dirfd`/cross-process locking primitive in this
+  implementation, so the development broker must not be shared by concurrent
+  worker processes. Production remains fail-closed until an injected issuer
+  provides cross-process mint/revoke authority.
 - Durable controls guarantee restart-visible intent and exactly-once durable
   completion/events. A host crash after Pi starts but before PostgreSQL
   completion can leave a lifecycle hold; harness recovery terminates that exact

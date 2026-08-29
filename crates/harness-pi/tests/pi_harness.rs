@@ -1378,6 +1378,30 @@ async fn empty_session_resumes_via_fresh_packet_without_resetting_event_cursor()
 }
 
 #[tokio::test]
+async fn interactive_resume_rejects_an_empty_native_session_without_replaying_task_packet() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    harness.stop(&session).await.unwrap();
+    let durable = fixture
+        .conversation_dir()
+        .join(format!("session_{}.jsonl", fixture.execution_id));
+    fs::write(&durable, "").unwrap();
+    fs::write(fixture.conversation_dir().join("arguments"), "sentinel").unwrap();
+
+    assert!(matches!(
+        harness.resume_interactive(&session).await,
+        Err(HarnessError::NotResumable(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(fixture.conversation_dir().join("arguments")).unwrap(),
+        "sentinel"
+    );
+}
+
+#[tokio::test]
 async fn resume_rejects_malformed_complete_record_but_truncates_only_a_torn_tail() {
     let Some(fixture) = DockerPi::create() else {
         return;
