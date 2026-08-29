@@ -2758,6 +2758,41 @@ fn destroy_retries_repository_cleanup_from_durable_journal() {
     assert!(!journal.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn cleanup_ack_permission_error_preserves_authenticated_tombstone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let manager = manager(&state, &repository);
+    let labels = labels("project-14-impl-permission", repository.canonical());
+    bounded_repository_root(&state, labels.execution_id.as_str());
+    let receipt = allocation_receipt(state.path(), &labels);
+    let worktree = manager
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-14-impl-permission",
+            &receipt,
+        )
+        .expect("create worktree");
+    manager.destroy(&worktree).expect("physical cleanup");
+    let journal = state
+        .path()
+        .join(format!("worktrees/.cleanup-{}.json", worktree.execution_id));
+    let worktrees = state.path().join("worktrees");
+    let original = std::fs::metadata(&worktrees).unwrap().permissions();
+    std::fs::set_permissions(&worktrees, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = manager.ack_destroy(&worktree);
+
+    std::fs::set_permissions(&worktrees, original).unwrap();
+    assert!(matches!(result, Err(WorktreeError::Cleanup(_))));
+    assert!(journal.is_file(), "failed ack must preserve tombstone");
+}
+
 #[test]
 fn destroy_refuses_tampered_owner_record() {
     let repository = TestRepository::new();

@@ -18,6 +18,9 @@ pub enum ExecutionEventKind {
     TestsStarted,
     TestsFailed,
     ReviewReady,
+    ExecutionRequeued {
+        failure: FailureClass,
+    },
     ExecutionFailed {
         failure: FailureClass,
     },

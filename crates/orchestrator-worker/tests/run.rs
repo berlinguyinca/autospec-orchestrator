@@ -197,7 +197,7 @@ impl ReservationStore for FakeReservations {
         self.retained.lock().unwrap().push(id.clone());
         Ok(())
     }
-    async fn finalize_lost_cleanup(
+    async fn finalize_cleanup(
         &self,
         id: &ExecutionId,
         _: &AttemptId,
@@ -498,7 +498,11 @@ async fn failed_adoption_recovers_durable_authority_instead_of_releasing_live_la
         reservations.released.lock().unwrap().as_slice(),
         std::slice::from_ref(&execution.id)
     );
-    assert!(cleanup.pending.lock().unwrap().is_empty());
+    assert_eq!(
+        cleanup.pending.lock().unwrap().as_slice(),
+        std::slice::from_ref(&execution.id),
+        "the reservation store owns the atomic authority resolution in production"
+    );
 }
 
 #[tokio::test]
@@ -571,7 +575,6 @@ async fn successful_run_uses_exact_order_and_persists_result_before_cleanup() {
             "RUNTIME_DESTROYED",
             "GIT_RECOVERED_CLEANED",
             "STORAGE_RELEASED",
-            "RESERVATION_RELEASED",
         ]
     );
     assert!(checkpoints[0].1["receipt"].is_object());
@@ -790,7 +793,11 @@ async fn every_creation_and_result_phase_failure_cleans_only_acquired_lower_laye
             std::slice::from_ref(&execution.id),
             "{failure}"
         );
-        assert!(cleanup.pending.lock().unwrap().is_empty(), "{failure}");
+        assert_eq!(
+            cleanup.pending.lock().unwrap().as_slice(),
+            std::slice::from_ref(&execution.id),
+            "the reservation store owns the atomic authority resolution in production: {failure}"
+        );
         assert_eq!(
             store.get(&execution.id).await.unwrap().state,
             ExecutionState::Failed,

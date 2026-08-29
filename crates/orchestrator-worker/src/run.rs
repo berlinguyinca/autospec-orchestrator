@@ -88,38 +88,23 @@ pub(crate) async fn run_with_cancel(
         }
     };
     if cleanup_complete {
-        let reservation_released = match worker
+        let finalized = match worker
             .reservations
-            .release_attempt(&execution.id, attempt_id)
+            .finalize_cleanup(&execution.id, attempt_id)
             .await
         {
-            Ok(true) => true,
-            Ok(false) => {
-                cleanup_errors.push("reservation belongs to another attempt".into());
-                false
-            }
+            Ok(_) => true,
             Err(error) => {
                 cleanup_errors.push(error.to_string());
                 false
             }
         };
-        if reservation_released {
-            if let Err(error) = transition_authority(
-                worker,
-                &tracked,
-                CleanupDisposition::StorageReleased,
-                CleanupDisposition::ReservationReleased,
-                &guard,
-            )
-            .await
-            {
-                cleanup_errors.push(error.to_string());
+        if finalized {
+            if let Some(receipt) = &guard.receipt {
+                if let Err(error) = worker.lifecycle.ack_release_storage(receipt).await {
+                    cleanup_errors.push(error.to_string());
+                }
             }
-            if let Err(error) = worker.cleanup_authorities.resolve(&execution.id).await {
-                cleanup_errors.push(error.to_string());
-            }
-        } else {
-            cleanup_errors.push("cleanup authority retained for reservation recovery".into());
         }
     }
     if !cleanup_errors.is_empty() {
@@ -209,22 +194,14 @@ pub(crate) async fn run_adopted_with_cancel(
     if cleanup_complete {
         if let Err(error) = worker
             .reservations
-            .release_attempt(&execution.id, attempt_id)
+            .finalize_cleanup(&execution.id, attempt_id)
             .await
         {
             cleanup_errors.push(error.to_string());
-        } else if let Err(error) = transition_authority(
-            worker,
-            &tracked,
-            CleanupDisposition::StorageReleased,
-            CleanupDisposition::ReservationReleased,
-            &guard,
-        )
-        .await
-        {
-            cleanup_errors.push(error.to_string());
-        } else if let Err(error) = worker.cleanup_authorities.resolve(&execution.id).await {
-            cleanup_errors.push(error.to_string());
+        } else if let Some(receipt) = &guard.receipt {
+            if let Err(error) = worker.lifecycle.ack_release_storage(receipt).await {
+                cleanup_errors.push(error.to_string());
+            }
         }
     }
     if !cleanup_errors.is_empty() {
@@ -291,7 +268,6 @@ async fn cleanup_phases(
     if let Some(worktree) = &worktree_tombstone {
         worker.lifecycle.ack_destroy_worktree(worktree).await?;
     }
-    let release_tombstone = guard.receipt.clone();
     guard.release_storage().await?;
     transition_authority(
         worker,
@@ -301,9 +277,6 @@ async fn cleanup_phases(
         guard,
     )
     .await?;
-    if let Some(receipt) = &release_tombstone {
-        worker.lifecycle.ack_release_storage(receipt).await?;
-    }
     Ok(())
 }
 

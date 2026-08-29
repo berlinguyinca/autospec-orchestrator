@@ -48,6 +48,16 @@ Round 4 makes capacity release and physical cleanup crash-safe:
 - explicit cleanup accepts only exact `Retained` authority, rejecting active executions with HTTP 409 rather than creating an unsafe active-to-cleanup transition;
 - the real crash matrix now covers nine boundaries, including Git physical deletion and storage physical deletion before their PostgreSQL checkpoints.
 
+Round 5 closes the remaining fencing, event-truthfulness, and cleanup-finalization gaps:
+
+- controller fencing is idempotent for the exact already-finished attempt and every cleanup subphase, so a fresh worker process can restart after the authenticated controller reaper without aborting startup or duplicating execution;
+- fencing no longer publishes `ExecutionFailed` while the execution row is still assigned/running; the atomic finalizer alone publishes a state-matching `ExecutionRequeued`, `ExecutionFailed`, `ReviewReady`, `ExecutionCompleted`, or `ExecutionCancelled` event through the shared sequence allocator;
+- one `finalize_cleanup` PostgreSQL transaction releases exact capacity when present, updates execution and attempt disposition, resolves cleanup authority, and appends the final event; exact fenced/terminal evidence permits idempotent completion when capacity was already released;
+- ephemeral `ReviewReady` cleanup preserves the trusted result and `ReviewReady` state while removing disposable resources and capacity; resumable `ReviewReady` still retains its allocation until explicit cleanup;
+- storage release authenticates the receipt, labels, Ready/Releasing journal, backend identity, and Docker bind before creating and fsyncing the external tombstone immediately before the first physical mutation;
+- Git and storage acknowledge absence only for exact `NotFound`; dangling symlinks, permission failures, and other I/O errors fail closed without removing the external tombstone;
+- the real nine-stage matrix now performs authenticated worker registration, controller heartbeat reaping, and a fresh OS-process worker cleanup/finalization at the post-runtime crash boundary.
+
 ## Commits
 
 - `8ac7143` — Prevent worker oversubscription with durable capability-backed reservations
@@ -55,24 +65,28 @@ Round 4 makes capacity release and physical cleanup crash-safe:
 - `194680f8e170c1c02e73b937e69dad3cd44809ee` — Fence worker control and cleanup authority at durable boundaries
 - `4567709` — Resume exact Pi authority after worker process loss
 - `1c2e8f9` — Keep worker recovery authoritative across every durable boundary
-- This report's commit — Make worker cleanup disposition durable across crashes
+- `c8345c5` — Make worker cleanup disposition durable across crashes
+- `12f42cfb6e54974c707a011bfa6a7e86fdc100e3` — Keep capacity fenced until cleanup is durably acknowledged
+- This report's commit — Publish cleanup outcomes only with atomic final disposition
 
 ## Verification
 
 - `cargo fmt --all -- --check` and `git diff --check` — passed.
-- `AUTOSPEC_DATABASE_URL=… cargo test --workspace` — passed on current stable, including 38 real Docker/Pi, 18 real Docker runtime, 59 real Git, 21 real PostgreSQL, 11 worker lifecycle, and 5 worker real-E2E tests.
+- `AUTOSPEC_DATABASE_URL=… cargo test --workspace -- --test-threads=1` — passed on current stable, including 38 real Docker/Pi, 18 real Docker runtime, 60 real Git, 22 real PostgreSQL, 11 worker lifecycle, and 6 worker real-E2E target tests.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed on current stable.
-- `AUTOSPEC_DATABASE_URL=… cargo +1.85.0 test --workspace` — passed in full with the same real boundary suites.
+- `AUTOSPEC_DATABASE_URL=… cargo +1.85.0 test --workspace -- --test-threads=1` — passed in full with the same real boundary suites.
 - `cargo +1.85.0 clippy --workspace --all-targets -- -D warnings` — passed.
-- Focused Task 5 suite — passed: API route integration 3/3, autospec-worker 3/3, scheduler 4/4, worker lifecycle 11/11, health 3/3, recovery/evidence 3/3, PostgreSQL 21/21, execution storage 30/30, and Git worktree 59/59.
-- Worker real-E2E target — passed 5/5. Three are substantive tests: `crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cleanup`, `real_failure_stage_matrix_reconciles_without_resource_leaks`, and `real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer`; two are child-process helpers and are not counted as scenarios.
+- Focused Task 5 suite — passed: API route integration 3/3, autospec-worker 3/3, scheduler 4/4, worker lifecycle 11/11, health 3/3, recovery/evidence 3/3, PostgreSQL 22/22, execution storage 31/31, and Git worktree 60/60.
+- Worker real-E2E target — passed 6/6. Three are substantive tests: `crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cleanup`, `real_failure_stage_matrix_reconciles_without_resource_leaks`, and `real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer`; three are child-process helpers and are not counted as scenarios.
 - The nine-stage matrix crashes after reservation, storage, interrupted Git create, runtime, Git physical delete before disposition, storage physical delete before disposition, Pi-before-event, ReviewReady-before-retention, and retention; each fresh manager reconciliation proves the required retained/resolved disposition, released reservation, and absence of exact Docker/Git/storage/Pi leaks after explicit cleanup.
 - The peer-isolation test runs two real executions concurrently, crashes one after runtime creation, proves the other reaches `ReviewReady` with durable evidence and intact retained resources, then reconciles and cleans each exact authority independently.
+- The post-runtime matrix boundary additionally re-registers through the authenticated HTTP API, lets the controller mark the worker `UNREACHABLE` and fence the attempt, then launches a fresh test process that idempotently accepts the controller fence and performs exact physical cleanup plus atomic finalization.
 - PostgreSQL concurrency test launched 16 simultaneous reservations against four slots and assigned exactly four unique executions.
 
 ## Concerns
 
 - The monolithic E2E uses a test-only fixed-capacity filesystem backend so it can run safely where an APFS/LVM pool is unavailable. Production storage remains configured through APFS/LVM and fails closed when that capability is absent.
 - PostgreSQL advisory locking serializes the three production-shaped real worker scenarios inside one test binary; their subprocess helpers do not acquire the lock and are excluded from the scenario count.
+- A first parallel full-workspace run hit the pre-existing Pi `crash_before_pgid_binding_leaves_token_recoverable_hold` timing race under concurrent Docker load. The exact test passed immediately in isolation, and both current and Rust 1.85 full workspaces passed with `--test-threads=1`; no Task 5 code touches the Pi handshake.
 - Startup adoption accepts only exact, live authority: a Ready storage receipt, pinned worktree/session layout, matching Git owner, immutable Docker container proof and mounts, the complete manifest resource set, and one matching Pi hold. One invalid record is retained or cleaned independently and does not abort the daemon or create a duplicate workload.
 - Recovery policy remains authority classification only. Retry and workflow decisions remain outside this repository as required.

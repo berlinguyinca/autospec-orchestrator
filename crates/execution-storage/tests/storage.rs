@@ -953,7 +953,7 @@ fn live_capability_pins_each_runtime_bind_directory_identity() {
 
 #[test]
 fn release_refuses_label_or_backend_identity_mismatch_without_cleanup() {
-    let (_root, manager, calls) = manager_fixture();
+    let (root, manager, calls) = manager_fixture();
     let receipt = manager
         .allocate(&AllocationRequest {
             labels: labels(),
@@ -979,17 +979,61 @@ fn release_refuses_label_or_backend_identity_mismatch_without_cleanup() {
             .exists(),
         "invalid release must not create lease metadata"
     );
+    assert!(!root
+        .path()
+        .join("execution-storage/releases/foreign-execution.json")
+        .exists());
 
     let mut wrong_labels = receipt.clone();
     wrong_labels.labels.worker_id = WorkerId::new("foreign-worker");
     assert!(manager.release(&wrong_labels).is_err());
     assert_eq!(release_count(), 0);
+    assert!(!root
+        .path()
+        .join(format!(
+            "execution-storage/releases/{}.json",
+            wrong_labels.labels.execution_id
+        ))
+        .exists());
 
     let mut wrong_backend = receipt;
     wrong_backend.backend = apfs_identity("foreign-volume", "foreign-fs", "foreign-token");
     wrong_backend.docker_bind.filesystem_id = "foreign-fs".to_owned();
     assert!(manager.release(&wrong_backend).is_err());
     assert_eq!(release_count(), 0);
+    assert!(!root
+        .path()
+        .join(format!(
+            "execution-storage/releases/{}.json",
+            wrong_backend.labels.execution_id
+        ))
+        .exists());
+}
+
+#[test]
+fn release_ack_rejects_dangling_layout_symlink_and_preserves_tombstone() {
+    let (root, manager, _calls) = manager_fixture();
+    let receipt = manager
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 3,
+        })
+        .expect("allocate storage");
+    let layout = ExecutionLayout::new(manager.state_root(), &receipt.labels.execution_id)
+        .expect("execution layout");
+    manager.release(&receipt).expect("physical release");
+    std::os::unix::fs::symlink(root.path().join("missing-target"), &layout.root)
+        .expect("replace deleted allocation with dangling symlink");
+    let tombstone = root.path().join(format!(
+        "execution-storage/releases/{}.json",
+        receipt.labels.execution_id
+    ));
+
+    assert!(matches!(
+        manager.ack_release(&receipt),
+        Err(StorageError::IdentityMismatch(_))
+    ));
+    assert!(tombstone.is_file(), "failed ack must preserve tombstone");
 }
 
 #[test]

@@ -283,17 +283,15 @@ impl Worker {
                 .map_err(|error| WorkerError::Persistence(error.to_string()))?;
             disposition = next;
         }
-        self.lifecycle
-            .ack_cleanup_authority_step(authority, disposition)
-            .await?;
         if disposition == CleanupDisposition::StorageReleased {
             self.reservations
-                .finalize_lost_cleanup(&authority.execution_id, &authority.attempt_id)
+                .finalize_cleanup(&authority.execution_id, &authority.attempt_id)
                 .await
                 .map_err(|error| WorkerError::Persistence(error.to_string()))?;
-            disposition = CleanupDisposition::ReservationReleased;
-        }
-        if disposition == CleanupDisposition::ReservationReleased {
+            self.lifecycle
+                .ack_cleanup_authority_step(authority, disposition)
+                .await?;
+        } else if disposition == CleanupDisposition::ReservationReleased {
             self.cleanup_authorities
                 .resolve(&authority.execution_id)
                 .await

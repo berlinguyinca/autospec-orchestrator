@@ -74,8 +74,17 @@ pub(crate) fn ack_destroy(
     let journal_path = cleanup_journal_path(manager, &worktree.execution_id);
     let Some(journal) = read_cleanup_journal(manager, &journal_path)? else {
         let expected = manager.execution_repository_path(&worktree.execution_id);
-        if Path::new(&worktree.path) == expected && fs::symlink_metadata(&expected).is_err() {
-            return Ok(());
+        if Path::new(&worktree.path) == expected {
+            match fs::symlink_metadata(&expected) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(WorktreeError::Cleanup(format!(
+                        "cannot authenticate repository absence at {}: {error}",
+                        expected.display()
+                    )))
+                }
+                Ok(_) => {}
+            }
         }
         return Err(WorktreeError::Ownership(format!(
             "cleanup tombstone is absent for {}",
@@ -83,11 +92,20 @@ pub(crate) fn ack_destroy(
         )));
     };
     verify_journal(manager, worktree, &journal)?;
-    if fs::symlink_metadata(&journal.worktree_path).is_ok() {
-        return Err(WorktreeError::Cleanup(format!(
-            "cannot acknowledge cleanup while repository exists: {}",
-            journal.worktree_path
-        )));
+    match fs::symlink_metadata(&journal.worktree_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(WorktreeError::Cleanup(format!(
+                "cannot authenticate repository absence at {}: {error}",
+                journal.worktree_path
+            )))
+        }
+        Ok(_) => {
+            return Err(WorktreeError::Cleanup(format!(
+                "cannot acknowledge cleanup while repository exists: {}",
+                journal.worktree_path
+            )))
+        }
     }
     metadata_directory(manager, WorktreeError::Cleanup)?
         .remove(metadata_name(&journal_path)?)

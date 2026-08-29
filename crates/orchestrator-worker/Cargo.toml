@@ -29,4 +29,7 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
+orchestrator-api = { path = "../orchestrator-api" }
+reqwest.workspace = true
 sqlx.workspace = true

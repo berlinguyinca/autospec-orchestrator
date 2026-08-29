@@ -5,11 +5,13 @@ use execution_storage::{
 };
 use git_worktree::{GitWorktreeManager, Worktree};
 use harness_traits::SessionRef;
+use orchestrator_api::{router, WorkerApiState};
 use orchestrator_core::{
     event::ExecutionEventKind, AgentAssignment, Execution, ExecutionEvent, ExecutionId,
     ExecutionManifest, ExecutionResult, ExecutionState, HarnessKind, ModelPolicy, OwnershipLabels,
     PersistenceMode, RepositoryReference, Role, RuntimeKind, RuntimeRequirement, TaskPacket,
-    WorkerCapabilities, WorkerCapabilityProof, WorkerId, WorkerRegistration, WorkerState,
+    WorkerAdvertisement, WorkerCapabilities, WorkerCapabilityProof, WorkerId, WorkerRegistration,
+    WorkerState,
 };
 use orchestrator_persistence::{
     CleanupAuthorityStore, CleanupDisposition, CleanupStage, ExecutionStore,
@@ -29,6 +31,7 @@ use std::{
     process::Command,
     sync::Arc,
 };
+use tokio::net::TcpListener;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -599,6 +602,76 @@ async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
             .unwrap();
         assert_eq!(crashed.code(), Some(77), "stage {stage}");
 
+        if stage == "post_runtime" {
+            let token = format!("reaper-token-{suffix}");
+            let api_state = WorkerApiState::new(
+                Arc::new(PgWorkerStore::connect(&database_url).await.unwrap()),
+                reservations.clone(),
+                token.clone(),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_state = api_state.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router(server_state)).await.unwrap();
+            });
+            let registration = matrix_worker_registration(
+                worker_id.clone(),
+                format!("capability-{suffix}"),
+                &daemon_id,
+                &image_id,
+            );
+            let advertised = WorkerAdvertisement {
+                id: registration.id,
+                capabilities: registration.capabilities,
+                capability_proof: registration.capability_proof,
+            };
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/api/v1/workers"))
+                .bearer_auth(&token)
+                .json(&advertised)
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+            sqlx::query(
+                "UPDATE workers SET last_heartbeat = now() - interval '91 seconds' WHERE id = $1",
+            )
+            .bind(worker_id.as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert!(api_state
+                .reap_stale(Utc::now())
+                .await
+                .unwrap()
+                .contains(&worker_id));
+            let restarted = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "reaper_restart_process_helper", "--nocapture"])
+                .env("AUTOSPEC_TASK5_REAPER_RESTART_HELPER", "1")
+                .env("AUTOSPEC_DATABASE_URL", &database_url)
+                .env("AUTOSPEC_TASK5_ROOT", &root)
+                .env("AUTOSPEC_TASK5_REMOTE", &remote_root)
+                .env("AUTOSPEC_TASK5_DAEMON", &daemon_id)
+                .env("AUTOSPEC_TASK5_IMAGE", &image_id)
+                .env("AUTOSPEC_TASK5_EXECUTION", execution_id.as_str())
+                .status()
+                .unwrap();
+            assert!(
+                restarted.success(),
+                "fresh worker process must reconcile fenced cleanup"
+            );
+            server.abort();
+            assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup)
+                .await;
+            delete_matrix_records(&database_url, &execution_id, &worker_id).await;
+            if root.exists() {
+                fs::remove_dir_all(&root).unwrap();
+            }
+            continue;
+        }
+
         let mut authority = cleanup.get(&execution_id).await.unwrap();
         let execution = executions.get(&execution_id).await.unwrap();
         let replacement = Worker::new(
@@ -660,6 +733,41 @@ async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
             fs::remove_dir_all(&root).unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn reaper_restart_process_helper() {
+    if std::env::var_os("AUTOSPEC_TASK5_REAPER_RESTART_HELPER").is_none() {
+        return;
+    }
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").unwrap();
+    let root = PathBuf::from(std::env::var_os("AUTOSPEC_TASK5_ROOT").unwrap());
+    let remote = PathBuf::from(std::env::var_os("AUTOSPEC_TASK5_REMOTE").unwrap());
+    let daemon = std::env::var("AUTOSPEC_TASK5_DAEMON").unwrap();
+    let image = std::env::var("AUTOSPEC_TASK5_IMAGE").unwrap();
+    let execution_id = ExecutionId::new(std::env::var("AUTOSPEC_TASK5_EXECUTION").unwrap());
+    let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+    let authority = cleanup.get(&execution_id).await.unwrap();
+    let execution = executions.get(&execution_id).await.unwrap();
+    reservations
+        .fence_lost_attempt(&execution_id, &authority.attempt_id)
+        .await
+        .expect("controller-fenced attempt is idempotent on fresh worker startup");
+    Worker::new(
+        build_system_lifecycle(&root, &remote, &daemon, &image),
+        executions,
+        reservations,
+        cleanup,
+    )
+    .recover_cleanup_authority(&authority, &execution)
+    .await
+    .expect("fresh worker cleans and atomically finalizes exact authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1044,17 +1152,8 @@ async fn failure_stage_process_helper() {
     if stage == "review_ready_pre_retention" {
         std::process::exit(77);
     }
-    cleanup
-        .transition(
-            &execution.id,
-            CleanupDisposition::RetainRequested,
-            CleanupDisposition::Retained,
-            &handles,
-        )
-        .await
-        .unwrap();
     reservations
-        .release_attempt(&execution.id, &reservation.attempt_id)
+        .commit_retained_and_release_capacity(&execution.id, &reservation.attempt_id)
         .await
         .unwrap();
     std::process::exit(77);

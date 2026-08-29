@@ -871,14 +871,15 @@ impl ExecutionStorageManager for ExecutionStorage {
         let tombstone_name = release_tombstone_name(&receipt.labels.execution_id)?;
         let receipt_bytes = serde_json::to_vec(receipt)
             .map_err(|error| StorageError::Journal(error.to_string()))?;
-        match self.release_tombstones.read(&tombstone_name)? {
-            Some(existing) if existing != receipt_bytes => {
+        let existing_tombstone = self.release_tombstones.read(&tombstone_name)?;
+        match &existing_tombstone {
+            Some(existing) if existing.as_slice() != receipt_bytes.as_slice() => {
                 return Err(StorageError::IdentityMismatch(
                     "release tombstone belongs to another allocation receipt".to_owned(),
                 ));
             }
             Some(_)
-                if !layout.root.exists()
+                if path_is_exactly_absent(&layout.root)?
                     && self
                         .backend
                         .state(&layout, &receipt.backend, receipt.reserved_bytes)?
@@ -887,9 +888,7 @@ impl ExecutionStorageManager for ExecutionStorage {
                 return Ok(())
             }
             Some(_) => {}
-            None => self
-                .release_tombstones
-                .create(&tombstone_name, &receipt_bytes)?,
+            None => {}
         }
         if !self
             .lifecycle_holds
@@ -935,6 +934,12 @@ impl ExecutionStorageManager for ExecutionStorage {
                     "Docker bind proof changed since allocation".to_owned(),
                 ));
             }
+        }
+        if existing_tombstone.is_none() {
+            self.release_tombstones
+                .create(&tombstone_name, &receipt_bytes)?;
+        }
+        if journal.phase == AllocationPhase::Ready {
             self.journals.write(
                 &layout,
                 &PhaseJournal::releasing(receipt.clone(), ReleasePhase::Mounted),
@@ -959,7 +964,7 @@ impl ExecutionStorageManager for ExecutionStorage {
                 .backend
                 .state(&layout, &receipt.backend, receipt.reserved_bytes)?
                 == BackendState::Absent
-            && !layout.root.exists()
+            && path_is_exactly_absent(&layout.root)?
         {
             return Ok(());
         }
@@ -980,6 +985,11 @@ impl ExecutionStorageManager for ExecutionStorage {
                 "cannot acknowledge a release while its backend is present".to_owned(),
             ));
         }
+        if !path_is_exactly_absent(&layout.root)? {
+            return Err(StorageError::IdentityMismatch(
+                "cannot acknowledge a release while its allocation path is present".to_owned(),
+            ));
+        }
         self.release_tombstones.remove(&name)
     }
 
@@ -991,6 +1001,17 @@ impl ExecutionStorageManager for ExecutionStorage {
             .into_iter()
             .filter(|journal| !live.contains(&journal.labels.execution_id))
             .collect())
+    }
+}
+
+fn path_is_exactly_absent(path: &Path) -> Result<bool, StorageError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(StorageError::IdentityMismatch(format!(
+            "cannot authenticate allocation path absence at {}: {error}",
+            path.display()
+        ))),
     }
 }
 
