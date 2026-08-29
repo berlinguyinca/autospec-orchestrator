@@ -368,6 +368,24 @@ impl ExecutionLifecycle for FakeLifecycle {
             Ok(())
         }
     }
+    async fn ack_release_storage(&self, _: &AllocationReceipt) -> Result<(), LifecycleError> {
+        if self.fail_at == Some("storage-ack") {
+            return self.step("storage-ack");
+        }
+        Ok(())
+    }
+    async fn ack_cleanup_authority_step(
+        &self,
+        _: &CleanupAuthority,
+        disposition: CleanupDisposition,
+    ) -> Result<(), LifecycleError> {
+        if disposition == CleanupDisposition::ReservationReleased
+            && self.fail_at == Some("storage-ack")
+        {
+            return self.step("storage-ack");
+        }
+        Ok(())
+    }
     async fn adopt(&self, execution: &Execution) -> Result<AdoptedExecution, LifecycleError> {
         self.step("adopt")?;
         Ok(AdoptedExecution {
@@ -498,11 +516,7 @@ async fn failed_adoption_recovers_durable_authority_instead_of_releasing_live_la
         reservations.released.lock().unwrap().as_slice(),
         std::slice::from_ref(&execution.id)
     );
-    assert_eq!(
-        cleanup.pending.lock().unwrap().as_slice(),
-        std::slice::from_ref(&execution.id),
-        "the reservation store owns the atomic authority resolution in production"
-    );
+    assert!(cleanup.pending.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -581,6 +595,61 @@ async fn successful_run_uses_exact_order_and_persists_result_before_cleanup() {
     assert!(checkpoints[1].1["worktree"].is_object());
     assert!(checkpoints[2].1["runtime"].is_object());
     assert!(checkpoints[3].1["session"].is_object());
+}
+
+#[tokio::test]
+async fn storage_ack_failure_keeps_finalized_authority_for_fresh_worker_retry() {
+    let store = Arc::new(FakeStore::default());
+    let reservations = Arc::new(FakeReservations::default());
+    let cleanup = Arc::new(FakeCleanupAuthorities::default());
+    let execution = execution();
+    store.insert(&execution).await.unwrap();
+    let failing = worker_with_cleanup(
+        Arc::new(FakeLifecycle {
+            order: Arc::new(Mutex::new(Vec::new())),
+            fail_at: Some("storage-ack"),
+            poll_empty: false,
+            cleanup_fail: false,
+            hang_poll: false,
+        }),
+        store.clone(),
+        reservations.clone(),
+        cleanup.clone(),
+    );
+
+    assert!(failing.run(&execution).await.is_err());
+    assert_eq!(
+        cleanup.pending.lock().unwrap().as_slice(),
+        std::slice::from_ref(&execution.id),
+        "DB finalization must remain discoverable until external ACK succeeds"
+    );
+
+    let authority = CleanupAuthority {
+        execution_id: execution.id.clone(),
+        attempt_id: execution.attempt_id.clone().unwrap(),
+        worker_id: execution.worker_id.clone().unwrap(),
+        phase: "RESERVATION_RELEASED".into(),
+        handles: serde_json::json!({}),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let replacement = worker_with_cleanup(
+        Arc::new(FakeLifecycle {
+            order: Arc::new(Mutex::new(Vec::new())),
+            fail_at: None,
+            poll_empty: false,
+            cleanup_fail: false,
+            hang_poll: false,
+        }),
+        store,
+        reservations,
+        cleanup.clone(),
+    );
+    replacement
+        .recover_cleanup_authority(&authority, &execution)
+        .await
+        .unwrap();
+    assert!(cleanup.pending.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -793,10 +862,9 @@ async fn every_creation_and_result_phase_failure_cleans_only_acquired_lower_laye
             std::slice::from_ref(&execution.id),
             "{failure}"
         );
-        assert_eq!(
-            cleanup.pending.lock().unwrap().as_slice(),
-            std::slice::from_ref(&execution.id),
-            "the reservation store owns the atomic authority resolution in production: {failure}"
+        assert!(
+            cleanup.pending.lock().unwrap().is_empty(),
+            "successful external ACK resolves the authority: {failure}"
         );
         assert_eq!(
             store.get(&execution.id).await.unwrap().state,

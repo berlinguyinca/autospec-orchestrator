@@ -100,8 +100,24 @@ pub(crate) async fn run_with_cancel(
             }
         };
         if finalized {
-            if let Some(receipt) = &guard.receipt {
-                if let Err(error) = worker.lifecycle.ack_release_storage(receipt).await {
+            let authority = worker.cleanup_authorities.get(&execution.id).await;
+            match authority {
+                Ok(authority) => {
+                    if let Err(error) = worker
+                        .lifecycle
+                        .ack_cleanup_authority_step(
+                            &authority,
+                            CleanupDisposition::ReservationReleased,
+                        )
+                        .await
+                    {
+                        cleanup_errors.push(error.to_string());
+                    }
+                }
+                Err(error) => cleanup_errors.push(error.to_string()),
+            }
+            if cleanup_errors.is_empty() {
+                if let Err(error) = worker.cleanup_authorities.resolve(&execution.id).await {
                     cleanup_errors.push(error.to_string());
                 }
             }
@@ -198,9 +214,27 @@ pub(crate) async fn run_adopted_with_cancel(
             .await
         {
             cleanup_errors.push(error.to_string());
-        } else if let Some(receipt) = &guard.receipt {
-            if let Err(error) = worker.lifecycle.ack_release_storage(receipt).await {
-                cleanup_errors.push(error.to_string());
+        } else {
+            let authority = worker.cleanup_authorities.get(&execution.id).await;
+            match authority {
+                Ok(authority) => {
+                    if let Err(error) = worker
+                        .lifecycle
+                        .ack_cleanup_authority_step(
+                            &authority,
+                            CleanupDisposition::ReservationReleased,
+                        )
+                        .await
+                    {
+                        cleanup_errors.push(error.to_string());
+                    }
+                }
+                Err(error) => cleanup_errors.push(error.to_string()),
+            }
+            if cleanup_errors.is_empty() {
+                if let Err(error) = worker.cleanup_authorities.resolve(&execution.id).await {
+                    cleanup_errors.push(error.to_string());
+                }
             }
         }
     }
@@ -255,7 +289,6 @@ async fn cleanup_phases(
         guard,
     )
     .await?;
-    let worktree_tombstone = guard.worktree.clone();
     guard.destroy_worktree().await?;
     transition_authority(
         worker,
@@ -265,9 +298,6 @@ async fn cleanup_phases(
         guard,
     )
     .await?;
-    if let Some(worktree) = &worktree_tombstone {
-        worker.lifecycle.ack_destroy_worktree(worktree).await?;
-    }
     guard.release_storage().await?;
     transition_authority(
         worker,

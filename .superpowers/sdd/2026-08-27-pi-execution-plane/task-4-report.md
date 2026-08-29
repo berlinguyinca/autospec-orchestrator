@@ -112,3 +112,55 @@ root; only `session_root/conversation/` is mounted at `/session`.
   round; the upcoming runtime contract must bind the host worktree at
   `/workspace` and only `session_root/conversation/` at `/session`, leaving the
   session root host-private.
+
+## Task 5 fix round 6
+
+Cleanup finalization is now deliberately split across the database and external
+metadata boundaries. The atomic PostgreSQL operation commits execution, attempt,
+result, capacity release, and any required state-change event while advancing the
+durable cleanup authority only to `RESERVATION_RELEASED`. That authority remains
+listable until the worker durably acknowledges both authenticated Git and storage
+tombstones; only then does an exact phase CAS advance it to `RESOLVED`. Normal,
+adopted, startup-recovery, and periodic-reconciliation paths all use this order.
+An acknowledgment error therefore preserves enough authority for a fresh worker
+to retry without reopening deleted allocation storage.
+
+Cleanup finalization allocates an event only when it changes the logical execution
+state. Existing `ReviewReady`, `Failed`, `Completed`, and `Cancelled` outcomes keep
+their already-published event, so retained explicit cleanup and recovery cannot
+duplicate terminal events. A reservation-released replay authenticates the exact
+attempt/worker authority before accepting idempotent completion, but does not
+require an execution-to-reservation join after capacity has already been released.
+Startup fencing is restricted to `Active`/`CleanupPending` authorities with the
+exact live reservation; later physical-cleanup phases proceed directly to
+finalization or tombstone acknowledgment.
+
+### Round 6 verification
+
+- `cargo test -p orchestrator-worker --test run` — 12 passed, including injected
+  storage-ACK failure followed by successful fresh-worker authority recovery.
+- `cargo test -p orchestrator-persistence --test postgres` with the real task
+  PostgreSQL instance — 22 passed. The transaction fault regression proves
+  capacity and `STORAGE_RELEASED` remain unchanged on failure; the replay
+  regression rejects a forged authority worker; finalization remains idempotent
+  and emits no duplicate `ReviewReady`.
+- `cargo test -p orchestrator-worker --test real_e2e -- --nocapture` with real
+  PostgreSQL, Git, Docker, and stub Pi — 6 test functions passed (3 substantive,
+  3 guarded child helpers). The failure matrix covers 11 named crash/fault stages,
+  including ephemeral runtime loss and a separate-process exit after DB finalize
+  but before external ACK. Fresh recovery removes the exact tombstones and
+  resources, resolves the authority, and observes exactly one `ReviewReady` or
+  `ExecutionFailed` event as applicable. Restart adoption plus later explicit
+  retained cleanup also preserves exactly one `ReviewReady`.
+- Current toolchain: `cargo build --workspace`, serialized
+  `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  and `cargo fmt --all -- --check` — passed, including all real Docker,
+  PostgreSQL, Git, Pi, runtime, and worker E2E suites.
+- Rust 1.85.0: the same complete build, serialized test, clippy, and formatting
+  gates passed.
+
+### Round 6 concerns
+
+- The production storage backends still require their configured APFS/LVM pools;
+  the worker E2E intentionally uses the existing fixed-capacity filesystem test
+  backend while retaining real PostgreSQL, Git, Docker, and Pi process boundaries.

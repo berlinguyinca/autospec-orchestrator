@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
     let mut backoff = Duration::from_secs(1);
     let mut heartbeat_due = tokio::time::Instant::now();
     let mut tasks: Vec<ExecutionTask> = Vec::new();
+    let startup_reservations = reservations.list_for_worker(&worker.id).await?;
     for authority in cleanup.list_for_worker(&worker.id).await? {
         let execution = match executions.get(&authority.execution_id).await {
             Ok(execution) => execution,
@@ -247,7 +248,19 @@ async fn main() -> Result<()> {
             );
             continue;
         }
-        if same_attempt && !execution.state.is_terminal() {
+        let has_live_reservation = startup_reservations.iter().any(|reservation| {
+            reservation.execution.id == execution.id
+                && reservation.attempt_id == authority.attempt_id
+                && reservation.worker_id == worker.id
+        });
+        if same_attempt
+            && !execution.state.is_terminal()
+            && has_live_reservation
+            && matches!(
+                disposition,
+                CleanupDisposition::Active(_) | CleanupDisposition::CleanupPending
+            )
+        {
             reservations
                 .fence_lost_attempt(&execution.id, &authority.attempt_id)
                 .await?;

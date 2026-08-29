@@ -14,9 +14,9 @@ use orchestrator_core::{
     WorkerState,
 };
 use orchestrator_persistence::{
-    CleanupAuthorityStore, CleanupDisposition, CleanupStage, ExecutionStore,
-    PgCleanupAuthorityStore, PgExecutionStore, PgReservationStore, PgWorkerStore, ReservationStore,
-    WorkerStore,
+    CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog, ExecutionStore,
+    PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore, PgWorkerStore,
+    ReservationStore, WorkerStore,
 };
 use orchestrator_worker::{
     ExecutionLifecycle, FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
@@ -448,6 +448,18 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
     assert!(authorities[0].handles.get("receipt").is_some());
     assert!(authorities[0].handles.get("runtime").is_some());
     assert!(authorities[0].handles.get("session").is_some());
+    let event_log = PgEventLog::connect(&database_url).await.unwrap();
+    assert_eq!(
+        event_log
+            .since(&execution_id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ReviewReady))
+            .count(),
+        1,
+        "restart adoption must publish ReviewReady exactly once"
+    );
 
     let retained_execution = executions.get(&execution_id).await.unwrap();
     cleanup
@@ -489,6 +501,17 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
         .await
         .unwrap()
         .is_empty());
+    assert_eq!(
+        event_log
+            .since(&execution_id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ReviewReady))
+            .count(),
+        1,
+        "explicit retained cleanup must not republish ReviewReady"
+    );
     let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
     sqlx::query("DELETE FROM cleanup_authorities WHERE execution_id = $1")
         .bind(execution_id.as_str())
@@ -534,11 +557,13 @@ async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
         "post_storage",
         "mid_git_create",
         "post_runtime",
+        "ephemeral_post_runtime",
         "git_deleted_pre_disposition",
         "storage_deleted_pre_disposition",
         "post_pi_pre_event",
         "review_ready_pre_retention",
         "post_retention",
+        "post_finalize_pre_ack",
     ]
     .into_iter()
     .enumerate()
@@ -579,15 +604,12 @@ async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
                 .await
                 .unwrap(),
         );
-        executions
-            .insert(&queued_execution(
-                execution_id.clone(),
-                labels,
-                image_id.clone(),
-                capability,
-            ))
-            .await
-            .unwrap();
+        let mut queued =
+            queued_execution(execution_id.clone(), labels, image_id.clone(), capability);
+        if stage == "ephemeral_post_runtime" {
+            queued.manifest.persistence = PersistenceMode::Ephemeral;
+        }
+        executions.insert(&queued).await.unwrap();
         let crashed = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "failure_stage_process_helper", "--nocapture"])
             .env("AUTOSPEC_TASK5_MATRIX_HELPER", "1")
@@ -601,6 +623,18 @@ async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
             .status()
             .unwrap();
         assert_eq!(crashed.code(), Some(77), "stage {stage}");
+        if stage == "post_finalize_pre_ack" {
+            assert_eq!(
+                cleanup
+                    .get(&execution_id)
+                    .await
+                    .unwrap()
+                    .disposition()
+                    .unwrap(),
+                CleanupDisposition::ReservationReleased,
+                "DB finalization must remain discoverable before external ACK"
+            );
+        }
 
         if stage == "post_runtime" {
             let token = format!("reaper-token-{suffix}");
@@ -728,6 +762,34 @@ async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
                 .unwrap();
         }
         assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
+        let events = PgEventLog::connect(&database_url).await.unwrap();
+        let persisted_events = events.since(&execution_id, 0).await.unwrap();
+        if matches!(
+            stage,
+            "review_ready_pre_retention" | "post_retention" | "post_finalize_pre_ack"
+        ) {
+            assert_eq!(
+                persisted_events
+                    .iter()
+                    .filter(|event| matches!(event.kind, ExecutionEventKind::ReviewReady))
+                    .count(),
+                1,
+                "stage {stage} must preserve the single published ReviewReady"
+            );
+        }
+        if stage == "ephemeral_post_runtime" {
+            assert_eq!(
+                persisted_events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind,
+                        ExecutionEventKind::ExecutionFailed { .. }
+                    ))
+                    .count(),
+                1,
+                "recovery must publish exactly one terminal failure"
+            );
+        }
         delete_matrix_records(&database_url, &execution_id, &worker_id).await;
         if root.exists() {
             fs::remove_dir_all(&root).unwrap();
@@ -755,10 +817,27 @@ async fn reaper_restart_process_helper() {
     );
     let authority = cleanup.get(&execution_id).await.unwrap();
     let execution = executions.get(&execution_id).await.unwrap();
-    reservations
-        .fence_lost_attempt(&execution_id, &authority.attempt_id)
+    let disposition = authority.disposition().unwrap();
+    let has_live_reservation = reservations
+        .list_for_worker(&authority.worker_id)
         .await
-        .expect("controller-fenced attempt is idempotent on fresh worker startup");
+        .unwrap()
+        .iter()
+        .any(|reservation| {
+            reservation.execution.id == execution_id
+                && reservation.attempt_id == authority.attempt_id
+        });
+    if has_live_reservation
+        && matches!(
+            disposition,
+            CleanupDisposition::Active(_) | CleanupDisposition::CleanupPending
+        )
+    {
+        reservations
+            .fence_lost_attempt(&execution_id, &authority.attempt_id)
+            .await
+            .expect("live startup authority is fenced exactly once");
+    }
     Worker::new(
         build_system_lifecycle(&root, &remote, &daemon, &image),
         executions,
@@ -998,7 +1077,7 @@ async fn failure_stage_process_helper() {
         )
         .await
         .unwrap();
-    if stage == "post_runtime" {
+    if matches!(stage.as_str(), "post_runtime" | "ephemeral_post_runtime") {
         std::process::exit(77);
     }
     if matches!(
@@ -1154,6 +1233,41 @@ async fn failure_stage_process_helper() {
     }
     reservations
         .commit_retained_and_release_capacity(&execution.id, &reservation.attempt_id)
+        .await
+        .unwrap();
+    if stage == "post_retention" {
+        std::process::exit(77);
+    }
+    let authority = cleanup.get(&execution.id).await.unwrap();
+    cleanup
+        .transition(
+            &execution.id,
+            CleanupDisposition::Retained,
+            CleanupDisposition::CleanupPending,
+            &authority.handles,
+        )
+        .await
+        .unwrap();
+    let mut disposition = CleanupDisposition::CleanupPending;
+    while matches!(
+        disposition,
+        CleanupDisposition::CleanupPending
+            | CleanupDisposition::RuntimeStopped
+            | CleanupDisposition::RuntimeDestroyed
+            | CleanupDisposition::GitRecoveredCleaned
+    ) {
+        let next = lifecycle
+            .cleanup_authority_step(&authority, &execution, disposition)
+            .await
+            .unwrap();
+        cleanup
+            .transition(&execution.id, disposition, next, &authority.handles)
+            .await
+            .unwrap();
+        disposition = next;
+    }
+    reservations
+        .finalize_cleanup(&execution.id, &reservation.attempt_id)
         .await
         .unwrap();
     std::process::exit(77);

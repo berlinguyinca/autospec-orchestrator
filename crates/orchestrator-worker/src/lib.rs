@@ -265,9 +265,11 @@ impl Worker {
                 | CleanupDisposition::RuntimeDestroyed
                 | CleanupDisposition::GitRecoveredCleaned
         ) {
-            self.lifecycle
-                .ack_cleanup_authority_step(authority, disposition)
-                .await?;
+            if disposition != CleanupDisposition::GitRecoveredCleaned {
+                self.lifecycle
+                    .ack_cleanup_authority_step(authority, disposition)
+                    .await?;
+            }
             let next = self
                 .lifecycle
                 .cleanup_authority_step(authority, execution, disposition)
@@ -288,10 +290,12 @@ impl Worker {
                 .finalize_cleanup(&authority.execution_id, &authority.attempt_id)
                 .await
                 .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+            disposition = CleanupDisposition::ReservationReleased;
+        }
+        if disposition == CleanupDisposition::ReservationReleased {
             self.lifecycle
                 .ack_cleanup_authority_step(authority, disposition)
                 .await?;
-        } else if disposition == CleanupDisposition::ReservationReleased {
             self.cleanup_authorities
                 .resolve(&authority.execution_id)
                 .await

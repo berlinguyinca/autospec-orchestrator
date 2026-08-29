@@ -1283,6 +1283,33 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
                         .map_err(|error| LifecycleError::Step(error.to_string()))?;
                 }
             }
+            CleanupDisposition::ReservationReleased => {
+                if let Some(worktree) = handles.worktree {
+                    let worktree = durable_worktree(worktree);
+                    if worktree.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "worktree cleanup acknowledgment belongs to another execution".into(),
+                        ));
+                    }
+                    let manager = Arc::clone(&self.worktrees);
+                    tokio::task::spawn_blocking(move || manager.ack_destroy(&worktree))
+                        .await
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                }
+                if let Some(receipt) = handles.receipt {
+                    if receipt.labels.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "storage release acknowledgment belongs to another execution".into(),
+                        ));
+                    }
+                    let storage = Arc::clone(&self.storage);
+                    tokio::task::spawn_blocking(move || storage.ack_release(&receipt))
+                        .await
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                }
+            }
             _ => {}
         }
         Ok(())

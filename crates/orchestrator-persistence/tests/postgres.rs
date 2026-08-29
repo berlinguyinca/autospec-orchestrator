@@ -629,7 +629,7 @@ async fn startup_fence_blocks_reassignment_until_physical_cleanup_finalizes() {
             .unwrap()
             .disposition()
             .unwrap(),
-        CleanupDisposition::Resolved
+        CleanupDisposition::ReservationReleased
     );
     let final_events = events.since(&reservation.execution.id, 0).await.unwrap();
     assert_eq!(final_events.len(), 1);
@@ -640,6 +640,13 @@ async fn startup_fence_blocks_reassignment_until_physical_cleanup_finalizes() {
             failure: orchestrator_core::FailureClass::WorkerLost
         }
     ));
+    assert_eq!(cleanup.list_for_worker(&worker.id).await.unwrap().len(), 1);
+    cleanup.resolve(&reservation.execution.id).await.unwrap();
+    assert!(cleanup
+        .list_for_worker(&worker.id)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1008,7 +1015,26 @@ async fn ephemeral_review_ready_cleanup_preserves_result_and_finalizes_atomicall
     .execute(&pool)
     .await
     .unwrap();
+    events
+        .append(&ExecutionEvent {
+            execution_id: reservation.execution.id.clone(),
+            attempt_id: Some(reservation.attempt_id.clone()),
+            sequence: 0,
+            at: Utc::now(),
+            state: ExecutionState::ReviewReady,
+            kind: ExecutionEventKind::ReviewReady,
+        })
+        .await
+        .unwrap();
 
+    sqlx::query("DROP TRIGGER IF EXISTS autospec_test_fail_finalize ON cleanup_authorities")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION IF EXISTS autospec_test_fail_finalize()")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query(
         "CREATE OR REPLACE FUNCTION autospec_test_fail_finalize() RETURNS trigger LANGUAGE plpgsql AS $$ \
          BEGIN RAISE EXCEPTION 'injected cleanup finalize failure'; END $$",
@@ -1018,7 +1044,7 @@ async fn ephemeral_review_ready_cleanup_preserves_result_and_finalizes_atomicall
     .unwrap();
     sqlx::query(
         "CREATE TRIGGER autospec_test_fail_finalize BEFORE UPDATE ON cleanup_authorities \
-         FOR EACH ROW WHEN (NEW.phase = 'RESOLVED') EXECUTE FUNCTION autospec_test_fail_finalize()",
+         FOR EACH ROW WHEN (NEW.phase = 'RESERVATION_RELEASED') EXECUTE FUNCTION autospec_test_fail_finalize()",
     )
     .execute(&pool)
     .await
@@ -1045,11 +1071,14 @@ async fn ephemeral_review_ready_cleanup_preserves_result_and_finalizes_atomicall
             .unwrap(),
         CleanupDisposition::StorageReleased
     );
-    assert!(events
-        .since(&reservation.execution.id, 0)
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        events
+            .since(&reservation.execution.id, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     sqlx::query("DROP TRIGGER autospec_test_fail_finalize ON cleanup_authorities")
         .execute(&pool)
         .await
@@ -1084,7 +1113,7 @@ async fn ephemeral_review_ready_cleanup_preserves_result_and_finalizes_atomicall
             .unwrap()
             .disposition()
             .unwrap(),
-        CleanupDisposition::Resolved
+        CleanupDisposition::ReservationReleased
     );
     let final_events = events.since(&reservation.execution.id, 0).await.unwrap();
     assert_eq!(final_events.len(), 1);
@@ -1093,6 +1122,40 @@ async fn ephemeral_review_ready_cleanup_preserves_result_and_finalizes_atomicall
         final_events[0].kind,
         ExecutionEventKind::ReviewReady
     ));
+    sqlx::query(
+        "UPDATE cleanup_authorities SET worker_id = 'forged-worker' WHERE execution_id = $1",
+    )
+    .bind(reservation.execution.id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        reservations
+            .finalize_cleanup(&reservation.execution.id, &reservation.attempt_id)
+            .await
+            .is_err(),
+        "reservation-released replay must authenticate the exact attempt worker"
+    );
+    sqlx::query("UPDATE cleanup_authorities SET worker_id = $2 WHERE execution_id = $1")
+        .bind(reservation.execution.id.as_str())
+        .bind(worker.id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    reservations
+        .finalize_cleanup(&reservation.execution.id, &reservation.attempt_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .since(&reservation.execution.id, 0)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "idempotent finalization must not duplicate the terminal event"
+    );
+    cleanup.resolve(&reservation.execution.id).await.unwrap();
 }
 
 #[tokio::test]

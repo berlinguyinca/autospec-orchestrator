@@ -588,7 +588,7 @@ impl ReservationStore for PgReservationStore {
             "SELECT e.*, c.phase AS cleanup_phase, c.worker_id AS cleanup_worker_id \
              FROM executions e JOIN cleanup_authorities c ON c.execution_id = e.id \
              AND c.attempt_id = $2 WHERE e.id = $1 \
-             AND c.phase IN ('STORAGE_RELEASED', 'RESOLVED') FOR UPDATE OF e, c",
+             AND c.phase IN ('STORAGE_RELEASED', 'RESERVATION_RELEASED') FOR UPDATE OF e, c",
         )
         .bind(execution_id.as_str())
         .bind(attempt_id.as_str())
@@ -603,10 +603,6 @@ impl ReservationStore for PgReservationStore {
         let phase = row.try_get::<String, _>("cleanup_phase")?;
         let authority_worker = row.try_get::<String, _>("cleanup_worker_id")?;
         let outcome = cleanup_outcome(&execution);
-        if phase == "RESOLVED" {
-            transaction.commit().await?;
-            return Ok(outcome);
-        }
         let attempt = sqlx::query(
             "SELECT worker_id, finished_at FROM execution_attempts \
              WHERE attempt_id = $1 AND execution_id = $2 FOR UPDATE",
@@ -621,6 +617,10 @@ impl ReservationStore for PgReservationStore {
             return Err(StoreError::Conflict(
                 "cleanup authority and attempt worker differ".to_owned(),
             ));
+        }
+        if phase == "RESERVATION_RELEASED" {
+            transaction.commit().await?;
+            return Ok(outcome);
         }
         let worker_id = sqlx::query_scalar::<_, String>(
             "SELECT worker_id FROM reservations WHERE execution_id = $1 AND attempt_id = $2 FOR UPDATE",
@@ -728,45 +728,47 @@ impl ReservationStore for PgReservationStore {
             .await?;
         }
         sqlx::query(
-            "UPDATE cleanup_authorities SET phase = 'RESOLVED', updated_at = now() \
+            "UPDATE cleanup_authorities SET phase = 'RESERVATION_RELEASED', updated_at = now() \
              WHERE execution_id = $1 AND attempt_id = $2 AND phase = 'STORAGE_RELEASED'",
         )
         .bind(execution_id.as_str())
         .bind(attempt_id.as_str())
         .execute(&mut *transaction)
         .await?;
-        let kind = match next {
-            ExecutionState::Queued => ExecutionEventKind::ExecutionRequeued {
-                failure: FailureClass::WorkerLost,
-            },
-            ExecutionState::ReviewReady => ExecutionEventKind::ReviewReady,
-            ExecutionState::Failed => ExecutionEventKind::ExecutionFailed {
-                failure: execution
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.failure)
-                    .unwrap_or(FailureClass::WorkerLost),
-            },
-            ExecutionState::Cancelled => ExecutionEventKind::ExecutionCancelled,
-            ExecutionState::Completed => ExecutionEventKind::ExecutionCompleted,
-            other => {
-                return Err(StoreError::Conflict(format!(
-                    "cleanup finalization cannot publish state {other:?}"
-                )))
-            }
-        };
-        append_in_transaction(
-            &mut transaction,
-            &ExecutionEvent {
-                execution_id: execution_id.clone(),
-                attempt_id: Some(attempt_id.clone()),
-                sequence: 0,
-                at: Utc::now(),
-                state: next,
-                kind,
-            },
-        )
-        .await?;
+        if next != execution.state {
+            let kind = match next {
+                ExecutionState::Queued => ExecutionEventKind::ExecutionRequeued {
+                    failure: FailureClass::WorkerLost,
+                },
+                ExecutionState::ReviewReady => ExecutionEventKind::ReviewReady,
+                ExecutionState::Failed => ExecutionEventKind::ExecutionFailed {
+                    failure: execution
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.failure)
+                        .unwrap_or(FailureClass::WorkerLost),
+                },
+                ExecutionState::Cancelled => ExecutionEventKind::ExecutionCancelled,
+                ExecutionState::Completed => ExecutionEventKind::ExecutionCompleted,
+                other => {
+                    return Err(StoreError::Conflict(format!(
+                        "cleanup finalization cannot publish state {other:?}"
+                    )))
+                }
+            };
+            append_in_transaction(
+                &mut transaction,
+                &ExecutionEvent {
+                    execution_id: execution_id.clone(),
+                    attempt_id: Some(attempt_id.clone()),
+                    sequence: 0,
+                    at: Utc::now(),
+                    state: next,
+                    kind,
+                },
+            )
+            .await?;
+        }
         transaction.commit().await?;
         Ok(outcome)
     }
