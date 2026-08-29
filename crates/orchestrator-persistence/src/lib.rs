@@ -673,7 +673,7 @@ impl ExecutionStore for PgExecutionStore {
             .fetch_one(&mut *transaction)
             .await?;
         if let Some(row) = sqlx::query(
-            "SELECT request_scope, manifest, execution_id FROM execution_requests \
+            "SELECT request_scope, execution_id FROM execution_requests \
              WHERE idempotency_key = $1",
         )
         .bind(idempotency_key)
@@ -681,18 +681,17 @@ impl ExecutionStore for PgExecutionStore {
         .await?
         {
             let stored_scope: String = row.try_get("request_scope")?;
-            let stored_manifest: Value = row.try_get("manifest")?;
-            if stored_scope != request_scope || stored_manifest != manifest {
-                return Err(StoreError::IdempotencyConflict(
-                    "idempotency key was already used for a different request".to_owned(),
-                ));
-            }
             let execution_id = ExecutionId::new(row.try_get::<String, _>("execution_id")?);
             let row = sqlx::query("SELECT * FROM executions WHERE id = $1")
                 .bind(execution_id.as_str())
                 .fetch_one(&mut *transaction)
                 .await?;
             let replay = decode_execution(&row)?;
+            if stored_scope != request_scope || to_json(&replay.manifest)? != manifest {
+                return Err(StoreError::IdempotencyConflict(
+                    "idempotency key was already used for a different request".to_owned(),
+                ));
+            }
             transaction.commit().await?;
             return Ok(IdempotentExecution {
                 execution: replay,
@@ -725,12 +724,11 @@ impl ExecutionStore for PgExecutionStore {
         .map_err(map_conflict)?;
         sqlx::query(
             "INSERT INTO execution_requests \
-             (idempotency_key, request_scope, manifest, execution_id, created_at) \
-             VALUES ($1, $2, $3, $4, $5)",
+             (idempotency_key, request_scope, execution_id, created_at) \
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(idempotency_key)
         .bind(request_scope)
-        .bind(&manifest)
         .bind(execution.id.as_str())
         .bind(execution.created_at)
         .execute(&mut *transaction)

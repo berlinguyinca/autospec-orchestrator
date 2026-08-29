@@ -2457,6 +2457,11 @@ async fn configured_storage_enforces_one_aggregate_quota_and_preserves_another_e
         fs::create_dir(&path).expect("create storage control directory");
         secure_mode(&path);
     }
+    let shared_mirror = state.path().join("mirrors/owner__repo.git");
+    fs::create_dir_all(&shared_mirror).expect("create immutable shared mirror control");
+    let shared_mirror_sentinel = shared_mirror.join("HEAD");
+    fs::write(&shared_mirror_sentinel, b"ref: refs/heads/main\n")
+        .expect("write immutable shared mirror control");
     let first_labels = labels_for(unique_execution_id());
     let second_labels = labels_for(unique_execution_id());
     let make_manager = |labels: &OwnershipLabels| {
@@ -2572,6 +2577,11 @@ async fn configured_storage_enforces_one_aggregate_quota_and_preserves_another_e
     )
     .await;
     assert_eq!(exit, 0, "control execution write failed: {error}");
+    assert_eq!(
+        fs::read(&shared_mirror_sentinel).expect("read immutable shared mirror control"),
+        b"ref: refs/heads/main\n",
+        "aggregate execution exhaustion mutated shared mirror infrastructure"
+    );
 
     first_scope
         .cleanup()

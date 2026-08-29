@@ -922,17 +922,15 @@ async fn credential_echo_is_scrubbed_from_stdout_and_stderr_before_terminal_poll
         .session_dir()
         .join(format!("pi.events-{}.jsonl", fixture.execution_id));
     wait_for_content(&events_path, "agent_settled").await;
+    let stderr_path = fixture
+        .session_dir()
+        .join(format!("pi.stderr-{}.log", fixture.execution_id));
+    let stderr = wait_for_content(&stderr_path, "[REDACTED_CREDENTIAL]").await;
     let events = harness.poll_events(&session).await.unwrap();
     assert!(events
         .iter()
         .any(|event| matches!(event.kind, ExecutionEventKind::ReviewReady)));
     let stdout = fs::read_to_string(&events_path).unwrap();
-    let stderr = fs::read_to_string(
-        fixture
-            .session_dir()
-            .join(format!("pi.stderr-{}.log", fixture.execution_id)),
-    )
-    .unwrap();
     for durable in [&stdout, &stderr] {
         assert!(!durable
             .as_bytes()
