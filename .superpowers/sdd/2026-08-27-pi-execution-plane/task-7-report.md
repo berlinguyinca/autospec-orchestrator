@@ -4,10 +4,11 @@
 
 Task 7 is complete. Implementation and independent review executions now have
 real concurrent boundary proof across Docker, Git, Pi, credentials, mutable
-binds, and cleanup authority. The production worker mints one short-lived
-credential beneath the verified execution root, mounts it read-only into only
-that execution's agent, and revokes it on normal, cancellation, failure,
-recovery, and repeated cleanup paths. Authenticated pause, resume, attachment,
+binds, and cleanup authority. The production worker fails closed without an
+injected credential issuer; an explicit local-development opt-in mints one
+short-lived credential beneath the verified execution root, mounts it read-only
+into only that execution's agent, and revokes it on normal, cancellation,
+failure, recovery, and repeated cleanup paths. Authenticated pause, resume, attachment,
 and Pi conversation fork operations are durable worker-owned controls rather
 than controller-only state changes.
 
@@ -16,8 +17,10 @@ than controller-only state changes.
 - Added the exact `CredentialBroker::mint(&Execution)` and
   `CredentialBroker::revoke(&ExecutionId)` boundary and the reserved
   `EnvironmentHandle.credentials_path` field.
-- Added a local execution-scoped broker because no InferWeave issuance endpoint
-  is specified. It creates opaque 256-bit material from the operating system,
+- Added a development/test-only local execution-scoped broker because no
+  InferWeave issuance endpoint is specified. Production startup rejects it
+  unless `--allow-local-development-credentials` (or its explicit environment
+  equivalent) is supplied. It creates opaque 256-bit material from the operating system,
   stores it as a private `0600` file beneath a `0700` execution directory,
   records an expiry, reuses only an unexpired exact file, and revokes
   idempotently even after execution storage has already been released.
@@ -32,7 +35,7 @@ than controller-only state changes.
   GET/POST `/attach` routes with the existing bearer-auth contract, exact 1 MiB
   JSON limit, bounded idempotency keys, uniform errors, lifecycle conflicts,
   and `202 Accepted` for newly durable intent.
-- Added cursor-only attachment metadata: execution, state, session, worktree,
+- Added cursor-only attachment metadata: execution, state, session, opaque workspace reference,
   and latest durable event sequence. It never returns conversation history,
   artifact bodies, credentials, or prompt material.
 - Added the authoritative `0012_execution_control_requests.sql` migration. The
@@ -112,12 +115,39 @@ Task 7 was implemented RED to GREEN:
    ownership transition. The real test now proves pause, fork, and resume make
    exactly three Pi invocations, preserve one worktree, create a new session,
    reach `ReviewReady`, and emit exactly one paused, forked, and resumed event.
+8. Review-fix RED tests showed controls needed immutable acceptance fences and
+   crash phases. `ACCEPTED`, `APPLYING`, `SIDE_EFFECT_APPLIED`, `COMPLETED`, and
+   `STALE` now preserve the exact worker, attempt, source session, worktree,
+   execution version/state, deterministic fork target, and stale disposition.
+   The unreleased schema remains one authoritative `0012`; frozen fence columns
+   deliberately do not cascade from mutable attempt rows.
+9. Separate child processes now exit immediately after Pi stop, resume launch,
+   native fork launch, and `SIDE_EFFECT_APPLIED` before completion. Fresh worker
+   processes adopt the exact authority and reconcile through the production
+   daemon tick. The tests prove one durable action event. Debugging found two
+   concrete recovery defects: Running adoption resumed before pending controls,
+   and hold validation compared an immutable Docker ID with a container name.
+   Adoption now quiesces first, checks durable controls before resuming, and
+   fences holds against the resolved exact container ID.
+10. The adversarial Pi fixture reads its own credential, copies it into the
+    worktree, and echoes it. The worktree scan rejects evidence persistence and
+    cleanup removes the execution. A real Pi test separately proves recognized
+    terminal polling while both stdout JSONL and stderr logs contain only the
+    replacement marker. This RED test also found that stderr had previously
+    bypassed scrubbing; both streams now pass through known-secret redaction
+    before durable writes.
+11. The concurrent isolation E2E now provisions a real Redis service for each
+    execution and inspects exact agent/service container IDs, one distinct
+    network membership, execution-bounded binds, and absence of the credential
+    mount from services. After cleanup of one execution it reinspects the peer
+    service, runtime, session, credential, evidence, and cleanup authority.
 
 ## Verification
 
 - `AUTOSPEC_DATABASE_URL=... cargo test --workspace -- --test-threads=1`
-  — passed, including 30 PostgreSQL tests, 5 execution API tests, 38 Pi harness
-  tests, all 8 real worker E2Es, 3 credential tests, and 18 Docker runtime tests.
+  — passed on a fresh database, including 33 PostgreSQL tests, 5 execution API
+  tests, 39 Pi harness tests, all 10 real worker E2Es, 6 credential tests, and
+  18 Docker runtime tests.
 - `AUTOSPEC_DATABASE_URL=... cargo +1.85.0 test --workspace -- --test-threads=1`
   — passed with the same full serialized workspace coverage.
 - `cargo build --workspace` — passed.
@@ -136,19 +166,23 @@ Task 7 was implemented RED to GREEN:
 - `3986942` — idempotent revocation after already-released storage.
 - `2a73e64` — allocation-free token encoding accepted by current and Rust 1.85
   clippy.
+- `aee776b` — reviewer fix round: fenced control phases, crash reconciliation,
+  fail-closed credential startup, secret containment, timer suspension, opaque
+  attach snapshot, service-backed isolation, and 0011→0012 upgrade proof.
 - This report is recorded in the following documentation-only commit.
 
 ## Concerns and follow-up
 
-- The production broker is deliberately local and scoped because the contract
-  specifies no live InferWeave issuance or revocation API. Replacing it later
+- The local broker is deliberately development/test-only because the contract
+  specifies no live InferWeave issuance or revocation API. A production issuer
+  must be injected through the existing broker boundary. Replacing it later
   should preserve the same injected broker boundary, path containment, expiry,
   agent-only read-only mount, and cleanup proof; it must not introduce model or
   inference policy here.
 - Durable controls guarantee restart-visible intent and exactly-once durable
-  completion/events. As with other process side effects, a host crash after Pi
-  starts but before PostgreSQL completion can leave a lifecycle hold; existing
-  harness recovery terminates that exact process before retry. Any uncommitted
+  completion/events. A host crash after Pi starts but before PostgreSQL
+  completion can leave a lifecycle hold; harness recovery terminates that exact
+  process before idempotent retry. Any uncommitted
   native fork JSONL remains confined to the execution-private session directory
   and is removed with that execution's storage.
 - Attachment intentionally provides resumable metadata and an event cursor,
