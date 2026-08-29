@@ -35,6 +35,14 @@ impl ApiError {
     }
 
     pub(crate) fn store(error: StoreError) -> Self {
+        Self::store_with_execution(error, None)
+    }
+
+    pub(crate) fn store_for(error: StoreError, execution_id: &str) -> Self {
+        Self::store_with_execution(error, Some(execution_id))
+    }
+
+    fn store_with_execution(error: StoreError, execution_id: Option<&str>) -> Self {
         match error {
             StoreError::NotFound(message) => Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", message),
             StoreError::IllegalTransition { from, to } => Self::new(
@@ -50,11 +58,14 @@ impl ApiError {
             }
             StoreError::InvalidArtifactName(message) => Self::validation(message),
             StoreError::Conflict(message) => Self::conflict(message),
-            other => Self::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL",
-                other.to_string(),
-            ),
+            other => {
+                tracing::error!(execution_id, %other, "internal API persistence failure");
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL",
+                    "internal server error",
+                )
+            }
         }
     }
 }
@@ -66,5 +77,25 @@ impl IntoResponse for ApiError {
             Json(json!({"error": {"code": self.code, "message": self.message}})),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn internal_store_failures_never_expose_database_diagnostics() {
+        let response = ApiError::store(StoreError::SequenceConflict).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "error": {"code": "INTERNAL", "message": "internal server error"}
+            })
+        );
     }
 }

@@ -21,8 +21,8 @@ async fn list(
     authorize_api(&state, &headers)?;
     state
         .artifacts
-        .list(&ExecutionId::new(id))
+        .list(&ExecutionId::new(&id))
         .await
         .map(Json)
-        .map_err(ApiError::store)
+        .map_err(|error| ApiError::store_for(error, &id))
 }

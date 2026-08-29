@@ -653,7 +653,14 @@ impl ReservationStore for PgReservationStore {
                 .fetch_one(&mut *transaction)
                 .await?;
         }
-        let lost = !execution.state.is_terminal();
+        let cancellation_pending = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM execution_cancellation_requests \
+             WHERE execution_id = $1 AND completed_at IS NULL)",
+        )
+        .bind(execution_id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let lost = !execution.state.is_terminal() && !cancellation_pending;
         let review_ready = execution.state == ExecutionState::ReviewReady;
         let resumable =
             lost && !review_ready && execution.manifest.persistence == PersistenceMode::Resumable;

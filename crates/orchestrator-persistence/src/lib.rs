@@ -20,8 +20,8 @@ pub use workers::{PgWorkerStore, WorkerStore};
 use async_trait::async_trait;
 use event_log::append_in_transaction;
 use orchestrator_core::{
-    AttemptId, Execution, ExecutionId, ExecutionResult, ExecutionState, OwnershipLabels, Role,
-    SessionId, WorkerId,
+    event::ExecutionEventKind, AttemptId, Execution, ExecutionEvent, ExecutionId, ExecutionResult,
+    ExecutionState, FailureClass, OwnershipLabels, Role, SessionId, WorkerId,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -33,6 +33,38 @@ pub trait ExecutionStore: Send + Sync {
     async fn insert(&self, execution: &Execution) -> Result<(), StoreError>;
     async fn get(&self, id: &ExecutionId) -> Result<Execution, StoreError>;
     async fn list_live(&self) -> Result<Vec<Execution>, StoreError>;
+    async fn request_cancellation(&self, id: &ExecutionId) -> Result<Execution, StoreError> {
+        Err(StoreError::Conflict(format!(
+            "durable cancellation requests are unavailable for {id}"
+        )))
+    }
+    async fn cancellation_requested(&self, _id: &ExecutionId) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    async fn complete_cancellation(
+        &self,
+        id: &ExecutionId,
+        attempt_id: &AttemptId,
+    ) -> Result<(Execution, u64), StoreError> {
+        let mut execution = self.get(id).await?;
+        execution
+            .transition(ExecutionState::Cancelled)
+            .map_err(|_| StoreError::IllegalTransition {
+                from: execution.state,
+                to: ExecutionState::Cancelled,
+            })?;
+        execution.result = Some(cancelled_result(id));
+        let event = ExecutionEvent {
+            execution_id: id.clone(),
+            attempt_id: Some(attempt_id.clone()),
+            sequence: 0,
+            at: chrono::Utc::now(),
+            state: ExecutionState::Cancelled,
+            kind: ExecutionEventKind::ExecutionCancelled,
+        };
+        let sequence = self.record_progress(&execution, &event).await?;
+        Ok((execution, sequence))
+    }
     async fn transition(
         &self,
         id: &ExecutionId,
@@ -147,6 +179,145 @@ impl ExecutionStore for PgExecutionStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(decode_execution).collect()
+    }
+
+    async fn request_cancellation(&self, id: &ExecutionId) -> Result<Execution, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let execution = decode_execution(&row)?;
+        if execution.state.is_terminal() {
+            return Err(StoreError::IllegalTransition {
+                from: execution.state,
+                to: ExecutionState::Cancelled,
+            });
+        }
+        sqlx::query(
+            "INSERT INTO execution_cancellation_requests (execution_id) VALUES ($1) \
+             ON CONFLICT (execution_id) DO NOTHING",
+        )
+        .bind(id.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(execution)
+    }
+
+    async fn cancellation_requested(&self, id: &ExecutionId) -> Result<bool, StoreError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM execution_cancellation_requests \
+             WHERE execution_id = $1 AND completed_at IS NULL)",
+        )
+        .bind(id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::from)
+    }
+
+    async fn complete_cancellation(
+        &self,
+        id: &ExecutionId,
+        attempt_id: &AttemptId,
+    ) -> Result<(Execution, u64), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let request = sqlx::query(
+            "SELECT requested_at FROM execution_cancellation_requests \
+             WHERE execution_id = $1 AND completed_at IS NULL FOR UPDATE",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if request.is_none() {
+            return Err(StoreError::Conflict(format!(
+                "execution {id} has no pending cancellation request"
+            )));
+        }
+        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let mut execution = decode_execution(&row)?;
+        let from = execution.state;
+        execution
+            .transition(ExecutionState::Cancelled)
+            .map_err(|_| StoreError::IllegalTransition {
+                from,
+                to: ExecutionState::Cancelled,
+            })?;
+        let reservation_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM reservations WHERE execution_id = $1)",
+        )
+        .bind(id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let attempt_finished = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM execution_attempts \
+             WHERE execution_id = $1 AND attempt_id = $2 AND finished_at IS NOT NULL)",
+        )
+        .bind(id.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let cleanup_resolved = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM cleanup_authorities \
+             WHERE execution_id = $1 AND attempt_id = $2 AND phase = 'RESOLVED')",
+        )
+        .bind(id.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if reservation_exists || !attempt_finished || !cleanup_resolved {
+            return Err(StoreError::Conflict(format!(
+                "execution {id} cancellation cannot complete before cleanup and reservation release"
+            )));
+        }
+        execution.result = Some(cancelled_result(id));
+        sqlx::query(
+            "UPDATE executions SET state = 'CANCELLED', result = $2, updated_at = $3, \
+             version = version + 1 WHERE id = $1",
+        )
+        .bind(id.as_str())
+        .bind(to_json(
+            execution.result.as_ref().expect("cancelled result exists"),
+        )?)
+        .bind(execution.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE execution_attempts SET state = 'CANCELLED', result = $3, updated_at = $4 \
+             WHERE execution_id = $1 AND attempt_id = $2",
+        )
+        .bind(id.as_str())
+        .bind(attempt_id.as_str())
+        .bind(to_json(
+            execution.result.as_ref().expect("cancelled result exists"),
+        )?)
+        .bind(execution.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        let event = ExecutionEvent {
+            execution_id: id.clone(),
+            attempt_id: Some(attempt_id.clone()),
+            sequence: 0,
+            at: execution.updated_at,
+            state: ExecutionState::Cancelled,
+            kind: ExecutionEventKind::ExecutionCancelled,
+        };
+        let sequence = append_in_transaction(&mut transaction, &event).await?;
+        sqlx::query(
+            "UPDATE execution_cancellation_requests SET completed_at = $2 \
+             WHERE execution_id = $1 AND completed_at IS NULL",
+        )
+        .bind(id.as_str())
+        .bind(execution.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok((execution, sequence))
     }
 
     async fn transition(
@@ -340,6 +511,19 @@ impl ExecutionStore for PgExecutionStore {
             created: true,
             event_sequence: Some(sequence),
         })
+    }
+}
+
+fn cancelled_result(id: &ExecutionId) -> ExecutionResult {
+    ExecutionResult {
+        execution_id: id.clone(),
+        state: ExecutionState::Cancelled,
+        failure: Some(FailureClass::Cancelled),
+        branch: None,
+        base_sha: None,
+        diff_artifact: None,
+        artifacts: Vec::new(),
+        tests: None,
     }
 }
 

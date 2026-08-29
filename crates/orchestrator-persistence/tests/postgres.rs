@@ -9,8 +9,136 @@ use orchestrator_persistence::{
     ExecutionStore, LostWorkerRecovery, PgArtifactStore, PgCleanupAuthorityStore, PgEventLog,
     PgExecutionStore, PgReservationStore, PgWorkerStore, ReservationStore, StoreError, WorkerStore,
 };
-use sqlx::{postgres::PgPoolOptions, Row};
-use std::sync::{Arc, OnceLock};
+use sqlx::{postgres::PgPoolOptions, Connection, PgConnection, Row};
+use std::{
+    borrow::Cow,
+    sync::{Arc, OnceLock},
+};
+
+#[tokio::test]
+async fn cancellation_request_is_durable_without_publishing_a_terminal_state() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, events)) = stores().await else {
+        return;
+    };
+    let queued = execution(ExecutionState::Queued);
+    executions.insert(&queued).await.unwrap();
+
+    let requested = executions.request_cancellation(&queued.id).await.unwrap();
+    assert_eq!(requested.state, ExecutionState::Queued);
+    assert!(executions.cancellation_requested(&queued.id).await.unwrap());
+    assert!(events.since(&queued.id, 0).await.unwrap().is_empty());
+
+    let replay = executions.request_cancellation(&queued.id).await.unwrap();
+    assert_eq!(replay.id, queued.id);
+    assert_eq!(replay.state, ExecutionState::Queued);
+}
+
+#[tokio::test]
+async fn current_migrator_fills_vacant_task6_versions_without_losing_pre_task6_rows() {
+    let _database_test = database_test_lock().lock().await;
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        return;
+    };
+    let schema = format!("task6_upgrade_{}", uuid::Uuid::new_v4().simple());
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::raw_sql(&format!(
+        "CREATE SCHEMA {schema}; SET search_path TO {schema}"
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    let current = sqlx::migrate!();
+    let pre_task6 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            current
+                .migrations
+                .iter()
+                .filter(|migration| matches!(migration.version, 1 | 2 | 3 | 4 | 6 | 7 | 8 | 9))
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: false,
+        no_tx: false,
+    };
+    pre_task6.run(&mut connection).await.unwrap();
+    sqlx::query(
+        "INSERT INTO executions \
+         (id, role, state, manifest, labels, created_at, updated_at) \
+         VALUES ('preserved', 'implementation', 'QUEUED', '{}'::jsonb, '{}'::jsonb, now(), now())",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    current.run(&mut connection).await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version IN (5, 10)"
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT id FROM executions WHERE id = 'preserved'")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap(),
+        "preserved"
+    );
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT to_regclass('artifact_blobs') IS NOT NULL \
+         AND to_regclass('execution_requests') IS NOT NULL"
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap());
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn event_batches_are_bounded_and_strictly_ordered() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, events)) = stores().await else {
+        return;
+    };
+    let queued = execution(ExecutionState::Queued);
+    executions.insert(&queued).await.unwrap();
+    for _ in 0..140 {
+        events
+            .append(&ExecutionEvent {
+                execution_id: queued.id.clone(),
+                attempt_id: None,
+                sequence: 0,
+                at: Utc::now(),
+                state: ExecutionState::Queued,
+                kind: ExecutionEventKind::ExecutionCreated,
+            })
+            .await
+            .unwrap();
+    }
+    let first = events.since_batch(&queued.id, 0, 32).await.unwrap();
+    assert_eq!(first.len(), 32);
+    assert_eq!(
+        first.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+        (1..=32).collect::<Vec<_>>()
+    );
+    let second = events.since_batch(&queued.id, 32, 32).await.unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        (33..=64).collect::<Vec<_>>()
+    );
+}
 
 #[tokio::test]
 async fn artifacts_are_content_addressed_deduplicated_and_execution_scoped() {
@@ -72,6 +200,11 @@ async fn artifacts_are_content_addressed_deduplicated_and_execution_scoped() {
             .join(&replay.sha256[..2]),
     )
     .unwrap()
+    .filter(|entry| {
+        entry
+            .as_ref()
+            .is_ok_and(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+    })
     .count();
     assert_eq!(blob_count, 1, "identical bytes share one durable blob");
     assert!(matches!(
@@ -108,6 +241,7 @@ async fn artifacts_are_content_addressed_deduplicated_and_execution_scoped() {
         .join("artifacts")
         .join(&replay.sha256[..2])
         .join(&replay.sha256);
+    std::fs::remove_file(&blob_path).unwrap();
     std::fs::write(&blob_path, b"corrupted").unwrap();
     assert!(matches!(
         artifacts

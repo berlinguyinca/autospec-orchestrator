@@ -8,6 +8,16 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 pub trait EventLog: Send + Sync {
     async fn append(&self, event: &ExecutionEvent) -> Result<u64, StoreError>;
     async fn since(&self, id: &ExecutionId, after: u64) -> Result<Vec<ExecutionEvent>, StoreError>;
+    async fn since_batch(
+        &self,
+        id: &ExecutionId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<ExecutionEvent>, StoreError> {
+        let mut events = self.since(id, after).await?;
+        events.truncate(limit);
+        Ok(events)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,16 +97,29 @@ impl EventLog for PgEventLog {
     }
 
     async fn since(&self, id: &ExecutionId, after: u64) -> Result<Vec<ExecutionEvent>, StoreError> {
+        self.since_batch(id, after, usize::try_from(i64::MAX).unwrap_or(usize::MAX))
+            .await
+    }
+
+    async fn since_batch(
+        &self,
+        id: &ExecutionId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<ExecutionEvent>, StoreError> {
         let after = i64::try_from(after).map_err(|_| {
             StoreError::Conflict("event cursor exceeds PostgreSQL BIGINT".to_owned())
         })?;
+        let limit = i64::try_from(limit)
+            .map_err(|_| StoreError::Conflict("event batch limit exceeds BIGINT".to_owned()))?;
         let rows = sqlx::query(
             "SELECT sequence, payload FROM execution_events \
              WHERE execution_id = $1 AND sequence > $2 \
-             ORDER BY sequence ASC",
+             ORDER BY sequence ASC LIMIT $3",
         )
         .bind(id.as_str())
         .bind(after)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()

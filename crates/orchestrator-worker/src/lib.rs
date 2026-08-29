@@ -18,9 +18,10 @@ use async_trait::async_trait;
 use execution_storage::AllocationReceipt;
 use git_worktree::{DiffCapture, Worktree};
 use harness_traits::SessionRef;
-use orchestrator_core::{Execution, ExecutionEvent, ExecutionResult, TaskPacket};
+use orchestrator_core::{Execution, ExecutionEvent, ExecutionId, ExecutionResult, TaskPacket};
 use orchestrator_persistence::{
     CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore, ReservationStore,
+    StoreError,
 };
 use runtime_traits::EnvironmentHandle;
 use std::sync::{
@@ -175,13 +176,31 @@ pub struct Worker {
 }
 
 pub struct ExecutionTask {
+    execution_id: ExecutionId,
     cancelled: Arc<AtomicBool>,
     join: tokio::task::JoinHandle<Result<ExecutionResult, WorkerError>>,
 }
 
 impl ExecutionTask {
+    pub fn execution_id(&self) -> &ExecutionId {
+        &self.execution_id
+    }
+
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn observe_cancellation(
+        &self,
+        executions: &dyn ExecutionStore,
+    ) -> Result<bool, StoreError> {
+        let requested = executions
+            .cancellation_requested(&self.execution_id)
+            .await?;
+        if requested {
+            self.cancel();
+        }
+        Ok(requested)
     }
 
     pub async fn join(self) -> Result<ExecutionResult, WorkerError> {
@@ -215,21 +234,31 @@ impl Worker {
     }
 
     pub fn spawn(self: Arc<Self>, execution: Execution) -> ExecutionTask {
+        let execution_id = execution.id.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let task_cancelled = Arc::clone(&cancelled);
         let join = tokio::spawn(async move {
             run::run_with_cancel(&self, &execution, task_cancelled.as_ref()).await
         });
-        ExecutionTask { cancelled, join }
+        ExecutionTask {
+            execution_id,
+            cancelled,
+            join,
+        }
     }
 
     pub fn spawn_adopted(self: Arc<Self>, execution: Execution) -> ExecutionTask {
+        let execution_id = execution.id.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let task_cancelled = Arc::clone(&cancelled);
         let join = tokio::spawn(async move {
             run::run_adopted_with_cancel(&self, &execution, task_cancelled.as_ref()).await
         });
-        ExecutionTask { cancelled, join }
+        ExecutionTask {
+            execution_id,
+            cancelled,
+            join,
+        }
     }
 
     pub async fn recover_cleanup_authority(
@@ -298,6 +327,17 @@ impl Worker {
                 .await?;
             self.cleanup_authorities
                 .resolve(&authority.execution_id)
+                .await
+                .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        }
+        if self
+            .executions
+            .cancellation_requested(&authority.execution_id)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?
+        {
+            self.executions
+                .complete_cancellation(&authority.execution_id, &authority.attempt_id)
                 .await
                 .map_err(|error| WorkerError::Persistence(error.to_string()))?;
         }

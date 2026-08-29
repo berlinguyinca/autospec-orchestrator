@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{rejection::QueryRejection, Path, Query, State},
     http::HeaderMap,
     response::sse::{Event, KeepAlive, Sse},
     routing::get,
@@ -24,7 +24,10 @@ struct StreamState {
     pending: VecDeque<ExecutionEvent>,
     receiver: broadcast::Receiver<ExecutionEvent>,
     events: Arc<dyn orchestrator_persistence::EventLog>,
+    needs_fetch: bool,
 }
+
+const EVENT_BATCH_SIZE: usize = 128;
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/executions/{id}/events", get(events))
@@ -33,16 +36,18 @@ pub fn routes() -> Router<AppState> {
 async fn events(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<CursorQuery>,
+    query: Result<Query<CursorQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     authorize_api(&state, &headers)?;
+    let Query(query) =
+        query.map_err(|_| ApiError::validation("cursor must be an unsigned integer"))?;
     let execution_id = ExecutionId::new(id);
     state
         .executions
         .get(&execution_id)
         .await
-        .map_err(ApiError::store)?;
+        .map_err(|error| ApiError::store_for(error, execution_id.as_str()))?;
     let header_cursor = headers
         .get("last-event-id")
         .map(|value| {
@@ -54,19 +59,25 @@ async fn events(
         })
         .transpose()?;
     let cursor = header_cursor.or(query.cursor).unwrap_or(0);
+    if i64::try_from(cursor).is_err() {
+        return Err(ApiError::validation(
+            "event cursor exceeds the supported range",
+        ));
+    }
     let receiver = state.event_tx.subscribe();
     let pending = state
         .events
-        .since(&execution_id, cursor)
+        .since_batch(&execution_id, cursor, EVENT_BATCH_SIZE)
         .await
-        .map_err(ApiError::store)?
-        .into();
+        .map_err(|error| ApiError::store_for(error, execution_id.as_str()))?;
+    let needs_fetch = pending.len() == EVENT_BATCH_SIZE;
     let stream_state = StreamState {
         execution_id,
         cursor,
-        pending,
+        pending: pending.into(),
         receiver,
         events: state.events.clone(),
+        needs_fetch,
     };
     let stream = stream::unfold(stream_state, next_event);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
@@ -81,24 +92,32 @@ async fn next_event(mut state: StreamState) -> Option<(Result<Event, Infallible>
             state.cursor = event.sequence;
             return Some((Ok(to_sse(&event)), state));
         }
-        match tokio::time::timeout(Duration::from_millis(500), state.receiver.recv()).await {
-            Err(_) => {
-                if let Ok(events) = state.events.since(&state.execution_id, state.cursor).await {
-                    state.pending.extend(events);
-                }
-            }
-            Ok(Ok(event))
-                if event.execution_id == state.execution_id && event.sequence > state.cursor =>
+        if state.needs_fetch {
+            match state
+                .events
+                .since_batch(&state.execution_id, state.cursor, EVENT_BATCH_SIZE)
+                .await
             {
-                state.cursor = event.sequence;
-                return Some((Ok(to_sse(&event)), state));
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                if let Ok(events) = state.events.since(&state.execution_id, state.cursor).await {
+                Ok(events) => {
+                    state.needs_fetch = events.len() == EVENT_BATCH_SIZE;
                     state.pending.extend(events);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        execution_id = %state.execution_id,
+                        cursor = state.cursor,
+                        %error,
+                        "durable SSE replay failed; terminating stream for client reconnect"
+                    );
+                    return None;
                 }
             }
+        }
+        match tokio::time::timeout(Duration::from_millis(500), state.receiver.recv()).await {
+            Err(_) => state.needs_fetch = true,
+            Ok(Ok(_)) => state.needs_fetch = true,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => state.needs_fetch = true,
             Ok(Err(broadcast::error::RecvError::Closed)) => return None,
         }
     }
@@ -110,4 +129,62 @@ fn to_sse(event: &ExecutionEvent) -> Event {
         .event("execution")
         .json_data(event)
         .expect("ExecutionEvent serialization is infallible")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestrator_persistence::{EventLog, StoreError};
+
+    struct FailingEvents;
+
+    impl EventLog for FailingEvents {
+        fn append<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _: &'life1 ExecutionEvent,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<u64, StoreError>> + Send + 'async_trait>,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { unreachable!() })
+        }
+
+        fn since<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _: &'life1 ExecutionId,
+            _: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<ExecutionEvent>, StoreError>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Err(StoreError::SequenceConflict) })
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_store_failure_terminates_stream_for_reconnect() {
+        let (sender, receiver) = broadcast::channel(1);
+        let state = StreamState {
+            execution_id: ExecutionId::new("failed-stream"),
+            cursor: 41,
+            pending: VecDeque::new(),
+            receiver,
+            events: Arc::new(FailingEvents),
+            needs_fetch: true,
+        };
+        assert!(next_event(state).await.is_none());
+        drop(sender);
+    }
 }

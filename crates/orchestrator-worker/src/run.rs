@@ -59,8 +59,9 @@ pub(crate) async fn run_with_cancel(
         Ok(outcome) => outcome,
         Err(panic) => Err(WorkerError::Panic(panic_message(panic))),
     };
+    let cancellation = matches!(&outcome, Err(WorkerError::Cancelled));
     let mut cleanup_errors = Vec::new();
-    if outcome.is_err() && !tracked.state.is_terminal() {
+    if outcome.is_err() && !tracked.state.is_terminal() && !cancellation {
         let failure = if !guard.runtime_created {
             FailureClass::EnvironmentFailed
         } else if guard.session.is_some() {
@@ -123,6 +124,15 @@ pub(crate) async fn run_with_cancel(
             }
         }
     }
+    if cleanup_errors.is_empty() && cancellation {
+        if let Err(error) = worker
+            .executions
+            .complete_cancellation(&execution.id, attempt_id)
+            .await
+        {
+            cleanup_errors.push(error.to_string());
+        }
+    }
     if !cleanup_errors.is_empty() {
         let cleanup = cleanup_errors.join("; ");
         outcome = match outcome {
@@ -163,8 +173,9 @@ pub(crate) async fn run_adopted_with_cancel(
         Ok(outcome) => outcome,
         Err(panic) => Err(WorkerError::Panic(panic_message(panic))),
     };
+    let cancellation = matches!(&outcome, Err(WorkerError::Cancelled));
     let mut cleanup_errors = Vec::new();
-    if outcome.is_err() && !tracked.state.is_terminal() {
+    if outcome.is_err() && !tracked.state.is_terminal() && !cancellation {
         if let Err(error) = persist_failure(worker, &mut tracked, FailureClass::WorkerLost).await {
             cleanup_errors.push(error.to_string());
         }
@@ -236,6 +247,15 @@ pub(crate) async fn run_adopted_with_cancel(
                     cleanup_errors.push(error.to_string());
                 }
             }
+        }
+    }
+    if cleanup_errors.is_empty() && cancellation {
+        if let Err(error) = worker
+            .executions
+            .complete_cancellation(&execution.id, attempt_id)
+            .await
+        {
+            cleanup_errors.push(error.to_string());
         }
     }
     if !cleanup_errors.is_empty() {
@@ -387,7 +407,6 @@ async fn run_inner(
         )));
     }
     if cancelled.load(Ordering::SeqCst) {
-        persist_cancelled(worker, execution).await?;
         return Err(WorkerError::Cancelled);
     }
     let receipt = worker.lifecycle.allocate(execution).await?;
@@ -474,7 +493,6 @@ async fn drive_running(
     let mut health = HealthMonitor::default_at(Instant::now());
     'events: loop {
         if cancelled.load(Ordering::SeqCst) {
-            persist_cancelled(worker, execution).await?;
             return Err(WorkerError::Cancelled);
         }
         let cancellation = async {
@@ -488,7 +506,6 @@ async fn drive_running(
         let events = tokio::select! {
             events = worker.lifecycle.poll(execution, session) => events?,
             () = cancellation => {
-                persist_cancelled(worker, execution).await?;
                 return Err(WorkerError::Cancelled);
             }
         };
@@ -651,23 +668,6 @@ fn cleanup_handles(guard: &CleanupGuard) -> serde_json::Value {
         "runtime": runtime,
         "session": session,
     })
-}
-
-async fn persist_cancelled(worker: &Worker, execution: &mut Execution) -> Result<(), WorkerError> {
-    execution
-        .transition(ExecutionState::Cancelled)
-        .map_err(|error| WorkerError::Invalid(error.to_string()))?;
-    execution.result = Some(ExecutionResult {
-        execution_id: execution.id.clone(),
-        state: ExecutionState::Cancelled,
-        failure: Some(FailureClass::Cancelled),
-        branch: None,
-        base_sha: None,
-        diff_artifact: None,
-        artifacts: Vec::new(),
-        tests: None,
-    });
-    record(worker, execution, ExecutionEventKind::ExecutionCancelled).await
 }
 
 async fn fail(

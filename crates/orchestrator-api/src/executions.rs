@@ -47,40 +47,25 @@ async fn read(
     authorize_api(&state, &headers)?;
     state
         .executions
-        .get(&ExecutionId::new(id))
+        .get(&ExecutionId::new(&id))
         .await
         .map(Json)
-        .map_err(ApiError::store)
+        .map_err(|error| ApiError::store_for(error, &id))
 }
 
 async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<Execution>, ApiError> {
+) -> Result<(StatusCode, Json<Execution>), ApiError> {
     authorize_api(&state, &headers)?;
     let execution_id = ExecutionId::new(id);
-    let current = state
+    let execution = state
         .executions
-        .get(&execution_id)
+        .request_cancellation(&execution_id)
         .await
-        .map_err(ApiError::store)?;
-    let mut event = ExecutionEvent {
-        execution_id: execution_id.clone(),
-        attempt_id: current.attempt_id,
-        sequence: 0,
-        at: Utc::now(),
-        state: ExecutionState::Cancelled,
-        kind: ExecutionEventKind::ExecutionCancelled,
-    };
-    let (execution, sequence) = state
-        .executions
-        .transition_with_event(&execution_id, ExecutionState::Cancelled, &event)
-        .await
-        .map_err(ApiError::store)?;
-    event.sequence = sequence;
-    let _ = state.event_tx.send(event);
-    Ok(Json(execution))
+        .map_err(|error| ApiError::store_for(error, execution_id.as_str()))?;
+    Ok((StatusCode::ACCEPTED, Json(execution)))
 }
 
 async fn retry(
@@ -92,9 +77,9 @@ async fn retry(
     let key = idempotency_key(&headers)?;
     let source = state
         .executions
-        .get(&ExecutionId::new(id))
+        .get(&ExecutionId::new(&id))
         .await
-        .map_err(ApiError::store)?;
+        .map_err(|error| ApiError::store_for(error, &id))?;
     if !matches!(
         source.state,
         ExecutionState::Failed | ExecutionState::Cancelled

@@ -45,6 +45,17 @@ async fn authenticated_worker_routes_own_liveness_and_reap_after_ninety_seconds(
             .status(),
         reqwest::StatusCode::UNAUTHORIZED
     );
+    assert_eq!(
+        client
+            .post(&base)
+            .header("Authorization", "Basic worker-token")
+            .json(&advertised)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     let created = client
         .post(&base)
         .bearer_auth(&token)

@@ -4,8 +4,8 @@ use orchestrator_core::{
     event::ExecutionEventKind, ExecutionEvent, ExecutionId, ExecutionManifest, ExecutionState,
 };
 use orchestrator_persistence::{
-    ArtifactStore, EventLog, PgArtifactStore, PgEventLog, PgExecutionStore, PgReservationStore,
-    PgWorkerStore,
+    ArtifactStore, EventLog, ExecutionStore, PgArtifactStore, PgEventLog, PgExecutionStore,
+    PgReservationStore, PgWorkerStore,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -14,7 +14,9 @@ struct TestApi {
     base: String,
     token: String,
     events: Arc<PgEventLog>,
+    executions: Arc<PgExecutionStore>,
     artifacts: Arc<PgArtifactStore>,
+    event_tx: tokio::sync::broadcast::Sender<ExecutionEvent>,
     _root: tempfile::TempDir,
 }
 
@@ -35,7 +37,7 @@ async fn test_api() -> Option<TestApi> {
     );
     let token = format!("api-token-{}", uuid::Uuid::new_v4());
     let state = AppState::new(
-        executions,
+        executions.clone(),
         events.clone(),
         workers,
         reservations,
@@ -43,6 +45,7 @@ async fn test_api() -> Option<TestApi> {
         token.clone(),
         "worker-secret".into(),
     );
+    let event_tx = state.event_tx.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
@@ -50,7 +53,9 @@ async fn test_api() -> Option<TestApi> {
         base: format!("http://{address}/api/v1"),
         token,
         events,
+        executions,
         artifacts,
+        event_tx,
         _root: root,
     })
 }
@@ -62,7 +67,8 @@ fn manifest() -> ExecutionManifest {
         "task": {"project_id": "inferweave", "issue_id": "417"},
         "repository": {"repo": "InferWeave/inferweave-node", "baseRef": "main"},
         "agent": {"harness": "pi", "modelPolicy": {"provider": "inferweave"}},
-        "runtime": {"type": "docker", "cpu": 2, "memoryMib": 4096, "diskGib": 20},
+        "runtime": {"type": "docker", "cpu": 2, "memoryMib": 4096, "diskGib": 20,
+                    "capabilities": ["api-contract-only"]},
         "persistence": "resumable"
     }))
     .unwrap()
@@ -75,7 +81,7 @@ async fn cancel_execution(client: &reqwest::Client, api: &TestApi, execution_id:
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
 }
 
 #[tokio::test]
@@ -93,6 +99,17 @@ async fn create_read_auth_idempotency_validation_and_body_limit_contract() {
                 "message": "missing or invalid API bearer token"
             }
         })
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .header("Authorization", "Basic api-token")
+            .json(&manifest())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
     );
     let key = format!("create-{}", uuid::Uuid::new_v4());
     let created = client
@@ -183,6 +200,84 @@ async fn create_read_auth_idempotency_validation_and_body_limit_contract() {
 }
 
 #[tokio::test]
+async fn concurrent_create_and_retry_requests_preserve_idempotency_and_id_allocation() {
+    let Some(api) = test_api().await else { return };
+    let client = reqwest::Client::new();
+    let url = format!("{}/executions", api.base);
+    let shared_key = format!("concurrent-create-{}", uuid::Uuid::new_v4());
+    let create = |key: String| {
+        let client = client.clone();
+        let url = url.clone();
+        let token = api.token.clone();
+        async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .header("Idempotency-Key", key)
+                .json(&manifest())
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let (left, right) = tokio::join!(create(shared_key.clone()), create(shared_key));
+    assert_eq!(
+        [left.status(), right.status()]
+            .into_iter()
+            .filter(|status| *status == reqwest::StatusCode::CREATED)
+            .count(),
+        1
+    );
+    let left: orchestrator_core::Execution = left.json().await.unwrap();
+    let right: orchestrator_core::Execution = right.json().await.unwrap();
+    assert_eq!(left.id, right.id);
+
+    let (first_collision, second_collision) = tokio::join!(
+        create(format!("collision-a-{}", uuid::Uuid::new_v4())),
+        create(format!("collision-b-{}", uuid::Uuid::new_v4()))
+    );
+    assert_eq!(first_collision.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(second_collision.status(), reqwest::StatusCode::CREATED);
+    let first_collision: orchestrator_core::Execution = first_collision.json().await.unwrap();
+    let second_collision: orchestrator_core::Execution = second_collision.json().await.unwrap();
+    assert_ne!(first_collision.id, second_collision.id);
+
+    let mut source = left.clone();
+    source.id = ExecutionId::new(format!("retry-source-{}", uuid::Uuid::new_v4().simple()));
+    source.labels.execution_id = source.id.clone();
+    source.state = ExecutionState::Cancelled;
+    api.executions.insert(&source).await.unwrap();
+    let retry_url = format!("{}/executions/{}/retry", api.base, source.id);
+    let retry_key = format!("concurrent-retry-{}", uuid::Uuid::new_v4());
+    let retry = || {
+        let client = client.clone();
+        let retry_url = retry_url.clone();
+        let token = api.token.clone();
+        let retry_key = retry_key.clone();
+        async move {
+            client
+                .post(retry_url)
+                .bearer_auth(token)
+                .header("Idempotency-Key", retry_key)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let (left_retry, right_retry) = tokio::join!(retry(), retry());
+    assert_eq!(
+        [left_retry.status(), right_retry.status()]
+            .into_iter()
+            .filter(|status| *status == reqwest::StatusCode::CREATED)
+            .count(),
+        1
+    );
+    let left_retry: orchestrator_core::Execution = left_retry.json().await.unwrap();
+    let right_retry: orchestrator_core::Execution = right_retry.json().await.unwrap();
+    assert_eq!(left_retry.id, right_retry.id);
+}
+
+#[tokio::test]
 async fn cancel_and_retry_enforce_lifecycle_without_choosing_retry_policy() {
     let Some(api) = test_api().await else { return };
     let client = reqwest::Client::new();
@@ -207,14 +302,14 @@ async fn cancel_and_retry_enforce_lifecycle_without_choosing_retry_policy() {
         .send()
         .await
         .unwrap();
-    assert_eq!(cancelled.status(), reqwest::StatusCode::OK);
+    assert_eq!(cancelled.status(), reqwest::StatusCode::ACCEPTED);
     assert_eq!(
         cancelled
             .json::<orchestrator_core::Execution>()
             .await
             .unwrap()
             .state,
-        ExecutionState::Cancelled
+        ExecutionState::Queued
     );
     let events = api.events.since(&create.id, 0).await.unwrap();
     assert_eq!(
@@ -222,9 +317,13 @@ async fn cancel_and_retry_enforce_lifecycle_without_choosing_retry_policy() {
             .iter()
             .map(|event| event.sequence)
             .collect::<Vec<_>>(),
-        vec![1, 2]
+        vec![1]
     );
-    assert_eq!(events[1].state, ExecutionState::Cancelled);
+    assert!(api
+        .executions
+        .cancellation_requested(&create.id)
+        .await
+        .unwrap());
     assert_eq!(
         client
             .post(&cancel_url)
@@ -233,10 +332,32 @@ async fn cancel_and_retry_enforce_lifecycle_without_choosing_retry_policy() {
             .await
             .unwrap()
             .status(),
+        reqwest::StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        client
+            .post(format!("{}/executions/{}/retry", api.base, create.id))
+            .bearer_auth(&api.token)
+            .header("Idempotency-Key", format!("early-{}", uuid::Uuid::new_v4()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         reqwest::StatusCode::CONFLICT
     );
+    let mut cancelled_source = create.clone();
+    cancelled_source.id = ExecutionId::new(format!(
+        "cancelled-source-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    cancelled_source.labels.execution_id = cancelled_source.id.clone();
+    cancelled_source.state = ExecutionState::Cancelled;
+    api.executions.insert(&cancelled_source).await.unwrap();
     let retry = client
-        .post(format!("{}/executions/{}/retry", api.base, create.id))
+        .post(format!(
+            "{}/executions/{}/retry",
+            api.base, cancelled_source.id
+        ))
         .bearer_auth(&api.token)
         .header("Idempotency-Key", format!("retry-{}", uuid::Uuid::new_v4()))
         .send()
@@ -324,6 +445,26 @@ async fn sse_resumes_after_cursor_and_artifact_listing_never_returns_blob_conten
     assert!(query_text.contains("id: 2"));
     assert!(!query_text.contains("id: 1"));
 
+    let malformed = client
+        .get(format!(
+            "{}/executions/{}/events?cursor=not-a-number",
+            api.base, created.id
+        ))
+        .bearer_auth(&api.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        malformed.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "error": {
+                "code": "VALIDATION",
+                "message": "cursor must be an unsigned integer"
+            }
+        })
+    );
+
     let mut live_response = client
         .get(format!("{}/executions/{}/events", api.base, created.id))
         .bearer_auth(&api.token)
@@ -331,7 +472,7 @@ async fn sse_resumes_after_cursor_and_artifact_listing_never_returns_blob_conten
         .send()
         .await
         .unwrap();
-    let live_sequence = api
+    let second_sequence = api
         .events
         .append(&ExecutionEvent {
             execution_id: created.id.clone(),
@@ -343,13 +484,47 @@ async fn sse_resumes_after_cursor_and_artifact_listing_never_returns_blob_conten
         })
         .await
         .unwrap();
-    assert_eq!(live_sequence, 3);
+    assert_eq!(second_sequence, 3);
+    let third_sequence = api
+        .events
+        .append(&ExecutionEvent {
+            execution_id: created.id.clone(),
+            attempt_id: None,
+            sequence: 0,
+            at: Utc::now(),
+            state: ExecutionState::Cancelled,
+            kind: ExecutionEventKind::ExecutionCancelled,
+        })
+        .await
+        .unwrap();
+    assert_eq!(third_sequence, 4);
+    let wake_sender = api.event_tx.clone();
+    let wake_flood = tokio::spawn(async move {
+        for sequence in 1..=200 {
+            let _ = wake_sender.send(ExecutionEvent {
+                execution_id: ExecutionId::new("shared-wake-from-another-execution"),
+                attempt_id: None,
+                sequence,
+                at: Utc::now(),
+                state: ExecutionState::Cancelled,
+                kind: ExecutionEventKind::ExecutionCancelled,
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    });
     let live_chunk = tokio::time::timeout(std::time::Duration::from_secs(3), live_response.chunk())
         .await
         .expect("durably appended worker events must reach an existing SSE stream")
         .unwrap()
         .unwrap();
     assert!(String::from_utf8_lossy(&live_chunk).contains("id: 3"));
+    let next_chunk = tokio::time::timeout(std::time::Duration::from_secs(3), live_response.chunk())
+        .await
+        .expect("durable sequence four must follow sequence three")
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&next_chunk).contains("id: 4"));
+    wake_flood.abort();
 
     let secret = b"large binary artifact that must never enter a Pi task packet";
     api.artifacts

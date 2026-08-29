@@ -36,6 +36,18 @@ pub struct ServerConfig {
     pub worker_token: String,
 }
 
+impl ServerConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.api_token.is_empty() {
+            anyhow::bail!("API bearer token must not be empty");
+        }
+        if self.worker_token.is_empty() {
+            anyhow::bail!("worker bearer token must not be empty");
+        }
+        Ok(())
+    }
+}
+
 /// Router for the orchestrator controller.
 ///
 /// Planned routes under `/api/v1`:
@@ -63,6 +75,7 @@ pub fn router(state: AppState) -> Router {
 
 /// Bind and serve the controller API.
 pub async fn serve(config: ServerConfig) -> Result<()> {
+    config.validate()?;
     let state = AppState::new(
         Arc::new(PgExecutionStore::connect(&config.database_url).await?),
         Arc::new(PgEventLog::connect(&config.database_url).await?),
@@ -101,5 +114,19 @@ mod tests {
     #[test]
     fn api_is_versioned_from_the_start() {
         assert_eq!(api_root(), "/api/v1");
+    }
+
+    #[test]
+    fn server_config_rejects_empty_api_and_worker_tokens() {
+        let config = |api_token: &str, worker_token: &str| ServerConfig {
+            addr: "127.0.0.1:0".into(),
+            database_url: "postgres://unused".into(),
+            state_root: "/tmp/unused".into(),
+            api_token: api_token.into(),
+            worker_token: worker_token.into(),
+        };
+        assert!(config("", "worker").validate().is_err());
+        assert!(config("api", "").validate().is_err());
+        assert!(config("api", "worker").validate().is_ok());
     }
 }

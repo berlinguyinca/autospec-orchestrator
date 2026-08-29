@@ -541,6 +541,189 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
     fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_cancellation_stops_hung_pi_before_one_terminal_event_and_releases_everything() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("skipping real Task6 cancellation E2E: AUTOSPEC_DATABASE_URL is unset");
+        return;
+    };
+    let _serial = acquire_real_test_lock(&database_url).await;
+    let Some((daemon_id, image_id)) = docker_capability() else {
+        eprintln!("skipping real Task6 cancellation E2E: Docker or alpine:3.20 is unavailable");
+        return;
+    };
+    let suffix = format!(
+        "cancel-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    let root = std::env::temp_dir().join(format!("autospec-task6-{suffix}"));
+    initialize_state_root(&root);
+    let root = root.canonicalize().unwrap();
+    let remote_root = root.join("remotes");
+    create_stub_repository(&remote_root);
+    let worker_id = WorkerId::new(format!("worker-{suffix}"));
+    let execution_id = ExecutionId::new(format!("execution-{suffix}"));
+    let capability = format!("capability-{suffix}");
+    let workers = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
+    workers
+        .register(&matrix_worker_registration(
+            worker_id.clone(),
+            capability.clone(),
+            &daemon_id,
+            &image_id,
+        ))
+        .await
+        .unwrap();
+    let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
+    let events = Arc::new(PgEventLog::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+    let labels = OwnershipLabels {
+        execution_id: execution_id.clone(),
+        worker_id: worker_id.clone(),
+        repository: "owner/repo".into(),
+        issue: Some("task6-cancel".into()),
+    };
+    let mut queued = queued_execution(execution_id.clone(), labels, image_id.clone(), capability);
+    queued.manifest.persistence = PersistenceMode::Ephemeral;
+    queued.manifest.repository.branch = Some(format!("cancel-{suffix}"));
+    executions.insert(&queued).await.unwrap();
+    let assigned = reservations
+        .reserve_next(&worker_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .execution;
+    let worker = Arc::new(Worker::new(
+        build_system_lifecycle(&root, &remote_root, &daemon_id, &image_id),
+        executions.clone(),
+        reservations.clone(),
+        cleanup.clone(),
+    ));
+    let task = worker.spawn(assigned);
+    for _ in 0..300 {
+        if cleanup.get(&execution_id).await.is_ok_and(|authority| {
+            authority.disposition().ok() == Some(CleanupDisposition::Active(CleanupStage::Running))
+        }) {
+            break;
+        }
+        assert!(
+            !task.is_finished(),
+            "worker ended before hung Pi was running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        cleanup
+            .get(&execution_id)
+            .await
+            .unwrap()
+            .disposition()
+            .unwrap(),
+        CleanupDisposition::Active(CleanupStage::Running)
+    );
+
+    let api_token = format!("api-{suffix}");
+    let state = AppState::new(
+        executions.clone(),
+        events.clone(),
+        workers,
+        reservations.clone(),
+        Arc::new(
+            PgArtifactStore::connect(&database_url, &root)
+                .await
+                .unwrap(),
+        ),
+        api_token.clone(),
+        "worker-secret".into(),
+    )
+    .with_cleanup_authorities(cleanup.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{address}/api/v1/executions/{execution_id}/cancel"
+        ))
+        .bearer_auth(&api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(!executions
+        .get(&execution_id)
+        .await
+        .unwrap()
+        .state
+        .is_terminal());
+    assert_eq!(
+        events
+            .since(&execution_id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionCancelled))
+            .count(),
+        0
+    );
+    assert!(task
+        .observe_cancellation(executions.as_ref())
+        .await
+        .unwrap());
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), task.join())
+        .await
+        .expect("controller cancellation must bound hung Pi termination");
+    assert!(outcome.is_err());
+    assert_eq!(
+        executions.get(&execution_id).await.unwrap().state,
+        ExecutionState::Cancelled
+    );
+    assert!(reservations
+        .list_for_worker(&worker_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(cleanup
+        .list_for_worker(&worker_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!ExecutionLayout::new(&root, &execution_id)
+        .unwrap()
+        .root
+        .exists());
+    let remaining = Command::new("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=autospec.execution_id={execution_id}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&remaining.stdout).trim().is_empty());
+    assert_eq!(
+        events
+            .since(&execution_id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionCancelled))
+            .count(),
+        1
+    );
+    server.abort();
+    delete_matrix_records(&database_url, &execution_id, &worker_id).await;
+    if root.exists() {
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
     let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {

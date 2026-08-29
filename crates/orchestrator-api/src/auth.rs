@@ -30,12 +30,15 @@ impl ApiTokenValidator for StaticApiTokenValidator {
 }
 
 pub(crate) fn authorize_bearer(headers: &HeaderMap, validator: &dyn ApiTokenValidator) -> bool {
-    let supplied = headers
+    let Some(supplied) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
         .map(str::as_bytes)
-        .unwrap_or_default();
+    else {
+        return false;
+    };
     validator.validate(supplied)
 }
 
@@ -81,6 +84,16 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingValidator(AtomicUsize);
+
+    impl ApiTokenValidator for CountingValidator {
+        fn validate(&self, _: &[u8]) -> bool {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
 
     #[test]
     fn static_token_validator_rejects_prefix_suffix_and_length_mismatch() {
@@ -89,5 +102,17 @@ mod tests {
         assert!(!validator.validate(b"secret"));
         assert!(!validator.validate(b"secret-token-extra"));
         assert!(!validator.validate(b"xsecret-token"));
+    }
+
+    #[test]
+    fn missing_and_malformed_bearer_headers_fail_before_secret_validation() {
+        let validator = CountingValidator(AtomicUsize::new(0));
+        assert!(!authorize_bearer(&HeaderMap::new(), &validator));
+        for value in ["", "secret", "Basic secret", "Bearer ", "bearer secret"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(axum::http::header::AUTHORIZATION, value.parse().unwrap());
+            assert!(!authorize_bearer(&headers, &validator), "{value:?}");
+        }
+        assert_eq!(validator.0.load(Ordering::SeqCst), 0);
     }
 }

@@ -6,9 +6,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 /// Durable artifact metadata. Payload bytes stay in content-addressed storage
 /// and are never serialized into execution manifests or Pi task packets
@@ -199,58 +202,87 @@ fn validate_name(name: &str) -> Result<(), StoreError> {
 }
 
 fn persist_blob(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    persist_blob_with_hook(path, bytes, || {})
+}
+
+fn persist_blob_with_hook(
+    path: &Path,
+    bytes: &[u8],
+    before_install: impl FnOnce(),
+) -> Result<(), StoreError> {
     let parent = path
         .parent()
         .ok_or_else(|| StoreError::Conflict("artifact path lacks parent".to_owned()))?;
     std::fs::create_dir_all(parent).map_err(io_error)?;
     reject_symlink_directory(parent)?;
-    if let Ok(metadata) = std::fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(StoreError::Conflict(
-                "artifact blob path is not a regular file".to_owned(),
-            ));
-        }
-        let existing = std::fs::read(path).map_err(io_error)?;
-        if existing == bytes {
-            return Ok(());
-        }
-        return Err(StoreError::Conflict(
-            "artifact blob content does not match its SHA-256 path".to_owned(),
-        ));
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return verify_blob(path, bytes),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(error)),
     }
-    let temporary = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+    let temporary = parent.join(format!(".pending-{}", uuid::Uuid::new_v4().simple()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
         .map_err(io_error)?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        let _ = std::fs::remove_file(&temporary);
         return Err(io_error(error));
     }
-    if path.exists() {
-        std::fs::remove_file(&temporary).map_err(io_error)?;
-    } else {
-        std::fs::rename(&temporary, path).map_err(io_error)?;
-        File::open(parent)
+    let mut permissions = file.metadata().map_err(io_error)?.permissions();
+    permissions.set_readonly(true);
+    file.set_permissions(permissions).map_err(io_error)?;
+    file.sync_all().map_err(io_error)?;
+    drop(file);
+    before_install();
+    match std::fs::hard_link(&temporary, path) {
+        Ok(()) => File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(io_error)?;
+            .map_err(io_error)?,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io_error(error)),
+    }
+    verify_blob(path, bytes)
+}
+
+fn verify_blob(path: &Path, expected: &[u8]) -> Result<(), StoreError> {
+    let mut file = OpenOptions::new().read(true).open(path).map_err(io_error)?;
+    let opened = file.metadata().map_err(io_error)?;
+    let linked = std::fs::symlink_metadata(path).map_err(io_error)?;
+    if linked.file_type().is_symlink() || !linked.is_file() || !opened.is_file() {
+        return Err(StoreError::Conflict(
+            "artifact blob path is not a regular file".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    if opened.dev() != linked.dev() || opened.ino() != linked.ino() {
+        return Err(StoreError::Conflict(
+            "artifact blob identity changed during verification".to_owned(),
+        ));
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).map_err(io_error)?;
+    if contents.len() != expected.len() || sha256_hex(&contents) != sha256_hex(expected) {
+        return Err(StoreError::Conflict(
+            "artifact blob content does not match its SHA-256 path".to_owned(),
+        ));
     }
     Ok(())
 }
 
 fn reject_symlink_directory(path: &Path) -> Result<(), StoreError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(StoreError::Conflict(
-            "artifact directory is not a regular directory".to_owned(),
-        ));
-    }
-    if let Some(artifacts_root) = path.parent() {
-        let metadata = std::fs::symlink_metadata(artifacts_root).map_err(io_error)?;
+    for directory in [
+        Some(path),
+        path.parent(),
+        path.parent().and_then(Path::parent),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let metadata = std::fs::symlink_metadata(directory).map_err(io_error)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(StoreError::Conflict(
-                "artifact root is not a regular directory".to_owned(),
+                "artifact directory ancestry is not a regular directory".to_owned(),
             ));
         }
     }
@@ -339,6 +371,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn sha256_matches_standard_vector() {
@@ -346,5 +379,53 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn corrupt_race_winner_is_never_overwritten_or_trusted() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("blob");
+        let result = persist_blob_with_hook(&destination, b"expected", || {
+            std::fs::write(&destination, b"corrupt winner").unwrap();
+        });
+        assert!(matches!(result, Err(StoreError::Conflict(_))));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"corrupt winner");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_swap_winner_is_rejected_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("blob");
+        let target = root.path().join("outside");
+        std::fs::write(&target, b"outside").unwrap();
+        let result = persist_blob_with_hook(&destination, b"expected", || {
+            symlink(&target, &destination).unwrap();
+        });
+        assert!(matches!(result, Err(StoreError::Conflict(_))));
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn concurrent_writers_share_one_verified_no_clobber_winner() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = Arc::new(root.path().join("blob"));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut writers = Vec::new();
+        for _ in 0..2 {
+            let destination = destination.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                persist_blob_with_hook(&destination, b"shared", || {
+                    barrier.wait();
+                })
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        assert_eq!(std::fs::read(destination.as_ref()).unwrap(), b"shared");
     }
 }

@@ -300,7 +300,9 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
              FROM executions e, execution_attempts a \
              WHERE c.execution_id = $1 AND e.id = c.execution_id \
              AND a.attempt_id = c.attempt_id AND a.execution_id = c.execution_id \
-             AND (a.finished_at IS NOT NULL OR e.state IN ('REVIEW_READY', 'COMPLETED', 'FAILED', 'CANCELLED')) \
+             AND (a.finished_at IS NOT NULL OR e.state IN ('REVIEW_READY', 'COMPLETED', 'FAILED', 'CANCELLED') \
+                 OR EXISTS (SELECT 1 FROM execution_cancellation_requests r \
+                     WHERE r.execution_id = c.execution_id AND r.completed_at IS NULL)) \
              AND c.phase NOT IN ('RETAINED', 'RUNTIME_STOPPED', 'RUNTIME_DESTROYED', \
                  'GIT_RECOVERED_CLEANED', 'STORAGE_RELEASED', 'RESERVATION_RELEASED', 'RESOLVED')",
         )

@@ -317,6 +317,16 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        for task in &tasks {
+            if let Err(error) = task.observe_cancellation(executions.as_ref()).await {
+                tracing::warn!(
+                    worker_id = %worker.id,
+                    execution_id = %task.execution_id(),
+                    %error,
+                    "cancellation request poll failed; execution remains supervised"
+                );
+            }
+        }
         for authority in cleanup
             .list_for_worker(&worker.id)
             .await
@@ -399,6 +409,9 @@ async fn main() -> Result<()> {
             signal = tokio::signal::ctrl_c() => {
                 signal.context("failed to listen for shutdown")?;
                 for task in &tasks {
+                    if let Err(error) = executions.request_cancellation(task.execution_id()).await {
+                        tracing::error!(execution_id = %task.execution_id(), %error, "failed to persist shutdown cancellation request");
+                    }
                     task.cancel();
                 }
                 for task in tasks {
