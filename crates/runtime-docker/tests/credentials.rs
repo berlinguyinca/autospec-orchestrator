@@ -43,6 +43,26 @@ fn execution_root(root: &TempDir, id: &str) -> std::path::PathBuf {
     execution_root.canonicalize().unwrap()
 }
 
+fn assert_complete_credential(path: &std::path::Path) {
+    let body = fs::read_to_string(path).unwrap();
+    let mut lines = body.lines();
+    let token = lines.next().expect("credential token is present");
+    let expires_at = lines
+        .next()
+        .expect("credential expiry is present")
+        .parse::<chrono::DateTime<Utc>>()
+        .expect("credential expiry is valid");
+    assert!(lines.next().is_none(), "credential has exactly two lines");
+    assert_eq!(token.len(), 64);
+    assert!(
+        token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "credential token is lowercase hexadecimal"
+    );
+    assert!(expires_at > Utc::now(), "credential authority is live");
+}
+
 #[tokio::test]
 async fn credentials_are_execution_scoped_short_lived_private_and_unpredictable() {
     let root = TempDir::new().unwrap();
@@ -168,7 +188,8 @@ fn concurrent_mint_reuses_one_atomic_winner() {
 fn concurrent_mint_and_revoke_are_linearized_per_execution() {
     let root = TempDir::new().unwrap();
     let execution = execution("repo-7-mint-revoke-race-01");
-    execution_root(&root, execution.id.as_str());
+    let execution_root = execution_root(&root, execution.id.as_str());
+    let credential_directory = execution_root.join("credentials");
     let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -201,9 +222,27 @@ fn concurrent_mint_and_revoke_are_linearized_per_execution() {
         revoke.join().unwrap().unwrap();
     });
 
+    let mut post_join_names = fs::read_dir(&credential_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    post_join_names.sort();
+    assert!(
+        post_join_names
+            .iter()
+            .all(|name| !name.starts_with(".inferweave.credential.")),
+        "mint/revoke join left a validated crash candidate: {post_join_names:?}"
+    );
+    assert!(
+        post_join_names.is_empty() || post_join_names.as_slice() == ["inferweave.credential"],
+        "post-race authority is absent or one exact final credential: {post_join_names:?}"
+    );
+    if !post_join_names.is_empty() {
+        assert_complete_credential(&credential_directory.join("inferweave.credential"));
+    }
+
     let reminted = runtime.block_on(broker.mint(&execution)).unwrap();
-    let body = fs::read_to_string(&reminted.path).unwrap();
-    assert_eq!(body.lines().count(), 2);
+    assert_complete_credential(&reminted.path);
     let names = fs::read_dir(reminted.path.parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())

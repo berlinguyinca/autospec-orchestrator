@@ -8,16 +8,16 @@ use git_worktree::{GitWorktreeManager, Worktree};
 use harness_traits::SessionRef;
 use orchestrator_api::{router, AppState};
 use orchestrator_core::{
-    event::ExecutionEventKind, AgentAssignment, Execution, ExecutionControlAction, ExecutionEvent,
-    ExecutionId, ExecutionManifest, ExecutionResult, ExecutionState, HarnessKind, ModelPolicy,
-    OwnershipLabels, PersistenceMode, RepositoryReference, Role, RuntimeKind, RuntimeRequirement,
-    ServiceRequirement, TaskPacket, WorkerAdvertisement, WorkerCapabilities, WorkerCapabilityProof,
-    WorkerId, WorkerRegistration, WorkerState,
+    event::ExecutionEventKind, AgentAssignment, AttemptId, Execution, ExecutionControlAction,
+    ExecutionEvent, ExecutionId, ExecutionManifest, ExecutionResult, ExecutionState, HarnessKind,
+    ModelPolicy, OwnershipLabels, PersistenceMode, RepositoryReference, Role, RuntimeKind,
+    RuntimeRequirement, ServiceRequirement, TaskPacket, WorkerAdvertisement, WorkerCapabilities,
+    WorkerCapabilityProof, WorkerId, WorkerRegistration, WorkerState,
 };
 use orchestrator_persistence::{
-    CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog, ExecutionStore,
-    PgArtifactStore, PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore,
-    PgWorkerStore, ReservationStore, WorkerStore,
+    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog,
+    ExecutionStore, PgArtifactStore, PgCleanupAuthorityStore, PgEventLog, PgExecutionStore,
+    PgReservationStore, PgWorkerStore, ReservationStore, WorkerStore,
 };
 use orchestrator_worker::{
     ControlCheckpoint, ControlCheckpointObserver, ExecutionLifecycle, FilesystemEvidenceStore,
@@ -907,6 +907,103 @@ async fn control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_onc
             fs::remove_dir_all(&root).unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn expired_bound_credential_does_not_block_exact_runtime_cleanup() {
+    let Some((daemon_id, image_id)) = docker_capability() else {
+        eprintln!("skipping expired credential cleanup: Docker is unavailable");
+        return;
+    };
+    let suffix = format!(
+        "expired-cleanup-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    let root = std::env::temp_dir().join(format!("autospec-task7-{suffix}"));
+    initialize_state_root(&root);
+    let root = root.canonicalize().unwrap();
+    let remote = root.join("remotes");
+    create_stub_repository(&remote);
+    let execution_id = ExecutionId::new(format!("execution-{suffix}"));
+    let worker_id = WorkerId::new(format!("worker-{suffix}"));
+    let labels = OwnershipLabels {
+        execution_id: execution_id.clone(),
+        worker_id: worker_id.clone(),
+        repository: "owner/repo".into(),
+        issue: Some("expired-cleanup".into()),
+    };
+    let execution = queued_execution(
+        execution_id.clone(),
+        labels.clone(),
+        image_id.clone(),
+        format!("capability-{suffix}"),
+    );
+    let lifecycle = build_system_lifecycle(&root, &remote, &daemon_id, &image_id);
+    let receipt = lifecycle.allocate(&execution).await.unwrap();
+    let credential = receipt.mount_path.join("credentials/inferweave.credential");
+    fs::write(&credential, "expired\n2020-01-01T00:00:00Z\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+    let network = DockerRuntime::network_name(&execution_id);
+    let network_status = Command::new("docker")
+        .args([
+            "network",
+            "create",
+            "--label",
+            "autospec.managed=true",
+            "--label",
+            &format!("autospec.execution_id={execution_id}"),
+            "--label",
+            &format!("autospec.worker_id={worker_id}"),
+            "--label",
+            "autospec.repository=owner/repo",
+            "--label",
+            "autospec.issue=expired-cleanup",
+            &network,
+        ])
+        .status()
+        .unwrap();
+    assert!(network_status.success());
+    let authority = CleanupAuthority {
+        execution_id: execution_id.clone(),
+        attempt_id: AttemptId::new(format!("attempt-{suffix}")),
+        worker_id,
+        phase: CleanupDisposition::RuntimeStopped.to_string(),
+        handles: matrix_handles(Some(&receipt), None, None, None),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let result = lifecycle
+        .cleanup_authority_step(&authority, &execution, CleanupDisposition::RuntimeStopped)
+        .await;
+    if result.is_err() {
+        let runtime = DockerRuntime::connect_with_state_root(None, &root).unwrap();
+        let _ = runtime.destroy(&labels).await;
+        let broker = LocalCredentialBroker::new(&root, chrono::Duration::minutes(15)).unwrap();
+        let _ = broker.revoke(&execution_id).await;
+    }
+    assert!(!credential.exists());
+    assert!(!docker_resource_exists("network", &network));
+
+    let storage_released = lifecycle
+        .cleanup_authority_step(
+            &authority,
+            &execution,
+            CleanupDisposition::GitRecoveredCleaned,
+        )
+        .await
+        .unwrap();
+    assert_eq!(storage_released, CleanupDisposition::StorageReleased);
+    lifecycle
+        .ack_cleanup_authority_step(&authority, storage_released)
+        .await
+        .unwrap();
+    if root.exists() {
+        fs::remove_dir_all(root).unwrap();
+    }
+    assert_eq!(result.unwrap(), CleanupDisposition::RuntimeDestroyed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

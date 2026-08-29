@@ -41,6 +41,16 @@ pub trait RuntimeFactory: Send + Sync {
         let _ = environment;
         self.build(execution, receipt).await
     }
+    /// Constructs exact runtime cleanup authority without minting workload
+    /// credentials, which may be expired when durable cleanup resumes (spec
+    /// sections 36 and 48).
+    async fn build_for_cleanup(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        self.build(execution, receipt).await
+    }
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError>;
     async fn revoke_credentials(&self, execution_id: &ExecutionId) -> Result<(), LifecycleError>;
 }
@@ -157,6 +167,21 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
             ));
         }
         Ok(runtime)
+    }
+
+    async fn build_for_cleanup(
+        &self,
+        _: &Execution,
+        receipt: &AllocationReceipt,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        DockerRuntime::connect_with_verified_execution_storage(
+            self.socket.as_deref(),
+            Arc::clone(&self.verifier),
+            receipt.clone(),
+            self.trusted_verifier.clone(),
+        )
+        .map(|runtime| Arc::new(runtime) as Arc<dyn Runtime>)
+        .map_err(|error| LifecycleError::Step(error.to_string()))
     }
 
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError> {
@@ -1441,7 +1466,7 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
                 LifecycleError::Step("runtime cleanup lacks storage receipt".into())
             })?;
             self.runtimes
-                .build(execution, receipt)
+                .build_for_cleanup(execution, receipt)
                 .await?
                 .destroy(&receipt.labels)
                 .await
@@ -1536,7 +1561,7 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
                         .is_empty();
                     if runtime_present {
                         self.runtimes
-                            .build(execution, &receipt)
+                            .build_for_cleanup(execution, &receipt)
                             .await?
                             .destroy(&receipt.labels)
                             .await

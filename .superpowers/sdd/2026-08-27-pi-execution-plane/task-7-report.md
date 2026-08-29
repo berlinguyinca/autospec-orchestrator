@@ -185,7 +185,8 @@ Task 7 was implemented RED to GREEN:
     cancellation, terminal-progress, and cleanup transition now acquires the
     execution row first and then its exact control/cleanup row. Barriers at
     `APPLYING`, `SIDE_EFFECT_APPLIED`, and completion prove cancellation wins
-    without a stranded row or native side effect.
+    without a stranded control row or durable action event. These persistence
+    barriers do not claim that an already-started native side effect is absent.
 20. An attachment race initially returned metadata while retained cleanup had
     already locked its authority row for transition. Attachment now locks the
     execution and matching cleanup authority, in that order, before reading
@@ -240,17 +241,58 @@ Task 7 was implemented RED to GREEN:
     through recovery. The regression injects failure for the first record and
     proves only the later record resolves.
 28. Credential race tests now cross actual operating-system threads. Barriers
-    release simultaneous mint/mint and mint/revoke calls, and deterministic
-    post-race assertions prove one complete authority with no temporary secret
-    residue.
+    release simultaneous mint/mint and mint/revoke calls. Immediately after
+    both threads join, before any remint or scavenging, the mint/revoke test
+    requires zero exact candidates and permits only an absent final credential
+    or one complete exact final credential. A subsequent remint separately
+    proves live authority. Injecting an exact validated candidate made this
+    pre-remint assertion fail before the injection was removed for GREEN.
+29. The live `resume_side_effect` resource identified after round four was the
+    residue of the expected RED recovery run at 05:14. Its complete labels
+    resolved container
+    `b2ec22de91030d4a00a9124dbfb8fae98c437e66df0838ec1db489c7a91880d8`
+    and network
+    `2d4959b051d0d6e27e8672e6837ac3a4e1811ade382b6c41b44d68526af8dc03`
+    to execution `execution-cc-rse-93541-1788005657794257000`, attempt
+    `attempt-b5d4ac775e0b44539b6b87809dc3e434`, and its exact verified storage
+    receipt, Git owner, Pi session, and private credential. The original
+    `autospec_red` PostgreSQL database belonged to the temporary
+    `autospec-task7-round3-pg` gate and had been explicitly removed after the
+    run, so no current PostgreSQL row falsely claimed authority. The archived
+    command result proves the replacement child had restored the exact session
+    but failed the newly added observer assertion; the parent therefore exited
+    before its cleanup block. The same scenario passed after the observer fix.
+30. Exact production reconciliation of that old authority exposed a separate
+    recovery defect: runtime cleanup used the provisioning constructor, so the
+    now-expired bound credential blocked Docker destruction. A RED real-Docker
+    regression reproduced the failure. `RuntimeFactory::build_for_cleanup`
+    now constructs only receipt- and label-scoped teardown authority and never
+    mints workload credentials. The GREEN path destroyed the exact runtime,
+    revoked the expired credential, destroyed and acknowledged the exact Git
+    worktree, released and acknowledged storage, and removed the test root.
+    The four-cut control recovery scenario then passed on a fresh PostgreSQL
+    database, with no matching container, network, volume, execution, control,
+    cleanup authority, credential, storage root, or current temporary root in
+    the post-run audit.
 
 ## Verification
 
-- `AUTOSPEC_DATABASE_URL=.../autospec_task7_r4_current_final_20260829 cargo test --workspace -- --test-threads=1`
+- The strengthened OS-thread credential test was run RED with an injected exact
+  validated candidate immediately after the joins; it failed at the new
+  pre-remint assertion. With the injection removed, the complete 9-test
+  credential suite passed.
+- `expired_bound_credential_does_not_block_exact_runtime_cleanup` was run RED
+  against real Docker and failed because the provisioning constructor rejected
+  the expired bound credential. It passed after cleanup gained its credential-
+  independent constructor.
+- The exact four-cut `control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_once`
+  scenario passed to completion on the fresh
+  `autospec_task7_fix5_focus_20260829` database.
+- `AUTOSPEC_DATABASE_URL=.../autospec_task7_fix5_current_final_20260829 cargo test --workspace -- --test-threads=1`
   — passed on its own empty database, including 35 PostgreSQL tests, 5 execution
-  API tests, 40 Pi harness tests, all 12 real worker E2Es, 17 Docker runtime
+  API tests, 40 Pi harness tests, all 13 real worker E2Es, 17 Docker runtime
   unit tests, 9 credential tests, and 18 real Docker runtime tests.
-- `AUTOSPEC_DATABASE_URL=.../autospec_task7_r4_msrv_final_20260829 rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
+- `AUTOSPEC_DATABASE_URL=.../autospec_task7_fix5_msrv_final_20260829 rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
   — passed on a separate empty database with the same full serialized workspace
   coverage.
 - `cargo build --workspace` — passed.
@@ -259,11 +301,16 @@ Task 7 was implemented RED to GREEN:
 - `rustup run 1.85.0 cargo clippy --workspace --all-targets -- -D warnings` — passed.
 - `cargo fmt --all -- --check` — passed.
 - `git diff --check` — passed.
-- Post-gate Docker audit found and removed one empty round-four `peer-task7`
-  network whose owning process had exited. Reinspection found no container,
-  network, or volume for that peer or any round-four partial-provision
-  execution; older Task 5/runtime resources owned by other work were
-  deliberately left untouched.
+- The round-four post-gate audit found and removed one empty `peer-task7`
+  network but missed the live Task 7 resume RED residue described above. Round
+  five resolved it through production cleanup and found six additional
+  filesystem-only control RED roots whose PostgreSQL and Docker authorities
+  were already absent. Those six roots and the deliberately failed expired-
+  credential regression root were moved by exact path to the user's Trash, so
+  they remain recoverable. Reinspection after both final workspace gates found
+  zero current Task 7 control-recovery or expired-cleanup Docker resources,
+  PostgreSQL execution/control/cleanup rows, credentials, storage, or temporary
+  roots; older Task 5/runtime resources owned by other work remain untouched.
 
 ## Commits
 
@@ -283,7 +330,10 @@ Task 7 was implemented RED to GREEN:
 - `c4ab8b4` — fix round three: post-create candidate ownership, explicit
   recovery-boundary proof, shared startup reconciliation, and execution-first
   cleanup attachment locking.
-- Fix round four is recorded with this updated report in the following commit.
+- `7993a95` — fix round four: explicit cleanup locking, immediate credential
+  candidate ownership, fresh-process partial rollback, and isolated startup
+  cancellation recovery.
+- Fix round five is recorded with this updated report in the following commit.
 
 ## Concerns and follow-up
 
