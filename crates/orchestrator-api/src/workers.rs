@@ -114,10 +114,17 @@ async fn request_cleanup(
     })?;
     let execution_id = ExecutionId::new(id);
     let authority = cleanup.get(&execution_id).await.map_err(ApiError::store)?;
+    if authority.disposition().map_err(ApiError::store)? != CleanupDisposition::Retained {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "CLEANUP_NOT_RETAINED",
+            "only a retained execution can be explicitly cleaned",
+        ));
+    }
     cleanup
         .transition(
             &execution_id,
-            authority.disposition().map_err(ApiError::store)?,
+            CleanupDisposition::Retained,
             CleanupDisposition::CleanupPending,
             &authority.handles,
         )

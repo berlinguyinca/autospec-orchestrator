@@ -39,6 +39,15 @@ Round 3 closes the remaining disposition and crash-recovery gaps:
 - journal-aware recovery of partial Git creation even when no worktree owner record was committed;
 - a real seven-stage child-process crash matrix and a concurrent peer-isolation scenario over PostgreSQL, Git, Docker, execution storage, and stub Pi.
 
+Round 4 makes capacity release and physical cleanup crash-safe:
+
+- one PostgreSQL transaction now commits `Retained` and releases the exact attempt reservation/capacity under execution, authority, attempt, and worker locks; injected transaction failure proves all-or-nothing behavior and idempotent replay;
+- the cleanup-disposition migration derives legacy `ReviewReady` handling from the manifest persistence mode, retaining only explicit resumable executions and conservatively scheduling ephemeral or ambiguous rows for cleanup;
+- unreachable-worker reaping fences the old attempt and capacity behind `CleanupPending`; the scheduler excludes every execution with unresolved cleanup authority, and only post-cleanup finalization requeues resumable work or fails ephemeral work as `WorkerLost`;
+- Git destruction and storage release leave authenticated, fsynced tombstones in pinned metadata outside the deleted resource; worker recovery acknowledges them only after the matching PostgreSQL disposition checkpoint commits;
+- explicit cleanup accepts only exact `Retained` authority, rejecting active executions with HTTP 409 rather than creating an unsafe active-to-cleanup transition;
+- the real crash matrix now covers nine boundaries, including Git physical deletion and storage physical deletion before their PostgreSQL checkpoints.
+
 ## Commits
 
 - `8ac7143` — Prevent worker oversubscription with durable capability-backed reservations
@@ -51,13 +60,13 @@ Round 3 closes the remaining disposition and crash-recovery gaps:
 ## Verification
 
 - `cargo fmt --all -- --check` and `git diff --check` — passed.
-- `AUTOSPEC_DATABASE_URL=… cargo test --workspace` — passed on current stable, including 38 real Docker/Pi, 18 real Docker runtime, 59 real Git, 18 real PostgreSQL, 11 worker lifecycle, and 5 worker real-E2E tests.
+- `AUTOSPEC_DATABASE_URL=… cargo test --workspace` — passed on current stable, including 38 real Docker/Pi, 18 real Docker runtime, 59 real Git, 21 real PostgreSQL, 11 worker lifecycle, and 5 worker real-E2E tests.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed on current stable.
 - `AUTOSPEC_DATABASE_URL=… cargo +1.85.0 test --workspace` — passed in full with the same real boundary suites.
 - `cargo +1.85.0 clippy --workspace --all-targets -- -D warnings` — passed.
-- Focused Task 5 suite — passed: API route integration 3/3, autospec-worker 3/3, scheduler 4/4, worker lifecycle 11/11, health 3/3, recovery/evidence 3/3, PostgreSQL 18/18, and Git worktree 59/59.
+- Focused Task 5 suite — passed: API route integration 3/3, autospec-worker 3/3, scheduler 4/4, worker lifecycle 11/11, health 3/3, recovery/evidence 3/3, PostgreSQL 21/21, execution storage 30/30, and Git worktree 59/59.
 - Worker real-E2E target — passed 5/5. Three are substantive tests: `crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cleanup`, `real_failure_stage_matrix_reconciles_without_resource_leaks`, and `real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer`; two are child-process helpers and are not counted as scenarios.
-- The seven-stage matrix crashes after reservation, storage, interrupted Git create, runtime, Pi-before-event, ReviewReady-before-retention, and retention; each fresh manager reconciliation proves the required retained/resolved disposition, released reservation, and absence of exact Docker/Git/storage/Pi leaks after explicit cleanup.
+- The nine-stage matrix crashes after reservation, storage, interrupted Git create, runtime, Git physical delete before disposition, storage physical delete before disposition, Pi-before-event, ReviewReady-before-retention, and retention; each fresh manager reconciliation proves the required retained/resolved disposition, released reservation, and absence of exact Docker/Git/storage/Pi leaks after explicit cleanup.
 - The peer-isolation test runs two real executions concurrently, crashes one after runtime creation, proves the other reaches `ReviewReady` with durable evidence and intact retained resources, then reconciles and cleans each exact authority independently.
 - PostgreSQL concurrency test launched 16 simultaneous reservations against four slots and assigned exactly four unique executions.
 

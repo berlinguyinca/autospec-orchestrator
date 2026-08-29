@@ -531,6 +531,8 @@ async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
         "post_storage",
         "mid_git_create",
         "post_runtime",
+        "git_deleted_pre_disposition",
+        "storage_deleted_pre_disposition",
         "post_pi_pre_event",
         "review_ready_pre_retention",
         "post_retention",
@@ -607,27 +609,20 @@ async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
         );
         match authority.disposition().unwrap() {
             CleanupDisposition::RetainRequested => {
-                cleanup
-                    .transition(
-                        &execution_id,
-                        CleanupDisposition::RetainRequested,
-                        CleanupDisposition::Retained,
-                        &authority.handles,
-                    )
-                    .await
-                    .unwrap();
                 reservations
-                    .release_attempt(&execution_id, &authority.attempt_id)
+                    .commit_retained_and_release_capacity(&execution_id, &authority.attempt_id)
                     .await
                     .unwrap();
                 authority = cleanup.get(&execution_id).await.unwrap();
             }
             CleanupDisposition::Retained => {}
-            _ => {
-                reservations
-                    .fence_lost_attempt(&execution_id, &authority.attempt_id)
-                    .await
-                    .unwrap();
+            disposition => {
+                if matches!(disposition, CleanupDisposition::Active(_)) {
+                    reservations
+                        .fence_lost_attempt(&execution_id, &authority.attempt_id)
+                        .await
+                        .unwrap();
+                }
                 replacement
                     .recover_cleanup_authority(&authority, &execution)
                     .await
@@ -896,6 +891,63 @@ async fn failure_stage_process_helper() {
         .await
         .unwrap();
     if stage == "post_runtime" {
+        std::process::exit(77);
+    }
+    if matches!(
+        stage.as_str(),
+        "git_deleted_pre_disposition" | "storage_deleted_pre_disposition"
+    ) {
+        reservations
+            .fence_lost_attempt(&execution.id, &reservation.attempt_id)
+            .await
+            .unwrap();
+        let authority = cleanup.get(&execution.id).await.unwrap();
+        let runtime_stopped = lifecycle
+            .cleanup_authority_step(&authority, &execution, CleanupDisposition::CleanupPending)
+            .await
+            .unwrap();
+        cleanup
+            .transition(
+                &execution.id,
+                CleanupDisposition::CleanupPending,
+                runtime_stopped,
+                &authority.handles,
+            )
+            .await
+            .unwrap();
+        let runtime_destroyed = lifecycle
+            .cleanup_authority_step(&authority, &execution, runtime_stopped)
+            .await
+            .unwrap();
+        cleanup
+            .transition(
+                &execution.id,
+                runtime_stopped,
+                runtime_destroyed,
+                &authority.handles,
+            )
+            .await
+            .unwrap();
+        let git_cleaned = lifecycle
+            .cleanup_authority_step(&authority, &execution, runtime_destroyed)
+            .await
+            .unwrap();
+        if stage == "git_deleted_pre_disposition" {
+            std::process::exit(77);
+        }
+        cleanup
+            .transition(
+                &execution.id,
+                runtime_destroyed,
+                git_cleaned,
+                &authority.handles,
+            )
+            .await
+            .unwrap();
+        lifecycle
+            .cleanup_authority_step(&authority, &execution, git_cleaned)
+            .await
+            .unwrap();
         std::process::exit(77);
     }
     executions

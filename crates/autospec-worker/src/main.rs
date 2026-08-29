@@ -236,19 +236,9 @@ async fn main() -> Result<()> {
                 CleanupDisposition::RetainRequested | CleanupDisposition::Retained
             )
         {
-            if disposition == CleanupDisposition::RetainRequested {
-                cleanup
-                    .transition(
-                        &execution.id,
-                        CleanupDisposition::RetainRequested,
-                        CleanupDisposition::Retained,
-                        &authority.handles,
-                    )
-                    .await?;
-                reservations
-                    .release_attempt(&execution.id, &authority.attempt_id)
-                    .await?;
-            }
+            reservations
+                .commit_retained_and_release_capacity(&execution.id, &authority.attempt_id)
+                .await?;
             tracing::info!(
                 worker_id = %worker.id,
                 execution_id = %execution.id,

@@ -73,20 +73,9 @@ pub(crate) async fn run_with_cancel(
         }
     }
     if retain_for_resume(&tracked, &outcome) {
-        let handles = cleanup_handles(&guard);
-        worker
-            .cleanup_authorities
-            .transition(
-                &execution.id,
-                CleanupDisposition::RetainRequested,
-                CleanupDisposition::Retained,
-                &handles,
-            )
-            .await
-            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
         worker
             .reservations
-            .release_attempt(&execution.id, attempt_id)
+            .commit_retained_and_release_capacity(&execution.id, attempt_id)
             .await
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
         return outcome;
@@ -203,20 +192,9 @@ pub(crate) async fn run_adopted_with_cancel(
         });
     }
     if retain_for_resume(&tracked, &outcome) {
-        let handles = cleanup_handles(&guard);
-        worker
-            .cleanup_authorities
-            .transition(
-                &execution.id,
-                CleanupDisposition::RetainRequested,
-                CleanupDisposition::Retained,
-                &handles,
-            )
-            .await
-            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
         worker
             .reservations
-            .release_attempt(&execution.id, attempt_id)
+            .commit_retained_and_release_capacity(&execution.id, attempt_id)
             .await
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
         return outcome;
@@ -276,14 +254,11 @@ async fn cleanup_phases(
         .disposition()
         .map_err(|error| WorkerError::Persistence(error.to_string()))?;
     if disposition != CleanupDisposition::CleanupPending {
-        transition_authority(
-            worker,
-            execution,
-            disposition,
-            CleanupDisposition::CleanupPending,
-            guard,
-        )
-        .await?;
+        worker
+            .cleanup_authorities
+            .fence_for_cleanup(&execution.id, &cleanup_handles(guard))
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
     }
     guard.stop_runtime_process().await?;
     transition_authority(
@@ -303,6 +278,7 @@ async fn cleanup_phases(
         guard,
     )
     .await?;
+    let worktree_tombstone = guard.worktree.clone();
     guard.destroy_worktree().await?;
     transition_authority(
         worker,
@@ -312,6 +288,10 @@ async fn cleanup_phases(
         guard,
     )
     .await?;
+    if let Some(worktree) = &worktree_tombstone {
+        worker.lifecycle.ack_destroy_worktree(worktree).await?;
+    }
+    let release_tombstone = guard.receipt.clone();
     guard.release_storage().await?;
     transition_authority(
         worker,
@@ -320,7 +300,11 @@ async fn cleanup_phases(
         CleanupDisposition::StorageReleased,
         guard,
     )
-    .await
+    .await?;
+    if let Some(receipt) = &release_tombstone {
+        worker.lifecycle.ack_release_storage(receipt).await?;
+    }
+    Ok(())
 }
 
 async fn transition_authority(
@@ -592,14 +576,11 @@ async fn drive_running(
             .record_progress(execution, &event)
             .await
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
-        transition_cleanup(
-            worker,
-            execution,
-            guard,
-            CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent),
-            CleanupDisposition::CleanupPending,
-        )
-        .await?;
+        worker
+            .cleanup_authorities
+            .fence_for_cleanup(&execution.id, &cleanup_handles(guard))
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
     }
     Ok(result)
 }

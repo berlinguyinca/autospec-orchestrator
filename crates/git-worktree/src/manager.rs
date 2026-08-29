@@ -543,6 +543,10 @@ impl WorktreeManager for GitWorktreeManager {
         crate::cleanup::destroy(self, worktree)
     }
 
+    fn ack_destroy(&self, worktree: &Worktree) -> Result<(), WorktreeError> {
+        crate::cleanup::ack_destroy(self, worktree)
+    }
+
     fn recover_interrupted_create(
         &self,
         labels: &OwnershipLabels,

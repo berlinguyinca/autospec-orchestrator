@@ -1,8 +1,8 @@
 use crate::journal::{require_real_directory, PinnedDirectory};
 use crate::{
     disk_gib_to_bytes, AllocationPhase, AllocationReceipt, BackendIdentity, BackendState,
-    DockerBindProof, ExecutionLayout, JournalStore, PhaseJournal, ReleasePhase, StorageError,
-    ALLOCATION_API_VERSION,
+    DockerBindProof, ExecutionLayout, JournalStore, PhaseJournal, ReleasePhase,
+    SecureMetadataDirectory, StorageError, ALLOCATION_API_VERSION,
 };
 use fs2::FileExt;
 use orchestrator_core::{ExecutionId, OwnershipLabels};
@@ -294,6 +294,9 @@ pub trait ExecutionStorageManager: Send + Sync {
     fn probe(&self, disk_gib: u64) -> Result<StorageCapability, StorageError>;
     fn allocate(&self, request: &AllocationRequest) -> Result<AllocationReceipt, StorageError>;
     fn release(&self, receipt: &AllocationReceipt) -> Result<(), StorageError>;
+    fn ack_release(&self, _receipt: &AllocationReceipt) -> Result<(), StorageError> {
+        Ok(())
+    }
     fn reconcile(&self, live: &[ExecutionId]) -> Result<Vec<PhaseJournal>, StorageError>;
 }
 
@@ -305,6 +308,7 @@ pub struct ExecutionStorage {
     docker: Box<dyn DockerBindVerifier>,
     executions_directory: PinnedDirectory,
     lifecycle_holds: crate::ExecutionLifecycleHoldStore,
+    release_tombstones: SecureMetadataDirectory,
 }
 
 impl ExecutionStorage {
@@ -324,6 +328,13 @@ impl ExecutionStorage {
             PinnedDirectory::capture(&state_root.join("executions"), "executions directory")?;
         let journals = JournalStore::new(&state_root)?;
         let lifecycle_holds = crate::ExecutionLifecycleHoldStore::new(&state_root)?;
+        let metadata = SecureMetadataDirectory::new(state_root.join("execution-storage"))?;
+        let release_path = metadata.path().join("releases");
+        let release_tombstones = if release_path.exists() {
+            SecureMetadataDirectory::new(&release_path)?
+        } else {
+            metadata.create_subdirectory("releases")?
+        };
         state_identity.verify("state root")?;
         Ok(Self {
             state_root,
@@ -332,6 +343,7 @@ impl ExecutionStorage {
             docker,
             executions_directory,
             lifecycle_holds,
+            release_tombstones,
         })
     }
 
@@ -697,6 +709,15 @@ impl ExecutionStorageManager for ExecutionStorage {
     fn allocate(&self, request: &AllocationRequest) -> Result<AllocationReceipt, StorageError> {
         let reserved_bytes = disk_gib_to_bytes(request.disk_gib)?;
         let layout = ExecutionLayout::new(&self.state_root, &request.labels.execution_id)?;
+        if self
+            .release_tombstones
+            .read(&release_tombstone_name(&request.labels.execution_id)?)?
+            .is_some()
+        {
+            return Err(StorageError::Unavailable(
+                "prior physical release is awaiting durable acknowledgment".to_owned(),
+            ));
+        }
         if self.journals.exists(&layout)? {
             self.recover_existing(&layout, request)?;
         }
@@ -847,6 +868,29 @@ impl ExecutionStorageManager for ExecutionStorage {
 
     fn release(&self, receipt: &AllocationReceipt) -> Result<(), StorageError> {
         let layout = ExecutionLayout::new(&self.state_root, &receipt.labels.execution_id)?;
+        let tombstone_name = release_tombstone_name(&receipt.labels.execution_id)?;
+        let receipt_bytes = serde_json::to_vec(receipt)
+            .map_err(|error| StorageError::Journal(error.to_string()))?;
+        match self.release_tombstones.read(&tombstone_name)? {
+            Some(existing) if existing != receipt_bytes => {
+                return Err(StorageError::IdentityMismatch(
+                    "release tombstone belongs to another allocation receipt".to_owned(),
+                ));
+            }
+            Some(_)
+                if !layout.root.exists()
+                    && self
+                        .backend
+                        .state(&layout, &receipt.backend, receipt.reserved_bytes)?
+                        == BackendState::Absent =>
+            {
+                return Ok(())
+            }
+            Some(_) => {}
+            None => self
+                .release_tombstones
+                .create(&tombstone_name, &receipt_bytes)?,
+        }
         if !self
             .lifecycle_holds
             .list(&receipt.labels.execution_id)?
@@ -904,6 +948,41 @@ impl ExecutionStorageManager for ExecutionStorage {
         )
     }
 
+    fn ack_release(&self, receipt: &AllocationReceipt) -> Result<(), StorageError> {
+        let name = release_tombstone_name(&receipt.labels.execution_id)?;
+        let expected = serde_json::to_vec(receipt)
+            .map_err(|error| StorageError::Journal(error.to_string()))?;
+        let actual = self.release_tombstones.read(&name)?;
+        let layout = ExecutionLayout::new(&self.state_root, &receipt.labels.execution_id)?;
+        if actual.is_none()
+            && self
+                .backend
+                .state(&layout, &receipt.backend, receipt.reserved_bytes)?
+                == BackendState::Absent
+            && !layout.root.exists()
+        {
+            return Ok(());
+        }
+        let actual = actual.ok_or_else(|| {
+            StorageError::IdentityMismatch("release tombstone is absent".to_owned())
+        })?;
+        if actual != expected {
+            return Err(StorageError::IdentityMismatch(
+                "release tombstone belongs to another allocation receipt".to_owned(),
+            ));
+        }
+        if self
+            .backend
+            .state(&layout, &receipt.backend, receipt.reserved_bytes)?
+            != BackendState::Absent
+        {
+            return Err(StorageError::IdentityMismatch(
+                "cannot acknowledge a release while its backend is present".to_owned(),
+            ));
+        }
+        self.release_tombstones.remove(&name)
+    }
+
     fn reconcile(&self, live: &[ExecutionId]) -> Result<Vec<PhaseJournal>, StorageError> {
         let live = live.iter().cloned().collect::<BTreeSet<_>>();
         Ok(self
@@ -913,6 +992,19 @@ impl ExecutionStorageManager for ExecutionStorage {
             .filter(|journal| !live.contains(&journal.labels.execution_id))
             .collect())
     }
+}
+
+fn release_tombstone_name(execution_id: &ExecutionId) -> Result<String, StorageError> {
+    let name = format!("{}.json", execution_id.as_str());
+    if execution_id.as_str().is_empty()
+        || execution_id.as_str().contains('/')
+        || execution_id.as_str().contains("..")
+    {
+        return Err(StorageError::IdentityMismatch(
+            "release tombstone execution id is unsafe".to_owned(),
+        ));
+    }
+    Ok(name)
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ pub struct Reservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LostWorkerRecovery {
+    CleanupPending(ExecutionId),
     Requeued(ExecutionId),
     Failed(ExecutionId),
 }
@@ -38,6 +39,15 @@ pub trait ReservationStore: Send + Sync {
         let _ = attempt_id;
         self.release(execution_id).await?;
         Ok(true)
+    }
+    async fn commit_retained_and_release_capacity(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_id: &AttemptId,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Conflict(format!(
+            "atomic retained capacity release is unavailable for {execution_id}/{attempt_id}"
+        )))
     }
     async fn list_for_worker(&self, worker_id: &WorkerId) -> Result<Vec<Reservation>, StoreError>;
     async fn reconcile(&self, live: &[ExecutionId]) -> Result<Vec<ExecutionId>, StoreError>;
@@ -56,6 +66,15 @@ pub trait ReservationStore: Send + Sync {
     ) -> Result<LostWorkerRecovery, StoreError> {
         Err(StoreError::Conflict(format!(
             "startup fencing is unavailable for {execution_id}/{attempt_id}"
+        )))
+    }
+    async fn finalize_lost_cleanup(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_id: &AttemptId,
+    ) -> Result<LostWorkerRecovery, StoreError> {
+        Err(StoreError::Conflict(format!(
+            "lost cleanup finalization is unavailable for {execution_id}/{attempt_id}"
         )))
     }
 }
@@ -116,6 +135,8 @@ impl ReservationStore for PgReservationStore {
         }
         let rows = sqlx::query(
             "SELECT * FROM executions WHERE state = 'QUEUED' \
+             AND NOT EXISTS (SELECT 1 FROM cleanup_authorities c \
+                 WHERE c.execution_id = executions.id AND c.phase <> 'RESOLVED') \
              ORDER BY created_at, id FOR UPDATE SKIP LOCKED",
         )
         .fetch_all(&mut *transaction)
@@ -256,6 +277,96 @@ impl ReservationStore for PgReservationStore {
         Ok(worker.is_some())
     }
 
+    async fn commit_retained_and_release_capacity(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_id: &AttemptId,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let execution = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(execution_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(execution_id.to_string()))?;
+        let execution = decode_execution(&execution)?;
+        if execution.state != ExecutionState::ReviewReady
+            || execution.manifest.persistence != PersistenceMode::Resumable
+            || execution.attempt_id.as_ref() != Some(attempt_id)
+        {
+            return Err(StoreError::Conflict(format!(
+                "execution {execution_id} is not resumable ReviewReady authority for {attempt_id}"
+            )));
+        }
+        let authority = sqlx::query(
+            "SELECT phase, worker_id FROM cleanup_authorities \
+             WHERE execution_id = $1 AND attempt_id = $2 FOR UPDATE",
+        )
+        .bind(execution_id.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(execution_id.to_string()))?;
+        let phase = authority.try_get::<String, _>("phase")?;
+        if phase != "RETAIN_REQUESTED" && phase != "RETAINED" {
+            return Err(StoreError::Conflict(format!(
+                "cleanup authority is {phase}, expected RETAIN_REQUESTED or RETAINED"
+            )));
+        }
+        let worker_id = authority.try_get::<String, _>("worker_id")?;
+        sqlx::query(
+            "SELECT attempt_id FROM execution_attempts \
+             WHERE attempt_id = $1 AND execution_id = $2 AND worker_id = $3 FOR UPDATE",
+        )
+        .bind(attempt_id.as_str())
+        .bind(execution_id.as_str())
+        .bind(&worker_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| StoreError::Conflict(format!("attempt {attempt_id} authority is absent")))?;
+        sqlx::query("SELECT id FROM workers WHERE id = $1 FOR UPDATE")
+            .bind(&worker_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(worker_id.clone()))?;
+        let reservation_worker = sqlx::query_scalar::<_, String>(
+            "DELETE FROM reservations WHERE execution_id = $1 AND attempt_id = $2 \
+             RETURNING worker_id",
+        )
+        .bind(execution_id.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if phase == "RETAIN_REQUESTED" && reservation_worker.is_none() {
+            return Err(StoreError::Conflict(
+                "retention request lost its reservation before atomic commit".to_owned(),
+            ));
+        }
+        if let Some(reservation_worker) = reservation_worker {
+            if reservation_worker != worker_id {
+                return Err(StoreError::Conflict(
+                    "retention reservation belongs to another worker".to_owned(),
+                ));
+            }
+            sqlx::query(
+                "UPDATE workers SET running_executions = GREATEST(running_executions - 1, 0), \
+                 updated_at = now() WHERE id = $1",
+            )
+            .bind(&worker_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE cleanup_authorities SET phase = 'RETAINED', updated_at = now() \
+             WHERE execution_id = $1 AND attempt_id = $2 AND phase IN ('RETAIN_REQUESTED', 'RETAINED')",
+        )
+        .bind(execution_id.as_str())
+        .bind(attempt_id.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     async fn list_for_worker(&self, worker_id: &WorkerId) -> Result<Vec<Reservation>, StoreError> {
         let rows = sqlx::query(
             "SELECT e.*, r.worker_id AS reservation_worker_id, r.attempt_id AS reservation_attempt_id, \
@@ -323,9 +434,8 @@ impl ReservationStore for PgReservationStore {
         .await?;
         let mut recovered = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut execution = decode_execution(&row)?;
+            let execution = decode_execution(&row)?;
             let attempt_id = AttemptId::new(row.try_get::<String, _>("reservation_attempt_id")?);
-            let resumable = execution.manifest.persistence == PersistenceMode::Resumable;
             let attempt_result = ExecutionResult {
                 execution_id: execution.id.clone(),
                 state: ExecutionState::Failed,
@@ -354,65 +464,33 @@ impl ReservationStore for PgReservationStore {
                 // and continue reaping unrelated executions.
                 continue;
             }
-            let (next, result) = if resumable {
-                (ExecutionState::Queued, None)
-            } else {
-                execution.result = Some(attempt_result.clone());
-                (
-                    ExecutionState::Failed,
-                    execution.result.as_ref().map(to_json).transpose()?,
-                )
-            };
-            let updated = sqlx::query(
-                "UPDATE executions SET state = $2, worker_id = NULL, attempt_id = NULL, result = $3, \
-                 updated_at = now(), version = version + 1 WHERE id = $1 AND worker_id = $4 \
-                 AND attempt_id = $5",
+            sqlx::query(
+                "INSERT INTO cleanup_authorities (execution_id, attempt_id, worker_id, phase) \
+                 VALUES ($1, $2, $3, 'CLEANUP_PENDING') ON CONFLICT (execution_id) DO UPDATE \
+                 SET phase = 'CLEANUP_PENDING', updated_at = now() \
+                 WHERE cleanup_authorities.attempt_id = EXCLUDED.attempt_id \
+                 AND cleanup_authorities.worker_id = EXCLUDED.worker_id \
+                 AND cleanup_authorities.phase NOT IN ('RUNTIME_STOPPED', 'RUNTIME_DESTROYED', \
+                     'GIT_RECOVERED_CLEANED', 'STORAGE_RELEASED', 'RESERVATION_RELEASED', 'RESOLVED')",
             )
             .bind(execution.id.as_str())
-            .bind(enum_text(&next)?)
-            .bind(result)
-            .bind(worker_id.as_str())
             .bind(attempt_id.as_str())
+            .bind(worker_id.as_str())
             .execute(&mut *transaction)
             .await?;
-            if updated.rows_affected() != 1 {
-                return Err(StoreError::Conflict(format!(
-                    "execution {} authority changed during recovery",
-                    execution.id
-                )));
-            }
             let event = ExecutionEvent {
                 execution_id: execution.id.clone(),
                 attempt_id: Some(attempt_id),
                 sequence: 0,
                 at: Utc::now(),
-                state: next,
+                state: execution.state,
                 kind: ExecutionEventKind::ExecutionFailed {
                     failure: FailureClass::WorkerLost,
                 },
             };
             append_in_transaction(&mut transaction, &event).await?;
-            let deleted =
-                sqlx::query("DELETE FROM reservations WHERE execution_id = $1 AND worker_id = $2")
-                    .bind(execution.id.as_str())
-                    .bind(worker_id.as_str())
-                    .execute(&mut *transaction)
-                    .await?;
-            if deleted.rows_affected() != 1 {
-                return Err(StoreError::Conflict(
-                    "reservation disappeared during recovery".to_owned(),
-                ));
-            }
-            recovered.push(if resumable {
-                LostWorkerRecovery::Requeued(execution.id)
-            } else {
-                LostWorkerRecovery::Failed(execution.id)
-            });
+            recovered.push(LostWorkerRecovery::CleanupPending(execution.id));
         }
-        sqlx::query("UPDATE workers SET running_executions = 0, updated_at = now() WHERE id = $1")
-            .bind(worker_id.as_str())
-            .execute(&mut *transaction)
-            .await?;
         transaction.commit().await?;
         Ok(recovered)
     }
@@ -436,7 +514,7 @@ impl ReservationStore for PgReservationStore {
                 "startup authority changed for {execution_id}/{attempt_id}"
             ))
         })?;
-        let mut execution = decode_execution(&row)?;
+        let execution = decode_execution(&row)?;
         let worker_id = execution.worker_id.clone().ok_or_else(|| {
             StoreError::Conflict("startup-fenced execution lacks worker authority".to_owned())
         })?;
@@ -466,12 +544,110 @@ impl ReservationStore for PgReservationStore {
                 "attempt {attempt_id} was already fenced"
             )));
         }
-        let resumable = execution.manifest.persistence == PersistenceMode::Resumable;
-        let (next, persisted_result) = if resumable {
-            (ExecutionState::Queued, None)
+        sqlx::query(
+            "INSERT INTO cleanup_authorities (execution_id, attempt_id, worker_id, phase) \
+             VALUES ($1, $2, $3, 'CLEANUP_PENDING') ON CONFLICT (execution_id) DO UPDATE \
+             SET phase = 'CLEANUP_PENDING', updated_at = now() \
+             WHERE cleanup_authorities.attempt_id = EXCLUDED.attempt_id \
+             AND cleanup_authorities.worker_id = EXCLUDED.worker_id \
+             AND cleanup_authorities.phase NOT IN ('RUNTIME_STOPPED', 'RUNTIME_DESTROYED', \
+                 'GIT_RECOVERED_CLEANED', 'STORAGE_RELEASED', 'RESERVATION_RELEASED', 'RESOLVED')",
+        )
+        .bind(execution_id.as_str())
+        .bind(attempt_id.as_str())
+        .bind(worker_id.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        append_in_transaction(
+            &mut transaction,
+            &ExecutionEvent {
+                execution_id: execution_id.clone(),
+                attempt_id: Some(attempt_id.clone()),
+                sequence: 0,
+                at: Utc::now(),
+                state: execution.state,
+                kind: ExecutionEventKind::ExecutionFailed {
+                    failure: FailureClass::WorkerLost,
+                },
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(LostWorkerRecovery::CleanupPending(execution_id.clone()))
+    }
+
+    async fn finalize_lost_cleanup(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_id: &AttemptId,
+    ) -> Result<LostWorkerRecovery, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT e.* FROM executions e \
+             JOIN cleanup_authorities c ON c.execution_id = e.id AND c.attempt_id = $2 \
+             WHERE e.id = $1 AND c.phase = 'STORAGE_RELEASED' FOR UPDATE OF e, c",
+        )
+        .bind(execution_id.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "lost cleanup is not ready to finalize for {execution_id}/{attempt_id}"
+            ))
+        })?;
+        let execution = decode_execution(&row)?;
+        let worker_id = sqlx::query_scalar::<_, String>(
+            "SELECT worker_id FROM reservations WHERE execution_id = $1 AND attempt_id = $2 FOR UPDATE",
+        )
+        .bind(execution_id.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if worker_id.is_none() && execution.state == ExecutionState::ReviewReady {
+            sqlx::query(
+                "UPDATE cleanup_authorities SET phase = 'RESERVATION_RELEASED', updated_at = now() \
+                 WHERE execution_id = $1 AND attempt_id = $2 AND phase = 'STORAGE_RELEASED'",
+            )
+            .bind(execution_id.as_str())
+            .bind(attempt_id.as_str())
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(LostWorkerRecovery::Failed(execution_id.clone()));
+        }
+        let worker_id = worker_id.ok_or_else(|| {
+            StoreError::Conflict("nonterminal lost cleanup has no fenced reservation".to_owned())
+        })?;
+        sqlx::query("SELECT id FROM workers WHERE id = $1 FOR UPDATE")
+            .bind(&worker_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let lost = !execution.state.is_terminal();
+        let resumable = lost && execution.manifest.persistence == PersistenceMode::Resumable;
+        let result = ExecutionResult {
+            execution_id: execution_id.clone(),
+            state: ExecutionState::Failed,
+            failure: Some(FailureClass::WorkerLost),
+            branch: None,
+            base_sha: None,
+            diff_artifact: None,
+            artifacts: Vec::new(),
+            tests: None,
+        };
+        let next = if resumable {
+            ExecutionState::Queued
+        } else if lost {
+            ExecutionState::Failed
         } else {
-            execution.result = Some(result.clone());
-            (ExecutionState::Failed, Some(to_json(&result)?))
+            execution.state
+        };
+        let persisted_result = if resumable {
+            None
+        } else if lost {
+            Some(to_json(&result)?)
+        } else {
+            execution.result.as_ref().map(to_json).transpose()?
         };
         sqlx::query(
             "UPDATE executions SET state = $2, worker_id = NULL, attempt_id = NULL, \
@@ -486,19 +662,24 @@ impl ReservationStore for PgReservationStore {
         .bind(attempt_id.as_str())
         .execute(&mut *transaction)
         .await?;
-        append_in_transaction(
-            &mut transaction,
-            &ExecutionEvent {
-                execution_id: execution_id.clone(),
-                attempt_id: Some(attempt_id.clone()),
-                sequence: 0,
-                at: Utc::now(),
-                state: next,
-                kind: ExecutionEventKind::ExecutionFailed {
-                    failure: FailureClass::WorkerLost,
-                },
-            },
+        sqlx::query("DELETE FROM reservations WHERE execution_id = $1 AND attempt_id = $2")
+            .bind(execution_id.as_str())
+            .bind(attempt_id.as_str())
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE workers SET running_executions = GREATEST(running_executions - 1, 0), updated_at = now() WHERE id = $1",
         )
+        .bind(&worker_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE cleanup_authorities SET phase = 'RESERVATION_RELEASED', updated_at = now() \
+             WHERE execution_id = $1 AND attempt_id = $2 AND phase = 'STORAGE_RELEASED'",
+        )
+        .bind(execution_id.as_str())
+        .bind(attempt_id.as_str())
+        .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
         Ok(if resumable {

@@ -535,7 +535,9 @@ impl JournalStore {
             let file_type = entry
                 .file_type()
                 .map_err(|error| journal_error("inspect entry", &entry.path(), error))?;
-            if entry.file_name() == "holds" && file_type.is_dir() {
+            if matches!(entry.file_name().to_str(), Some("holds" | "releases"))
+                && file_type.is_dir()
+            {
                 SecureMetadataDirectory::new(entry.path())?;
                 continue;
             }

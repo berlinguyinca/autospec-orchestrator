@@ -71,6 +71,7 @@ impl ExecutionStore for FakeStore {
 #[derive(Default)]
 struct FakeReservations {
     released: Mutex<Vec<ExecutionId>>,
+    retained: Mutex<Vec<ExecutionId>>,
 }
 
 #[derive(Default)]
@@ -186,6 +187,25 @@ impl ReservationStore for FakeReservations {
     async fn release(&self, id: &ExecutionId) -> Result<(), StoreError> {
         self.released.lock().unwrap().push(id.clone());
         Ok(())
+    }
+    async fn commit_retained_and_release_capacity(
+        &self,
+        id: &ExecutionId,
+        _: &AttemptId,
+    ) -> Result<(), StoreError> {
+        self.released.lock().unwrap().push(id.clone());
+        self.retained.lock().unwrap().push(id.clone());
+        Ok(())
+    }
+    async fn finalize_lost_cleanup(
+        &self,
+        id: &ExecutionId,
+        _: &AttemptId,
+    ) -> Result<orchestrator_persistence::LostWorkerRecovery, StoreError> {
+        self.released.lock().unwrap().push(id.clone());
+        Ok(orchestrator_persistence::LostWorkerRecovery::Failed(
+            id.clone(),
+        ))
     }
     async fn list_for_worker(&self, _: &WorkerId) -> Result<Vec<Reservation>, StoreError> {
         Ok(Vec::new())
@@ -530,7 +550,7 @@ async fn successful_run_uses_exact_order_and_persists_result_before_cleanup() {
         .all(|event| !matches!(event.kind, ExecutionEventKind::AgentStarted { .. })));
     assert_eq!(
         reservations.released.lock().unwrap().as_slice(),
-        &[execution.id]
+        std::slice::from_ref(&execution.id)
     );
     let checkpoints = cleanup.checkpoints.lock().unwrap();
     assert_eq!(
@@ -582,11 +602,11 @@ async fn resumable_review_ready_retains_resources_but_releases_capacity() {
 
     assert_eq!(
         reservations.released.lock().unwrap().as_slice(),
-        &[execution.id]
+        std::slice::from_ref(&execution.id)
     );
     assert_eq!(
-        cleanup.checkpoints.lock().unwrap().last().unwrap().0,
-        CleanupDisposition::Retained.to_string()
+        reservations.retained.lock().unwrap().as_slice(),
+        std::slice::from_ref(&execution.id)
     );
     assert_eq!(
         *order.lock().unwrap(),

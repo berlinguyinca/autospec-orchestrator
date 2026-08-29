@@ -79,7 +79,6 @@ impl CleanupGuard {
                 .await
                 .map_err(|_| WorkerError::Cleanup("timed out destroying worktree".into()))?
                 .map_err(WorkerError::from)?;
-            self.worktree = None;
         }
         self.lifecycle
             .recover_interrupted_worktree(&self.execution, self.receipt.as_ref())
@@ -93,7 +92,6 @@ impl CleanupGuard {
                 .await
                 .map_err(|_| WorkerError::Cleanup("timed out releasing storage".into()))?
                 .map_err(WorkerError::from)?;
-            self.receipt = None;
         }
         Ok(())
     }

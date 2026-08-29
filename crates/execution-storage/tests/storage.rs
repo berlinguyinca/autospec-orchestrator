@@ -812,6 +812,19 @@ fn manager_trait_is_object_safe_and_lifecycle_is_journaled() {
     object.release(&receipt).expect("release exact allocation");
     assert!(!layout.root.exists());
     assert!(!layout.journal.exists());
+    assert!(
+        object.allocate(&request).is_err(),
+        "release awaits durable ack"
+    );
+    object
+        .release(&receipt)
+        .expect("physical absence is authenticated by the external tombstone");
+    object
+        .ack_release(&receipt)
+        .expect("controller disposition acknowledges physical release");
+    let replacement = object.allocate(&request).expect("ack permits exact reuse");
+    object.release(&replacement).expect("release replacement");
+    object.ack_release(&replacement).expect("ack replacement");
     let calls = calls.lock().expect("fake calls");
     assert_eq!(calls[0], format!("probe:{}", disk_gib_to_bytes(3).unwrap()));
     assert!(calls.iter().any(|call| call == "create"));

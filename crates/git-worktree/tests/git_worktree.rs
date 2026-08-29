@@ -2744,8 +2744,18 @@ fn destroy_retries_repository_cleanup_from_durable_journal() {
 
     manager.destroy(&worktree).expect("retry cleanup");
 
-    assert!(!journal.exists());
+    assert!(
+        journal.is_file(),
+        "physical deletion keeps durable tombstone"
+    );
     assert!(!Path::new(&worktree.path).exists());
+    manager
+        .destroy(&worktree)
+        .expect("absence retry authenticates through tombstone");
+    manager
+        .ack_destroy(&worktree)
+        .expect("controller disposition acknowledges cleanup");
+    assert!(!journal.exists());
 }
 
 #[test]

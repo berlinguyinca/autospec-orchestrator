@@ -1,8 +1,8 @@
 use chrono::{Duration, Utc};
 use orchestrator_api::{router, WorkerApiState};
 use orchestrator_core::{
-    RuntimeKind, WorkerCapabilities, WorkerCapabilityProof, WorkerId, WorkerRegistration,
-    WorkerState,
+    ExecutionId, RuntimeKind, WorkerCapabilities, WorkerCapabilityProof, WorkerId,
+    WorkerRegistration, WorkerState,
 };
 use orchestrator_persistence::{
     CleanupAuthorityStore, CleanupDisposition, CleanupStage, PgCleanupAuthorityStore,
@@ -201,6 +201,38 @@ async fn authenticated_execution_cleanup_requests_durable_reconciliation() {
             .disposition()
             .unwrap(),
         CleanupDisposition::CleanupPending
+    );
+
+    let active_execution =
+        ExecutionId::new(format!("cleanup-active-{}", uuid::Uuid::new_v4().simple()));
+    cleanup
+        .begin(
+            &active_execution,
+            &orchestrator_core::AttemptId::new("active-attempt"),
+            &WorkerId::new("active-worker"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .post(format!(
+                "http://{address}/api/v1/executions/{active_execution}/cleanup"
+            ))
+            .bearer_auth("secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        cleanup
+            .get(&active_execution)
+            .await
+            .unwrap()
+            .disposition()
+            .unwrap(),
+        CleanupDisposition::Active(CleanupStage::Reserved)
     );
 }
 

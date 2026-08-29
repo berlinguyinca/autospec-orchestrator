@@ -886,6 +886,15 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             .map_err(|error| LifecycleError::Step(error.to_string()))
     }
 
+    async fn ack_destroy_worktree(&self, worktree: &Worktree) -> Result<(), LifecycleError> {
+        let manager = Arc::clone(&self.worktrees);
+        let worktree = worktree.clone();
+        tokio::task::spawn_blocking(move || manager.ack_destroy(&worktree))
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
     async fn recover_interrupted_worktree(
         &self,
         execution: &Execution,
@@ -907,6 +916,15 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         let storage = Arc::clone(&self.storage);
         let receipt = receipt.clone();
         tokio::task::spawn_blocking(move || storage.release(&receipt))
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn ack_release_storage(&self, receipt: &AllocationReceipt) -> Result<(), LifecycleError> {
+        let storage = Arc::clone(&self.storage);
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || storage.ack_release(&receipt))
             .await
             .map_err(|error| LifecycleError::Step(error.to_string()))?
             .map_err(|error| LifecycleError::Step(error.to_string()))
@@ -1226,6 +1244,48 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
                 "cleanup step cannot advance {other}"
             ))),
         }
+    }
+
+    async fn ack_cleanup_authority_step(
+        &self,
+        authority: &CleanupAuthority,
+        disposition: CleanupDisposition,
+    ) -> Result<(), LifecycleError> {
+        let handles: DurableCleanupHandles = serde_json::from_value(authority.handles.clone())
+            .map_err(|error| LifecycleError::Step(format!("decode cleanup authority: {error}")))?;
+        match disposition {
+            CleanupDisposition::GitRecoveredCleaned => {
+                if let Some(worktree) = handles.worktree {
+                    let worktree = durable_worktree(worktree);
+                    if worktree.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "worktree cleanup acknowledgment belongs to another execution".into(),
+                        ));
+                    }
+                    let manager = Arc::clone(&self.worktrees);
+                    tokio::task::spawn_blocking(move || manager.ack_destroy(&worktree))
+                        .await
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                }
+            }
+            CleanupDisposition::StorageReleased => {
+                if let Some(receipt) = handles.receipt {
+                    if receipt.labels.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "storage release acknowledgment belongs to another execution".into(),
+                        ));
+                    }
+                    let storage = Arc::clone(&self.storage);
+                    tokio::task::spawn_blocking(move || storage.ack_release(&receipt))
+                        .await
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn adopt(&self, execution: &Execution) -> Result<AdoptedExecution, LifecycleError> {

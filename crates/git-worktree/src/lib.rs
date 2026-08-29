@@ -88,6 +88,9 @@ pub trait WorktreeManager: Send + Sync {
     /// Remove exactly the independent repository this execution owns.
     fn destroy(&self, worktree: &Worktree) -> Result<(), WorktreeError>;
 
+    /// Acknowledge the durable cleanup tombstone after controller disposition commits.
+    fn ack_destroy(&self, worktree: &Worktree) -> Result<(), WorktreeError>;
+
     /// Recover an exact journaled create that failed before an owner record was durable.
     fn recover_interrupted_create(
         &self,

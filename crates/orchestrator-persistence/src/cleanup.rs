@@ -52,8 +52,6 @@ impl CleanupDisposition {
                 | (D::GitRecoveredCleaned, D::StorageReleased)
                 | (D::StorageReleased, D::ReservationReleased)
                 | (D::ReservationReleased, D::Resolved)
-                | (D::Active(_), D::CleanupPending)
-                | (D::RetainRequested, D::CleanupPending)
         )
     }
 }
@@ -162,6 +160,18 @@ pub trait CleanupAuthorityStore: Send + Sync {
                 "illegal cleanup transition {expected} -> {next}"
             )))
         }
+    }
+    async fn fence_for_cleanup(
+        &self,
+        execution_id: &ExecutionId,
+        handles: &Value,
+    ) -> Result<(), StoreError> {
+        self.checkpoint(
+            execution_id,
+            &CleanupDisposition::CleanupPending.to_string(),
+            handles,
+        )
+        .await
     }
     async fn resolve(&self, execution_id: &ExecutionId) -> Result<(), StoreError>;
     async fn get(&self, execution_id: &ExecutionId) -> Result<CleanupAuthority, StoreError> {
@@ -276,6 +286,33 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
             let actual = self.get(execution_id).await?.disposition()?;
             Err(StoreError::Conflict(format!(
                 "cleanup authority is {actual}, expected {expected}"
+            )))
+        }
+    }
+
+    async fn fence_for_cleanup(
+        &self,
+        execution_id: &ExecutionId,
+        handles: &Value,
+    ) -> Result<(), StoreError> {
+        let updated = sqlx::query(
+            "UPDATE cleanup_authorities c SET phase = 'CLEANUP_PENDING', handles = $2, updated_at = now() \
+             FROM executions e, execution_attempts a \
+             WHERE c.execution_id = $1 AND e.id = c.execution_id \
+             AND a.attempt_id = c.attempt_id AND a.execution_id = c.execution_id \
+             AND (a.finished_at IS NOT NULL OR e.state IN ('REVIEW_READY', 'COMPLETED', 'FAILED', 'CANCELLED')) \
+             AND c.phase NOT IN ('RETAINED', 'RUNTIME_STOPPED', 'RUNTIME_DESTROYED', \
+                 'GIT_RECOVERED_CLEANED', 'STORAGE_RELEASED', 'RESERVATION_RELEASED', 'RESOLVED')",
+        )
+        .bind(execution_id.as_str())
+        .bind(handles)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::Conflict(format!(
+                "cleanup authority {execution_id} is not fenced or terminal"
             )))
         }
     }
