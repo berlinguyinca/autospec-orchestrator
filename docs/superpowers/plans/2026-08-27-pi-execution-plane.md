@@ -153,10 +153,10 @@
 **Files:**
 - Create: `deploy/docker-compose.yml`, `Dockerfile`, Podman/Apptainer crates, controller CLI module
 
-- [ ] Add a single-host deployment with constrained Docker access.
-- [ ] Provision the documented APFS or LVM execution-storage pool and surface capability failures in worker health.
-- [ ] Run the frozen runtime conformance suite against Docker, Podman, and Apptainer where available.
-- [ ] Implement operator commands for workers, executions, queue state, and cleanup health.
+- [x] Add a single-host deployment with constrained Docker access.
+- [x] Provision the documented APFS or LVM execution-storage pool and surface capability failures in worker health.
+- [x] Run the frozen runtime conformance suite against Docker, Podman, and Apptainer where available.
+- [x] Implement operator commands for workers, executions, queue state, and cleanup health.
 
 ### Task 9: Completion and invariant audit (#33)
 
