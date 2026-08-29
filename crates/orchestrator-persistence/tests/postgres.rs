@@ -208,15 +208,37 @@ async fn resolved_cleanup_cancellation_is_listable_and_restart_idempotent() {
         .await
         .unwrap()
         .iter()
-        .any(|execution| execution.id == reservation.execution.id));
-    executions
-        .complete_cancellation(&reservation.execution.id, &reservation.attempt_id)
-        .await
-        .unwrap();
-    let replay = executions
-        .request_cancellation(&reservation.execution.id)
-        .await
-        .unwrap();
+        .any(|pending| pending.execution.id == reservation.execution.id));
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT execution_id FROM execution_cancellation_requests \
+         WHERE execution_id = $1 FOR UPDATE",
+    )
+    .bind(reservation.execution.id.as_str())
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+    let completing = {
+        let executions = executions.clone();
+        let id = reservation.execution.id.clone();
+        let attempt_id = reservation.attempt_id.clone();
+        tokio::spawn(async move { executions.complete_cancellation(&id, &attempt_id).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let replaying = {
+        let executions = executions.clone();
+        let id = reservation.execution.id.clone();
+        tokio::spawn(async move { executions.request_cancellation(&id).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    blocker.commit().await.unwrap();
+    let (completed, replay) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(completing, replaying)
+    })
+    .await
+    .expect("cancellation completion and replay must not deadlock");
+    completed.unwrap().unwrap();
+    let replay = replay.unwrap().unwrap();
     assert_eq!(replay.state, ExecutionState::Cancelled);
     assert!(!executions
         .cancellation_requested(&reservation.execution.id)

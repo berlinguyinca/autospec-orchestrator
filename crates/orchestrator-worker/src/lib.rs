@@ -22,8 +22,8 @@ use orchestrator_core::{
     Execution, ExecutionEvent, ExecutionId, ExecutionResult, TaskPacket, WorkerId,
 };
 use orchestrator_persistence::{
-    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore, ReservationStore,
-    StoreError,
+    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore,
+    PendingCancellation, ReservationStore, StoreError,
 };
 use runtime_traits::EnvironmentHandle;
 use std::sync::{
@@ -263,54 +263,123 @@ impl Worker {
         }
     }
 
-    /// Observes durable cancellation intent for this worker's active and
-    /// restart-recoverable executions. The database remains authoritative;
-    /// task flags only interrupt an in-process workload.
-    pub async fn observe_cancellations(
+    /// Runs the production daemon's durable reconciliation tick. Active tasks
+    /// are all signalled before any fallible cleanup recovery is attempted.
+    pub async fn reconcile_daemon_tick(
         &self,
         worker_id: &WorkerId,
         tasks: &[ExecutionTask],
     ) -> Result<(), WorkerError> {
-        for execution in self
+        let pending = self
             .executions
             .list_pending_cancellations()
             .await
-            .map_err(|error| WorkerError::Persistence(error.to_string()))?
-        {
-            if execution.worker_id.as_ref() != Some(worker_id) {
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        for request in &pending {
+            if request.worker_id.as_ref() != Some(worker_id) {
                 continue;
             }
             if let Some(task) = tasks
                 .iter()
-                .find(|task| task.execution_id() == &execution.id)
+                .find(|task| task.execution_id() == &request.execution.id)
             {
                 task.cancel();
+            }
+        }
+
+        let mut errors = Vec::new();
+        for request in &pending {
+            if request.worker_id.as_ref() != Some(worker_id)
+                || tasks
+                    .iter()
+                    .any(|task| task.execution_id() == &request.execution.id)
+            {
                 continue;
             }
-            let authority = match self.cleanup_authorities.get(&execution.id).await {
-                Ok(authority) => authority,
-                Err(StoreError::NotFound(_)) => {
-                    let attempt_id = execution.attempt_id.as_ref().ok_or_else(|| {
-                        WorkerError::Invalid(format!(
-                            "pending cancellation {} lacks attempt authority",
-                            execution.id
-                        ))
-                    })?;
-                    self.cleanup_authorities
-                        .begin(&execution.id, attempt_id, worker_id)
-                        .await
-                        .map_err(|error| WorkerError::Persistence(error.to_string()))?;
-                    self.cleanup_authorities
-                        .get(&execution.id)
-                        .await
-                        .map_err(|error| WorkerError::Persistence(error.to_string()))?
-                }
-                Err(error) => return Err(WorkerError::Persistence(error.to_string())),
-            };
-            self.recover_cleanup_authority(&authority, &execution)
-                .await?;
+            if let Err(error) = self
+                .reconcile_pending_cancellation(worker_id, request)
+                .await
+            {
+                errors.push(format!("execution {}: {error}", request.execution.id));
+            }
         }
-        Ok(())
+
+        match self.cleanup_authorities.list_for_worker(worker_id).await {
+            Ok(authorities) => {
+                for authority in authorities {
+                    if pending
+                        .iter()
+                        .any(|request| request.execution.id == authority.execution_id)
+                    {
+                        continue;
+                    }
+                    let Ok(disposition) = authority.disposition() else {
+                        continue;
+                    };
+                    if !matches!(
+                        disposition,
+                        CleanupDisposition::CleanupPending
+                            | CleanupDisposition::RuntimeStopped
+                            | CleanupDisposition::RuntimeDestroyed
+                            | CleanupDisposition::GitRecoveredCleaned
+                            | CleanupDisposition::StorageReleased
+                            | CleanupDisposition::ReservationReleased
+                    ) {
+                        continue;
+                    }
+                    match self.executions.get(&authority.execution_id).await {
+                        Ok(execution) => {
+                            if let Err(error) =
+                                self.recover_cleanup_authority(&authority, &execution).await
+                            {
+                                errors
+                                    .push(format!("execution {}: {error}", authority.execution_id));
+                            }
+                        }
+                        Err(error) => errors.push(format!(
+                            "execution {} is unavailable: {error}",
+                            authority.execution_id
+                        )),
+                    }
+                }
+            }
+            Err(error) => errors.push(format!("list cleanup authorities: {error}")),
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkerError::Cleanup(errors.join("; ")))
+        }
+    }
+
+    async fn reconcile_pending_cancellation(
+        &self,
+        worker_id: &WorkerId,
+        request: &PendingCancellation,
+    ) -> Result<(), WorkerError> {
+        let authority = match self.cleanup_authorities.get(&request.execution.id).await {
+            Ok(authority) => authority,
+            Err(StoreError::NotFound(_)) => {
+                let attempt_id = request.attempt_id.as_ref().ok_or_else(|| {
+                    WorkerError::Invalid(format!(
+                        "pending cancellation {} lacks attempt authority",
+                        request.execution.id
+                    ))
+                })?;
+                self.cleanup_authorities
+                    .begin(&request.execution.id, attempt_id, worker_id)
+                    .await
+                    .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+                self.cleanup_authorities
+                    .get(&request.execution.id)
+                    .await
+                    .map_err(|error| WorkerError::Persistence(error.to_string()))?
+            }
+            Err(error) => return Err(WorkerError::Persistence(error.to_string())),
+        };
+        self.recover_cleanup_authority(&authority, &request.execution)
+            .await
     }
 
     pub async fn recover_cleanup_authority(

@@ -349,7 +349,7 @@ async fn main() -> Result<()> {
             }
         }
         if let Err(error) = execution_worker
-            .observe_cancellations(&worker.id, &tasks)
+            .reconcile_daemon_tick(&worker.id, &tasks)
             .await
         {
             tracing::warn!(
@@ -357,39 +357,6 @@ async fn main() -> Result<()> {
                 %error,
                 "durable cancellation reconciliation remains pending"
             );
-        }
-        for authority in cleanup
-            .list_for_worker(&worker.id)
-            .await
-            .unwrap_or_default()
-        {
-            let Ok(disposition) = authority.disposition() else {
-                continue;
-            };
-            if !matches!(
-                disposition,
-                CleanupDisposition::CleanupPending
-                    | CleanupDisposition::RuntimeStopped
-                    | CleanupDisposition::RuntimeDestroyed
-                    | CleanupDisposition::GitRecoveredCleaned
-                    | CleanupDisposition::StorageReleased
-                    | CleanupDisposition::ReservationReleased
-            ) {
-                continue;
-            }
-            match executions.get(&authority.execution_id).await {
-                Ok(execution) => {
-                    if let Err(error) = execution_worker
-                        .recover_cleanup_authority(&authority, &execution)
-                        .await
-                    {
-                        tracing::warn!(execution_id = %authority.execution_id, %error, "periodic cleanup reconciliation remains pending");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(execution_id = %authority.execution_id, %error, "cleanup authority execution is unavailable")
-                }
-            }
         }
         if tokio::time::Instant::now() >= heartbeat_due {
             let request = if registered {

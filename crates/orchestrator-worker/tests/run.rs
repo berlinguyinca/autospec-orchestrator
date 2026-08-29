@@ -11,8 +11,8 @@ use orchestrator_core::{
     RepositoryReference, Role, RuntimeRequirement, SessionId, TaskPacket, WorkerId,
 };
 use orchestrator_persistence::{
-    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore, Reservation,
-    ReservationStore, StoreError,
+    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore,
+    PendingCancellation, Reservation, ReservationStore, StoreError,
 };
 use orchestrator_worker::{AdoptedExecution, ExecutionLifecycle, LifecycleError, Worker};
 use runtime_traits::{EnvironmentHandle, VerifiedAgentContainer};
@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 struct FakeStore {
     execution: Mutex<Option<Execution>>,
     events: Mutex<Vec<ExecutionEvent>>,
+    pending_cancellations: Mutex<Vec<PendingCancellation>>,
     fail_record: bool,
 }
 
@@ -40,6 +41,17 @@ impl ExecutionStore for FakeStore {
     }
     async fn list_live(&self) -> Result<Vec<Execution>, StoreError> {
         Ok(self.execution.lock().unwrap().clone().into_iter().collect())
+    }
+    async fn cancellation_requested(&self, id: &ExecutionId) -> Result<bool, StoreError> {
+        Ok(self
+            .pending_cancellations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|pending| pending.execution.id == *id))
+    }
+    async fn list_pending_cancellations(&self) -> Result<Vec<PendingCancellation>, StoreError> {
+        Ok(self.pending_cancellations.lock().unwrap().clone())
     }
     async fn transition(
         &self,
@@ -968,6 +980,62 @@ async fn cancellation_interrupts_a_hung_poll_and_still_runs_cleanup() {
         "cancelled poll task did not stop within bound"
     );
     assert!(order.lock().unwrap().contains(&"pi-stop"));
+}
+
+#[tokio::test]
+async fn failing_oldest_taskless_cancellation_does_not_starve_active_peer_signal() {
+    let mut active = execution();
+    active.id = ExecutionId::new("active-peer-cancellation");
+    active.labels.execution_id = active.id.clone();
+    let mut malformed = active.clone();
+    malformed.id = ExecutionId::new("oldest-malformed-cancellation");
+    malformed.labels.execution_id = malformed.id.clone();
+    malformed.attempt_id = None;
+    let worker_id = active.worker_id.clone().unwrap();
+    let store = Arc::new(FakeStore::default());
+    store.insert(&active).await.unwrap();
+    *store.pending_cancellations.lock().unwrap() = vec![
+        PendingCancellation {
+            execution: malformed,
+            worker_id: Some(worker_id.clone()),
+            attempt_id: None,
+        },
+        PendingCancellation {
+            execution: active.clone(),
+            worker_id: Some(worker_id.clone()),
+            attempt_id: active.attempt_id.clone(),
+        },
+    ];
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::new(Mutex::new(Vec::new())),
+        fail_at: None,
+        poll_empty: false,
+        cleanup_fail: false,
+        hang_poll: true,
+    });
+    let worker = Arc::new(worker(
+        lifecycle,
+        store.clone(),
+        Arc::new(FakeReservations::default()),
+    ));
+    let task = worker.clone().spawn(active);
+
+    assert!(worker
+        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+        .await
+        .is_err());
+    tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
+        .await
+        .expect("active peer must be signalled before malformed cleanup recovery")
+        .unwrap_err();
+    assert_eq!(
+        store
+            .get(&ExecutionId::new("active-peer-cancellation"))
+            .await
+            .unwrap()
+            .state,
+        ExecutionState::Cancelled
+    );
 }
 
 fn execution() -> Execution {

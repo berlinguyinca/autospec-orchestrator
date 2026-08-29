@@ -41,7 +41,7 @@ pub trait ExecutionStore: Send + Sync {
     async fn cancellation_requested(&self, _id: &ExecutionId) -> Result<bool, StoreError> {
         Ok(false)
     }
-    async fn list_pending_cancellations(&self) -> Result<Vec<Execution>, StoreError> {
+    async fn list_pending_cancellations(&self) -> Result<Vec<PendingCancellation>, StoreError> {
         Ok(Vec::new())
     }
     async fn complete_cancellation(
@@ -113,6 +113,13 @@ pub struct IdempotentExecution {
     pub execution: Execution,
     pub created: bool,
     pub event_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingCancellation {
+    pub execution: Execution,
+    pub worker_id: Option<WorkerId>,
+    pub attempt_id: Option<AttemptId>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,15 +277,30 @@ impl ExecutionStore for PgExecutionStore {
         .map_err(StoreError::from)
     }
 
-    async fn list_pending_cancellations(&self) -> Result<Vec<Execution>, StoreError> {
+    async fn list_pending_cancellations(&self) -> Result<Vec<PendingCancellation>, StoreError> {
         let rows = sqlx::query(
-            "SELECT e.* FROM executions e JOIN execution_cancellation_requests r \
-             ON r.execution_id = e.id WHERE r.completed_at IS NULL \
+            "SELECT e.*, COALESCE(c.worker_id, e.worker_id) AS cancellation_worker_id, \
+             COALESCE(c.attempt_id, e.attempt_id) AS cancellation_attempt_id \
+             FROM executions e JOIN execution_cancellation_requests r ON r.execution_id = e.id \
+             LEFT JOIN cleanup_authorities c ON c.execution_id = e.id \
+             WHERE r.completed_at IS NULL \
              ORDER BY r.requested_at, e.id",
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(decode_execution).collect()
+        rows.iter()
+            .map(|row| {
+                Ok(PendingCancellation {
+                    execution: decode_execution(row)?,
+                    worker_id: row
+                        .try_get::<Option<String>, _>("cancellation_worker_id")?
+                        .map(WorkerId::new),
+                    attempt_id: row
+                        .try_get::<Option<String>, _>("cancellation_attempt_id")?
+                        .map(AttemptId::new),
+                })
+            })
+            .collect()
     }
 
     async fn complete_cancellation(
@@ -287,6 +309,11 @@ impl ExecutionStore for PgExecutionStore {
         attempt_id: &AttemptId,
     ) -> Result<(Execution, u64), StoreError> {
         let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
         let request = sqlx::query(
             "SELECT requested_at FROM execution_cancellation_requests \
              WHERE execution_id = $1 AND completed_at IS NULL FOR UPDATE",
@@ -299,11 +326,6 @@ impl ExecutionStore for PgExecutionStore {
                 "execution {id} has no pending cancellation request"
             )));
         }
-        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
-            .bind(id.as_str())
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
         let mut execution = decode_execution(&row)?;
         let from = execution.state;
         execution

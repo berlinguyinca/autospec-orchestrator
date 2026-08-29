@@ -466,7 +466,7 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
         .await
         .unwrap();
     replacement
-        .observe_cancellations(&worker_id, &[])
+        .reconcile_daemon_tick(&worker_id, &[])
         .await
         .unwrap();
     assert_eq!(
@@ -684,7 +684,7 @@ async fn controller_cancellation_stops_hung_pi_before_one_terminal_event_and_rel
         0
     );
     worker
-        .observe_cancellations(&worker_id, std::slice::from_ref(&task))
+        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
         .await
         .unwrap();
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), task.join())
@@ -752,7 +752,7 @@ async fn controller_cancellation_stops_hung_pi_before_one_terminal_event_and_rel
         .request_cancellation(&before_task_id)
         .await
         .unwrap();
-    worker.observe_cancellations(&worker_id, &[]).await.unwrap();
+    worker.reconcile_daemon_tick(&worker_id, &[]).await.unwrap();
     assert_eq!(
         executions.get(&before_task_id).await.unwrap().state,
         ExecutionState::Cancelled
@@ -771,9 +771,91 @@ async fn controller_cancellation_stops_hung_pi_before_one_terminal_event_and_rel
             .count(),
         1
     );
+
+    let restart_id = ExecutionId::new(format!("execution-post-resolve-{suffix}"));
+    let mut restart_execution = queued.clone();
+    restart_execution.id = restart_id.clone();
+    restart_execution.labels.execution_id = restart_id.clone();
+    restart_execution.state = ExecutionState::Queued;
+    restart_execution.worker_id = None;
+    restart_execution.attempt_id = None;
+    restart_execution.session_id = None;
+    restart_execution.worktree_path = None;
+    restart_execution.result = None;
+    restart_execution.created_at = Utc::now();
+    restart_execution.updated_at = restart_execution.created_at;
+    executions.insert(&restart_execution).await.unwrap();
+    let restart_reservation = reservations
+        .reserve_next(&worker_id)
+        .await
+        .unwrap()
+        .expect("post-resolve cancellation execution must reserve");
+    cleanup
+        .begin(&restart_id, &restart_reservation.attempt_id, &worker_id)
+        .await
+        .unwrap();
+    executions.request_cancellation(&restart_id).await.unwrap();
+    cleanup
+        .fence_for_cleanup(&restart_id, &serde_json::json!({}))
+        .await
+        .unwrap();
+    let mut disposition = CleanupDisposition::CleanupPending;
+    for next in [
+        CleanupDisposition::RuntimeStopped,
+        CleanupDisposition::RuntimeDestroyed,
+        CleanupDisposition::GitRecoveredCleaned,
+        CleanupDisposition::StorageReleased,
+    ] {
+        cleanup
+            .transition(&restart_id, disposition, next, &serde_json::json!({}))
+            .await
+            .unwrap();
+        disposition = next;
+    }
+    reservations
+        .finalize_cleanup(&restart_id, &restart_reservation.attempt_id)
+        .await
+        .unwrap();
+    cleanup.resolve(&restart_id).await.unwrap();
+    assert!(executions
+        .get(&restart_id)
+        .await
+        .unwrap()
+        .worker_id
+        .is_none());
+    let restarted_worker = Worker::new(
+        build_system_lifecycle(&root, &remote_root, &daemon_id, &image_id),
+        Arc::new(PgExecutionStore::connect(&database_url).await.unwrap()),
+        Arc::new(PgReservationStore::connect(&database_url).await.unwrap()),
+        Arc::new(
+            PgCleanupAuthorityStore::connect(&database_url)
+                .await
+                .unwrap(),
+        ),
+    );
+    restarted_worker
+        .reconcile_daemon_tick(&worker_id, &[])
+        .await
+        .unwrap();
+    let reopened_events = PgEventLog::connect(&database_url).await.unwrap();
+    assert_eq!(
+        reopened_events
+            .since(&restart_id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionCancelled))
+            .count(),
+        1
+    );
+    assert!(!executions
+        .cancellation_requested(&restart_id)
+        .await
+        .unwrap());
     server.abort();
     delete_matrix_records(&database_url, &execution_id, &worker_id).await;
     delete_matrix_records(&database_url, &before_task_id, &worker_id).await;
+    delete_matrix_records(&database_url, &restart_id, &worker_id).await;
     if root.exists() {
         fs::remove_dir_all(root).unwrap();
     }
