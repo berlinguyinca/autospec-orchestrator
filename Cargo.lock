@@ -142,6 +142,7 @@ dependencies = [
  "orchestrator-worker",
  "reqwest",
  "runtime-docker",
+ "runtime-traits",
  "serde_json",
  "tokio",
  "tracing",
@@ -1737,10 +1738,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bollard",
+ "chrono",
  "execution-storage",
  "futures-util",
  "orchestrator-core",
  "runtime-traits",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -1751,6 +1754,7 @@ name = "runtime-traits"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "orchestrator-core",
  "thiserror",
 ]

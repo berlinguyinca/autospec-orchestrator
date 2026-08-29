@@ -20,6 +20,7 @@ use std::{
 
 const CONTAINER_WORKTREE: &str = "/workspace";
 const CONTAINER_SESSION: &str = "/session";
+const CONTAINER_CREDENTIAL: &str = "/run/autospec/credential";
 
 pub(crate) struct ReadyStorageGuard<'a> {
     runtime: &'a DockerRuntime,
@@ -315,7 +316,13 @@ async fn provision_inner(
         .chain(service_images.iter())
         .collect::<Vec<_>>();
     validate_reserved_image_volumes(&image_inspects)?;
-    let execution_mounts = execution_bind_mounts(layout)?;
+    let execution_mounts = execution_bind_mounts(
+        layout,
+        runtime
+            .credentials
+            .as_ref()
+            .map(|credentials| credentials.path.as_path()),
+    )?;
     let agent_mounts = writable_container_mounts(&layout.runtime, "agent", &image_inspect)?;
     let service_mounts = service_requirements
         .iter()
@@ -428,7 +435,10 @@ async fn provision_inner(
         verified_agent_container,
         service_containers,
         volumes: Vec::new(),
-        credentials_path: None,
+        credentials_path: runtime
+            .credentials
+            .as_ref()
+            .map(|credentials| credentials.path.clone()),
     })
 }
 
@@ -534,11 +544,40 @@ async fn issue_agent_container_capability(
     })
 }
 
-fn execution_bind_mounts(layout: &ExecutionLayout) -> Result<Vec<Mount>, RuntimeError> {
-    Ok(vec![
+fn execution_bind_mounts(
+    layout: &ExecutionLayout,
+    credential: Option<&Path>,
+) -> Result<Vec<Mount>, RuntimeError> {
+    let mut mounts = vec![
         bind_mount(&layout.repository, CONTAINER_WORKTREE)?,
         bind_mount(&layout.conversation, CONTAINER_SESSION)?,
-    ])
+    ];
+    if let Some(credential) = credential {
+        let canonical = fs::canonicalize(credential).map_err(|error| {
+            RuntimeError::Provisioning(format!("canonicalize execution credential: {error}"))
+        })?;
+        let credential_root = fs::canonicalize(&layout.credentials).map_err(|error| {
+            RuntimeError::Provisioning(format!("canonicalize credential root: {error}"))
+        })?;
+        if canonical.parent() != Some(credential_root.as_path())
+            || fs::symlink_metadata(credential)
+                .map_err(|error| {
+                    RuntimeError::Provisioning(format!("inspect execution credential: {error}"))
+                })?
+                .file_type()
+                .is_symlink()
+            || !canonical.is_file()
+        {
+            return Err(RuntimeError::ResourceLimit(
+                "credential is not an exact regular file under the execution credential root"
+                    .to_owned(),
+            ));
+        }
+        let mut mount = bind_mount(&canonical, CONTAINER_CREDENTIAL)?;
+        mount.read_only = Some(true);
+        mounts.push(mount);
+    }
+    Ok(mounts)
 }
 
 fn verified_execution_layout(
@@ -1302,5 +1341,31 @@ mod tests {
         let mut wrong_source = exact;
         wrong_source[0].source = Some(state.path().join("other").display().to_string());
         assert!(validate_actual_mounts(&requested, &wrong_source).is_err());
+    }
+
+    #[test]
+    fn execution_credentials_are_read_only_and_reserved_for_the_agent() {
+        let state = tempfile::tempdir().expect("state");
+        let layout = ExecutionLayout::new(
+            state.path(),
+            &orchestrator_core::ExecutionId::new("node-417-impl-01"),
+        )
+        .expect("layout");
+        std::fs::create_dir_all(&layout.repository).expect("repository");
+        std::fs::create_dir_all(&layout.conversation).expect("conversation");
+        std::fs::create_dir_all(&layout.credentials).expect("credentials");
+        let credential = layout.credentials.join("inferweave.credential");
+        std::fs::write(&credential, "opaque\n2026-08-29T01:00:00Z\n").expect("credential");
+
+        let mounts = execution_bind_mounts(&layout, Some(&credential)).expect("execution mounts");
+        let credential_mount = mounts
+            .iter()
+            .find(|mount| mount.target.as_deref() == Some("/run/autospec/credential"))
+            .expect("credential mount");
+        assert_eq!(credential_mount.read_only, Some(true));
+        assert_eq!(
+            std::fs::canonicalize(credential_mount.source.as_deref().unwrap()).unwrap(),
+            std::fs::canonicalize(&credential).unwrap()
+        );
     }
 }

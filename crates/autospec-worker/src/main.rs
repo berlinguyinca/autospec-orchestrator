@@ -19,7 +19,9 @@ use orchestrator_worker::{
     ContentAddressedEvidenceStore, ExecutionTask, SystemExecutionLifecycle, SystemRecoveryConfig,
     VerifiedDockerRuntimeFactory, VerifiedPiHarnessFactory, Worker,
 };
+use runtime_docker::LocalCredentialBroker;
 use runtime_docker::TrustedVerifierImage;
+use runtime_traits::CredentialBroker;
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -131,11 +133,16 @@ async fn main() -> Result<()> {
     ));
     let trusted_verifier =
         TrustedVerifierImage::new(&cli.docker_verifier_image, &cli.docker_verifier_command)?;
+    let credential_broker: Arc<dyn CredentialBroker> = Arc::new(LocalCredentialBroker::new(
+        &cli.state_root,
+        chrono::Duration::minutes(15),
+    )?);
     let runtimes = Arc::new(VerifiedDockerRuntimeFactory::new(
         cli.docker_socket.clone(),
         PathBuf::from(&cli.docker_binary),
         verifier.clone(),
         trusted_verifier,
+        credential_broker,
     ));
     let harnesses = Arc::new(VerifiedPiHarnessFactory::new(
         verifier.clone(),

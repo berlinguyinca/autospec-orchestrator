@@ -22,8 +22,8 @@ use orchestrator_worker::{
     ExecutionLifecycle, FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
     VerifiedDockerRuntimeFactory, VerifiedPiHarnessFactory, Worker,
 };
-use runtime_docker::TrustedVerifierImage;
-use runtime_traits::EnvironmentHandle;
+use runtime_docker::{LocalCredentialBroker, TrustedVerifierImage};
+use runtime_traits::{CredentialBroker, EnvironmentHandle};
 use sqlx::{Connection, PgConnection};
 use std::{
     fs,
@@ -1697,6 +1697,8 @@ fn build_system_lifecycle(
             PathBuf::from("docker"),
             verifier.clone(),
             trusted,
+            Arc::new(LocalCredentialBroker::new(root, chrono::Duration::minutes(15)).unwrap())
+                as Arc<dyn CredentialBroker>,
         )),
         Arc::new(VerifiedPiHarnessFactory::new(
             verifier,

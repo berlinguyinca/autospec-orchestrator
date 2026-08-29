@@ -5,6 +5,7 @@
 //! (spec section 42).
 
 mod cleanup;
+mod credentials;
 mod limits;
 mod provision;
 mod services;
@@ -13,9 +14,10 @@ use async_trait::async_trait;
 use bollard::Docker;
 use execution_storage::{AllocationReceipt, ReadyAllocationVerifier};
 use orchestrator_core::{ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement};
-use runtime_traits::{EnvironmentHandle, Runtime, RuntimeError};
+use runtime_traits::{EnvironmentHandle, ExecutionCredentials, Runtime, RuntimeError};
 use std::{env, path::PathBuf, sync::Arc};
 
+pub use credentials::LocalCredentialBroker;
 pub use limits::{host_limits, HostConfigLimits, DEFAULT_PIDS_LIMIT};
 
 const DEFAULT_MIN_API_VERSION: &str = "1.41";
@@ -66,6 +68,7 @@ pub struct DockerRuntime {
     pub(crate) storage_verifier: Option<Arc<dyn ReadyAllocationVerifier>>,
     pub(crate) allocation: Option<AllocationReceipt>,
     pub(crate) trusted_verifier: Option<TrustedVerifierImage>,
+    pub(crate) credentials: Option<ExecutionCredentials>,
 }
 
 impl DockerRuntime {
@@ -100,6 +103,7 @@ impl DockerRuntime {
             storage_verifier: None,
             allocation: None,
             trusted_verifier: None,
+            credentials: None,
         })
     }
 
@@ -146,6 +150,12 @@ impl DockerRuntime {
 
     pub fn new() -> Result<Self, RuntimeError> {
         Self::connect(None)
+    }
+
+    /// Binds one already-minted execution credential into only the agent.
+    pub fn with_credentials(mut self, credentials: ExecutionCredentials) -> Self {
+        self.credentials = Some(credentials);
+        self
     }
 
     /// Network name for an execution's isolated environment.

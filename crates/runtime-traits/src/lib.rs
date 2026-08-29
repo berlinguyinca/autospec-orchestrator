@@ -5,7 +5,10 @@
 //! must not change because of the runtime (spec section 65).
 
 use async_trait::async_trait;
-use orchestrator_core::{ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement};
+use chrono::{DateTime, Utc};
+use orchestrator_core::{
+    Execution, ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement,
+};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -48,6 +51,22 @@ pub struct EnvironmentHandle {
     pub service_containers: Vec<String>,
     pub volumes: Vec<String>,
     pub credentials_path: Option<PathBuf>,
+}
+
+/// Exact execution-scoped credential material made available to one workload.
+/// The broker owns its lifetime; callers persist neither its content nor path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCredentials {
+    pub path: PathBuf,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Issuance boundary for short-lived execution credentials (spec section 36).
+/// InferWeave policy and validation remain outside the orchestrator.
+#[async_trait]
+pub trait CredentialBroker: Send + Sync {
+    async fn mint(&self, execution: &Execution) -> Result<ExecutionCredentials, RuntimeError>;
+    async fn revoke(&self, id: &ExecutionId) -> Result<(), RuntimeError>;
 }
 
 /// A runtime provisions one isolated environment per execution and can destroy

@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 bollard.workspace = true
+chrono.workspace = true
 execution-storage.workspace = true
 futures-util.workspace = true
 orchestrator-core.workspace = true
@@ -19,5 +20,6 @@ runtime-traits.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

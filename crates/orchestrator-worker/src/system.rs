@@ -12,7 +12,9 @@ use orchestrator_core::{
 };
 use orchestrator_persistence::{ArtifactStore, CleanupAuthority, CleanupDisposition};
 use runtime_docker::{DockerRuntime, TrustedVerifierImage};
-use runtime_traits::{EnvironmentHandle, Runtime, VerifiedAgentContainer, VerifiedBindMount};
+use runtime_traits::{
+    CredentialBroker, EnvironmentHandle, Runtime, VerifiedAgentContainer, VerifiedBindMount,
+};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -31,6 +33,7 @@ pub trait RuntimeFactory: Send + Sync {
         receipt: &AllocationReceipt,
     ) -> Result<Arc<dyn Runtime>, LifecycleError>;
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError>;
+    async fn revoke_credentials(&self, execution_id: &ExecutionId) -> Result<(), LifecycleError>;
 }
 
 #[async_trait]
@@ -53,12 +56,13 @@ pub trait EvidenceStore: Send + Sync {
     ) -> Result<String, LifecycleError>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VerifiedDockerRuntimeFactory {
     socket: Option<String>,
     docker_binary: PathBuf,
     verifier: Arc<dyn ReadyAllocationVerifier>,
     trusted_verifier: TrustedVerifierImage,
+    credentials: Arc<dyn CredentialBroker>,
 }
 
 impl VerifiedDockerRuntimeFactory {
@@ -67,12 +71,14 @@ impl VerifiedDockerRuntimeFactory {
         docker_binary: PathBuf,
         verifier: Arc<dyn ReadyAllocationVerifier>,
         trusted_verifier: TrustedVerifierImage,
+        credentials: Arc<dyn CredentialBroker>,
     ) -> Self {
         Self {
             socket,
             docker_binary,
             verifier,
             trusted_verifier,
+            credentials,
         }
     }
 }
@@ -81,17 +87,41 @@ impl VerifiedDockerRuntimeFactory {
 impl RuntimeFactory for VerifiedDockerRuntimeFactory {
     async fn build(
         &self,
-        _: &Execution,
+        execution: &Execution,
         receipt: &AllocationReceipt,
     ) -> Result<Arc<dyn Runtime>, LifecycleError> {
-        DockerRuntime::connect_with_verified_execution_storage(
+        let credentials = self
+            .credentials
+            .mint(execution)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        if credentials.expires_at <= chrono::Utc::now()
+            || !credentials
+                .path
+                .starts_with(receipt.mount_path.join("credentials"))
+        {
+            let _ = self.credentials.revoke(&execution.id).await;
+            return Err(LifecycleError::Step(
+                "credential broker returned invalid execution authority".into(),
+            ));
+        }
+        match DockerRuntime::connect_with_verified_execution_storage(
             self.socket.as_deref(),
             Arc::clone(&self.verifier),
             receipt.clone(),
             self.trusted_verifier.clone(),
         )
-        .map(|runtime| Arc::new(runtime) as Arc<dyn Runtime>)
-        .map_err(|error| LifecycleError::Step(error.to_string()))
+        .map(|runtime| Arc::new(runtime.with_credentials(credentials)) as Arc<dyn Runtime>)
+        {
+            Ok(runtime) => Ok(runtime),
+            Err(error) => {
+                let revocation = self.credentials.revoke(&execution.id).await;
+                Err(LifecycleError::Step(match revocation {
+                    Ok(()) => error.to_string(),
+                    Err(revoke) => format!("{error}; credential revocation failed: {revoke}"),
+                }))
+            }
+        }
     }
 
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError> {
@@ -125,6 +155,13 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
         })
         .await
         .map_err(|error| LifecycleError::Step(error.to_string()))?
+    }
+
+    async fn revoke_credentials(&self, execution_id: &ExecutionId) -> Result<(), LifecycleError> {
+        self.credentials
+            .revoke(execution_id)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))
     }
 }
 
@@ -902,15 +939,26 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
 
     async fn destroy_runtime(&self, execution: &Execution) -> Result<(), LifecycleError> {
         let runtime = self.runtime(&execution.id)?;
-        runtime
-            .destroy(&execution.labels)
-            .await
-            .map_err(|error| LifecycleError::Step(error.to_string()))?;
-        self.active_runtimes
-            .lock()
-            .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
-            .remove(&execution.id);
-        Ok(())
+        let destroy = runtime.destroy(&execution.labels).await;
+        let revoke = self.runtimes.revoke_credentials(&execution.id).await;
+        if destroy.is_ok() && revoke.is_ok() {
+            self.active_runtimes
+                .lock()
+                .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
+                .remove(&execution.id);
+            return Ok(());
+        }
+        Err(LifecycleError::Step(format!(
+            "runtime destroy: {}; credential revoke: {}",
+            destroy
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_owned()),
+            revoke
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_owned())
+        )))
     }
 
     async fn destroy_worktree(&self, worktree: &Worktree) -> Result<(), LifecycleError> {
@@ -1243,6 +1291,9 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
                             .map_err(|error| LifecycleError::Step(error.to_string()))?;
                     }
                 }
+                self.runtimes
+                    .revoke_credentials(&authority.execution_id)
+                    .await?;
                 Ok(CleanupDisposition::RuntimeDestroyed)
             }
             CleanupDisposition::RuntimeDestroyed => {
