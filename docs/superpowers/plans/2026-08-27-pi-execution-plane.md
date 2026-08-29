@@ -56,7 +56,7 @@
 - [x] Connect through bollard with a minimum API version check.
 - [x] Provision one labelled network, limited agent container, and isolated service containers without host ports.
 - [x] Enforce CPU, memory, PID, and container-local disk constraints on every container.
-- [ ] Replace container-local disk accounting with one hard execution-wide storage boundary before declaring `disk_gib` enforced.
+- [x] Replace container-local disk accounting with one hard execution-wide storage boundary before declaring `disk_gib` enforced.
 - [x] Destroy only selector-matched resources and report—not delete—orphans during reconciliation.
 - [x] Prove unrelated Docker resources survive cleanup.
 
@@ -72,7 +72,7 @@
 
 - [x] Add tests using real temporary Git repositories.
 - [x] Implement locked bare mirrors and safe repository-name normalization.
-- [ ] Create independent execution repositories whose Git common directory and objects remain inside the bounded execution root.
+- [x] Create independent execution repositories whose Git common directory and objects remain inside the bounded execution root.
 - [x] Capture patch plus changed-file evidence.
 - [x] Destroy only verified owned worktrees and identify stale owner records.
 
@@ -103,12 +103,12 @@
 - Produces a worker-owned `ExecutionStorageManager` that allocates and verifies one physically reserved filesystem before Git runs.
 - Consumed by Git, Docker, Pi, and the worker lifecycle; immutable mirrors and durable artifact retention remain separately capacity-managed infrastructure.
 
-- [ ] Define versioned allocation receipts, journals, exact-identity cleanup, and deterministic `executions/{execution_id}/...` paths.
-- [ ] Implement fail-closed APFS quota+reserve and Linux thick-LVM capability probes without heuristic usage polling.
-- [ ] Place an independent Git repository, Pi private/session state, credentials, and every runtime-writable path beneath the verified execution root.
-- [ ] Make agent and service root filesystems read-only; disable daemon logs or redirect them into the bounded root.
-- [ ] Prove aggregate exhaustion across Git, Pi, agent, and service paths cannot affect another execution.
-- [ ] Refuse worker readiness when physical reservation, exact mount identity, or Docker bind proof is unavailable.
+- [x] Define versioned allocation receipts, journals, exact-identity cleanup, and deterministic `executions/{execution_id}/...` paths.
+- [x] Implement fail-closed APFS quota+reserve and Linux thick-LVM capability probes without heuristic usage polling.
+- [x] Place an independent Git repository, Pi private/session state, credentials, and every runtime-writable path beneath the verified execution root.
+- [x] Make agent and service root filesystems read-only; disable daemon logs or redirect them into the bounded root.
+- [x] Prove aggregate exhaustion across Git, Pi, agent, and service paths cannot affect another execution.
+- [x] Refuse worker readiness when physical reservation, exact mount identity, or Docker bind proof is unavailable.
 
 ### Task 5: Worker scheduling, lifecycle, and recovery (#19–#22)
 
@@ -119,11 +119,11 @@
 **Interfaces:**
 - Produces registration/heartbeat, transactional capacity reservation, terminal run results, and stranded-execution recovery.
 
-- [ ] Add concurrency and failure-injection tests proving one execution cannot destabilize another.
-- [ ] Implement authenticated worker registration and heartbeats.
-- [ ] Reserve worker slots transactionally before assignment.
-- [ ] Execute storage → independent repository → runtime → Pi → incremental events → diff/artifacts with reverse-order cleanup guards.
-- [ ] Persist state before publishing events and recover executions from lost workers.
+- [x] Add concurrency and failure-injection tests proving one execution cannot destabilize another.
+- [x] Implement authenticated worker registration and heartbeats.
+- [x] Reserve worker slots transactionally before assignment.
+- [x] Execute storage → independent repository → runtime → Pi → incremental events → diff/artifacts with reverse-order cleanup guards.
+- [x] Persist state before publishing events and recover executions from lost workers.
 
 ### Task 6: Versioned execution API and durable evidence (#23–#25)
 
@@ -134,10 +134,10 @@
 **Interfaces:**
 - Produces authenticated `/api/v1` execution, worker, SSE, and artifact surfaces.
 
-- [ ] Add HTTP contract tests for status codes, auth, idempotency, transitions, and body limits.
-- [ ] Implement create/read/cancel/retry without duplicating core DTOs.
-- [ ] Implement resumable SSE using append-only sequence cursors.
-- [ ] Store artifacts by SHA-256 and list them by execution without injecting blobs into prompts.
+- [x] Add HTTP contract tests for status codes, auth, idempotency, transitions, and body limits.
+- [x] Implement create/read/cancel/retry without duplicating core DTOs.
+- [x] Implement resumable SSE using append-only sequence cursors.
+- [x] Store artifacts by SHA-256 and list them by execution without injecting blobs into prompts.
 
 ### Task 7: Isolation, scoped credentials, and interactive Pi (#26–#28)
 
