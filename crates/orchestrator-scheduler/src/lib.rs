@@ -102,6 +102,7 @@ mod tests {
                 runtimes: vec![RuntimeKind::Docker],
                 capabilities: caps.iter().map(|s| (*s).to_owned()).collect(),
                 max_concurrent_executions: 4,
+                health_errors: Vec::new(),
             },
             state: WorkerState::Ready,
             running_executions: running,

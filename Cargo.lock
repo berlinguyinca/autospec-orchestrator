@@ -122,6 +122,8 @@ dependencies = [
  "clap",
  "orchestrator-api",
  "orchestrator-core",
+ "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1733,6 +1735,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-apptainer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "orchestrator-core",
+ "runtime-traits",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "runtime-docker"
 version = "0.1.0"
 dependencies = [
@@ -1742,11 +1755,24 @@ dependencies = [
  "execution-storage",
  "futures-util",
  "orchestrator-core",
+ "runtime-apptainer",
+ "runtime-podman",
  "runtime-traits",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "runtime-podman"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "orchestrator-core",
+ "runtime-traits",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1757,6 +1783,7 @@ dependencies = [
  "chrono",
  "orchestrator-core",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

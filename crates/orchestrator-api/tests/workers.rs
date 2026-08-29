@@ -88,7 +88,22 @@ async fn authenticated_worker_routes_own_liveness_and_reap_after_ninety_seconds(
         1
     );
 
-    let listed = client.get(&base).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(
+        client
+            .get(&base)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let listed = client
+        .get(&base)
+        .bearer_auth("api-secret")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(listed.status(), reqwest::StatusCode::OK);
     let listed: Vec<WorkerRegistration> = listed.json().await.unwrap();
     assert!(listed.iter().any(|worker| worker.id == advertised.id));
@@ -191,6 +206,23 @@ async fn authenticated_execution_cleanup_requests_durable_reconciliation() {
     });
     let client = reqwest::Client::new();
     let url = format!("http://{address}/api/v1/executions/{execution_id}/cleanup");
+    let health_url = format!("http://{address}/api/v1/operator/cleanup-health");
+
+    assert_eq!(
+        client.get(&health_url).send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let health = client
+        .get(&health_url)
+        .bearer_auth("api-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+    let health = health.json::<serde_json::Value>().await.unwrap();
+    assert!(health["unresolved"].as_u64().unwrap() >= 1);
+    assert!(health["retained"].as_u64().unwrap() >= 1);
+    assert!(health.get("oldest_unresolved_at").is_some());
 
     assert_eq!(
         client.post(&url).send().await.unwrap().status(),
@@ -297,6 +329,7 @@ fn registration(id: &str) -> WorkerRegistration {
             runtimes: vec![RuntimeKind::Docker],
             capabilities: vec!["docker".into()],
             max_concurrent_executions: 2,
+            health_errors: Vec::new(),
         },
         state: WorkerState::Ready,
         running_executions: 0,

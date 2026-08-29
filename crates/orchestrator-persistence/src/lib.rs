@@ -9,8 +9,8 @@ mod workers;
 
 pub use artifacts::{Artifact, ArtifactStore, PgArtifactStore};
 pub use cleanup::{
-    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, CleanupStage,
-    PgCleanupAuthorityStore,
+    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, CleanupHealthSnapshot,
+    CleanupStage, PgCleanupAuthorityStore,
 };
 pub use error::StoreError;
 pub use event_log::{EventLog, PgEventLog};
@@ -34,6 +34,26 @@ pub trait ExecutionStore: Send + Sync {
     async fn insert(&self, execution: &Execution) -> Result<(), StoreError>;
     async fn get(&self, id: &ExecutionId) -> Result<Execution, StoreError>;
     async fn list_live(&self) -> Result<Vec<Execution>, StoreError>;
+    /// Bounded metadata source for operator surfaces. Implementations should
+    /// apply `limit` in the backing store rather than materializing all rows.
+    async fn list_operational(&self, limit: u32) -> Result<Vec<Execution>, StoreError> {
+        let mut executions = self.list_live().await?;
+        executions.truncate(limit as usize);
+        Ok(executions)
+    }
+    /// Exact live-state counts used by queue health. This reports execution
+    /// state only; retry and prioritization policy remain outside this crate.
+    async fn live_state_counts(&self) -> Result<Vec<(ExecutionState, u64)>, StoreError> {
+        let mut counts = std::collections::BTreeMap::<String, (ExecutionState, u64)>::new();
+        for execution in self.list_live().await? {
+            let key = enum_text(&execution.state)?;
+            counts
+                .entry(key)
+                .and_modify(|(_, count)| *count += 1)
+                .or_insert((execution.state, 1));
+        }
+        Ok(counts.into_values().collect())
+    }
     async fn request_cancellation(&self, id: &ExecutionId) -> Result<Execution, StoreError> {
         Err(StoreError::Conflict(format!(
             "durable cancellation requests are unavailable for {id}"
@@ -271,6 +291,35 @@ impl ExecutionStore for PgExecutionStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(decode_execution).collect()
+    }
+
+    async fn list_operational(&self, limit: u32) -> Result<Vec<Execution>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM executions \
+             WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') \
+             ORDER BY created_at, id LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(decode_execution).collect()
+    }
+
+    async fn live_state_counts(&self) -> Result<Vec<(ExecutionState, u64)>, StoreError> {
+        sqlx::query(
+            "SELECT state, COUNT(*) AS count FROM executions \
+             WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') GROUP BY state ORDER BY state",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let state = enum_from_text::<ExecutionState>(row.try_get("state")?)?;
+            let count = u64::try_from(row.try_get::<i64, _>("count")?)
+                .map_err(|_| StoreError::Conflict("negative execution count".to_owned()))?;
+            Ok((state, count))
+        })
+        .collect()
     }
 
     async fn request_cancellation(&self, id: &ExecutionId) -> Result<Execution, StoreError> {

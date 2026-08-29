@@ -85,6 +85,64 @@ async fn cancel_execution(client: &reqwest::Client, api: &TestApi, execution_id:
 }
 
 #[tokio::test]
+async fn operator_execution_and_queue_routes_are_authenticated_bounded_and_metadata_only() {
+    let Some(api) = test_api().await else { return };
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/executions", api.base))
+        .bearer_auth(&api.token)
+        .header(
+            "Idempotency-Key",
+            format!("operator-{}", uuid::Uuid::new_v4()),
+        )
+        .json(&manifest())
+        .send()
+        .await
+        .unwrap()
+        .json::<orchestrator_core::Execution>()
+        .await
+        .unwrap();
+    let executions = format!("{}/operator/executions?limit=1", api.base);
+    assert_eq!(
+        client.get(&executions).send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let listed = client
+        .get(&executions)
+        .bearer_auth(&api.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    let listed = listed.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert!(listed[0].get("manifest").is_none());
+    assert!(listed[0].get("task_packet").is_none());
+    assert!(!listed.to_string().contains("api-contract-only"));
+    assert_eq!(
+        client
+            .get(format!("{}/operator/executions?limit=101", api.base))
+            .bearer_auth(&api.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let queue = client
+        .get(format!("{}/operator/queue", api.base))
+        .bearer_auth(&api.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(queue.status(), reqwest::StatusCode::OK);
+    let queue = queue.json::<serde_json::Value>().await.unwrap();
+    assert!(queue["queued"].as_u64().unwrap() >= 1);
+    assert!(queue["total"].as_u64().unwrap() >= 1);
+    cancel_execution(&client, &api, &created.id).await;
+}
+
+#[tokio::test]
 async fn interactive_routes_are_authenticated_idempotent_bounded_and_metadata_only() {
     let Some(api) = test_api().await else { return };
     let client = reqwest::Client::new();

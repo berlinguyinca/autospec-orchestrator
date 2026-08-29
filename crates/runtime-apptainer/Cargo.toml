@@ -1,5 +1,5 @@
 [package]
-name = "runtime-traits"
+name = "runtime-apptainer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,9 +11,9 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
-chrono.workspace = true
 orchestrator-core.workspace = true
-thiserror.workspace = true
+runtime-traits.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio.workspace = true

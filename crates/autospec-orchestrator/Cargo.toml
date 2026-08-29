@@ -14,11 +14,17 @@ workspace = true
 name = "autospec-orchestrator"
 path = "src/main.rs"
 
+[[bin]]
+name = "autospecctl"
+path = "src/bin/autospecctl.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 orchestrator-api.workspace = true
 orchestrator-core.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

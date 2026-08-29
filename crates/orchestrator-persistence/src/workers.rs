@@ -57,13 +57,21 @@ fn validate(worker: &WorkerRegistration) -> Result<(), StoreError> {
             "inference capabilities do not belong in worker registration".to_owned(),
         ));
     }
+    if !capabilities.health_errors_are_sanitized() {
+        return Err(StoreError::Conflict(
+            "worker capability health failures are not sanitized".to_owned(),
+        ));
+    }
     let proof_is_complete = worker
         .capability_proof
         .as_ref()
         .is_some_and(orchestrator_core::WorkerCapabilityProof::is_complete);
-    if worker.state == WorkerState::Ready && !proof_is_complete {
+    if worker.state == WorkerState::Ready
+        && (!proof_is_complete || !worker.capabilities.health_errors.is_empty())
+    {
         return Err(StoreError::Conflict(
-            "Ready worker lacks complete storage and Docker capability proof".to_owned(),
+            "Ready worker lacks a complete capability proof or reports capability health failures"
+                .to_owned(),
         ));
     }
     Ok(())

@@ -12,6 +12,36 @@ use orchestrator_core::{
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub const RUNTIME_CONFORMANCE_VERSION: &str = "autospec.dev/runtime-conformance/v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeConformanceReport {
+    pub contract: &'static str,
+    pub runtime: &'static str,
+    pub availability: RuntimeAvailability,
+}
+
+/// Runs the frozen host-independent portion of the runtime contract. Lifecycle
+/// conformance remains adapter-owned because provisioning requires a real,
+/// runtime-specific image and an execution-storage allocation.
+pub async fn inspect_runtime(runtime: &dyn Runtime) -> RuntimeConformanceReport {
+    RuntimeConformanceReport {
+        contract: RUNTIME_CONFORMANCE_VERSION,
+        runtime: runtime.name(),
+        availability: if runtime.available().await {
+            RuntimeAvailability::Available
+        } else {
+            RuntimeAvailability::Unavailable
+        },
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("runtime unavailable: {0}")]
@@ -95,4 +125,43 @@ pub trait Runtime: Send + Sync {
     /// Find orphaned resources labelled `autospec.managed=true` whose execution
     /// is no longer live, so they can be reclaimed (spec section 42).
     async fn reconcile(&self, live: &[ExecutionId]) -> Result<Vec<ExecutionId>, RuntimeError>;
+}
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::*;
+
+    struct AvailableRuntime;
+
+    #[async_trait]
+    impl Runtime for AvailableRuntime {
+        fn name(&self) -> &'static str {
+            "fixture"
+        }
+        async fn available(&self) -> bool {
+            true
+        }
+        async fn provision(
+            &self,
+            _: &OwnershipLabels,
+            _: &RuntimeRequirement,
+            _: &[ServiceRequirement],
+        ) -> Result<EnvironmentHandle, RuntimeError> {
+            Err(RuntimeError::Provisioning("not exercised".into()))
+        }
+        async fn destroy(&self, _: &OwnershipLabels) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+        async fn reconcile(&self, _: &[ExecutionId]) -> Result<Vec<ExecutionId>, RuntimeError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_conformance_report_names_version_and_availability() {
+        let report = inspect_runtime(&AvailableRuntime).await;
+        assert_eq!(report.contract, RUNTIME_CONFORMANCE_VERSION);
+        assert_eq!(report.runtime, "fixture");
+        assert_eq!(report.availability, RuntimeAvailability::Available);
+    }
 }

@@ -121,6 +121,14 @@ pub struct CleanupAuthority {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupHealthSnapshot {
+    pub unresolved: u64,
+    pub cleanup_pending: u64,
+    pub retained: u64,
+    pub oldest_unresolved_at: Option<DateTime<Utc>>,
+}
+
 impl CleanupAuthority {
     pub fn disposition(&self) -> Result<CleanupDisposition, StoreError> {
         self.phase.parse()
@@ -181,6 +189,11 @@ pub trait CleanupAuthorityStore: Send + Sync {
         &self,
         worker_id: &WorkerId,
     ) -> Result<Vec<CleanupAuthority>, StoreError>;
+    async fn health_snapshot(&self) -> Result<CleanupHealthSnapshot, StoreError> {
+        Err(StoreError::Conflict(
+            "cleanup health is unavailable for this store".to_owned(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -427,5 +440,27 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
             })
         })
         .collect()
+    }
+
+    async fn health_snapshot(&self) -> Result<CleanupHealthSnapshot, StoreError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) FILTER (WHERE phase <> 'RESOLVED') AS unresolved, \
+             COUNT(*) FILTER (WHERE phase = 'CLEANUP_PENDING') AS cleanup_pending, \
+             COUNT(*) FILTER (WHERE phase = 'RETAINED') AS retained, \
+             MIN(updated_at) FILTER (WHERE phase <> 'RESOLVED') AS oldest_unresolved_at \
+             FROM cleanup_authorities",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let count = |name| -> Result<u64, StoreError> {
+            u64::try_from(row.try_get::<i64, _>(name)?)
+                .map_err(|_| StoreError::Conflict(format!("negative cleanup count for {name}")))
+        };
+        Ok(CleanupHealthSnapshot {
+            unresolved: count("unresolved")?,
+            cleanup_pending: count("cleanup_pending")?,
+            retained: count("retained")?,
+            oldest_unresolved_at: row.try_get("oldest_unresolved_at")?,
+        })
     }
 }

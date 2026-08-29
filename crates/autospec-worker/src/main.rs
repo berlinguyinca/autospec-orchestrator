@@ -121,14 +121,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     ensure_local_development_credentials_allowed(&cli)?;
     let storage = build_storage(&cli)?;
-    let proof = match probe_capabilities(&cli, storage.as_ref()) {
-        Ok(proof) => Some(proof),
+    let (proof, health_errors) = match probe_capabilities(&cli, storage.as_ref()) {
+        Ok(proof) => (Some(proof), Vec::new()),
         Err(error) => {
             tracing::error!(worker_id = %cli.worker_id, %error, "worker capability proof unavailable; advertising no runtime capacity");
-            None
+            (None, vec![capability_failure_code(&error).to_owned()])
         }
     };
-    let worker = advertisement(&cli, proof)?;
+    let worker = advertisement(&cli, proof, health_errors)?;
     let executions = Arc::new(PgExecutionStore::connect(&cli.database_url).await?);
     let reservations = Arc::new(PgReservationStore::connect(&cli.database_url).await?);
     let cleanup = Arc::new(PgCleanupAuthorityStore::connect(&cli.database_url).await?);
@@ -312,7 +312,11 @@ fn ensure_local_development_credentials_allowed(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn advertisement(cli: &Cli, proof: Option<WorkerCapabilityProof>) -> Result<WorkerAdvertisement> {
+fn advertisement(
+    cli: &Cli,
+    proof: Option<WorkerCapabilityProof>,
+    health_errors: Vec<String>,
+) -> Result<WorkerAdvertisement> {
     if cli.concurrency == 0 || cli.concurrency > 64 {
         anyhow::bail!("worker concurrency must be between 1 and 64");
     }
@@ -340,9 +344,18 @@ fn advertisement(cli: &Cli, proof: Option<WorkerCapabilityProof>) -> Result<Work
                 Vec::new()
             },
             max_concurrent_executions: cli.concurrency,
+            health_errors,
         },
         capability_proof: proof,
     })
+}
+
+fn capability_failure_code(error: &anyhow::Error) -> &'static str {
+    if error.to_string().to_ascii_lowercase().contains("docker") {
+        "docker-capability-unavailable"
+    } else {
+        "storage-capability-unavailable"
+    }
 }
 
 fn probe_capabilities(
@@ -540,8 +553,17 @@ mod tests {
 
     #[test]
     fn missing_storage_proof_forces_offline_and_token_debug_is_redacted() {
-        let worker = advertisement(&cli(), None).unwrap();
+        let worker = advertisement(
+            &cli(),
+            None,
+            vec!["storage-capability-unavailable".to_owned()],
+        )
+        .unwrap();
         assert!(worker.capability_proof.is_none());
+        assert_eq!(
+            worker.capabilities.health_errors,
+            vec!["storage-capability-unavailable"]
+        );
         let wire = serde_json::to_value(worker).unwrap();
         assert!(wire.get("state").is_none());
         assert!(wire.get("last_heartbeat").is_none());
@@ -558,8 +580,9 @@ mod tests {
             docker_verifier: format!("sha256:{}", "a".repeat(64)),
             docker_method_version: "v2".into(),
         };
-        let worker = advertisement(&cli(), Some(proof)).unwrap();
+        let worker = advertisement(&cli(), Some(proof), Vec::new()).unwrap();
         assert_eq!(worker.capabilities.runtimes, vec![RuntimeKind::Docker]);
+        assert!(worker.capabilities.health_errors.is_empty());
     }
 
     #[test]

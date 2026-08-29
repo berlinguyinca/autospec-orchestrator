@@ -20,6 +20,8 @@ runtime-traits.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+runtime-apptainer.workspace = true
+runtime-podman.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

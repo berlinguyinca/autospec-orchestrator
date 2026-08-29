@@ -10,6 +10,7 @@ mod error;
 mod events;
 mod executions;
 mod interactive;
+mod operations;
 mod state;
 mod workers;
 
@@ -70,6 +71,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(interactive::routes())
                 .merge(events::routes())
                 .merge(artifacts::routes())
+                .merge(operations::routes())
                 .merge(workers::routes()),
         )
         .with_state(state)

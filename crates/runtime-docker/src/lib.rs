@@ -93,6 +93,9 @@ impl DockerRuntime {
             .map(ToOwned::to_owned)
             .or_else(|| env::var("AUTOSPEC_DOCKER_SOCKET").ok());
         let client = match configured_socket {
+            Some(socket) if socket.starts_with("tcp://") || socket.starts_with("http://") => {
+                Docker::connect_with_http(&socket, 120, bollard::API_DEFAULT_VERSION)
+            }
             Some(socket) => Docker::connect_with_socket(&socket, 120, bollard::API_DEFAULT_VERSION),
             None => Docker::connect_with_local_defaults(),
         }
@@ -421,6 +424,20 @@ mod tests {
         assert!(absent.to_ascii_lowercase().contains("socket"));
         assert!(incompatible.contains("below required"));
         assert_ne!(absent, incompatible);
+    }
+
+    #[test]
+    fn constrained_http_proxy_endpoints_are_constructed_without_socket_path_checks() {
+        assert!(DockerRuntime::connect_with_state_root(
+            Some("tcp://docker-api:2375"),
+            "/var/lib/autospec"
+        )
+        .is_ok());
+        assert!(DockerRuntime::connect_with_state_root(
+            Some("http://docker-api:2375"),
+            "/var/lib/autospec"
+        )
+        .is_ok());
     }
 
     #[test]

@@ -14,6 +14,8 @@ members = [
     "crates/autospec-worker",
     "crates/orchestrator-persistence",
     "crates/execution-storage",
+    "crates/runtime-apptainer",
+    "crates/runtime-podman",
 ]
 
 [workspace.package]
@@ -34,6 +36,8 @@ orchestrator-scheduler = { path = "crates/orchestrator-scheduler" }
 orchestrator-worker = { path = "crates/orchestrator-worker" }
 runtime-traits = { path = "crates/runtime-traits" }
 runtime-docker = { path = "crates/runtime-docker" }
+runtime-apptainer = { path = "crates/runtime-apptainer" }
+runtime-podman = { path = "crates/runtime-podman" }
 harness-traits = { path = "crates/harness-traits" }
 harness-pi = { path = "crates/harness-pi" }
 git-worktree = { path = "crates/git-worktree" }

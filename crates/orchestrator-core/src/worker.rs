@@ -23,10 +23,30 @@ pub struct WorkerCapabilities {
     pub capabilities: Vec<String>,
     #[serde(rename = "maxConcurrentExecutions", default = "default_concurrency")]
     pub max_concurrent_executions: u32,
+    /// Sanitized, operator-actionable reasons this worker cannot advertise
+    /// execution capacity. Values must never contain credentials or raw paths.
+    #[serde(
+        rename = "healthErrors",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub health_errors: Vec<String>,
 }
 
 fn default_concurrency() -> u32 {
     2
+}
+
+impl WorkerCapabilities {
+    pub fn health_errors_are_sanitized(&self) -> bool {
+        self.health_errors.len() <= 2
+            && self.health_errors.iter().all(|error| {
+                matches!(
+                    error.as_str(),
+                    "storage-capability-unavailable" | "docker-capability-unavailable"
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,10 +106,50 @@ pub struct WorkerAdvertisement {
 impl WorkerRegistration {
     pub fn has_capacity(&self) -> bool {
         self.state == WorkerState::Ready
+            && self.capabilities.health_errors.is_empty()
             && self
                 .capability_proof
                 .as_ref()
                 .is_some_and(WorkerCapabilityProof::is_complete)
             && self.running_executions < self.capabilities.max_concurrent_executions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitized_health_failures_prevent_ready_capacity_even_with_a_complete_proof() {
+        let worker: WorkerRegistration = serde_json::from_value(serde_json::json!({
+            "id": "worker-health",
+            "capabilities": {
+                "os": "linux",
+                "arch": "x86_64",
+                "cpu": 4,
+                "memoryMib": 4096,
+                "diskGib": 40,
+                "runtimes": ["docker"],
+                "capabilities": ["docker"],
+                "maxConcurrentExecutions": 2,
+                "healthErrors": ["storage-capability-unavailable"]
+            },
+            "state": "READY",
+            "running_executions": 0,
+            "last_heartbeat": Utc::now(),
+            "capability_proof": {
+                "storage_backend": "apfs",
+                "storage_pool_identity": "pool",
+                "docker_daemon_id": "daemon",
+                "docker_verifier": "verifier",
+                "docker_method_version": "v2"
+            }
+        }))
+        .unwrap();
+        assert!(worker.capabilities.health_errors_are_sanitized());
+        assert!(!worker.has_capacity());
+        let mut malicious = worker.capabilities.clone();
+        malicious.health_errors = vec!["/secret/path?token=credential".to_owned()];
+        assert!(!malicious.health_errors_are_sanitized());
     }
 }

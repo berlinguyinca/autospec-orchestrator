@@ -10,7 +10,11 @@ use orchestrator_core::{
 };
 use orchestrator_persistence::{CleanupDisposition, StoreError};
 
-use crate::{auth::authorize_worker, error::ApiError, state::AppState};
+use crate::{
+    auth::{authorize_api, authorize_worker},
+    error::ApiError,
+    state::AppState,
+};
 
 const WORKER_BODY_LIMIT: usize = 1_048_576;
 const HEARTBEAT_DEADLINE_SECONDS: i64 = 90;
@@ -166,7 +170,7 @@ async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<WorkerRegistration>>, ApiError> {
-    authorize_worker(&state, &headers)?;
+    authorize_api(&state, &headers)?;
     state
         .workers
         .list()
@@ -181,6 +185,7 @@ fn own_liveness(worker: &mut WorkerRegistration) {
         .capability_proof
         .as_ref()
         .is_some_and(orchestrator_core::WorkerCapabilityProof::is_complete)
+        && worker.capabilities.health_errors.is_empty()
     {
         WorkerState::Ready
     } else {
