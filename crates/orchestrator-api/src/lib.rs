@@ -9,6 +9,7 @@ mod auth;
 mod error;
 mod events;
 mod executions;
+mod interactive;
 mod state;
 mod workers;
 
@@ -66,6 +67,7 @@ pub fn router(state: AppState) -> Router {
             &api_root(),
             Router::new()
                 .merge(executions::routes())
+                .merge(interactive::routes())
                 .merge(events::routes())
                 .merge(artifacts::routes())
                 .merge(workers::routes()),

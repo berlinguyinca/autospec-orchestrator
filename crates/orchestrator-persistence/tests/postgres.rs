@@ -1,9 +1,156 @@
 use chrono::{Duration, Utc};
 use orchestrator_core::{
-    event::ExecutionEventKind, AgentAssignment, Execution, ExecutionEvent, ExecutionId,
-    ExecutionManifest, ExecutionResult, ExecutionState, HarnessKind, ModelPolicy, OwnershipLabels,
-    PersistenceMode, RepositoryReference, Role, RuntimeRequirement, WorkerId,
+    event::ExecutionEventKind, AgentAssignment, Execution, ExecutionControlAction, ExecutionEvent,
+    ExecutionId, ExecutionManifest, ExecutionResult, ExecutionState, HarnessKind, ModelPolicy,
+    OwnershipLabels, PersistenceMode, RepositoryReference, Role, RuntimeRequirement, SessionId,
+    WorkerId,
 };
+
+#[tokio::test]
+async fn interactive_intents_are_ordered_restart_visible_and_complete_exactly_once() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").unwrap();
+    let events = PgEventLog::connect(&database_url).await.unwrap();
+    let worker = registered_worker(
+        &format!("worker-controls-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    let mut queued = execution(ExecutionState::Queued);
+    queued.manifest.persistence = PersistenceMode::Resumable;
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut running = reservation.execution;
+    running.transition(ExecutionState::Provisioning).unwrap();
+    running.worktree_path = Some("/bounded/execution/repository".into());
+    executions
+        .record_progress(
+            &running,
+            &progress_event(&running, ExecutionEventKind::EnvironmentReady),
+        )
+        .await
+        .unwrap();
+    running.transition(ExecutionState::Running).unwrap();
+    running.session_id = Some(SessionId::new("session-original"));
+    executions
+        .record_progress(
+            &running,
+            &progress_event(
+                &running,
+                ExecutionEventKind::AgentStarted {
+                    session_id: SessionId::new("session-original"),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    let pause = executions
+        .request_control(&running.id, ExecutionControlAction::Pause, "pause-once")
+        .await
+        .unwrap();
+    assert!(pause.created);
+    assert!(
+        !executions
+            .request_control(&running.id, ExecutionControlAction::Pause, "pause-once")
+            .await
+            .unwrap()
+            .created
+    );
+    assert_eq!(
+        executions
+            .list_pending_controls(&worker.id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|control| control.execution.id == running.id)
+            .count(),
+        1
+    );
+
+    let mut paused = running.clone();
+    paused.transition(ExecutionState::PausedForHuman).unwrap();
+    let paused_event = progress_event(&paused, ExecutionEventKind::ExecutionPaused);
+    assert!(executions
+        .complete_control(pause.request.request_id, &paused, &paused_event)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(executions
+        .complete_control(pause.request.request_id, &paused, &paused_event)
+        .await
+        .unwrap()
+        .is_none());
+
+    let fork = executions
+        .request_control(
+            &running.id,
+            ExecutionControlAction::ForkConversation,
+            "fork-once",
+        )
+        .await
+        .unwrap();
+    let mut forked = paused.clone();
+    forked.session_id = Some(SessionId::new("session-fork"));
+    forked.updated_at = Utc::now();
+    executions
+        .complete_control(
+            fork.request.request_id,
+            &forked,
+            &progress_event(
+                &forked,
+                ExecutionEventKind::ConversationForked {
+                    session_id: SessionId::new("session-fork"),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let persisted_fork = executions.get(&running.id).await.unwrap();
+    assert_eq!(persisted_fork.worktree_path, running.worktree_path);
+    assert_eq!(
+        persisted_fork.session_id.as_ref().map(SessionId::as_str),
+        Some("session-fork")
+    );
+
+    let resume = executions
+        .request_control(&running.id, ExecutionControlAction::Resume, "resume-once")
+        .await
+        .unwrap();
+    let mut resumed = forked;
+    resumed.transition(ExecutionState::Running).unwrap();
+    executions
+        .complete_control(
+            resume.request.request_id,
+            &resumed,
+            &progress_event(&resumed, ExecutionEventKind::ExecutionResumed),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .since(&running.id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionPaused))
+            .count(),
+        1
+    );
+    assert!(executions
+        .list_pending_controls(&worker.id)
+        .await
+        .unwrap()
+        .iter()
+        .all(|control| control.execution.id != running.id));
+}
 use orchestrator_persistence::{
     ArtifactStore, CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog,
     ExecutionStore, LostWorkerRecovery, PgArtifactStore, PgCleanupAuthorityStore, PgEventLog,

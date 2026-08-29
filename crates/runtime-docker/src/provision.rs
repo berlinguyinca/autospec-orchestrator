@@ -20,7 +20,7 @@ use std::{
 
 const CONTAINER_WORKTREE: &str = "/workspace";
 const CONTAINER_SESSION: &str = "/session";
-const CONTAINER_CREDENTIAL: &str = "/run/autospec/credential";
+const CONTAINER_CREDENTIAL: &str = "/autospec-credential";
 
 pub(crate) struct ReadyStorageGuard<'a> {
     runtime: &'a DockerRuntime,
@@ -252,13 +252,30 @@ fn verify_mount_directories(
     verified: &dyn VerifiedExecutionStorage,
     mounts: &[Mount],
 ) -> Result<(), RuntimeError> {
-    let sources = mounts
-        .iter()
-        .filter_map(|mount| mount.source.as_deref())
-        .collect::<BTreeSet<_>>();
-    for source in sources {
+    for mount in mounts {
+        let Some(source) = mount.source.as_deref() else {
+            continue;
+        };
+        let source = Path::new(source);
+        let metadata = fs::symlink_metadata(source).map_err(|error| {
+            RuntimeError::ResourceLimit(format!("inspect verified bind source: {error}"))
+        })?;
+        if metadata.is_dir() {
+            verified.verify_directory(source).map_err(storage_error)?;
+            continue;
+        }
+        if mount.target.as_deref() != Some(CONTAINER_CREDENTIAL)
+            || metadata.file_type().is_symlink()
+            || !metadata.is_file()
+        {
+            return Err(RuntimeError::ResourceLimit(
+                "only the execution credential may be a file bind".to_owned(),
+            ));
+        }
         verified
-            .verify_directory(Path::new(source))
+            .verify_directory(source.parent().ok_or_else(|| {
+                RuntimeError::ResourceLimit("credential bind lacks a parent".to_owned())
+            })?)
             .map_err(storage_error)?;
     }
     Ok(())
@@ -387,6 +404,7 @@ async fn provision_inner(
                 env: Some(vec![
                     "HOME=/home/autospec".to_owned(),
                     "TMPDIR=/tmp".to_owned(),
+                    format!("INFERWEAVE_CREDENTIAL_FILE={CONTAINER_CREDENTIAL}"),
                 ]),
                 labels: Some(labels.to_map().into_iter().collect()),
                 host_config: Some(limits),
@@ -1360,7 +1378,7 @@ mod tests {
         let mounts = execution_bind_mounts(&layout, Some(&credential)).expect("execution mounts");
         let credential_mount = mounts
             .iter()
-            .find(|mount| mount.target.as_deref() == Some("/run/autospec/credential"))
+            .find(|mount| mount.target.as_deref() == Some(CONTAINER_CREDENTIAL))
             .expect("credential mount");
         assert_eq!(credential_mount.read_only, Some(true));
         assert_eq!(

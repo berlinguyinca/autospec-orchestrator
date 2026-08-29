@@ -7,11 +7,11 @@ use git_worktree::{GitWorktreeManager, Worktree};
 use harness_traits::SessionRef;
 use orchestrator_api::{router, AppState};
 use orchestrator_core::{
-    event::ExecutionEventKind, AgentAssignment, Execution, ExecutionEvent, ExecutionId,
-    ExecutionManifest, ExecutionResult, ExecutionState, HarnessKind, ModelPolicy, OwnershipLabels,
-    PersistenceMode, RepositoryReference, Role, RuntimeKind, RuntimeRequirement, TaskPacket,
-    WorkerAdvertisement, WorkerCapabilities, WorkerCapabilityProof, WorkerId, WorkerRegistration,
-    WorkerState,
+    event::ExecutionEventKind, AgentAssignment, Execution, ExecutionControlAction, ExecutionEvent,
+    ExecutionId, ExecutionManifest, ExecutionResult, ExecutionState, HarnessKind, ModelPolicy,
+    OwnershipLabels, PersistenceMode, RepositoryReference, Role, RuntimeKind, RuntimeRequirement,
+    TaskPacket, WorkerAdvertisement, WorkerCapabilities, WorkerCapabilityProof, WorkerId,
+    WorkerRegistration, WorkerState,
 };
 use orchestrator_persistence::{
     CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog, ExecutionStore,
@@ -22,7 +22,7 @@ use orchestrator_worker::{
     ExecutionLifecycle, FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
     VerifiedDockerRuntimeFactory, VerifiedPiHarnessFactory, Worker,
 };
-use runtime_docker::{LocalCredentialBroker, TrustedVerifierImage};
+use runtime_docker::{DockerRuntime, LocalCredentialBroker, TrustedVerifierImage};
 use runtime_traits::{CredentialBroker, EnvironmentHandle};
 use sqlx::{Connection, PgConnection};
 use std::{
@@ -1235,6 +1235,8 @@ async fn real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer() {
         peer_capability,
     );
     peer_execution.manifest.repository.branch = Some(format!("peer-{suffix}"));
+    peer_execution.role = Role::Review;
+    peer_execution.manifest.role = Role::Review;
     executions.insert(&peer_execution).await.unwrap();
     let peer_reservation = reservations
         .reserve_next(&worker_id)
@@ -1263,10 +1265,28 @@ async fn real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer() {
         cleanup.clone(),
     ));
     let peer_task = worker.clone().spawn(peer_reservation.execution);
+    let peer_layout = ExecutionLayout::new(&root, &peer_id).unwrap();
+    for _ in 0..300 {
+        if peer_layout
+            .credentials
+            .join("inferweave.credential")
+            .is_file()
+            && docker_resource_exists("container", &DockerRuntime::agent_container_name(&peer_id))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if peer_task.is_finished() {
+        panic!(
+            "peer ended before isolation probe: {:?}",
+            peer_task.join().await
+        );
+    }
     let crashed = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "failure_stage_process_helper", "--nocapture"])
         .env("AUTOSPEC_TASK5_MATRIX_HELPER", "1")
-        .env("AUTOSPEC_TASK5_MATRIX_STAGE", "post_runtime")
+        .env("AUTOSPEC_TASK5_MATRIX_STAGE", "running")
         .env("AUTOSPEC_DATABASE_URL", &database_url)
         .env("AUTOSPEC_TASK5_ROOT", &root)
         .env("AUTOSPEC_TASK5_REMOTE", &remote_root)
@@ -1283,6 +1303,20 @@ async fn real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer() {
         .as_ref()
         .is_some_and(|path| Path::new(path).is_file()));
 
+    assert_execution_boundaries_are_disjoint(&root, &failed_id, &peer_id);
+    for id in [&failed_id, &peer_id] {
+        let layout = ExecutionLayout::new(&root, id).unwrap();
+        let credential =
+            fs::read_to_string(layout.credentials.join("inferweave.credential")).unwrap();
+        let token = credential.lines().next().unwrap();
+        assert_secret_absent_from_durable_records(&database_url, token).await;
+        assert!(
+            !fs::read_to_string(peer_result.diff_artifact.as_ref().unwrap())
+                .unwrap()
+                .contains(token)
+        );
+    }
+
     let failed_authority = cleanup.get(&failed_id).await.unwrap();
     let failed_execution = executions.get(&failed_id).await.unwrap();
     reservations
@@ -1295,8 +1329,20 @@ async fn real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer() {
         .unwrap();
     assert_matrix_case_clean(&root, &failed_id, &worker_id, &reservations, &cleanup).await;
 
-    let peer_layout = ExecutionLayout::new(&root, &peer_id).unwrap();
     assert!(peer_layout.root.exists());
+    assert!(peer_layout
+        .credentials
+        .join("inferweave.credential")
+        .is_file());
+    assert!(peer_layout.session.exists());
+    assert!(docker_resource_exists(
+        "container",
+        &DockerRuntime::agent_container_name(&peer_id)
+    ));
+    assert!(docker_resource_exists(
+        "network",
+        &DockerRuntime::network_name(&peer_id)
+    ));
     assert!(peer_result
         .diff_artifact
         .as_ref()
@@ -1327,6 +1373,199 @@ async fn real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer() {
     if root.exists() {
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_daemon_reconciles_pause_fork_resume_without_replaying_the_task_packet() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("skipping real Task7 interactive controls: AUTOSPEC_DATABASE_URL is unset");
+        return;
+    };
+    let _serial = acquire_real_test_lock(&database_url).await;
+    let Some((daemon_id, image_id)) = docker_capability() else {
+        eprintln!("skipping real Task7 interactive controls: Docker is unavailable");
+        return;
+    };
+    let suffix = format!(
+        "interactive-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    let root = std::env::temp_dir().join(format!("autospec-task7-{suffix}"));
+    initialize_state_root(&root);
+    let root = root.canonicalize().unwrap();
+    let remote_root = root.join("remotes");
+    create_stub_repository(&remote_root);
+    let worker_id = WorkerId::new(format!("worker-{suffix}"));
+    let execution_id = ExecutionId::new(format!("control-{suffix}"));
+    let capability = format!("control-capability-{suffix}");
+    let registration =
+        matrix_worker_registration(worker_id.clone(), capability.clone(), &daemon_id, &image_id);
+    let workers = PgWorkerStore::connect(&database_url).await.unwrap();
+    workers.register(&registration).await.unwrap();
+    let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
+    let events = PgEventLog::connect(&database_url).await.unwrap();
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+    let mut queued = queued_execution(
+        execution_id.clone(),
+        OwnershipLabels {
+            execution_id: execution_id.clone(),
+            worker_id: worker_id.clone(),
+            repository: "owner/repo".into(),
+            issue: Some("interactive".into()),
+        },
+        image_id.clone(),
+        capability,
+    );
+    queued.role = Role::Interactive;
+    queued.manifest.role = Role::Interactive;
+    queued.manifest.persistence = PersistenceMode::Resumable;
+    queued.manifest.repository.branch = Some(format!("interactive-{suffix}"));
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let worker = Arc::new(Worker::new(
+        build_system_lifecycle(&root, &remote_root, &daemon_id, &image_id),
+        executions.clone(),
+        reservations.clone(),
+        cleanup.clone(),
+    ));
+    let task = worker.clone().spawn(reservation.execution);
+    let running = wait_for_running_session(&executions, &execution_id).await;
+    let original_session = running.session_id.clone().unwrap();
+    let original_worktree = running.worktree_path.clone();
+
+    executions
+        .request_control(&execution_id, ExecutionControlAction::Pause, "pause-real")
+        .await
+        .unwrap();
+    worker
+        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+        .await
+        .unwrap();
+    wait_for_exact_state(&executions, &execution_id, ExecutionState::PausedForHuman).await;
+
+    executions
+        .request_control(
+            &execution_id,
+            ExecutionControlAction::ForkConversation,
+            "fork-real",
+        )
+        .await
+        .unwrap();
+    worker
+        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+        .await
+        .unwrap();
+    let forked = wait_for_new_session(&executions, &execution_id, &original_session).await;
+    assert_eq!(forked.state, ExecutionState::PausedForHuman);
+    assert_eq!(forked.worktree_path, original_worktree);
+
+    executions
+        .request_control(&execution_id, ExecutionControlAction::Resume, "resume-real")
+        .await
+        .unwrap();
+    worker
+        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+        .await
+        .unwrap();
+    let result = task.join().await.unwrap();
+    assert_eq!(result.state, ExecutionState::ReviewReady);
+    let interactive_events = events.since(&execution_id, 0).await.unwrap();
+    assert_eq!(
+        interactive_events
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionPaused))
+            .count(),
+        1
+    );
+    assert_eq!(
+        interactive_events
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionResumed))
+            .count(),
+        1
+    );
+    assert_eq!(
+        interactive_events
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ConversationForked { .. }))
+            .count(),
+        1
+    );
+    let layout = ExecutionLayout::new(&root, &execution_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(layout.conversation.join("invocations"))
+            .unwrap()
+            .trim(),
+        "3",
+        "start, fork, and resume each invoke Pi once without replay loops"
+    );
+
+    let retained = cleanup.get(&execution_id).await.unwrap();
+    cleanup
+        .transition(
+            &execution_id,
+            CleanupDisposition::Retained,
+            CleanupDisposition::CleanupPending,
+            &retained.handles,
+        )
+        .await
+        .unwrap();
+    worker
+        .recover_cleanup_authority(
+            &cleanup.get(&execution_id).await.unwrap(),
+            &executions.get(&execution_id).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
+    delete_matrix_records(&database_url, &execution_id, &worker_id).await;
+    if root.exists() {
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+async fn wait_for_exact_state(
+    store: &PgExecutionStore,
+    id: &ExecutionId,
+    expected: ExecutionState,
+) -> Execution {
+    for _ in 0..300 {
+        let execution = store.get(id).await.unwrap();
+        if execution.state == expected {
+            return execution;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("execution {id} did not reach {expected:?}");
+}
+
+async fn wait_for_new_session(
+    store: &PgExecutionStore,
+    id: &ExecutionId,
+    previous: &orchestrator_core::SessionId,
+) -> Execution {
+    for _ in 0..300 {
+        let execution = store.get(id).await.unwrap();
+        if execution
+            .session_id
+            .as_ref()
+            .is_some_and(|id| id != previous)
+        {
+            return execution;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("execution {id} did not persist a forked Pi session");
 }
 
 #[tokio::test]
@@ -1514,6 +1753,9 @@ async fn failure_stage_process_helper() {
         )
         .await
         .unwrap();
+    if stage == "running" {
+        std::process::exit(77);
+    }
     lifecycle.stop(&execution, &session).await.unwrap();
     let capture = lifecycle.capture(&worktree).await.unwrap();
     let artifact = lifecycle
@@ -1656,6 +1898,149 @@ async fn wait_for_running_session(store: &PgExecutionStore, id: &ExecutionId) ->
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("execution did not reach durable Running session");
+}
+
+fn docker_resource_exists(kind: &str, name: &str) -> bool {
+    let mut command = Command::new("docker");
+    match kind {
+        "container" => {
+            command.args(["inspect", "--type", "container", name]);
+        }
+        "network" => {
+            command.args(["network", "inspect", name]);
+        }
+        _ => panic!("unsupported Docker resource kind {kind}"),
+    }
+    command.output().is_ok_and(|output| output.status.success())
+}
+
+async fn assert_secret_absent_from_durable_records(database_url: &str, secret: &str) {
+    let pool = sqlx::PgPool::connect(database_url).await.unwrap();
+    for table in [
+        "executions",
+        "execution_events",
+        "cleanup_authorities",
+        "artifacts",
+    ] {
+        let query = format!(
+            "SELECT EXISTS(SELECT 1 FROM {table} record WHERE to_jsonb(record)::text LIKE '%' || $1 || '%')"
+        );
+        let present: bool = sqlx::query_scalar(&query)
+            .bind(secret)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!present, "credential material persisted in {table}");
+    }
+}
+
+fn assert_execution_boundaries_are_disjoint(
+    root: &Path,
+    implementation_id: &ExecutionId,
+    review_id: &ExecutionId,
+) {
+    let implementation = ExecutionLayout::new(root, implementation_id).unwrap();
+    let review = ExecutionLayout::new(root, review_id).unwrap();
+    assert_ne!(implementation.root, review.root);
+    assert_ne!(
+        implementation.repository.canonicalize().unwrap(),
+        review.repository.canonicalize().unwrap()
+    );
+    assert_ne!(
+        git_path(&implementation.repository, &["--git-common-dir"]),
+        git_path(&review.repository, &["--git-common-dir"])
+    );
+    assert_ne!(
+        git_path(&implementation.repository, &["--git-path", "objects"]),
+        git_path(&review.repository, &["--git-path", "objects"])
+    );
+    assert_ne!(
+        implementation.session.canonicalize().unwrap(),
+        review.session.canonicalize().unwrap()
+    );
+    assert_ne!(
+        implementation.conversation.canonicalize().unwrap(),
+        review.conversation.canonicalize().unwrap()
+    );
+    let implementation_credential = implementation.credentials.join("inferweave.credential");
+    let review_credential = review.credentials.join("inferweave.credential");
+    assert_ne!(
+        fs::read(&implementation_credential).unwrap(),
+        fs::read(&review_credential).unwrap()
+    );
+    assert_ne!(
+        DockerRuntime::network_name(implementation_id),
+        DockerRuntime::network_name(review_id)
+    );
+    assert_ne!(
+        DockerRuntime::agent_container_name(implementation_id),
+        DockerRuntime::agent_container_name(review_id)
+    );
+    assert_agent_mounts_bounded(implementation_id, &implementation.root, &review.root);
+    assert_agent_mounts_bounded(review_id, &review.root, &implementation.root);
+    for id in [implementation_id, review_id] {
+        let volumes = Command::new("docker")
+            .args([
+                "volume",
+                "ls",
+                "--filter",
+                "label=autospec.managed=true",
+                "--filter",
+                &format!("label=autospec.execution_id={id}"),
+                "--format",
+                "{{.Name}}",
+            ])
+            .output()
+            .unwrap();
+        assert!(volumes.status.success());
+        assert!(String::from_utf8(volumes.stdout).unwrap().trim().is_empty());
+    }
+}
+
+fn git_path(repository: &Path, arguments: &[&str]) -> PathBuf {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .arg("rev-parse")
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repository.join(path)
+    };
+    path.canonicalize().unwrap()
+}
+
+fn assert_agent_mounts_bounded(id: &ExecutionId, own_root: &Path, peer_root: &Path) {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--type",
+            "container",
+            "--format={{json .Mounts}}",
+            &DockerRuntime::agent_container_name(id),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let mounts: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mounts = mounts.as_array().unwrap();
+    assert!(!mounts.is_empty());
+    for mount in mounts {
+        assert_eq!(mount["Type"], "bind");
+        let source = PathBuf::from(mount["Source"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert!(source.starts_with(own_root), "foreign bind: {source:?}");
+        assert!(!source.starts_with(peer_root), "peer bind: {source:?}");
+        if mount["Destination"] == "/autospec-credential" {
+            assert_eq!(mount["RW"], false);
+        }
+    }
 }
 
 fn build_system_lifecycle(
@@ -2033,7 +2418,7 @@ fn create_stub_repository_with_behavior(remote_root: &Path, block_first_run: boo
     fs::write(
         &pi,
         format!(
-            "#!/bin/sh\ncount=1\nif test -f /session/invocations; then count=$(( $(cat /session/invocations) + 1 )); fi\nprintf '%s\\n' \"$count\" > /session/invocations\nprintf '%s\\n' '{{\"type\":\"session\",\"id\":\"e2e\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"turn_start\"}}'\n{first_run_gate}printf 'worker-e2e-%s\\n' \"$count\" > /workspace/result.txt\nprintf '%s\\n' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"stopReason\":\"stop\"}}}}' '{{\"type\":\"agent_settled\"}}'\n"
+            "#!/bin/sh\nsession_id=\nsource_session=\nwhile test \"$#\" -gt 0; do\n  case \"$1\" in\n    --session-id) session_id=$2; shift 2 ;;\n    --session|--fork) source_session=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nif test -z \"$session_id\" && test -n \"$source_session\"; then\n  session_id=$(sed -n '1s/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p' \"$source_session\")\nfi\nif test -n \"$session_id\" && test ! -s \"/session/session_${{session_id}}.jsonl\"; then\n  printf '{{\"type\":\"session\",\"version\":3,\"id\":\"%s\",\"cwd\":\"/workspace\"}}\\n' \"$session_id\" > \"/session/session_${{session_id}}.jsonl\"\nfi\ncount=1\nif test -f /session/invocations; then count=$(( $(cat /session/invocations) + 1 )); fi\nprintf '%s\\n' \"$count\" > /session/invocations\nprintf '%s\\n' '{{\"type\":\"session\",\"id\":\"e2e\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"turn_start\"}}'\n{first_run_gate}printf 'worker-e2e-%s\\n' \"$count\" > /workspace/result.txt\nprintf '%s\\n' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"stopReason\":\"stop\"}}}}' '{{\"type\":\"agent_settled\"}}'\n"
         ),
     )
     .unwrap();

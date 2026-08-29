@@ -6,13 +6,14 @@ use execution_storage::{
 use git_worktree::{DiffCapture, Worktree};
 use harness_traits::SessionRef;
 use orchestrator_core::{
-    event::ExecutionEventKind, AgentAssignment, AttemptId, Execution, ExecutionEvent, ExecutionId,
-    ExecutionManifest, ExecutionState, HarnessKind, ModelPolicy, OwnershipLabels, PersistenceMode,
-    RepositoryReference, Role, RuntimeRequirement, SessionId, TaskPacket, WorkerId,
+    event::ExecutionEventKind, AgentAssignment, AttemptId, Execution, ExecutionControlAction,
+    ExecutionControlRequest, ExecutionEvent, ExecutionId, ExecutionManifest, ExecutionState,
+    HarnessKind, ModelPolicy, OwnershipLabels, PersistenceMode, RepositoryReference, Role,
+    RuntimeRequirement, SessionId, TaskPacket, WorkerId,
 };
 use orchestrator_persistence::{
     CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore,
-    PendingCancellation, Reservation, ReservationStore, StoreError,
+    PendingCancellation, PendingExecutionControl, Reservation, ReservationStore, StoreError,
 };
 use orchestrator_worker::{AdoptedExecution, ExecutionLifecycle, LifecycleError, Worker};
 use runtime_traits::{EnvironmentHandle, VerifiedAgentContainer};
@@ -23,6 +24,7 @@ struct FakeStore {
     execution: Mutex<Option<Execution>>,
     events: Mutex<Vec<ExecutionEvent>>,
     pending_cancellations: Mutex<Vec<PendingCancellation>>,
+    pending_controls: Mutex<Vec<PendingExecutionControl>>,
     fail_record: bool,
 }
 
@@ -52,6 +54,29 @@ impl ExecutionStore for FakeStore {
     }
     async fn list_pending_cancellations(&self) -> Result<Vec<PendingCancellation>, StoreError> {
         Ok(self.pending_cancellations.lock().unwrap().clone())
+    }
+    async fn list_pending_controls(
+        &self,
+        _: &WorkerId,
+    ) -> Result<Vec<PendingExecutionControl>, StoreError> {
+        Ok(self.pending_controls.lock().unwrap().clone())
+    }
+    async fn complete_control(
+        &self,
+        request_id: i64,
+        execution: &Execution,
+        event: &ExecutionEvent,
+    ) -> Result<Option<u64>, StoreError> {
+        *self.execution.lock().unwrap() = Some(execution.clone());
+        self.pending_controls
+            .lock()
+            .unwrap()
+            .retain(|control| control.request.request_id != request_id);
+        let mut events = self.events.lock().unwrap();
+        let mut event = event.clone();
+        event.sequence = events.len() as u64 + 1;
+        events.push(event);
+        Ok(Some(events.len() as u64))
     }
     async fn transition(
         &self,
@@ -312,6 +337,22 @@ impl ExecutionLifecycle for FakeLifecycle {
         _: &SessionRef,
     ) -> Result<(), LifecycleError> {
         self.step("pi-resume")
+    }
+    async fn pause(&self, _: &Execution, _: &SessionRef) -> Result<(), LifecycleError> {
+        self.step("pi-pause")
+    }
+    async fn fork_conversation(
+        &self,
+        execution: &Execution,
+        session: &SessionRef,
+    ) -> Result<SessionRef, LifecycleError> {
+        self.step("pi-fork")?;
+        Ok(SessionRef {
+            id: SessionId::new(format!("{}-fork", session.id)),
+            path: format!("{}/fork", session.path),
+            execution_id: execution.id.clone(),
+            worktree_path: session.worktree_path.clone(),
+        })
     }
     async fn poll(
         &self,
@@ -1036,6 +1077,117 @@ async fn failing_oldest_taskless_cancellation_does_not_starve_active_peer_signal
             .state,
         ExecutionState::Cancelled
     );
+}
+
+#[tokio::test]
+async fn durable_pause_resume_and_conversation_fork_interrupt_poll_without_workspace_fork() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::clone(&order),
+        fail_at: None,
+        poll_empty: false,
+        cleanup_fail: false,
+        hang_poll: true,
+    });
+    let store = Arc::new(FakeStore::default());
+    let reservations = Arc::new(FakeReservations::default());
+    let execution = execution();
+    let worker_id = execution.worker_id.clone().unwrap();
+    store.insert(&execution).await.unwrap();
+    let worker = Arc::new(worker(lifecycle, store.clone(), reservations));
+    let task = worker.clone().spawn(execution.clone());
+    for _ in 0..100 {
+        if order.lock().unwrap().contains(&"pi-poll") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let pending = |request_id, action| PendingExecutionControl {
+        request: ExecutionControlRequest {
+            request_id,
+            execution_id: execution.id.clone(),
+            action,
+            requested_at: Utc::now(),
+            completed_at: None,
+        },
+        execution: store.execution.lock().unwrap().clone().unwrap(),
+    };
+    store
+        .pending_controls
+        .lock()
+        .unwrap()
+        .push(pending(1, ExecutionControlAction::Pause));
+    worker
+        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+        .await
+        .unwrap();
+    wait_for_state(&store, ExecutionState::PausedForHuman).await;
+
+    store
+        .pending_controls
+        .lock()
+        .unwrap()
+        .push(pending(2, ExecutionControlAction::ForkConversation));
+    worker
+        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if order.lock().unwrap().contains(&"pi-fork") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let forked = store.get(&execution.id).await.unwrap();
+    assert_eq!(
+        forked.worktree_path.as_deref(),
+        Some("/allocation/repository")
+    );
+    assert!(forked
+        .session_id
+        .as_ref()
+        .is_some_and(|session| session.as_str().ends_with("-fork")));
+    assert_eq!(
+        order
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|step| **step == "pi-pause")
+            .count(),
+        2,
+        "a fork created while paused must be quiesced before it is persisted"
+    );
+
+    store
+        .pending_controls
+        .lock()
+        .unwrap()
+        .push(pending(3, ExecutionControlAction::Resume));
+    worker
+        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+        .await
+        .unwrap();
+    wait_for_state(&store, ExecutionState::Running).await;
+    assert!(order.lock().unwrap().contains(&"pi-resume"));
+    task.cancel();
+    let _ = task.join().await;
+}
+
+async fn wait_for_state(store: &FakeStore, expected: ExecutionState) {
+    for _ in 0..100 {
+        if store
+            .execution
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|execution| execution.state == expected)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("execution did not reach {expected:?}");
 }
 
 fn execution() -> Execution {

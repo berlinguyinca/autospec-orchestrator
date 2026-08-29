@@ -85,6 +85,134 @@ async fn cancel_execution(client: &reqwest::Client, api: &TestApi, execution_id:
 }
 
 #[tokio::test]
+async fn interactive_routes_are_authenticated_idempotent_bounded_and_metadata_only() {
+    let Some(api) = test_api().await else { return };
+    let client = reqwest::Client::new();
+    let mut execution: orchestrator_core::Execution = serde_json::from_value(serde_json::json!({
+        "id": format!("interactive-{}", uuid::Uuid::new_v4().simple()),
+        "role": "interactive",
+        "state": "RUNNING",
+        "manifest": manifest(),
+        "worker_id": "worker-interactive",
+        "attempt_id": "attempt-interactive",
+        "session_id": "session-interactive",
+        "worktree_path": "/bounded/execution/repository",
+        "labels": {
+            "execution_id": "placeholder",
+            "worker_id": "worker-interactive",
+            "repository": "owner/repository"
+        },
+        "created_at": Utc::now(),
+        "updated_at": Utc::now()
+    }))
+    .unwrap();
+    execution.labels.execution_id = execution.id.clone();
+    execution.manifest.role = orchestrator_core::Role::Interactive;
+    api.executions.insert(&execution).await.unwrap();
+    let base = format!("{}/executions/{}", api.base, execution.id);
+
+    assert_eq!(
+        client
+            .post(format!("{base}/pause"))
+            .header("Idempotency-Key", "pause-1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let pause = client
+        .post(format!("{base}/pause"))
+        .bearer_auth(&api.token)
+        .header("Idempotency-Key", "pause-1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pause.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        pause.json::<serde_json::Value>().await.unwrap()["action"],
+        "pause"
+    );
+    let replay = client
+        .post(format!("{base}/pause"))
+        .bearer_auth(&api.token)
+        .header("Idempotency-Key", "pause-1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), reqwest::StatusCode::OK);
+
+    let attach = client
+        .get(format!("{base}/attach"))
+        .bearer_auth(&api.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(attach.status(), reqwest::StatusCode::OK);
+    let attach = attach.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(attach["session_id"], "session-interactive");
+    assert_eq!(attach["worktree_path"], "/bounded/execution/repository");
+    assert!(attach.get("event_cursor").is_some());
+    assert!(attach.get("events").is_none());
+    assert!(attach.get("artifacts").is_none());
+    assert!(attach.get("prompt").is_none());
+
+    let fork = client
+        .post(format!("{base}/attach"))
+        .bearer_auth(&api.token)
+        .header("Idempotency-Key", "fork-1")
+        .json(&serde_json::json!({"mode": "fork-conversation"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fork.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        fork.json::<serde_json::Value>().await.unwrap()["action"],
+        "fork-conversation"
+    );
+
+    let resume = client
+        .post(format!("{base}/resume"))
+        .bearer_auth(&api.token)
+        .header("Idempotency-Key", "resume-1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resume.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        resume.json::<serde_json::Value>().await.unwrap()["action"],
+        "resume"
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/resume"))
+            .bearer_auth(&api.token)
+            .header("Idempotency-Key", "resume-conflict")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+
+    assert_eq!(
+        client
+            .post(format!("{base}/attach"))
+            .bearer_auth(&api.token)
+            .header("Idempotency-Key", "too-large")
+            .header("content-type", "application/json")
+            .body(vec![b'x'; 1_048_577])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    cancel_execution(&client, &api, &execution.id).await;
+}
+
+#[tokio::test]
 async fn create_read_auth_idempotency_validation_and_body_limit_contract() {
     let Some(api) = test_api().await else { return };
     let client = reqwest::Client::new();

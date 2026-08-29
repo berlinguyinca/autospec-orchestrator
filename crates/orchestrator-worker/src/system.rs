@@ -8,7 +8,7 @@ use git_worktree::{DiffCapture, Worktree, WorktreeManager};
 use harness_pi::{PiHarness, PiHarnessConfig};
 use harness_traits::{AgentHarness, SessionRef};
 use orchestrator_core::{
-    Execution, ExecutionEvent, ExecutionId, OwnershipLabels, SessionId, TaskPacket,
+    Execution, ExecutionEvent, ExecutionId, ExecutionState, OwnershipLabels, SessionId, TaskPacket,
 };
 use orchestrator_persistence::{ArtifactStore, CleanupAuthority, CleanupDisposition};
 use runtime_docker::{DockerRuntime, TrustedVerifierImage};
@@ -888,6 +888,28 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             .map_err(|error| LifecycleError::Step(error.to_string()))
     }
 
+    async fn pause(
+        &self,
+        execution: &Execution,
+        session: &SessionRef,
+    ) -> Result<(), LifecycleError> {
+        self.harness(&execution.id)?
+            .stop(session)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn fork_conversation(
+        &self,
+        execution: &Execution,
+        session: &SessionRef,
+    ) -> Result<SessionRef, LifecycleError> {
+        self.harness(&execution.id)?
+            .fork_conversation(session)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
     async fn poll(
         &self,
         execution: &Execution,
@@ -1485,6 +1507,11 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             &container_id,
             execution,
         )?;
+        let credentials_path = container
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/autospec-credential")
+            .map(|mount| mount.source.clone());
         let environment = EnvironmentHandle {
             execution_id: execution.id.clone(),
             network: DockerRuntime::network_name(&execution.id),
@@ -1497,7 +1524,7 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
                 .map(|service| DockerRuntime::service_container_name(&execution.id, &service.name))
                 .collect(),
             volumes: Vec::new(),
-            credentials_path: None,
+            credentials_path,
         };
         let runtime = self.runtimes.build(execution, &receipt).await?;
         let harness = self
@@ -1510,10 +1537,12 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             execution_id: execution.id.clone(),
             worktree_path: layout.repository.to_string_lossy().into_owned(),
         };
-        harness
-            .resume(&session)
-            .await
-            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        if execution.state == ExecutionState::Running {
+            harness
+                .resume(&session)
+                .await
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        }
         self.active_runtimes
             .lock()
             .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?

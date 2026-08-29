@@ -251,6 +251,7 @@ async fn main() -> Result<()> {
                 execution.state,
                 orchestrator_core::ExecutionState::Provisioning
                     | orchestrator_core::ExecutionState::Running
+                    | orchestrator_core::ExecutionState::PausedForHuman
             )
             && matches!(
                 disposition,

@@ -19,7 +19,8 @@ use execution_storage::AllocationReceipt;
 use git_worktree::{DiffCapture, Worktree};
 use harness_traits::SessionRef;
 use orchestrator_core::{
-    Execution, ExecutionEvent, ExecutionId, ExecutionResult, TaskPacket, WorkerId,
+    Execution, ExecutionControlRequest, ExecutionEvent, ExecutionId, ExecutionResult, TaskPacket,
+    WorkerId,
 };
 use orchestrator_persistence::{
     CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore,
@@ -30,6 +31,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::{collections::BTreeSet, sync::Mutex};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -85,6 +87,24 @@ pub trait ExecutionLifecycle: Send + Sync {
         environment: &EnvironmentHandle,
         session: &SessionRef,
     ) -> Result<(), LifecycleError>;
+    async fn pause(
+        &self,
+        _execution: &Execution,
+        _session: &SessionRef,
+    ) -> Result<(), LifecycleError> {
+        Err(LifecycleError::Step(
+            "execution lifecycle does not support pause".into(),
+        ))
+    }
+    async fn fork_conversation(
+        &self,
+        _execution: &Execution,
+        _session: &SessionRef,
+    ) -> Result<SessionRef, LifecycleError> {
+        Err(LifecycleError::Step(
+            "execution lifecycle does not support conversation fork".into(),
+        ))
+    }
     async fn poll(
         &self,
         execution: &Execution,
@@ -181,6 +201,8 @@ pub struct ExecutionTask {
     execution_id: ExecutionId,
     cancelled: Arc<AtomicBool>,
     join: tokio::task::JoinHandle<Result<ExecutionResult, WorkerError>>,
+    controls: tokio::sync::mpsc::UnboundedSender<ExecutionControlRequest>,
+    signalled_controls: Mutex<BTreeSet<i64>>,
 }
 
 impl ExecutionTask {
@@ -190,6 +212,19 @@ impl ExecutionTask {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn signal_control(&self, request: ExecutionControlRequest) -> Result<(), WorkerError> {
+        let mut signalled = self
+            .signalled_controls
+            .lock()
+            .map_err(|_| WorkerError::Invalid("control signal lock poisoned".into()))?;
+        if !signalled.insert(request.request_id) {
+            return Ok(());
+        }
+        self.controls
+            .send(request)
+            .map_err(|_| WorkerError::Invalid("execution control channel closed".into()))
     }
 
     pub async fn observe_cancellation(
@@ -239,13 +274,17 @@ impl Worker {
         let execution_id = execution.id.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let task_cancelled = Arc::clone(&cancelled);
+        let (controls, receiver) = tokio::sync::mpsc::unbounded_channel();
         let join = tokio::spawn(async move {
-            run::run_with_cancel(&self, &execution, task_cancelled.as_ref()).await
+            run::run_with_cancel_and_controls(&self, &execution, task_cancelled.as_ref(), receiver)
+                .await
         });
         ExecutionTask {
             execution_id,
             cancelled,
             join,
+            controls,
+            signalled_controls: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -253,13 +292,22 @@ impl Worker {
         let execution_id = execution.id.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let task_cancelled = Arc::clone(&cancelled);
+        let (controls, receiver) = tokio::sync::mpsc::unbounded_channel();
         let join = tokio::spawn(async move {
-            run::run_adopted_with_cancel(&self, &execution, task_cancelled.as_ref()).await
+            run::run_adopted_with_cancel_and_controls(
+                &self,
+                &execution,
+                task_cancelled.as_ref(),
+                receiver,
+            )
+            .await
         });
         ExecutionTask {
             execution_id,
             cancelled,
             join,
+            controls,
+            signalled_controls: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -284,6 +332,20 @@ impl Worker {
                 .find(|task| task.execution_id() == &request.execution.id)
             {
                 task.cancel();
+            }
+        }
+
+        let controls = self
+            .executions
+            .list_pending_controls(worker_id)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        for control in controls {
+            if let Some(task) = tasks
+                .iter()
+                .find(|task| task.execution_id() == &control.execution.id)
+            {
+                task.signal_control(control.request)?;
             }
         }
 

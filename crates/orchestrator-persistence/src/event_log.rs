@@ -18,6 +18,14 @@ pub trait EventLog: Send + Sync {
         events.truncate(limit);
         Ok(events)
     }
+    async fn latest_sequence(&self, id: &ExecutionId) -> Result<u64, StoreError> {
+        Ok(self
+            .since(id, 0)
+            .await?
+            .last()
+            .map(|event| event.sequence)
+            .unwrap_or(0))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,5 +144,16 @@ impl EventLog for PgEventLog {
                 Ok(event)
             })
             .collect()
+    }
+
+    async fn latest_sequence(&self, id: &ExecutionId) -> Result<u64, StoreError> {
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), 0) FROM execution_events WHERE execution_id = $1",
+        )
+        .bind(id.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        u64::try_from(sequence)
+            .map_err(|_| StoreError::Conflict("negative event sequence".to_owned()))
     }
 }

@@ -21,7 +21,10 @@ pub mod worker;
 pub use environment::EnvironmentFile;
 pub use error::{CoreError, FailureClass};
 pub use event::ExecutionEvent;
-pub use execution::{Execution, ExecutionResult, ExecutionState, Role};
+pub use execution::{
+    AttachmentMode, AttachmentRequest, Execution, ExecutionAttachment, ExecutionControlAction,
+    ExecutionControlRequest, ExecutionResult, ExecutionState, Role,
+};
 pub use ids::{AttemptId, ExecutionId, SessionId, WorkerId};
 pub use labels::OwnershipLabels;
 pub use manifest::{

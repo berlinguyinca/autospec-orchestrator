@@ -20,8 +20,9 @@ pub use workers::{PgWorkerStore, WorkerStore};
 use async_trait::async_trait;
 use event_log::append_in_transaction;
 use orchestrator_core::{
-    event::ExecutionEventKind, AttemptId, Execution, ExecutionEvent, ExecutionId, ExecutionResult,
-    ExecutionState, FailureClass, OwnershipLabels, Role, SessionId, WorkerId,
+    event::ExecutionEventKind, AttemptId, Execution, ExecutionControlAction,
+    ExecutionControlRequest, ExecutionEvent, ExecutionId, ExecutionResult, ExecutionState,
+    FailureClass, OwnershipLabels, Role, SessionId, WorkerId,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -106,6 +107,32 @@ pub trait ExecutionStore: Send + Sync {
             "idempotent creation is unavailable for this store".to_owned(),
         ))
     }
+    async fn request_control(
+        &self,
+        id: &ExecutionId,
+        action: ExecutionControlAction,
+        idempotency_key: &str,
+    ) -> Result<IdempotentExecutionControl, StoreError> {
+        Err(StoreError::Conflict(format!(
+            "durable interactive controls are unavailable for {id}: {action:?} {idempotency_key}"
+        )))
+    }
+    async fn list_pending_controls(
+        &self,
+        _worker_id: &WorkerId,
+    ) -> Result<Vec<PendingExecutionControl>, StoreError> {
+        Ok(Vec::new())
+    }
+    async fn complete_control(
+        &self,
+        _request_id: i64,
+        _execution: &Execution,
+        _event: &ExecutionEvent,
+    ) -> Result<Option<u64>, StoreError> {
+        Err(StoreError::Conflict(
+            "durable interactive controls are unavailable".to_owned(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +147,18 @@ pub struct PendingCancellation {
     pub execution: Execution,
     pub worker_id: Option<WorkerId>,
     pub attempt_id: Option<AttemptId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdempotentExecutionControl {
+    pub request: ExecutionControlRequest,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingExecutionControl {
+    pub request: ExecutionControlRequest,
+    pub execution: Execution,
 }
 
 #[derive(Debug, Clone)]
@@ -608,6 +647,285 @@ impl ExecutionStore for PgExecutionStore {
             event_sequence: Some(sequence),
         })
     }
+
+    async fn request_control(
+        &self,
+        id: &ExecutionId,
+        action: ExecutionControlAction,
+        idempotency_key: &str,
+    ) -> Result<IdempotentExecutionControl, StoreError> {
+        if idempotency_key.is_empty() || idempotency_key.len() > 255 {
+            return Err(StoreError::Conflict(
+                "idempotency key must be 1-255 bytes".to_owned(),
+            ));
+        }
+        let action_text = enum_text(&action)?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 2))")
+            .bind(id.as_str())
+            .fetch_one(&mut *transaction)
+            .await?;
+        if let Some(row) = sqlx::query(
+            "SELECT request_id, action, requested_at, completed_at \
+             FROM execution_control_requests \
+             WHERE execution_id = $1 AND idempotency_key = $2",
+        )
+        .bind(id.as_str())
+        .bind(idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            let stored_action: String = row.try_get("action")?;
+            if stored_action != action_text {
+                return Err(StoreError::IdempotencyConflict(
+                    "idempotency key was already used for another execution control".to_owned(),
+                ));
+            }
+            let request = decode_control_request(id, &row)?;
+            transaction.commit().await?;
+            return Ok(IdempotentExecutionControl {
+                request,
+                created: false,
+            });
+        }
+        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let execution = decode_execution(&row)?;
+        let pending_actions = sqlx::query_scalar::<_, String>(
+            "SELECT action FROM execution_control_requests \
+             WHERE execution_id = $1 AND completed_at IS NULL \
+             ORDER BY requested_at, request_id",
+        )
+        .bind(id.as_str())
+        .fetch_all(&mut *transaction)
+        .await?;
+        let mut projected_state = execution.state;
+        for pending in pending_actions {
+            match decode_control_action(pending)? {
+                ExecutionControlAction::Pause if projected_state == ExecutionState::Running => {
+                    projected_state = ExecutionState::PausedForHuman;
+                }
+                ExecutionControlAction::Resume
+                    if projected_state == ExecutionState::PausedForHuman =>
+                {
+                    projected_state = ExecutionState::Running;
+                }
+                ExecutionControlAction::ForkConversation
+                    if matches!(
+                        projected_state,
+                        ExecutionState::Running | ExecutionState::PausedForHuman
+                    ) => {}
+                pending => {
+                    return Err(StoreError::Conflict(format!(
+                        "pending {pending:?} is invalid for projected state {projected_state:?}"
+                    )))
+                }
+            }
+        }
+        let allowed = match action {
+            ExecutionControlAction::Pause => projected_state == ExecutionState::Running,
+            ExecutionControlAction::Resume => projected_state == ExecutionState::PausedForHuman,
+            ExecutionControlAction::ForkConversation => matches!(
+                projected_state,
+                ExecutionState::Running | ExecutionState::PausedForHuman
+            ),
+        };
+        if !allowed {
+            return Err(StoreError::Conflict(format!(
+                "execution {id} cannot accept {action:?} while {:?}",
+                projected_state
+            )));
+        }
+        if execution.worker_id.is_none()
+            || execution.attempt_id.is_none()
+            || execution.session_id.is_none()
+            || execution.worktree_path.is_none()
+        {
+            return Err(StoreError::Conflict(format!(
+                "execution {id} lacks durable interactive authority"
+            )));
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO execution_control_requests \
+             (execution_id, action, idempotency_key) VALUES ($1, $2, $3) \
+             RETURNING request_id, action, requested_at, completed_at",
+        )
+        .bind(id.as_str())
+        .bind(action_text)
+        .bind(idempotency_key)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(map_conflict)?;
+        let request = decode_control_request(id, &inserted)?;
+        transaction.commit().await?;
+        Ok(IdempotentExecutionControl {
+            request,
+            created: true,
+        })
+    }
+
+    async fn list_pending_controls(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Result<Vec<PendingExecutionControl>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT c.request_id AS control_request_id, c.action AS control_action, \
+                    c.requested_at AS control_requested_at, \
+                    c.completed_at AS control_completed_at, e.* \
+             FROM execution_control_requests c \
+             JOIN executions e ON e.id = c.execution_id \
+             WHERE c.completed_at IS NULL AND e.worker_id = $1 \
+             ORDER BY c.requested_at, c.request_id",
+        )
+        .bind(worker_id.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let execution = decode_execution(row)?;
+                let action = decode_control_action(row.try_get("control_action")?)?;
+                Ok(PendingExecutionControl {
+                    request: ExecutionControlRequest {
+                        request_id: row.try_get("control_request_id")?,
+                        execution_id: execution.id.clone(),
+                        action,
+                        requested_at: row.try_get("control_requested_at")?,
+                        completed_at: row.try_get("control_completed_at")?,
+                    },
+                    execution,
+                })
+            })
+            .collect()
+    }
+
+    async fn complete_control(
+        &self,
+        request_id: i64,
+        execution: &Execution,
+        event: &ExecutionEvent,
+    ) -> Result<Option<u64>, StoreError> {
+        if event.execution_id != execution.id
+            || event.state != execution.state
+            || event.attempt_id != execution.attempt_id
+            || event.sequence != 0
+        {
+            return Err(StoreError::Conflict(
+                "interactive control progress and event identity do not match".to_owned(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let control = sqlx::query(
+            "SELECT execution_id, action, completed_at FROM execution_control_requests \
+             WHERE request_id = $1 FOR UPDATE",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("control request {request_id}")))?;
+        if control.try_get::<String, _>("execution_id")? != execution.id.as_str() {
+            return Err(StoreError::Conflict(
+                "interactive control belongs to another execution".to_owned(),
+            ));
+        }
+        if control
+            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")?
+            .is_some()
+        {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        let action = decode_control_action(control.try_get("action")?)?;
+        let expected_state = match action {
+            ExecutionControlAction::Pause => ExecutionState::PausedForHuman,
+            ExecutionControlAction::Resume => ExecutionState::Running,
+            ExecutionControlAction::ForkConversation => execution.state,
+        };
+        if execution.state != expected_state {
+            return Err(StoreError::Conflict(format!(
+                "completed {action:?} has unexpected state {:?}",
+                execution.state
+            )));
+        }
+        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(execution.id.as_str())
+            .fetch_one(&mut *transaction)
+            .await?;
+        let persisted = decode_execution(&row)?;
+        if persisted.worker_id != execution.worker_id
+            || persisted.attempt_id != execution.attempt_id
+        {
+            return Err(StoreError::Conflict(
+                "interactive control attempt authority changed".to_owned(),
+            ));
+        }
+        if action != ExecutionControlAction::ForkConversation
+            && !persisted.state.can_transition_to(execution.state)
+        {
+            return Err(StoreError::IllegalTransition {
+                from: persisted.state,
+                to: execution.state,
+            });
+        }
+        if action == ExecutionControlAction::ForkConversation
+            && persisted.worktree_path != execution.worktree_path
+        {
+            return Err(StoreError::Conflict(
+                "conversation fork changed the workspace boundary".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE executions SET state = $2, session_id = $3, updated_at = $4, \
+             version = version + 1 WHERE id = $1",
+        )
+        .bind(execution.id.as_str())
+        .bind(enum_text(&execution.state)?)
+        .bind(execution.session_id.as_ref().map(SessionId::as_str))
+        .bind(execution.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE execution_attempts SET state = $2, session_id = $3, updated_at = $4 \
+             WHERE execution_id = $1 AND attempt_id = $5 AND finished_at IS NULL",
+        )
+        .bind(execution.id.as_str())
+        .bind(enum_text(&execution.state)?)
+        .bind(execution.session_id.as_ref().map(SessionId::as_str))
+        .bind(execution.updated_at)
+        .bind(execution.attempt_id.as_ref().map(AttemptId::as_str))
+        .execute(&mut *transaction)
+        .await?;
+        let sequence = append_in_transaction(&mut transaction, event).await?;
+        sqlx::query(
+            "UPDATE execution_control_requests SET completed_at = $2 WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .bind(execution.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(Some(sequence))
+    }
+}
+
+fn decode_control_request(
+    execution_id: &ExecutionId,
+    row: &sqlx::postgres::PgRow,
+) -> Result<ExecutionControlRequest, StoreError> {
+    Ok(ExecutionControlRequest {
+        request_id: row.try_get("request_id")?,
+        execution_id: execution_id.clone(),
+        action: decode_control_action(row.try_get("action")?)?,
+        requested_at: row.try_get("requested_at")?,
+        completed_at: row.try_get("completed_at")?,
+    })
+}
+
+fn decode_control_action(value: String) -> Result<ExecutionControlAction, StoreError> {
+    serde_json::from_value(Value::String(value))
+        .map_err(|error| StoreError::Conflict(format!("invalid execution control action: {error}")))
 }
 
 fn cancelled_result(id: &ExecutionId) -> ExecutionResult {

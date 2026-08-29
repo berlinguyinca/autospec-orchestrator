@@ -30,6 +30,11 @@ pub enum ExecutionEventKind {
     AgentInactive {
         seconds: u64,
     },
+    ExecutionPaused,
+    ExecutionResumed,
+    ConversationForked {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
