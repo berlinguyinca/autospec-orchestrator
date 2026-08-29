@@ -1,8 +1,6 @@
 use axum::{
-    body::Body,
     extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -10,60 +8,14 @@ use chrono::{DateTime, Duration, Utc};
 use orchestrator_core::{
     ExecutionId, WorkerAdvertisement, WorkerId, WorkerRegistration, WorkerState,
 };
-use orchestrator_persistence::{
-    CleanupAuthorityStore, CleanupDisposition, ReservationStore, StoreError, WorkerStore,
-};
-use serde_json::json;
-use std::sync::Arc;
+use orchestrator_persistence::{CleanupDisposition, StoreError};
 
-use crate::auth::{authorize_bearer, ApiTokenValidator, StaticApiTokenValidator};
+use crate::{auth::authorize_worker, error::ApiError, state::AppState};
 
 const WORKER_BODY_LIMIT: usize = 1_048_576;
 const HEARTBEAT_DEADLINE_SECONDS: i64 = 90;
 
-#[derive(Clone)]
-pub struct WorkerApiState {
-    workers: Arc<dyn WorkerStore>,
-    reservations: Arc<dyn ReservationStore>,
-    token_validator: Arc<dyn ApiTokenValidator>,
-    cleanup_authorities: Option<Arc<dyn CleanupAuthorityStore>>,
-}
-
-impl WorkerApiState {
-    pub fn new(
-        workers: Arc<dyn WorkerStore>,
-        reservations: Arc<dyn ReservationStore>,
-        token: String,
-    ) -> Self {
-        Self {
-            workers,
-            reservations,
-            token_validator: Arc::new(StaticApiTokenValidator::new(token)),
-            cleanup_authorities: None,
-        }
-    }
-
-    pub fn with_token_validator(
-        workers: Arc<dyn WorkerStore>,
-        reservations: Arc<dyn ReservationStore>,
-        token_validator: Arc<dyn ApiTokenValidator>,
-    ) -> Self {
-        Self {
-            workers,
-            reservations,
-            token_validator,
-            cleanup_authorities: None,
-        }
-    }
-
-    pub fn with_cleanup_authorities(
-        mut self,
-        cleanup_authorities: Arc<dyn CleanupAuthorityStore>,
-    ) -> Self {
-        self.cleanup_authorities = Some(cleanup_authorities);
-        self
-    }
-
+impl AppState {
     pub async fn reap_stale(&self, now: DateTime<Utc>) -> Result<Vec<WorkerId>, StoreError> {
         let stale = self
             .workers
@@ -91,7 +43,7 @@ impl WorkerApiState {
     }
 }
 
-pub fn routes() -> Router<WorkerApiState> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/workers", get(list).post(register))
         .route("/workers/{id}/heartbeat", post(heartbeat))
@@ -100,11 +52,11 @@ pub fn routes() -> Router<WorkerApiState> {
 }
 
 async fn request_cleanup(
-    State(state): State<WorkerApiState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_worker(&state, &headers)?;
     let cleanup = state.cleanup_authorities.as_ref().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -134,11 +86,11 @@ async fn request_cleanup(
 }
 
 async fn register(
-    State(state): State<WorkerApiState>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     payload: Result<Json<WorkerAdvertisement>, JsonRejection>,
 ) -> Result<(StatusCode, Json<WorkerRegistration>), ApiError> {
-    authorize(&state, &headers)?;
+    authorize_worker(&state, &headers)?;
     let Json(advertisement) = decode_payload(payload)?;
     let mut worker = WorkerRegistration {
         id: advertisement.id,
@@ -176,15 +128,15 @@ async fn register(
 }
 
 async fn heartbeat(
-    State(state): State<WorkerApiState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
     payload: Result<Json<WorkerAdvertisement>, JsonRejection>,
 ) -> Result<Json<WorkerRegistration>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_worker(&state, &headers)?;
     let Json(advertisement) = decode_payload(payload)?;
     if advertisement.id.as_str() != id {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::validation(
             "worker id does not match heartbeat path",
         ));
     }
@@ -211,10 +163,10 @@ async fn heartbeat(
 }
 
 async fn list(
-    State(state): State<WorkerApiState>,
+    State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<WorkerRegistration>>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_worker(&state, &headers)?;
     state
         .workers
         .list()
@@ -247,61 +199,7 @@ fn decode_payload(
                 rejection.body_text(),
             )
         } else {
-            ApiError::bad_request(rejection.body_text())
+            ApiError::validation(rejection.body_text())
         }
     })
-}
-
-fn authorize(state: &WorkerApiState, headers: &HeaderMap) -> Result<(), ApiError> {
-    if authorize_bearer(headers, state.token_validator.as_ref()) {
-        Ok(())
-    } else {
-        Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "UNAUTHORIZED",
-            "missing or invalid worker bearer token",
-        ))
-    }
-}
-
-struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
-}
-
-impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            code,
-            message: message.into(),
-        }
-    }
-
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "VALIDATION", message)
-    }
-
-    fn store(error: StoreError) -> Self {
-        match error {
-            StoreError::NotFound(message) => Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", message),
-            StoreError::Conflict(message) => Self::bad_request(message),
-            other => Self::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL",
-                other.to_string(),
-            ),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response<Body> {
-        (
-            self.status,
-            Json(json!({"error": {"code": self.code, "message": self.message}})),
-        )
-            .into_response()
-    }
 }

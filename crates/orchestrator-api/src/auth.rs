@@ -1,6 +1,8 @@
 use axum::http::HeaderMap;
 use std::sync::Arc;
 
+use crate::{error::ApiError, state::AppState};
+
 /// Pluggable API-token validation boundary. Production currently uses one
 /// static bearer secret; external identity providers can implement the same
 /// contract without changing route handlers.
@@ -35,6 +37,34 @@ pub(crate) fn authorize_bearer(headers: &HeaderMap, validator: &dyn ApiTokenVali
         .map(str::as_bytes)
         .unwrap_or_default();
     validator.validate(supplied)
+}
+
+pub(crate) fn authorize_api(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    authorize(
+        headers,
+        state.api_token_validator.as_ref(),
+        "missing or invalid API bearer token",
+    )
+}
+
+pub(crate) fn authorize_worker(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    authorize(
+        headers,
+        state.worker_token_validator.as_ref(),
+        "missing or invalid worker bearer token",
+    )
+}
+
+fn authorize(
+    headers: &HeaderMap,
+    validator: &dyn ApiTokenValidator,
+    message: &'static str,
+) -> Result<(), ApiError> {
+    if authorize_bearer(headers, validator) {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized(message))
+    }
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

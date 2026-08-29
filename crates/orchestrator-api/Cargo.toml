@@ -13,6 +13,7 @@ workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 axum.workspace = true
+futures-util.workspace = true
 orchestrator-persistence.workspace = true
 orchestrator-core.workspace = true
 orchestrator-scheduler.workspace = true
@@ -24,4 +25,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
+tempfile.workspace = true
 uuid.workspace = true

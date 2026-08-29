@@ -1,11 +1,13 @@
 //! Durable PostgreSQL storage for execution-plane records (spec sections 32, 49, 61, 74).
 
+mod artifacts;
 mod cleanup;
 mod error;
 mod event_log;
 mod reservations;
 mod workers;
 
+pub use artifacts::{Artifact, ArtifactStore, PgArtifactStore};
 pub use cleanup::{
     CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, CleanupStage,
     PgCleanupAuthorityStore,
@@ -36,6 +38,16 @@ pub trait ExecutionStore: Send + Sync {
         id: &ExecutionId,
         next: ExecutionState,
     ) -> Result<Execution, StoreError>;
+    async fn transition_with_event(
+        &self,
+        _id: &ExecutionId,
+        _next: ExecutionState,
+        _event: &orchestrator_core::ExecutionEvent,
+    ) -> Result<(Execution, u64), StoreError> {
+        Err(StoreError::Conflict(
+            "atomic transition events are unavailable for this store".to_owned(),
+        ))
+    }
     async fn record_progress(
         &self,
         execution: &Execution,
@@ -48,6 +60,24 @@ pub trait ExecutionStore: Send + Sync {
     ) -> Result<u64, StoreError> {
         self.record_progress(execution, event).await
     }
+    async fn create_idempotent(
+        &self,
+        _execution: &Execution,
+        _event: &orchestrator_core::ExecutionEvent,
+        _idempotency_key: &str,
+        _request_scope: &str,
+    ) -> Result<IdempotentExecution, StoreError> {
+        Err(StoreError::Conflict(
+            "idempotent creation is unavailable for this store".to_owned(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IdempotentExecution {
+    pub execution: Execution,
+    pub created: bool,
+    pub event_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +182,50 @@ impl ExecutionStore for PgExecutionStore {
         Ok(execution)
     }
 
+    async fn transition_with_event(
+        &self,
+        id: &ExecutionId,
+        next: ExecutionState,
+        event: &orchestrator_core::ExecutionEvent,
+    ) -> Result<(Execution, u64), StoreError> {
+        if id != &event.execution_id || next != event.state || event.sequence != 0 {
+            return Err(StoreError::Conflict(
+                "execution transition and event identity do not match".to_owned(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
+            .bind(id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let mut execution = decode_execution(&row)?;
+        if execution.attempt_id != event.attempt_id {
+            return Err(StoreError::Conflict(
+                "execution transition and event attempt do not match".to_owned(),
+            ));
+        }
+        let from = execution.state;
+        if !from.can_transition_to(next) {
+            return Err(StoreError::IllegalTransition { from, to: next });
+        }
+        execution
+            .transition(next)
+            .map_err(|_| StoreError::IllegalTransition { from, to: next })?;
+        sqlx::query(
+            "UPDATE executions SET state = $2, updated_at = $3, version = version + 1 \
+             WHERE id = $1",
+        )
+        .bind(id.as_str())
+        .bind(enum_text(&execution.state)?)
+        .bind(execution.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        let sequence = append_in_transaction(&mut transaction, event).await?;
+        transaction.commit().await?;
+        Ok((execution, sequence))
+    }
+
     async fn record_progress(
         &self,
         execution: &Execution,
@@ -166,6 +240,106 @@ impl ExecutionStore for PgExecutionStore {
         event: &orchestrator_core::ExecutionEvent,
     ) -> Result<u64, StoreError> {
         record_progress(&self.pool, execution, event, true).await
+    }
+
+    async fn create_idempotent(
+        &self,
+        execution: &Execution,
+        event: &orchestrator_core::ExecutionEvent,
+        idempotency_key: &str,
+        request_scope: &str,
+    ) -> Result<IdempotentExecution, StoreError> {
+        if idempotency_key.is_empty() || idempotency_key.len() > 255 {
+            return Err(StoreError::Conflict(
+                "idempotency key must be 1-255 bytes".to_owned(),
+            ));
+        }
+        if execution.id != event.execution_id
+            || execution.state != event.state
+            || event.sequence != 0
+        {
+            return Err(StoreError::Conflict(
+                "created execution and event identity do not match".to_owned(),
+            ));
+        }
+        let manifest = to_json(&execution.manifest)?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))")
+            .bind(idempotency_key)
+            .fetch_one(&mut *transaction)
+            .await?;
+        if let Some(row) = sqlx::query(
+            "SELECT request_scope, manifest, execution_id FROM execution_requests \
+             WHERE idempotency_key = $1",
+        )
+        .bind(idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            let stored_scope: String = row.try_get("request_scope")?;
+            let stored_manifest: Value = row.try_get("manifest")?;
+            if stored_scope != request_scope || stored_manifest != manifest {
+                return Err(StoreError::IdempotencyConflict(
+                    "idempotency key was already used for a different request".to_owned(),
+                ));
+            }
+            let execution_id = ExecutionId::new(row.try_get::<String, _>("execution_id")?);
+            let row = sqlx::query("SELECT * FROM executions WHERE id = $1")
+                .bind(execution_id.as_str())
+                .fetch_one(&mut *transaction)
+                .await?;
+            let replay = decode_execution(&row)?;
+            transaction.commit().await?;
+            return Ok(IdempotentExecution {
+                execution: replay,
+                created: false,
+                event_sequence: None,
+            });
+        }
+
+        let result = execution.result.as_ref().map(to_json).transpose()?;
+        sqlx::query(
+            "INSERT INTO executions \
+             (id, role, state, manifest, worker_id, attempt_id, session_id, worktree_path, \
+              labels, result, created_at, updated_at, version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1)",
+        )
+        .bind(execution.id.as_str())
+        .bind(enum_text(&execution.role)?)
+        .bind(enum_text(&execution.state)?)
+        .bind(&manifest)
+        .bind(execution.worker_id.as_ref().map(WorkerId::as_str))
+        .bind(execution.attempt_id.as_ref().map(AttemptId::as_str))
+        .bind(execution.session_id.as_ref().map(SessionId::as_str))
+        .bind(execution.worktree_path.as_deref())
+        .bind(to_json(&execution.labels)?)
+        .bind(result)
+        .bind(execution.created_at)
+        .bind(execution.updated_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_conflict)?;
+        sqlx::query(
+            "INSERT INTO execution_requests \
+             (idempotency_key, request_scope, manifest, execution_id, created_at) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(idempotency_key)
+        .bind(request_scope)
+        .bind(&manifest)
+        .bind(execution.id.as_str())
+        .bind(execution.created_at)
+        .execute(&mut *transaction)
+        .await?;
+        let sequence = append_in_transaction(&mut transaction, event).await?;
+        transaction.commit().await?;
+        let mut persisted = execution.clone();
+        persisted.updated_at = execution.updated_at;
+        Ok(IdempotentExecution {
+            execution: persisted,
+            created: true,
+            event_sequence: Some(sequence),
+        })
     }
 }
 
@@ -347,20 +521,21 @@ pub(crate) fn decode_execution(row: &sqlx::postgres::PgRow) -> Result<Execution,
 }
 
 fn map_conflict(error: sqlx::Error) -> StoreError {
-    if error
-        .as_database_error()
-        .and_then(|error| error.code())
-        .is_some_and(|code| code == "23505")
-    {
-        StoreError::Conflict(error.to_string())
-    } else {
-        StoreError::Db(error)
+    if let Some(database_error) = error.as_database_error() {
+        if database_error.code().as_deref() == Some("23505") {
+            return if database_error.constraint() == Some("executions_pkey") {
+                StoreError::DuplicateExecutionId(error.to_string())
+            } else {
+                StoreError::Conflict(error.to_string())
+            };
+        }
     }
+    StoreError::Db(error)
 }
 
 #[cfg(test)]
 mod contract_tests {
-    use super::{EventLog, ExecutionStore, ReservationStore, WorkerStore};
+    use super::{ArtifactStore, EventLog, ExecutionStore, ReservationStore, WorkerStore};
 
     #[allow(dead_code)]
     fn traits_are_object_safe(
@@ -368,6 +543,7 @@ mod contract_tests {
         _: &dyn EventLog,
         _: &dyn WorkerStore,
         _: &dyn ReservationStore,
+        _: &dyn ArtifactStore,
     ) {
     }
 }

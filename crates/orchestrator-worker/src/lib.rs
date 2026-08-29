@@ -9,8 +9,8 @@ mod system;
 pub use health::{HealthAssessment, HealthMonitor};
 pub use recovery::{RecoveryAuthority, RecoveryCoordinator, RecoveryDisposition};
 pub use system::{
-    EvidenceStore, FilesystemEvidenceStore, HarnessFactory, RuntimeFactory,
-    SystemExecutionLifecycle, SystemRecoveryConfig, VerifiedDockerRuntimeFactory,
+    ContentAddressedEvidenceStore, EvidenceStore, FilesystemEvidenceStore, HarnessFactory,
+    RuntimeFactory, SystemExecutionLifecycle, SystemRecoveryConfig, VerifiedDockerRuntimeFactory,
     VerifiedPiHarnessFactory,
 };
 

@@ -12,11 +12,11 @@ use orchestrator_core::{
     WorkerCapabilityProof, WorkerId, API_VERSION,
 };
 use orchestrator_persistence::{
-    CleanupAuthorityStore, CleanupDisposition, CleanupStage, ExecutionStore,
+    CleanupAuthorityStore, CleanupDisposition, CleanupStage, ExecutionStore, PgArtifactStore,
     PgCleanupAuthorityStore, PgExecutionStore, PgReservationStore, ReservationStore,
 };
 use orchestrator_worker::{
-    ExecutionTask, FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
+    ContentAddressedEvidenceStore, ExecutionTask, SystemExecutionLifecycle, SystemRecoveryConfig,
     VerifiedDockerRuntimeFactory, VerifiedPiHarnessFactory, Worker,
 };
 use runtime_docker::TrustedVerifierImage;
@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
     let executions = Arc::new(PgExecutionStore::connect(&cli.database_url).await?);
     let reservations = Arc::new(PgReservationStore::connect(&cli.database_url).await?);
     let cleanup = Arc::new(PgCleanupAuthorityStore::connect(&cli.database_url).await?);
+    let artifacts = Arc::new(PgArtifactStore::connect(&cli.database_url, &cli.state_root).await?);
     let verifier: Arc<dyn execution_storage::ReadyAllocationVerifier> = storage.clone();
     let worktrees = Arc::new(GitWorktreeManager::with_clone_base_and_verifier(
         &cli.state_root,
@@ -155,7 +156,7 @@ async fn main() -> Result<()> {
         worktrees,
         runtimes,
         harnesses,
-        Arc::new(FilesystemEvidenceStore::new(&cli.state_root)),
+        Arc::new(ContentAddressedEvidenceStore::new(artifacts)),
     ));
     let execution_worker = Arc::new(Worker::new(
         lifecycle,

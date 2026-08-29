@@ -1,12 +1,13 @@
 use chrono::{Duration, Utc};
-use orchestrator_api::{router, WorkerApiState};
+use orchestrator_api::{router, AppState};
 use orchestrator_core::{
     ExecutionId, RuntimeKind, WorkerCapabilities, WorkerCapabilityProof, WorkerId,
     WorkerRegistration, WorkerState,
 };
 use orchestrator_persistence::{
-    CleanupAuthorityStore, CleanupDisposition, CleanupStage, PgCleanupAuthorityStore,
-    PgReservationStore, PgWorkerStore, WorkerStore,
+    CleanupAuthorityStore, CleanupDisposition, CleanupStage, PgArtifactStore,
+    PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore, PgWorkerStore,
+    WorkerStore,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -20,7 +21,7 @@ async fn authenticated_worker_routes_own_liveness_and_reap_after_ninety_seconds(
     let store = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
     let token = format!("worker-token-{}", uuid::Uuid::new_v4());
     let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
-    let state = WorkerApiState::new(store.clone(), reservations, token.clone());
+    let state = app_state(&database_url, store.clone(), reservations, token.clone()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server_state = state.clone();
@@ -169,7 +170,8 @@ async fn authenticated_execution_cleanup_requests_durable_reconciliation() {
             .await
             .unwrap();
     }
-    let state = WorkerApiState::new(workers, reservations, "secret".into())
+    let state = app_state(&database_url, workers, reservations, "secret".into())
+        .await
         .with_cleanup_authorities(cleanup.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -244,7 +246,7 @@ async fn worker_routes_reject_invalid_and_oversized_bodies() {
     };
     let store = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
     let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
-    let state = WorkerApiState::new(store, reservations, "secret".into());
+    let state = app_state(&database_url, store, reservations, "secret".into()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -296,4 +298,25 @@ fn registration(id: &str) -> WorkerRegistration {
             docker_method_version: "v1".into(),
         }),
     }
+}
+
+async fn app_state(
+    database_url: &str,
+    workers: Arc<PgWorkerStore>,
+    reservations: Arc<PgReservationStore>,
+    worker_token: String,
+) -> AppState {
+    AppState::new(
+        Arc::new(PgExecutionStore::connect(database_url).await.unwrap()),
+        Arc::new(PgEventLog::connect(database_url).await.unwrap()),
+        workers,
+        reservations,
+        Arc::new(
+            PgArtifactStore::connect(database_url, std::env::temp_dir())
+                .await
+                .unwrap(),
+        ),
+        "api-secret".into(),
+        worker_token,
+    )
 }

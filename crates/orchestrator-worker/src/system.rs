@@ -10,7 +10,7 @@ use harness_traits::{AgentHarness, SessionRef};
 use orchestrator_core::{
     Execution, ExecutionEvent, ExecutionId, OwnershipLabels, SessionId, TaskPacket,
 };
-use orchestrator_persistence::{CleanupAuthority, CleanupDisposition};
+use orchestrator_persistence::{ArtifactStore, CleanupAuthority, CleanupDisposition};
 use runtime_docker::{DockerRuntime, TrustedVerifierImage};
 use runtime_traits::{EnvironmentHandle, Runtime, VerifiedAgentContainer, VerifiedBindMount};
 use serde::Deserialize;
@@ -186,6 +186,42 @@ impl HarnessFactory for VerifiedPiHarnessFactory {
 #[derive(Debug, Clone)]
 pub struct FilesystemEvidenceStore {
     root: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct ContentAddressedEvidenceStore {
+    artifacts: Arc<dyn ArtifactStore>,
+}
+
+impl ContentAddressedEvidenceStore {
+    pub fn new(artifacts: Arc<dyn ArtifactStore>) -> Self {
+        Self { artifacts }
+    }
+}
+
+#[async_trait]
+impl EvidenceStore for ContentAddressedEvidenceStore {
+    async fn persist(
+        &self,
+        execution: &Execution,
+        capture: &DiffCapture,
+    ) -> Result<String, LifecycleError> {
+        let attempt_id = execution
+            .attempt_id
+            .as_ref()
+            .ok_or_else(|| LifecycleError::Step("evidence lacks attempt id".into()))?;
+        let name = format!("diff-{attempt_id}.patch");
+        self.artifacts
+            .store(
+                &execution.id,
+                &name,
+                "text/x-diff; charset=utf-8",
+                capture.patch.as_bytes(),
+            )
+            .await
+            .map(|artifact| artifact.sha256)
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
 }
 
 impl FilesystemEvidenceStore {

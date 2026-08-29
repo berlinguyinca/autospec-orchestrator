@@ -5,7 +5,7 @@ use execution_storage::{
 };
 use git_worktree::{GitWorktreeManager, Worktree};
 use harness_traits::SessionRef;
-use orchestrator_api::{router, WorkerApiState};
+use orchestrator_api::{router, AppState};
 use orchestrator_core::{
     event::ExecutionEventKind, AgentAssignment, Execution, ExecutionEvent, ExecutionId,
     ExecutionManifest, ExecutionResult, ExecutionState, HarnessKind, ModelPolicy, OwnershipLabels,
@@ -15,8 +15,8 @@ use orchestrator_core::{
 };
 use orchestrator_persistence::{
     CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog, ExecutionStore,
-    PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore, PgWorkerStore,
-    ReservationStore, WorkerStore,
+    PgArtifactStore, PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore,
+    PgWorkerStore, ReservationStore, WorkerStore,
 };
 use orchestrator_worker::{
     ExecutionLifecycle, FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
@@ -638,9 +638,17 @@ async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
 
         if stage == "post_runtime" {
             let token = format!("reaper-token-{suffix}");
-            let api_state = WorkerApiState::new(
+            let api_state = AppState::new(
+                Arc::new(PgExecutionStore::connect(&database_url).await.unwrap()),
+                Arc::new(PgEventLog::connect(&database_url).await.unwrap()),
                 Arc::new(PgWorkerStore::connect(&database_url).await.unwrap()),
                 reservations.clone(),
+                Arc::new(
+                    PgArtifactStore::connect(&database_url, &root)
+                        .await
+                        .unwrap(),
+                ),
+                "api-secret".into(),
                 token.clone(),
             );
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

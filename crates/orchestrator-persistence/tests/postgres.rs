@@ -5,12 +5,122 @@ use orchestrator_core::{
     PersistenceMode, RepositoryReference, Role, RuntimeRequirement, WorkerId,
 };
 use orchestrator_persistence::{
-    CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog, ExecutionStore,
-    LostWorkerRecovery, PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore,
-    PgWorkerStore, ReservationStore, StoreError, WorkerStore,
+    ArtifactStore, CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog,
+    ExecutionStore, LostWorkerRecovery, PgArtifactStore, PgCleanupAuthorityStore, PgEventLog,
+    PgExecutionStore, PgReservationStore, PgWorkerStore, ReservationStore, StoreError, WorkerStore,
 };
 use sqlx::{postgres::PgPoolOptions, Row};
 use std::sync::{Arc, OnceLock};
+
+#[tokio::test]
+async fn artifacts_are_content_addressed_deduplicated_and_execution_scoped() {
+    let _database_test = database_test_lock().lock().await;
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real PostgreSQL test");
+        return;
+    };
+    let state_root = tempfile::tempdir().unwrap();
+    let executions = PgExecutionStore::connect(&database_url).await.unwrap();
+    let artifacts = PgArtifactStore::connect(&database_url, state_root.path())
+        .await
+        .unwrap();
+    let first = execution(ExecutionState::Queued);
+    let second = execution(ExecutionState::Queued);
+    executions.insert(&first).await.unwrap();
+    executions.insert(&second).await.unwrap();
+
+    let first_record = artifacts
+        .store(
+            &first.id,
+            "test-results.json",
+            "application/json",
+            br#"{"passed":12}"#,
+        )
+        .await
+        .unwrap();
+    let replay = artifacts
+        .store(
+            &first.id,
+            "test-results.json",
+            "application/json",
+            br#"{"passed":12}"#,
+        )
+        .await
+        .unwrap();
+    let second_record = artifacts
+        .store(
+            &second.id,
+            "review-results.json",
+            "application/json",
+            br#"{"passed":12}"#,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first_record.sha256, replay.sha256);
+    assert_eq!(first_record.sha256, second_record.sha256);
+    assert_eq!(first_record.size_bytes, 13);
+    assert_eq!(artifacts.list(&first.id).await.unwrap(), vec![first_record]);
+    assert_eq!(
+        artifacts.list(&second.id).await.unwrap(),
+        vec![second_record]
+    );
+    let blob_count = std::fs::read_dir(
+        state_root
+            .path()
+            .join("artifacts")
+            .join(&replay.sha256[..2]),
+    )
+    .unwrap()
+    .count();
+    assert_eq!(blob_count, 1, "identical bytes share one durable blob");
+    assert!(matches!(
+        artifacts
+            .store(&first.id, "../escape", "text/plain", b"bad")
+            .await,
+        Err(StoreError::InvalidArtifactName(_))
+    ));
+    assert!(matches!(
+        artifacts
+            .store(
+                &first.id,
+                "test-results.json",
+                "application/json",
+                b"different",
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        artifacts
+            .store(
+                &ExecutionId::new("unknown-execution"),
+                "evidence.txt",
+                "text/plain",
+                b"foreign",
+            )
+            .await,
+        Err(StoreError::NotFound(_))
+    ));
+
+    let blob_path = state_root
+        .path()
+        .join("artifacts")
+        .join(&replay.sha256[..2])
+        .join(&replay.sha256);
+    std::fs::write(&blob_path, b"corrupted").unwrap();
+    assert!(matches!(
+        artifacts
+            .store(
+                &first.id,
+                "test-results.json",
+                "application/json",
+                br#"{"passed":12}"#,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+}
 
 fn database_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -450,6 +560,7 @@ async fn concurrent_reservation_assigns_each_execution_once_without_oversubscrip
         reservation.execution.state == ExecutionState::WorkerAssigned
             && reservation.execution.worker_id.as_ref() == Some(&worker.id)
             && reservation.execution.attempt_id.as_ref() == Some(&reservation.attempt_id)
+            && reservation.execution.labels.worker_id == worker.id
     }));
     assert_eq!(
         reservations

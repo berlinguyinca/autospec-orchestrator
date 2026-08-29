@@ -194,14 +194,16 @@ impl ReservationStore for PgReservationStore {
             })?;
         execution.worker_id = Some(worker_id.clone());
         execution.attempt_id = Some(attempt_id.clone());
+        execution.labels.worker_id = worker_id.clone();
         sqlx::query(
             "UPDATE executions SET state = 'WORKER_ASSIGNED', worker_id = $2, attempt_id = $3, \
-             updated_at = $4, version = version + 1 WHERE id = $1",
+             updated_at = $4, labels = $5, version = version + 1 WHERE id = $1",
         )
         .bind(execution.id.as_str())
         .bind(worker_id.as_str())
         .bind(attempt_id.as_str())
         .bind(execution.updated_at)
+        .bind(to_json(&execution.labels)?)
         .execute(&mut *transaction)
         .await?;
         sqlx::query(

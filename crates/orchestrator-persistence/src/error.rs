@@ -14,6 +14,10 @@ pub enum StoreError {
     },
     #[error("storage conflict: {0}")]
     Conflict(String),
+    #[error("idempotency conflict: {0}")]
+    IdempotencyConflict(String),
+    #[error("execution id already exists: {0}")]
+    DuplicateExecutionId(String),
     #[error("event sequence conflict")]
     SequenceConflict,
     #[error("worker capacity exhausted: {0}")]
