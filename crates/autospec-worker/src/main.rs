@@ -408,6 +408,10 @@ struct DockerCapabilityVerifier {
 }
 
 impl DockerBindVerifier for DockerCapabilityVerifier {
+    fn cleanup_daemon_id(&self) -> &str {
+        &self.daemon_id
+    }
+
     fn probe(&self) -> Result<DockerBindCapability, StorageError> {
         let output = docker_command(&self.docker, self.docker_host.as_deref())
             .args([

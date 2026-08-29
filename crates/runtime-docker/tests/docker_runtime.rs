@@ -314,6 +314,10 @@ struct DockerCliBindVerifier {
 }
 
 impl DockerBindVerifier for DockerCliBindVerifier {
+    fn cleanup_daemon_id(&self) -> &str {
+        &self.daemon_id
+    }
+
     fn probe(&self) -> Result<DockerBindCapability, StorageError> {
         Ok(DockerBindCapability {
             daemon_id: self.daemon_id.clone(),

@@ -105,6 +105,12 @@ pub trait StorageBackend: Debug + Send + Sync {
 }
 
 pub trait DockerBindVerifier: Debug + Send + Sync {
+    /// Returns the daemon identity used for cleanup authentication without
+    /// executing or inspecting the current verifier image. Durable receipts
+    /// can outlive verifier image and proof-method rollouts (spec sections 36
+    /// and 48).
+    fn cleanup_daemon_id(&self) -> &str;
+
     fn probe(&self) -> Result<DockerBindCapability, StorageError>;
 
     fn verify(&self, source: &Path) -> Result<DockerBindProof, StorageError>;
@@ -391,6 +397,62 @@ impl ExecutionStorage {
         Ok(verified)
     }
 
+    fn authenticate_cleanup_authority(
+        &self,
+        layout: &ExecutionLayout,
+        receipt: &AllocationReceipt,
+        journal: &PhaseJournal,
+    ) -> Result<BackendState, StorageError> {
+        receipt.validate(&receipt.labels, layout)?;
+        if journal.receipt.as_ref() != Some(receipt)
+            || !matches!(
+                journal.phase,
+                AllocationPhase::Ready | AllocationPhase::Releasing
+            )
+        {
+            return Err(StorageError::IdentityMismatch(
+                "cleanup receipt does not exactly match durable Ready/Releasing authority"
+                    .to_owned(),
+            ));
+        }
+        self.validate_backend_config(journal)?;
+        if self.docker.cleanup_daemon_id() != receipt.docker_bind.daemon_id {
+            return Err(StorageError::IdentityMismatch(
+                "Docker daemon identity differs from the durable bind proof".to_owned(),
+            ));
+        }
+        self.executions_directory.verify("executions directory")?;
+        let state = self
+            .backend
+            .state(layout, &receipt.backend, receipt.reserved_bytes)?;
+        match fs::symlink_metadata(&layout.root) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(StorageError::IdentityMismatch(
+                        "cleanup allocation path is not a real directory".to_owned(),
+                    ));
+                }
+                let pinned = PinnedDirectory::capture(&layout.root, "cleanup allocation")?;
+                pinned.verify("cleanup allocation")?;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && state == BackendState::Absent => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::IdentityMismatch(
+                    "cleanup allocation path disappeared while its backend remains".to_owned(),
+                ));
+            }
+            Err(error) => {
+                return Err(StorageError::IdentityMismatch(format!(
+                    "inspect cleanup allocation {}: {error}",
+                    layout.root.display()
+                )));
+            }
+        }
+        Ok(state)
+    }
+
     fn create_mountpoint(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
         self.executions_directory.verify("executions directory")?;
         if layout.root.parent() != Some(self.state_root.join("executions").as_path()) {
@@ -506,14 +568,15 @@ impl ExecutionStorage {
                 "execution storage is already allocated".to_owned(),
             )),
             AllocationPhase::Releasing => {
-                let receipt = journal.receipt.ok_or_else(|| {
+                let receipt = journal.receipt.as_ref().ok_or_else(|| {
                     StorageError::IdentityMismatch("releasing journal lacks receipt".to_owned())
                 })?;
+                self.authenticate_cleanup_authority(layout, receipt, &journal)?;
                 self.cleanup_identity(
                     layout,
                     &receipt.backend,
                     receipt.reserved_bytes,
-                    Some(&receipt),
+                    Some(receipt),
                 )
             }
             AllocationPhase::Allocating => {
@@ -905,35 +968,12 @@ impl ExecutionStorageManager for ExecutionStorage {
                 "execution has an active Ready consumer lease: {error}"
             ))
         })?;
-        receipt.validate(&receipt.labels, &layout)?;
         let journal = self.journals.read(&layout)?;
-        if journal.receipt.as_ref() != Some(receipt)
-            || !matches!(
-                journal.phase,
-                crate::AllocationPhase::Ready | crate::AllocationPhase::Releasing
-            )
-        {
+        let state = self.authenticate_cleanup_authority(&layout, receipt, &journal)?;
+        if journal.phase == AllocationPhase::Ready && state != BackendState::Mounted {
             return Err(StorageError::IdentityMismatch(
-                "release receipt does not exactly match the durable journal".to_owned(),
+                "ready backend is not mounted".to_owned(),
             ));
-        }
-        self.validate_backend_config(&journal)?;
-        if journal.phase == AllocationPhase::Ready {
-            if self
-                .backend
-                .state(&layout, &receipt.backend, receipt.reserved_bytes)?
-                != BackendState::Mounted
-            {
-                return Err(StorageError::IdentityMismatch(
-                    "ready backend is not mounted".to_owned(),
-                ));
-            }
-            let current_bind = self.docker.verify(&layout.root)?;
-            if current_bind != receipt.docker_bind {
-                return Err(StorageError::IdentityMismatch(
-                    "Docker bind proof changed since allocation".to_owned(),
-                ));
-            }
         }
         if existing_tombstone.is_none() {
             self.release_tombstones

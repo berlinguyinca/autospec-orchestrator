@@ -392,10 +392,15 @@ fn fixed_identity_with_filesystem(
 struct TestDockerBindVerifier {
     daemon_id: String,
     image_id: String,
+    command: String,
     method: String,
 }
 
 impl DockerBindVerifier for TestDockerBindVerifier {
+    fn cleanup_daemon_id(&self) -> &str {
+        &self.daemon_id
+    }
+
     fn probe(&self) -> Result<DockerBindCapability, StorageError> {
         Ok(DockerBindCapability {
             daemon_id: self.daemon_id.clone(),
@@ -419,7 +424,7 @@ impl DockerBindVerifier for TestDockerBindVerifier {
                 "--mount",
                 &mount,
                 &self.image_id,
-                "/bin/stat",
+                &self.command,
                 "-c",
                 "%d:%i",
                 "/proof",
@@ -1131,6 +1136,7 @@ async fn partial_docker_provision_and_rollback_failure_recovers_by_exact_selecto
             Box::new(TestDockerBindVerifier {
                 daemon_id: daemon_id.clone(),
                 image_id: image_id.clone(),
+                command: "/bin/stat".into(),
                 method: TrustedVerifierImage::new(&image_id, "/bin/stat")
                     .unwrap()
                     .proof_method(),
@@ -1173,6 +1179,18 @@ async fn partial_docker_provision_and_rollback_failure_recovers_by_exact_selecto
     ));
     assert!(!credential.exists());
     assert!(docker_resource_exists("network", &peer_network));
+    assert!(
+        !root
+            .join(format!("worktrees/.cleanup-{execution_id}.json"))
+            .exists(),
+        "Git cleanup tombstone must be acknowledged"
+    );
+    assert!(
+        !root
+            .join(format!("execution-storage/releases/{execution_id}.json"))
+            .exists(),
+        "storage release tombstone must be acknowledged"
+    );
     assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
     run(Command::new("docker").args(["network", "rm", &peer_network]));
     delete_matrix_records(&database_url, &execution_id, &worker_id).await;
@@ -1252,7 +1270,6 @@ async fn partial_provision_process_helper() {
                     &root,
                     &remote,
                     &daemon,
-                    &image,
                     &restarted_image,
                     &restarted_command,
                 ),
@@ -3122,23 +3139,24 @@ fn build_system_lifecycle(
     build_system_lifecycle_with_runtime(root, remote_root, daemon_id, image_id, None)
 }
 
+#[derive(Clone, Copy)]
+struct TestVerifierConfig<'a> {
+    image_id: &'a str,
+    command: &'a str,
+}
+
 fn build_system_lifecycle_with_verifier_config(
     root: &Path,
     remote_root: &Path,
     daemon_id: &str,
-    storage_image_id: &str,
-    runtime_image_id: &str,
-    runtime_verifier_command: &str,
+    verifier_image_id: &str,
+    verifier_command: &str,
 ) -> Arc<SystemExecutionLifecycle> {
-    build_system_lifecycle_with_configs(
-        root,
-        remote_root,
-        daemon_id,
-        storage_image_id,
-        runtime_image_id,
-        runtime_verifier_command,
-        None,
-    )
+    let verifier = TestVerifierConfig {
+        image_id: verifier_image_id,
+        command: verifier_command,
+    };
+    build_system_lifecycle_with_configs(root, remote_root, daemon_id, verifier, verifier, None)
 }
 
 fn build_system_lifecycle_with_runtime(
@@ -3148,13 +3166,16 @@ fn build_system_lifecycle_with_runtime(
     image_id: &str,
     runtime_override: Option<Arc<dyn RuntimeFactory>>,
 ) -> Arc<SystemExecutionLifecycle> {
+    let verifier = TestVerifierConfig {
+        image_id,
+        command: "/bin/stat",
+    };
     build_system_lifecycle_with_configs(
         root,
         remote_root,
         daemon_id,
-        image_id,
-        image_id,
-        "/bin/stat",
+        verifier,
+        verifier,
         runtime_override,
     )
 }
@@ -3163,13 +3184,14 @@ fn build_system_lifecycle_with_configs(
     root: &Path,
     remote_root: &Path,
     daemon_id: &str,
-    storage_image_id: &str,
-    runtime_image_id: &str,
-    runtime_verifier_command: &str,
+    storage_verifier: TestVerifierConfig<'_>,
+    runtime_verifier: TestVerifierConfig<'_>,
     runtime_override: Option<Arc<dyn RuntimeFactory>>,
 ) -> Arc<SystemExecutionLifecycle> {
-    let storage_trusted = TrustedVerifierImage::new(storage_image_id, "/bin/stat").unwrap();
-    let trusted = TrustedVerifierImage::new(runtime_image_id, runtime_verifier_command).unwrap();
+    let storage_trusted =
+        TrustedVerifierImage::new(storage_verifier.image_id, storage_verifier.command).unwrap();
+    let trusted =
+        TrustedVerifierImage::new(runtime_verifier.image_id, runtime_verifier.command).unwrap();
     let method = storage_trusted.proof_method();
     let storage = Arc::new(
         ExecutionStorage::new(
@@ -3177,7 +3199,8 @@ fn build_system_lifecycle_with_configs(
             Box::new(FixedFilesystemBackend),
             Box::new(TestDockerBindVerifier {
                 daemon_id: daemon_id.into(),
-                image_id: storage_image_id.into(),
+                image_id: storage_verifier.image_id.into(),
+                command: storage_verifier.command.into(),
                 method,
             }),
         )

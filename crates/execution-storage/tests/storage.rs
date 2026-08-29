@@ -189,6 +189,10 @@ struct DockerCliBindVerifier {
 }
 
 impl DockerBindVerifier for DockerCliBindVerifier {
+    fn cleanup_daemon_id(&self) -> &str {
+        &self.daemon_id
+    }
+
     fn probe(&self) -> Result<DockerBindCapability, StorageError> {
         Ok(DockerBindCapability {
             daemon_id: self.daemon_id.clone(),
@@ -647,6 +651,10 @@ impl StorageBackend for FakeBackend {
 struct FakeDockerVerifier;
 
 impl DockerBindVerifier for FakeDockerVerifier {
+    fn cleanup_daemon_id(&self) -> &str {
+        "daemon-7"
+    }
+
     fn probe(&self) -> Result<DockerBindCapability, StorageError> {
         Ok(DockerBindCapability {
             daemon_id: "daemon-7".to_owned(),
@@ -667,9 +675,38 @@ impl DockerBindVerifier for FakeDockerVerifier {
 }
 
 #[derive(Debug)]
+struct RotatedCleanupDockerVerifier {
+    daemon_id: &'static str,
+}
+
+impl DockerBindVerifier for RotatedCleanupDockerVerifier {
+    fn cleanup_daemon_id(&self) -> &str {
+        self.daemon_id
+    }
+
+    fn probe(&self) -> Result<DockerBindCapability, StorageError> {
+        Ok(DockerBindCapability {
+            daemon_id: self.daemon_id.to_owned(),
+            verifier: "replacement-verifier-image".to_owned(),
+            method_version: "autospec.dev/docker-bind-proof/v2".to_owned(),
+        })
+    }
+
+    fn verify(&self, _source: &Path) -> Result<DockerBindProof, StorageError> {
+        Err(StorageError::Unavailable(
+            "cleanup must not execute the replacement verifier".to_owned(),
+        ))
+    }
+}
+
+#[derive(Debug)]
 struct FailingDockerVerifier;
 
 impl DockerBindVerifier for FailingDockerVerifier {
+    fn cleanup_daemon_id(&self) -> &str {
+        "daemon-7"
+    }
+
     fn probe(&self) -> Result<DockerBindCapability, StorageError> {
         Ok(DockerBindCapability {
             daemon_id: "daemon-7".to_owned(),
@@ -689,6 +726,10 @@ impl DockerBindVerifier for FailingDockerVerifier {
 struct ChangingContractVerifier;
 
 impl DockerBindVerifier for ChangingContractVerifier {
+    fn cleanup_daemon_id(&self) -> &str {
+        "daemon-7"
+    }
+
     fn probe(&self) -> Result<DockerBindCapability, StorageError> {
         Ok(DockerBindCapability {
             daemon_id: "daemon-7".to_owned(),
@@ -714,6 +755,10 @@ struct SymlinkSwappingDockerVerifier;
 
 #[cfg(unix)]
 impl DockerBindVerifier for SymlinkSwappingDockerVerifier {
+    fn cleanup_daemon_id(&self) -> &str {
+        "daemon-7"
+    }
+
     fn probe(&self) -> Result<DockerBindCapability, StorageError> {
         FailingDockerVerifier.probe()
     }
@@ -831,6 +876,220 @@ fn manager_trait_is_object_safe_and_lifecycle_is_journaled() {
     assert!(calls.iter().any(|call| call.starts_with("prepare:")));
     assert!(calls.iter().any(|call| call.starts_with("mount:")));
     assert!(calls.iter().any(|call| call.starts_with("remove:")));
+}
+
+#[test]
+fn cleanup_releases_exact_durable_ready_allocation_after_verifier_rotation() {
+    let root = tempfile::tempdir().expect("temporary state root");
+    storage_directories(root.path());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = Arc::new(Mutex::new(BackendState::Absent));
+    let original = ExecutionStorage::new(
+        root.path(),
+        Box::new(FakeBackend {
+            calls: Arc::clone(&calls),
+            removes_mountpoint: false,
+            state: Arc::clone(&state),
+            pool_identity: "pool-7",
+            mutate_prepared: false,
+        }),
+        Box::new(FakeDockerVerifier),
+    )
+    .expect("original manager");
+    let receipt = original
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 3,
+        })
+        .expect("original allocation");
+    drop(original);
+
+    let replacement = ExecutionStorage::new(
+        root.path(),
+        Box::new(FakeBackend {
+            calls: Arc::clone(&calls),
+            removes_mountpoint: false,
+            state,
+            pool_identity: "pool-7",
+            mutate_prepared: false,
+        }),
+        Box::new(RotatedCleanupDockerVerifier {
+            daemon_id: "daemon-7",
+        }),
+    )
+    .expect("replacement manager");
+
+    assert!(
+        replacement.verify_ready(&receipt).is_err(),
+        "rotated proof must remain invalid for live provisioning and adoption"
+    );
+    replacement
+        .release(&receipt)
+        .expect("durable cleanup must survive verifier image and method rotation");
+    replacement
+        .ack_release(&receipt)
+        .expect("durable cleanup tombstone must remain acknowledgeable");
+    let layout = ExecutionLayout::new(replacement.state_root(), &labels().execution_id)
+        .expect("execution layout");
+    assert!(!layout.root.exists());
+    assert!(!layout.journal.exists());
+}
+
+#[test]
+fn cleanup_rejects_rotated_configuration_for_a_different_daemon() {
+    let root = tempfile::tempdir().expect("temporary state root");
+    storage_directories(root.path());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = Arc::new(Mutex::new(BackendState::Absent));
+    let original = ExecutionStorage::new(
+        root.path(),
+        Box::new(FakeBackend {
+            calls: Arc::clone(&calls),
+            removes_mountpoint: false,
+            state: Arc::clone(&state),
+            pool_identity: "pool-7",
+            mutate_prepared: false,
+        }),
+        Box::new(FakeDockerVerifier),
+    )
+    .expect("original manager");
+    let receipt = original
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 3,
+        })
+        .expect("original allocation");
+    drop(original);
+    let replacement = ExecutionStorage::new(
+        root.path(),
+        Box::new(FakeBackend {
+            calls: Arc::clone(&calls),
+            removes_mountpoint: false,
+            state,
+            pool_identity: "pool-7",
+            mutate_prepared: false,
+        }),
+        Box::new(RotatedCleanupDockerVerifier {
+            daemon_id: "foreign-daemon",
+        }),
+    )
+    .expect("replacement manager");
+
+    assert!(matches!(
+        replacement.release(&receipt),
+        Err(StorageError::IdentityMismatch(_))
+    ));
+    assert!(receipt.mount_path.is_dir());
+    assert!(!calls
+        .lock()
+        .expect("fake calls")
+        .iter()
+        .any(|call| call.starts_with("remove:")));
+}
+
+#[test]
+fn cleanup_rejects_each_durable_receipt_identity_mismatch() {
+    let (_root, manager, calls) = manager_fixture();
+    let receipt = manager
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 3,
+        })
+        .expect("allocate storage");
+    let mut mismatches = Vec::new();
+
+    let mut labels_mismatch = receipt.clone();
+    labels_mismatch.labels.worker_id = WorkerId::new("foreign-worker");
+    mismatches.push(("labels", labels_mismatch));
+
+    let mut source_mismatch = receipt.clone();
+    source_mismatch.docker_bind.source_path = receipt.mount_path.join("foreign");
+    mismatches.push(("source", source_mismatch));
+
+    let mut filesystem_mismatch = receipt.clone();
+    filesystem_mismatch.docker_bind.filesystem_id = "foreign-filesystem".to_owned();
+    mismatches.push(("filesystem", filesystem_mismatch));
+
+    let mut device_mismatch = receipt.clone();
+    let BackendIdentity::Apfs { volume, .. } = &mut device_mismatch.backend else {
+        panic!("fixture must use APFS identity");
+    };
+    *volume = "foreign-device".to_owned();
+    mismatches.push(("device", device_mismatch));
+
+    let mut allocation_mismatch = receipt.clone();
+    allocation_mismatch.backend_key = "apfs:foreign-allocation".to_owned();
+    mismatches.push(("allocation", allocation_mismatch));
+
+    for (identity, mismatch) in mismatches {
+        assert!(
+            matches!(
+                manager.release(&mismatch),
+                Err(StorageError::IdentityMismatch(_))
+            ),
+            "cleanup accepted mismatched {identity} identity"
+        );
+    }
+    assert!(receipt.mount_path.is_dir());
+    assert!(!calls
+        .lock()
+        .expect("fake calls")
+        .iter()
+        .any(|call| call.starts_with("remove:")));
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_rejects_symlink_and_irregular_allocation_paths_without_mutation() {
+    let (_root, manager, calls) = manager_fixture();
+    let receipt = manager
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 3,
+        })
+        .expect("allocate storage");
+    let displaced = receipt.mount_path.with_extension("displaced");
+    fs::rename(&receipt.mount_path, &displaced).expect("displace allocation");
+    let marker = displaced.join("foreign-marker");
+    fs::write(&marker, "preserve").expect("foreign marker");
+    std::os::unix::fs::symlink(&displaced, &receipt.mount_path)
+        .expect("replace allocation with symlink");
+
+    assert!(matches!(
+        manager.release(&receipt),
+        Err(StorageError::IdentityMismatch(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(&marker).expect("marker survives"),
+        "preserve"
+    );
+    assert!(!calls
+        .lock()
+        .expect("fake calls")
+        .iter()
+        .any(|call| call.starts_with("remove:")));
+
+    fs::remove_file(&receipt.mount_path).expect("remove test symlink");
+    fs::rename(&displaced, &receipt.mount_path).expect("restore allocation");
+    fs::remove_file(receipt.mount_path.join("foreign-marker")).expect("remove test marker");
+    for entry in fs::read_dir(&receipt.mount_path).expect("allocation entries") {
+        let path = entry.expect("allocation entry").path();
+        if path.is_dir() {
+            fs::remove_dir_all(path).expect("remove allocation directory");
+        } else {
+            fs::remove_file(path).expect("remove allocation file");
+        }
+    }
+    fs::remove_dir(&receipt.mount_path).expect("remove allocation directory");
+    fs::write(&receipt.mount_path, "foreign-file").expect("irregular allocation path");
+    assert!(matches!(
+        manager.release(&receipt),
+        Err(StorageError::IdentityMismatch(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(&receipt.mount_path).expect("irregular path survives"),
+        "foreign-file"
+    );
 }
 
 #[test]

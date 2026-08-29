@@ -291,6 +291,24 @@ Task 7 was implemented RED to GREEN:
     authority, and preserved the peer network. Constructor-level tests also
     reject mismatched worker labels, irregular allocation paths, and foreign
     Docker daemon receipts before removing the target.
+33. Breaker review found that the restart regression still masked the storage
+    half of a verifier rollout: its replacement worker built `ExecutionStorage`
+    with the old verifier while only `VerifiedDockerRuntimeFactory` received the
+    new verifier. Production `autospec-worker` shares one storage verifier with
+    storage, Git, Docker, and Pi. The regression now passes one replacement
+    image-and-command configuration to both storage and runtime exactly like
+    production. The true RED process destroyed runtime and Git but stopped at
+    `GitRecoveredCleaned` because storage release tried to execute the new
+    verifier against the old durable proof.
+34. Cleanup now authenticates the exact persisted receipt against its durable
+    Ready/Releasing journal, configured backend and pool, exact backend object
+    and filesystem/device identity, canonical real allocation path, execution
+    labels, allocation identity, and daemon identity. It deliberately does not
+    execute or compare the current verifier image, command, or proof method.
+    `verify_ready`, Ready leases, provisioning, and adoption retain the complete
+    current-proof check and reject the old receipt for live use. Negative tests
+    prove daemon, labels, source, filesystem, device, allocation, symlink, and
+    irregular-path mismatches fail before any cleanup mutation.
 
 ## Verification
 
@@ -313,6 +331,24 @@ Task 7 was implemented RED to GREEN:
 - `cargo test -p runtime-docker cleanup_constructor_ -- --nocapture --test-threads=1`
   — passed both focused cleanup authority tests, including a real Docker daemon
   mismatch that preserved the exact target until trusted test cleanup.
+- `cleanup_releases_exact_durable_ready_allocation_after_verifier_rotation` was
+  run RED and failed with
+  `Unavailable("cleanup must not execute the replacement verifier")`. GREEN
+  releases and acknowledges the exact old allocation without calling the
+  replacement verifier, while the same manager still rejects `verify_ready`.
+- The production-faithful
+  `partial_docker_provision_and_rollback_failure_recovers_by_exact_selector_after_restart`
+  was run RED on `autospec_task7_fix7_red_20260829`: the original provision
+  child passed and the replacement child observed `GitRecoveredCleaned` instead
+  of `Resolved`. GREEN passed on fresh
+  `autospec_task7_fix7_focus_postclippy_20260829`, proving exact Docker, Git,
+  credential, storage, reservation, cleanup-authority, and both ACK-tombstone
+  cleanup while preserving the peer network.
+- `cargo test -p execution-storage -- --test-threads=1` — passed 5 unit, 7
+  backend, and 35 storage integration tests, including the verifier-rollout and
+  complete negative cleanup-authority matrix.
+- `cargo test -p runtime-docker -- --test-threads=1` — passed 17 unit, 9
+  credential, and 20 real Docker integration tests.
 - The exact four-cut `control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_once`
   scenario passed to completion on the fresh
   `autospec_task7_fix5_focus_20260829` database.
@@ -329,6 +365,12 @@ Task 7 was implemented RED to GREEN:
   unit tests, 9 credential tests, and 20 real Docker runtime tests.
 - `AUTOSPEC_DATABASE_URL=.../autospec_task7_fix6_msrv_final_20260829 rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
   — passed on a distinct fresh database with the same complete serialized
+  workspace coverage.
+- `AUTOSPEC_DATABASE_URL=.../autospec_task7_fix7_current_final_20260829 cargo test --workspace -- --test-threads=1`
+  — passed on its own empty database, including 35 storage, 60 Git, 40 Pi, 35
+  PostgreSQL, all 13 real worker E2Es, and all 20 real Docker runtime tests.
+- `AUTOSPEC_DATABASE_URL=.../autospec_task7_fix7_msrv_final_20260829 rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
+  — passed on a distinct empty database with identical complete serialized
   workspace coverage.
 - `cargo build --workspace` — passed.
 - `rustup run 1.85.0 cargo build --workspace` — passed.
@@ -351,6 +393,17 @@ Task 7 was implemented RED to GREEN:
   zero current Task 7 control-recovery or expired-cleanup Docker resources,
   PostgreSQL execution/control/cleanup rows, credentials, storage, or temporary
   roots; older Task 5/runtime resources owned by other work remain untouched.
+- The intentional fix-seven RED authority was recovered through production
+  `Worker::reconcile_startup` to `Resolved`. Its exact runtime, Git and storage
+  resources, expired credential, reservation, and ACK tombstones are absent.
+  Its empty peer network was removed by exact name, its remaining state root was
+  moved to the user's Trash, and all six exact fix-seven test databases were
+  dropped. Reinspection found no fix-seven Docker resource, live root, or test
+  database. Two older uid-501, mode-0700 failed-test roots were also identified
+  exactly: one held a Task 7 `partial-provision` fixed-test receipt and one held
+  only a `Task5 E2E` seed repository. Neither had an exact Docker resource or
+  cleanup authority in any retained orchestrator/Task 7 database. Both exact
+  paths were moved to distinct names in the user's Trash and remain recoverable.
 
 ## Commits
 
@@ -375,7 +428,9 @@ Task 7 was implemented RED to GREEN:
   cancellation recovery.
 - `b3b6035` — fix round five: keep durable runtime cleanup independent of
   expired workload authority.
-- Fix round six is recorded with this updated report in the following commit.
+- `ee6b931` — fix round six: separate runtime teardown from current verifier
+  configuration.
+- Fix round seven is recorded with this updated report in the following commit.
 
 ## Concerns and follow-up
 
@@ -399,3 +454,6 @@ Task 7 was implemented RED to GREEN:
 - Attachment intentionally provides resumable metadata and an event cursor,
   not a websocket terminal or conversation dump. A richer Workbench transport
   can build on these references without copying prior context into prompts.
+- This round did not change descriptor-relative deletion behavior or add a
+  dependency. The previously documented macOS safe-Rust `dirfd` limitation and
+  exact-deletion hardening follow-up therefore remain unchanged.
