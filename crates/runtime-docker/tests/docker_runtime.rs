@@ -32,7 +32,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -45,6 +45,31 @@ fn secure_mode(path: &Path) {
 }
 
 static EXECUTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn exact_anonymous_volume_ids(inspect_mounts: &serde_json::Value) -> BTreeSet<String> {
+    inspect_mounts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|mount| mount.get("Type").and_then(serde_json::Value::as_str) == Some("volume"))
+        .filter_map(|mount| mount.get("Name").and_then(serde_json::Value::as_str))
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[test]
+fn anonymous_volume_capture_uses_only_exact_container_mount_ids() {
+    let inspect = serde_json::json!([
+        {"Type": "bind", "Name": null, "Destination": "/workspace"},
+        {"Type": "volume", "Name": "exact-anonymous-id", "Destination": "/data"},
+        {"Type": "volume", "Name": "", "Destination": "/invalid"}
+    ]);
+    assert_eq!(
+        exact_anonymous_volume_ids(&inspect),
+        BTreeSet::from(["exact-anonymous-id".to_owned()])
+    );
+}
 
 struct TestStateRoot {
     path: PathBuf,
@@ -138,6 +163,17 @@ struct TestReadyVerifier;
 struct RejectReadyAfterContainerCreate {
     docker: PathBuf,
     container: String,
+}
+
+#[derive(Debug)]
+struct SwapImageAndCaptureAnonymousVolumes {
+    docker: PathBuf,
+    network: String,
+    container: String,
+    volume_image: String,
+    mutable_image: String,
+    swapped: AtomicBool,
+    captured: Arc<Mutex<BTreeSet<String>>>,
 }
 
 #[derive(Debug)]
@@ -256,6 +292,59 @@ impl ReadyAllocationVerifier for RejectReadyAfterContainerCreate {
             return Err(StorageError::IdentityMismatch(
                 "allocation transitioned away from Ready after container creation".to_owned(),
             ));
+        }
+        TestReadyVerifier.verify_ready(receipt)
+    }
+
+    fn acquire_ready_lease(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn ReadyLease>, StorageError> {
+        TestReadyVerifier.acquire_ready_lease(receipt)
+    }
+}
+
+impl ReadyAllocationVerifier for SwapImageAndCaptureAnonymousVolumes {
+    fn verify_ready(
+        &self,
+        receipt: &AllocationReceipt,
+    ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+        let network_exists = Command::new(&self.docker)
+            .args(["network", "inspect", &self.network])
+            .output()
+            .map_err(|error| StorageError::Command(error.to_string()))?
+            .status
+            .success();
+        if network_exists && !self.swapped.swap(true, Ordering::SeqCst) {
+            let tagged = Command::new(&self.docker)
+                .args(["image", "tag", &self.volume_image, &self.mutable_image])
+                .output()
+                .map_err(|error| StorageError::Command(error.to_string()))?;
+            if !tagged.status.success() {
+                return Err(StorageError::Command(format!(
+                    "replace scoped service tag: {}",
+                    String::from_utf8_lossy(&tagged.stderr)
+                )));
+            }
+        }
+
+        let inspected = Command::new(&self.docker)
+            .args([
+                "container",
+                "inspect",
+                "--format",
+                "{{json .Mounts}}",
+                &self.container,
+            ])
+            .output()
+            .map_err(|error| StorageError::Command(error.to_string()))?;
+        if inspected.status.success() {
+            let mounts: serde_json::Value = serde_json::from_slice(&inspected.stdout)
+                .map_err(|error| StorageError::Command(error.to_string()))?;
+            self.captured
+                .lock()
+                .map_err(|_| StorageError::Command("anonymous-volume capture poisoned".into()))?
+                .extend(exact_anonymous_volume_ids(&mounts));
         }
         TestReadyVerifier.verify_ready(receipt)
     }
@@ -842,6 +931,23 @@ async fn runtime_at_state_root_or_skip(
     labels: &OwnershipLabels,
     disk_gib: u64,
 ) -> Option<DockerRuntime> {
+    runtime_at_state_root_with_verifier_or_skip(
+        test_name,
+        state_root,
+        labels,
+        disk_gib,
+        Arc::new(TestReadyVerifier),
+    )
+    .await
+}
+
+async fn runtime_at_state_root_with_verifier_or_skip(
+    test_name: &str,
+    state_root: &Path,
+    labels: &OwnershipLabels,
+    disk_gib: u64,
+    verifier: Arc<dyn ReadyAllocationVerifier>,
+) -> Option<DockerRuntime> {
     let state = TestStateRoot {
         path: state_root.to_path_buf(),
     };
@@ -882,7 +988,7 @@ async fn runtime_at_state_root_or_skip(
     std::mem::forget(state);
     let runtime = match DockerRuntime::connect_with_verified_execution_storage(
         None,
-        Arc::new(TestReadyVerifier),
+        verifier,
         receipt,
         trusted_verifier,
     ) {
@@ -2563,18 +2669,67 @@ async fn cleanup_aggregates_volume_failures_and_still_removes_the_network() {
 }
 
 #[tokio::test]
-async fn provisioning_failure_reports_rollback_failure_and_removes_attempt_resources() {
+async fn provisioning_failure_removes_exact_attempt_anonymous_volumes() {
     let execution_labels = labels_for(unique_execution_id());
-    let Some((_state, runtime)) = execution_runtime_or_skip(
-        "provisioning_failure_reports_rollback_failure_and_removes_attempt_resources",
+    let state = TestStateRoot::new(&execution_labels);
+    let docker = raw_client().expect("connect to probed daemon");
+    if docker.version().await.is_err() {
+        println!("SKIP provisioning_failure_removes_exact_attempt_anonymous_volumes: Docker daemon unavailable");
+        return;
+    }
+    ensure_alpine_image(&docker).await;
+    let docker_bin = docker_cli().expect("real Docker tests require the Docker CLI");
+    let source = format!("autospec-{}-volume-source", execution_labels.execution_id);
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: source.clone(),
+                platform: None,
+            }),
+            Config::<String> {
+                image: Some("alpine:3.20".to_owned()),
+                labels: Some(control_label_map(&execution_labels)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create anonymous-volume image source");
+    let volume_image =
+        commit_volume_image(&docker, &source, &execution_labels, "/attempt-volume", 91).await;
+    let mutable_image = format!(
+        "autospec-attempt-image-{}:test",
+        execution_labels.execution_id
+    );
+    let initial_tag = Command::new(&docker_bin)
+        .args(["image", "tag", "alpine:3.20", &mutable_image])
+        .output()
+        .expect("create scoped mutable service tag");
+    assert!(initial_tag.status.success());
+    let service_container =
+        DockerRuntime::service_container_name(&execution_labels.execution_id, "cache");
+    let anonymous_volumes = Arc::new(Mutex::new(BTreeSet::new()));
+    let verifier = Arc::new(SwapImageAndCaptureAnonymousVolumes {
+        docker: docker_bin,
+        network: DockerRuntime::network_name(&execution_labels.execution_id),
+        container: service_container,
+        volume_image: volume_image.clone(),
+        mutable_image: mutable_image.clone(),
+        swapped: AtomicBool::new(false),
+        captured: Arc::clone(&anonymous_volumes),
+    });
+    let runtime = runtime_at_state_root_with_verifier_or_skip(
+        "provisioning_failure_removes_exact_attempt_anonymous_volumes",
+        &state.path,
         &execution_labels,
+        runtime_requirement().disk_gib,
+        verifier,
     )
     .await
-    else {
-        return;
-    };
-    let docker = raw_client().expect("connect to probed daemon");
+    .expect("Docker daemon was already probed");
     let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let mut image_guard = DockerImageGuard::new(&docker);
+    image_guard.track(mutable_image);
+    image_guard.track(volume_image);
     let owned_volume = DockerRuntime::volume_name(&execution_labels.execution_id, "cache-data");
     let holder = format!("autospec-{}-holder", execution_labels.execution_id);
     let conflicting_agent = DockerRuntime::agent_container_name(&execution_labels.execution_id);
@@ -2621,18 +2776,43 @@ async fn provisioning_failure_reports_rollback_failure_and_removes_attempt_resou
     }
     let service = ServiceRequirement {
         name: "cache".to_owned(),
-        image: "redis:7-alpine".to_owned(),
+        image: format!(
+            "autospec-attempt-image-{}:test",
+            execution_labels.execution_id
+        ),
         env: BTreeMap::new(),
     };
     let error = runtime
         .provision(&execution_labels, &runtime_requirement(), &[service])
         .await
-        .expect_err("agent name conflict triggers provisioning rollback")
+        .expect_err("attempt-injected anonymous mount triggers provisioning rollback")
         .to_string();
     assert!(error.contains(execution_labels.execution_id.as_str()));
-    assert!(error.contains("create agent container"));
+    assert!(error.contains("unexpected or anonymous mount"));
     assert!(error.contains("rollback"));
     assert!(error.contains(&owned_volume));
+    let mut leaked = anonymous_volumes.lock().unwrap().clone();
+    assert!(
+        !leaked.is_empty(),
+        "the exact created service container must expose its anonymous volume ID"
+    );
+    for _ in 0..50 {
+        let mut still_present = BTreeSet::new();
+        for volume in &leaked {
+            if docker.inspect_volume(volume).await.is_ok() {
+                still_present.insert(volume.clone());
+            }
+        }
+        leaked = still_present;
+        if leaked.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        leaked.is_empty(),
+        "rollback left exact attempt anonymous volumes: {leaked:?}"
+    );
     assert!(docker
         .inspect_network::<String>(
             &DockerRuntime::network_name(&execution_labels.execution_id),
@@ -2658,4 +2838,8 @@ async fn provisioning_failure_reports_rollback_failure_and_removes_attempt_resou
         .cleanup()
         .await
         .expect("cleanup rollback-failure resources");
+    image_guard
+        .cleanup()
+        .await
+        .expect("cleanup attempt-scoped images");
 }

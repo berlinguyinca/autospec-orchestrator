@@ -6,6 +6,26 @@ use orchestrator_core::{
     WorkerId,
 };
 
+#[test]
+fn destructive_test_database_guard_rejects_operational_database_names() {
+    for name in [
+        "postgres",
+        "autospec_orchestrator",
+        "autospec_development",
+        "production_autospec_test_shadow",
+        "autospec_test_short",
+    ] {
+        assert!(
+            require_disposable_test_database(name).is_err(),
+            "accepted non-disposable database name: {name}"
+        );
+    }
+    assert!(require_disposable_test_database("autospec_test_0123456789abcdef").is_ok());
+    assert!(
+        require_disposable_test_database("autospec_orchestrator_test_0123456789abcdef").is_ok()
+    );
+}
+
 #[tokio::test]
 async fn interactive_intents_are_ordered_restart_visible_and_complete_exactly_once() {
     let _database_test = database_test_lock().lock().await;
@@ -1318,33 +1338,47 @@ struct DatabaseTestIsolation {
     mutex: tokio::sync::Mutex<()>,
 }
 
+fn require_disposable_test_database(database_name: &str) -> Result<(), String> {
+    let suffix = database_name
+        .strip_prefix("autospec_test_")
+        .or_else(|| database_name.strip_prefix("autospec_orchestrator_test_"))
+        .ok_or_else(|| {
+            format!(
+                "refusing PostgreSQL test mutations outside a disposable autospec test database: {database_name}"
+            )
+        })?;
+    if suffix.len() < 16
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(format!(
+            "disposable autospec test database needs a unique lowercase suffix of at least 16 characters: {database_name}"
+        ));
+    }
+    Ok(())
+}
+
 impl DatabaseTestIsolation {
     async fn lock(&'static self) -> tokio::sync::MutexGuard<'static, ()> {
         let guard = self.mutex.lock().await;
         let Ok(database_url) = std::env::var("AUTOSPEC_DATABASE_URL") else {
             return guard;
         };
-        PgExecutionStore::connect(&database_url)
-            .await
-            .expect("migrate isolated PostgreSQL test database");
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)
             .await
             .expect("connect isolated PostgreSQL test database");
-        for statement in [
-            "DROP TRIGGER IF EXISTS autospec_test_fail_finalize ON cleanup_authorities",
-            "DROP TRIGGER IF EXISTS autospec_test_fail_retained ON cleanup_authorities",
-            "DROP FUNCTION IF EXISTS autospec_test_fail_finalize()",
-            "DROP FUNCTION IF EXISTS autospec_test_fail_retained()",
-            "TRUNCATE TABLE workers, executions RESTART IDENTITY CASCADE",
-        ] {
-            sqlx::query(statement)
-                .execute(&pool)
-                .await
-                .expect("reset isolated PostgreSQL test database");
-        }
+        let database_name: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .expect("read PostgreSQL test database identity");
+        require_disposable_test_database(&database_name).unwrap_or_else(|error| panic!("{error}"));
         pool.close().await;
+        PgExecutionStore::connect(&database_url)
+            .await
+            .expect("migrate proven-disposable PostgreSQL test database");
         guard
     }
 }
