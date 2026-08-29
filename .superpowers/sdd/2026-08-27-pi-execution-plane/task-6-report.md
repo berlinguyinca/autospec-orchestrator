@@ -94,7 +94,32 @@ The reviewer fix round also followed RED to GREEN:
 5. PostgreSQL regressions cover concurrent same-key create/retry replay,
    different-key execution-ID collision handling, bounded event batches, and a
    pre-Task-6 migration fixture containing `0001`-`0004` and `0006`-`0009` that
-   preserves data while the current migrator applies missing `0005` and `0010`.
+   preserves data while the current migrator applies missing `0005`, `0010`,
+   and `0011`.
+
+The second reviewer fix round closed the remaining restart boundaries:
+
+1. The queued-cancellation contract first failed with `Queued` instead of
+   `Cancelled`. It now locks the execution row, atomically commits the terminal
+   result and one no-attempt cancellation event, completes the request, and
+   replays idempotently.
+2. The scheduler-exclusion regression initially reserved an execution whose
+   cancellation request was pending. `reserve_next` now excludes pending
+   requests in the same locking query used to select work.
+3. The production-observer regression initially failed to compile because
+   cancellation observation existed only on individual task handles. Worker
+   reconciliation now consumes the durable pending-request list, interrupts
+   exact active tasks, creates missing pre-task cleanup authority, and recovers
+   retained or already-resolved attempts after task removal or restart.
+4. Deterministic PostgreSQL tests prove accepted intent fences normal
+   transitions, final `ReviewReady` progress, and retention capacity commits;
+   a request remains listable after a simulated crash between cleanup
+   resolution and terminal publication and completes idempotently on restart.
+5. Real PostgreSQL/Docker/Pi tests exercise the production observer during a
+   hung Pi run, after reservation but before task execution, and after a
+   crashed worker is adopted into retained `ReviewReady`. Each path cleans and
+   releases exact resources, clears the request, and publishes exactly one
+   terminal cancellation event.
 
 ## Verification
 
@@ -102,7 +127,7 @@ Final verification used newly created, labelled PostgreSQL 17 containers and
 serialized workspace test runs on both toolchains:
 
 - `AUTOSPEC_DATABASE_URL=... cargo test --workspace -- --test-threads=1`
-  — passed, including 26 PostgreSQL persistence tests, 4 execution API contract
+  — passed, including 29 PostgreSQL persistence tests, 4 execution API contract
   tests, the production evidence-adapter test, and 7 real worker E2E tests.
 - `AUTOSPEC_DATABASE_URL=... cargo +1.85.0 test --workspace -- --test-threads=1`
   — passed with the same full workspace coverage.
@@ -118,6 +143,9 @@ serialized workspace test runs on both toolchains:
 - `f6aae6a` — initial Task 6 SDD report.
 - `3bb8fd6` — reviewer hardening for cancellation ownership, ordered SSE,
   authentication, uniform errors, artifact installation, and race coverage.
+- `e774bef` — first reviewer-fix SDD evidence update.
+- `7baa69f` — cancellation authority across scheduler races, production worker
+  observation, retained cleanup, and restart recovery.
 - This updated report is recorded in the following documentation-only commit.
 
 ## Concerns and follow-up
