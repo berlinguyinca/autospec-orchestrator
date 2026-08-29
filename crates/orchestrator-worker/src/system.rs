@@ -48,9 +48,7 @@ pub trait RuntimeFactory: Send + Sync {
         &self,
         execution: &Execution,
         receipt: &AllocationReceipt,
-    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
-        self.build(execution, receipt).await
-    }
+    ) -> Result<Arc<dyn Runtime>, LifecycleError>;
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError>;
     async fn revoke_credentials(&self, execution_id: &ExecutionId) -> Result<(), LifecycleError>;
 }
@@ -171,14 +169,13 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
 
     async fn build_for_cleanup(
         &self,
-        _: &Execution,
+        execution: &Execution,
         receipt: &AllocationReceipt,
     ) -> Result<Arc<dyn Runtime>, LifecycleError> {
-        DockerRuntime::connect_with_verified_execution_storage(
+        DockerRuntime::connect_for_cleanup(
             self.socket.as_deref(),
-            Arc::clone(&self.verifier),
             receipt.clone(),
-            self.trusted_verifier.clone(),
+            &execution.labels,
         )
         .map(|runtime| Arc::new(runtime) as Arc<dyn Runtime>)
         .map_err(|error| LifecycleError::Step(error.to_string()))

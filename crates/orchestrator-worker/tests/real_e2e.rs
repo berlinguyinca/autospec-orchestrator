@@ -152,6 +152,14 @@ impl RuntimeFactory for PartialProvisionFactory {
         Ok(self.0.clone())
     }
 
+    async fn build_for_cleanup(
+        &self,
+        _: &Execution,
+        _: &execution_storage::AllocationReceipt,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        Ok(self.0.clone())
+    }
+
     async fn cpu_percent(&self, _: &Execution) -> Result<f64, LifecycleError> {
         Ok(0.0)
     }
@@ -1029,6 +1037,8 @@ async fn partial_docker_provision_and_rollback_failure_recovers_by_exact_selecto
     create_stub_repository(&remote);
     let worker_id = WorkerId::new(format!("worker-{suffix}"));
     let execution_id = ExecutionId::new(format!("execution-{suffix}"));
+    let restarted_image_id = format!("sha256:{}", "b".repeat(64));
+    let restarted_verifier_command = "/usr/bin/stat";
     let peer_network = format!("autospec-peer-{suffix}");
     let peer = Command::new("docker")
         .args([
@@ -1105,6 +1115,39 @@ async fn partial_docker_provision_and_rollback_failure_recovers_by_exact_selecto
             .unwrap(),
         CleanupDisposition::RuntimeStopped
     );
+    let authority = cleanup.get(&execution_id).await.unwrap();
+    let receipt: execution_storage::AllocationReceipt =
+        serde_json::from_value(authority.handles["receipt"].clone()).unwrap();
+    let credential = receipt.mount_path.join("credentials/inferweave.credential");
+    fs::write(&credential, "expired\n2020-01-01T00:00:00Z\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+    let restarted_verifier =
+        TrustedVerifierImage::new(&restarted_image_id, restarted_verifier_command).unwrap();
+    let verifier: Arc<dyn execution_storage::ReadyAllocationVerifier> = Arc::new(
+        ExecutionStorage::new(
+            &root,
+            Box::new(FixedFilesystemBackend),
+            Box::new(TestDockerBindVerifier {
+                daemon_id: daemon_id.clone(),
+                image_id: image_id.clone(),
+                method: TrustedVerifierImage::new(&image_id, "/bin/stat")
+                    .unwrap()
+                    .proof_method(),
+            }),
+        )
+        .unwrap(),
+    );
+    assert!(
+        DockerRuntime::connect_with_verified_execution_storage(
+            None,
+            verifier,
+            receipt,
+            restarted_verifier,
+        )
+        .is_err(),
+        "provisioning must still reject a receipt made with the old verifier proof"
+    );
 
     let recovery = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "partial_provision_process_helper", "--nocapture"])
@@ -1114,6 +1157,11 @@ async fn partial_docker_provision_and_rollback_failure_recovers_by_exact_selecto
         .env("AUTOSPEC_TASK7_PARTIAL_REMOTE", &remote)
         .env("AUTOSPEC_TASK7_PARTIAL_DAEMON", &daemon_id)
         .env("AUTOSPEC_TASK7_PARTIAL_IMAGE", &image_id)
+        .env("AUTOSPEC_TASK7_PARTIAL_RESTART_IMAGE", &restarted_image_id)
+        .env(
+            "AUTOSPEC_TASK7_PARTIAL_RESTART_COMMAND",
+            restarted_verifier_command,
+        )
         .env("AUTOSPEC_TASK7_PARTIAL_WORKER", worker_id.as_str())
         .env("AUTOSPEC_TASK7_PARTIAL_EXECUTION", execution_id.as_str())
         .status()
@@ -1123,6 +1171,7 @@ async fn partial_docker_provision_and_rollback_failure_recovers_by_exact_selecto
         "network",
         &DockerRuntime::network_name(&execution_id)
     ));
+    assert!(!credential.exists());
     assert!(docker_resource_exists("network", &peer_network));
     assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
     run(Command::new("docker").args(["network", "rm", &peer_network]));
@@ -1143,6 +1192,8 @@ async fn partial_provision_process_helper() {
     let remote = PathBuf::from(std::env::var_os("AUTOSPEC_TASK7_PARTIAL_REMOTE").unwrap());
     let daemon = std::env::var("AUTOSPEC_TASK7_PARTIAL_DAEMON").unwrap();
     let image = std::env::var("AUTOSPEC_TASK7_PARTIAL_IMAGE").unwrap();
+    let restarted_image = std::env::var("AUTOSPEC_TASK7_PARTIAL_RESTART_IMAGE").ok();
+    let restarted_command = std::env::var("AUTOSPEC_TASK7_PARTIAL_RESTART_COMMAND").ok();
     let worker_id = WorkerId::new(std::env::var("AUTOSPEC_TASK7_PARTIAL_WORKER").unwrap());
     let execution_id = ExecutionId::new(std::env::var("AUTOSPEC_TASK7_PARTIAL_EXECUTION").unwrap());
     let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
@@ -1194,8 +1245,17 @@ async fn partial_provision_process_helper() {
             );
         }
         "recover" => {
+            let restarted_image = restarted_image.expect("restart verifier image");
+            let restarted_command = restarted_command.expect("restart verifier command");
             let worker = Arc::new(Worker::new(
-                build_system_lifecycle(&root, &remote, &daemon, &image),
+                build_system_lifecycle_with_verifier_config(
+                    &root,
+                    &remote,
+                    &daemon,
+                    &image,
+                    &restarted_image,
+                    &restarted_command,
+                ),
                 executions,
                 reservations,
                 cleanup.clone(),
@@ -3062,6 +3122,25 @@ fn build_system_lifecycle(
     build_system_lifecycle_with_runtime(root, remote_root, daemon_id, image_id, None)
 }
 
+fn build_system_lifecycle_with_verifier_config(
+    root: &Path,
+    remote_root: &Path,
+    daemon_id: &str,
+    storage_image_id: &str,
+    runtime_image_id: &str,
+    runtime_verifier_command: &str,
+) -> Arc<SystemExecutionLifecycle> {
+    build_system_lifecycle_with_configs(
+        root,
+        remote_root,
+        daemon_id,
+        storage_image_id,
+        runtime_image_id,
+        runtime_verifier_command,
+        None,
+    )
+}
+
 fn build_system_lifecycle_with_runtime(
     root: &Path,
     remote_root: &Path,
@@ -3069,15 +3148,36 @@ fn build_system_lifecycle_with_runtime(
     image_id: &str,
     runtime_override: Option<Arc<dyn RuntimeFactory>>,
 ) -> Arc<SystemExecutionLifecycle> {
-    let trusted = TrustedVerifierImage::new(image_id, "/bin/stat").unwrap();
-    let method = trusted.proof_method();
+    build_system_lifecycle_with_configs(
+        root,
+        remote_root,
+        daemon_id,
+        image_id,
+        image_id,
+        "/bin/stat",
+        runtime_override,
+    )
+}
+
+fn build_system_lifecycle_with_configs(
+    root: &Path,
+    remote_root: &Path,
+    daemon_id: &str,
+    storage_image_id: &str,
+    runtime_image_id: &str,
+    runtime_verifier_command: &str,
+    runtime_override: Option<Arc<dyn RuntimeFactory>>,
+) -> Arc<SystemExecutionLifecycle> {
+    let storage_trusted = TrustedVerifierImage::new(storage_image_id, "/bin/stat").unwrap();
+    let trusted = TrustedVerifierImage::new(runtime_image_id, runtime_verifier_command).unwrap();
+    let method = storage_trusted.proof_method();
     let storage = Arc::new(
         ExecutionStorage::new(
             root,
             Box::new(FixedFilesystemBackend),
             Box::new(TestDockerBindVerifier {
                 daemon_id: daemon_id.into(),
-                image_id: image_id.into(),
+                image_id: storage_image_id.into(),
                 method,
             }),
         )

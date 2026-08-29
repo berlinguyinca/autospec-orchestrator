@@ -274,6 +274,23 @@ Task 7 was implemented RED to GREEN:
     database, with no matching container, network, volume, execution, control,
     cleanup authority, credential, storage root, or current temporary root in
     the post-run audit.
+31. Final breaker review found that cleanup still inherited current provisioning
+    verifier authority in two ways: the factory trait supplied a credentialful
+    default, and Docker cleanup construction compared the persisted receipt's
+    proof method with the worker's current verifier image and command. The trait
+    now requires every implementation to provide `build_for_cleanup` explicitly.
+    The production implementation constructs only receipt-, daemon-, path-, and
+    full-label-bound Docker cleanup authority. It receives no credential broker,
+    live Ready verifier, or current trusted-verifier configuration. Provisioning
+    retains its immutable verifier proof comparison unchanged.
+32. The existing real partial-provision restart scenario now creates its receipt
+    under the original verifier configuration, writes an expired credential,
+    and restarts `Worker::reconcile_startup` with a different verifier image and
+    command. RED left the durable authority at `RuntimeStopped`; GREEN removed
+    only the target runtime, revoked the expired credential, resolved the exact
+    authority, and preserved the peer network. Constructor-level tests also
+    reject mismatched worker labels, irregular allocation paths, and foreign
+    Docker daemon receipts before removing the target.
 
 ## Verification
 
@@ -285,6 +302,17 @@ Task 7 was implemented RED to GREEN:
   against real Docker and failed because the provisioning constructor rejected
   the expired bound credential. It passed after cleanup gained its credential-
   independent constructor.
+- `partial_docker_provision_and_rollback_failure_recovers_by_exact_selector_after_restart`
+  was strengthened and run RED on
+  `autospec_task7_fix6_red_20260829`: the provision child passed, while the
+  restart child using a different verifier image and command left cleanup at
+  `RuntimeStopped`. It passed after the cleanup-only constructor stopped
+  accepting current verifier configuration. The provisioning constructor's
+  old-proof rejection, expired credential revocation, exact target removal, and
+  peer survival are assertions in the same regression.
+- `cargo test -p runtime-docker cleanup_constructor_ -- --nocapture --test-threads=1`
+  — passed both focused cleanup authority tests, including a real Docker daemon
+  mismatch that preserved the exact target until trusted test cleanup.
 - The exact four-cut `control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_once`
   scenario passed to completion on the fresh
   `autospec_task7_fix5_focus_20260829` database.
@@ -295,12 +323,24 @@ Task 7 was implemented RED to GREEN:
 - `AUTOSPEC_DATABASE_URL=.../autospec_task7_fix5_msrv_final_20260829 rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
   — passed on a separate empty database with the same full serialized workspace
   coverage.
+- `AUTOSPEC_DATABASE_URL=.../autospec_task7_fix6_current_final_20260829 cargo test --workspace -- --test-threads=1`
+  — passed on its own fresh database, including 35 PostgreSQL tests, 5 execution
+  API tests, 40 Pi harness tests, all 13 real worker E2Es, 17 Docker runtime
+  unit tests, 9 credential tests, and 20 real Docker runtime tests.
+- `AUTOSPEC_DATABASE_URL=.../autospec_task7_fix6_msrv_final_20260829 rustup run 1.85.0 cargo test --workspace -- --test-threads=1`
+  — passed on a distinct fresh database with the same complete serialized
+  workspace coverage.
 - `cargo build --workspace` — passed.
 - `rustup run 1.85.0 cargo build --workspace` — passed.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed.
 - `rustup run 1.85.0 cargo clippy --workspace --all-targets -- -D warnings` — passed.
 - `cargo fmt --all -- --check` — passed.
 - `git diff --check` — passed.
+- The intentional fix-six RED authority was recovered through production
+  `Worker::reconcile_startup`; its exact runtime and expired credential were
+  removed, its cleanup authority reached `Resolved`, its peer network was
+  removed by exact name, and its remaining test root was moved to the user's
+  Trash. Reinspection found no matching Docker resource or live temporary root.
 - The round-four post-gate audit found and removed one empty `peer-task7`
   network but missed the live Task 7 resume RED residue described above. Round
   five resolved it through production cleanup and found six additional
@@ -333,7 +373,9 @@ Task 7 was implemented RED to GREEN:
 - `7993a95` — fix round four: explicit cleanup locking, immediate credential
   candidate ownership, fresh-process partial rollback, and isolated startup
   cancellation recovery.
-- Fix round five is recorded with this updated report in the following commit.
+- `b3b6035` — fix round five: keep durable runtime cleanup independent of
+  expired workload authority.
+- Fix round six is recorded with this updated report in the following commit.
 
 ## Concerns and follow-up
 

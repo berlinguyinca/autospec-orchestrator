@@ -13,6 +13,7 @@ pub(crate) async fn destroy(
     labels: &OwnershipLabels,
 ) -> Result<(), RuntimeError> {
     runtime.require_compatible_daemon().await?;
+    runtime.require_cleanup_authority(labels).await?;
     let filters = label_filters(labels.selector());
     let mut errors = Vec::new();
 

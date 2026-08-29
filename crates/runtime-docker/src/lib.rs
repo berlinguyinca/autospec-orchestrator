@@ -12,7 +12,7 @@ mod services;
 
 use async_trait::async_trait;
 use bollard::Docker;
-use execution_storage::{AllocationReceipt, ReadyAllocationVerifier};
+use execution_storage::{AllocationReceipt, ExecutionLayout, ReadyAllocationVerifier};
 use orchestrator_core::{ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::{EnvironmentHandle, ExecutionCredentials, Runtime, RuntimeError};
 use std::{env, path::PathBuf, sync::Arc};
@@ -69,6 +69,7 @@ pub struct DockerRuntime {
     pub(crate) allocation: Option<AllocationReceipt>,
     pub(crate) trusted_verifier: Option<TrustedVerifierImage>,
     pub(crate) credentials: Option<ExecutionCredentials>,
+    cleanup_labels: Option<OwnershipLabels>,
 }
 
 impl DockerRuntime {
@@ -104,6 +105,7 @@ impl DockerRuntime {
             allocation: None,
             trusted_verifier: None,
             credentials: None,
+            cleanup_labels: None,
         })
     }
 
@@ -145,6 +147,59 @@ impl DockerRuntime {
         }
         let mut runtime = Self::connect_with_execution_storage(socket, verifier, allocation)?;
         runtime.trusted_verifier = Some(trusted_verifier);
+        Ok(runtime)
+    }
+
+    /// Connects only the exact authority needed to destroy one persisted
+    /// execution runtime after a worker restart (spec sections 36 and 48).
+    ///
+    /// Cleanup deliberately does not accept the current provisioning verifier
+    /// image or command: a verifier rollout must not strand resources created
+    /// under an older durable receipt. The receipt still binds cleanup to the
+    /// exact execution labels, state-root path, and Docker daemon identity.
+    pub fn connect_for_cleanup(
+        socket: Option<&str>,
+        allocation: AllocationReceipt,
+        labels: &OwnershipLabels,
+    ) -> Result<Self, RuntimeError> {
+        let state_root = allocation
+            .mount_path
+            .parent()
+            .and_then(|executions| executions.parent())
+            .ok_or_else(|| {
+                RuntimeError::Cleanup("allocation mount path lacks state root".to_owned())
+            })?
+            .to_path_buf();
+        let layout = ExecutionLayout::new(&state_root, &labels.execution_id)
+            .map_err(|error| RuntimeError::Cleanup(error.to_string()))?;
+        allocation
+            .validate(labels, &layout)
+            .map_err(|error| RuntimeError::Cleanup(error.to_string()))?;
+        let metadata = std::fs::symlink_metadata(&allocation.mount_path).map_err(|error| {
+            RuntimeError::Cleanup(format!(
+                "inspect cleanup allocation {}: {error}",
+                allocation.mount_path.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(RuntimeError::Cleanup(
+                "cleanup allocation path is not an owned directory".to_owned(),
+            ));
+        }
+        let canonical = allocation.mount_path.canonicalize().map_err(|error| {
+            RuntimeError::Cleanup(format!(
+                "canonicalize cleanup allocation {}: {error}",
+                allocation.mount_path.display()
+            ))
+        })?;
+        if canonical != allocation.mount_path {
+            return Err(RuntimeError::Cleanup(
+                "cleanup allocation path is not canonical".to_owned(),
+            ));
+        }
+        let mut runtime = Self::connect_with_state_root(socket, state_root)?;
+        runtime.allocation = Some(allocation);
+        runtime.cleanup_labels = Some(labels.clone());
         Ok(runtime)
     }
 
@@ -202,6 +257,48 @@ impl DockerRuntime {
             .negotiate_version()
             .await
             .map_err(|error| RuntimeError::Unavailable(format!("negotiate Docker API: {error}")))?;
+        Ok(())
+    }
+
+    async fn require_cleanup_authority(
+        &self,
+        labels: &OwnershipLabels,
+    ) -> Result<(), RuntimeError> {
+        if let Some(expected) = &self.cleanup_labels {
+            if expected != labels {
+                return Err(RuntimeError::Cleanup(
+                    "runtime cleanup labels differ from the persisted receipt".to_owned(),
+                ));
+            }
+            let receipt = self.allocation.as_ref().ok_or_else(|| {
+                RuntimeError::Cleanup("runtime cleanup lacks its persisted receipt".to_owned())
+            })?;
+            if &receipt.labels != labels {
+                return Err(RuntimeError::Cleanup(
+                    "runtime cleanup receipt labels differ from selector authority".to_owned(),
+                ));
+            }
+            let actual = self
+                .client
+                .info()
+                .await
+                .map_err(|error| {
+                    RuntimeError::Unavailable(format!(
+                        "inspect Docker daemon identity for cleanup: {error}"
+                    ))
+                })?
+                .id
+                .ok_or_else(|| {
+                    RuntimeError::Cleanup(
+                        "Docker daemon did not report an identity for cleanup".to_owned(),
+                    )
+                })?;
+            if actual != receipt.docker_bind.daemon_id {
+                return Err(RuntimeError::Cleanup(format!(
+                    "Docker daemon identity {actual} does not match the persisted cleanup receipt"
+                )));
+            }
+        }
         Ok(())
     }
 }

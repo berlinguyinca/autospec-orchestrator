@@ -1029,6 +1029,75 @@ async fn daemon_probe_reports_a_compatible_real_daemon() {
     assert_eq!(runtime.client_api_version(), expected);
 }
 
+#[test]
+fn cleanup_constructor_requires_exact_persisted_labels_and_directory() {
+    let labels = labels_for(unique_execution_id());
+    let state = TestStateRoot::new(&labels);
+    let receipt = state.receipt(&labels, runtime_requirement().disk_gib);
+    let mut foreign_labels = labels.clone();
+    foreign_labels.worker_id = WorkerId::new("foreign-worker");
+    let error = DockerRuntime::connect_for_cleanup(None, receipt.clone(), &foreign_labels)
+        .expect_err("cleanup labels must exactly match the persisted receipt")
+        .to_string();
+    assert!(error.contains("ownership labels"));
+
+    fs::remove_dir_all(&receipt.mount_path).unwrap();
+    fs::write(&receipt.mount_path, "not a directory").unwrap();
+    let error = DockerRuntime::connect_for_cleanup(None, receipt, &labels)
+        .expect_err("cleanup authority must name an execution directory")
+        .to_string();
+    assert!(error.contains("not an owned directory"));
+}
+
+#[tokio::test]
+async fn cleanup_constructor_rejects_foreign_daemon_before_exact_resource_removal() {
+    let labels = labels_for(unique_execution_id());
+    let state = TestStateRoot::new(&labels);
+    let Some(legacy) =
+        runtime_or_skip("cleanup_constructor_rejects_foreign_daemon_before_exact_resource_removal")
+            .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    let network = DockerRuntime::network_name(&labels.execution_id);
+    docker
+        .create_network(CreateNetworkOptions {
+            name: network.clone(),
+            check_duplicate: true,
+            driver: "bridge".to_owned(),
+            internal: false,
+            attachable: false,
+            ingress: false,
+            ipam: Default::default(),
+            enable_ipv6: false,
+            options: HashMap::new(),
+            labels: labels.to_map().into_iter().collect(),
+        })
+        .await
+        .expect("create exact cleanup target");
+    let mut scope = DockerTestScope::new(&legacy, &labels);
+    let mut receipt = state.receipt(&labels, runtime_requirement().disk_gib);
+    receipt.mount_path = receipt.mount_path.canonicalize().unwrap();
+    receipt.docker_bind.source_path = receipt.mount_path.clone();
+    receipt.docker_bind.daemon_id = "definitely-not-this-daemon".to_owned();
+    let cleanup = DockerRuntime::connect_for_cleanup(None, receipt, &labels)
+        .expect("construct persisted cleanup authority");
+
+    let error = cleanup
+        .destroy(&labels)
+        .await
+        .expect_err("foreign daemon receipt must fail closed")
+        .to_string();
+    assert!(error.contains("does not match the persisted cleanup receipt"));
+    docker
+        .inspect_network::<String>(&network, None)
+        .await
+        .expect("daemon mismatch preserves the target");
+
+    scope.cleanup().await.expect("remove exact test target");
+}
+
 #[tokio::test]
 async fn legacy_runtime_and_foreign_daemon_receipts_fail_before_docker_resources() {
     let labels = labels_for(unique_execution_id());
