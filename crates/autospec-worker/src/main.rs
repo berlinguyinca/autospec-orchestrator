@@ -12,8 +12,8 @@ use orchestrator_core::{
     WorkerCapabilityProof, WorkerId, API_VERSION,
 };
 use orchestrator_persistence::{
-    CleanupAuthorityStore, ExecutionStore, PgCleanupAuthorityStore, PgExecutionStore,
-    PgReservationStore, ReservationStore,
+    CleanupAuthorityStore, CleanupDisposition, CleanupStage, ExecutionStore,
+    PgCleanupAuthorityStore, PgExecutionStore, PgReservationStore, ReservationStore,
 };
 use orchestrator_worker::{
     ExecutionTask, FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
@@ -198,9 +198,26 @@ async fn main() -> Result<()> {
         };
         let same_attempt = execution.worker_id.as_ref() == Some(&worker.id)
             && execution.attempt_id.as_ref() == Some(&authority.attempt_id);
+        let disposition = match authority.disposition() {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                tracing::error!(execution_id = %authority.execution_id, %error, "invalid cleanup disposition");
+                continue;
+            }
+        };
         if same_attempt
-            && execution.state == orchestrator_core::ExecutionState::Running
-            && matches!(authority.phase.as_str(), "PI_STARTED" | "RUNNING")
+            && execution.manifest.persistence == orchestrator_core::PersistenceMode::Resumable
+            && matches!(
+                execution.state,
+                orchestrator_core::ExecutionState::Provisioning
+                    | orchestrator_core::ExecutionState::Running
+            )
+            && matches!(
+                disposition,
+                CleanupDisposition::Active(CleanupStage::PiStarted)
+                    | CleanupDisposition::Active(CleanupStage::Running)
+                    | CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent)
+            )
         {
             tracing::info!(
                 worker_id = %worker.id,
@@ -214,8 +231,24 @@ async fn main() -> Result<()> {
         }
         if same_attempt
             && execution.state == orchestrator_core::ExecutionState::ReviewReady
-            && authority.phase == "REVIEW_READY"
+            && matches!(
+                disposition,
+                CleanupDisposition::RetainRequested | CleanupDisposition::Retained
+            )
         {
+            if disposition == CleanupDisposition::RetainRequested {
+                cleanup
+                    .transition(
+                        &execution.id,
+                        CleanupDisposition::RetainRequested,
+                        CleanupDisposition::Retained,
+                        &authority.handles,
+                    )
+                    .await?;
+                reservations
+                    .release_attempt(&execution.id, &authority.attempt_id)
+                    .await?;
+            }
             tracing::info!(
                 worker_id = %worker.id,
                 execution_id = %execution.id,
@@ -223,6 +256,11 @@ async fn main() -> Result<()> {
                 "retaining resumable ReviewReady execution for later attach or explicit cleanup"
             );
             continue;
+        }
+        if same_attempt && !execution.state.is_terminal() {
+            reservations
+                .fence_lost_attempt(&execution.id, &authority.attempt_id)
+                .await?;
         }
         match execution_worker
             .recover_cleanup_authority(&authority, &execution)
@@ -272,6 +310,39 @@ async fn main() -> Result<()> {
                     heartbeat_due = tokio::time::Instant::now() + backoff;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                     break;
+                }
+            }
+        }
+        for authority in cleanup
+            .list_for_worker(&worker.id)
+            .await
+            .unwrap_or_default()
+        {
+            let Ok(disposition) = authority.disposition() else {
+                continue;
+            };
+            if !matches!(
+                disposition,
+                CleanupDisposition::CleanupPending
+                    | CleanupDisposition::RuntimeStopped
+                    | CleanupDisposition::RuntimeDestroyed
+                    | CleanupDisposition::GitRecoveredCleaned
+                    | CleanupDisposition::StorageReleased
+                    | CleanupDisposition::ReservationReleased
+            ) {
+                continue;
+            }
+            match executions.get(&authority.execution_id).await {
+                Ok(execution) => {
+                    if let Err(error) = execution_worker
+                        .recover_cleanup_authority(&authority, &execution)
+                        .await
+                    {
+                        tracing::warn!(execution_id = %authority.execution_id, %error, "periodic cleanup reconciliation remains pending");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(execution_id = %authority.execution_id, %error, "cleanup authority execution is unavailable")
                 }
             }
         }

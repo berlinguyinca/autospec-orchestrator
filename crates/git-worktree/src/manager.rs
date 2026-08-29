@@ -543,6 +543,44 @@ impl WorktreeManager for GitWorktreeManager {
         crate::cleanup::destroy(self, worktree)
     }
 
+    fn recover_interrupted_create(
+        &self,
+        labels: &OwnershipLabels,
+        repository_root: &Path,
+    ) -> Result<(), WorktreeError> {
+        validate_execution_id(&labels.execution_id)?;
+        let expected = self.execution_repository_path(&labels.execution_id);
+        if repository_root != expected {
+            return Err(WorktreeError::Ownership(format!(
+                "interrupted create path {} is not exact expected path {}",
+                repository_root.display(),
+                expected.display()
+            )));
+        }
+        let intent_path = create_intent_path(self, &labels.execution_id);
+        let Some(intent) = read_create_intent(self, &intent_path)? else {
+            return Ok(());
+        };
+        verify_repository_selector(
+            self,
+            &ExecutionLayout::new(&self.cache_root, &labels.execution_id)
+                .map_err(|error| WorktreeError::Ownership(error.to_string()))?,
+            repository_root,
+        )?;
+        if intent.labels != labels.to_map()
+            || Path::new(&intent.repository_path) != repository_root
+            || intent.repository != labels.repository
+        {
+            return Err(WorktreeError::Ownership(
+                "create intent does not match exact execution labels and root".to_owned(),
+            ));
+        }
+        rollback_independent_repository(self.filesystem.as_ref(), repository_root)
+            .map_err(WorktreeError::Cleanup)?;
+        remove_create_intent(self, &intent_path)
+            .map_err(|error| WorktreeError::Cleanup(error.to_string()))
+    }
+
     fn find_stale(&self, live: &[ExecutionId]) -> Result<Vec<Worktree>, WorktreeError> {
         crate::cleanup::find_stale(self, live)
     }

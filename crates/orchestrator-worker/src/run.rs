@@ -8,6 +8,7 @@ use orchestrator_core::{
     event::ExecutionEventKind, Execution, ExecutionEvent, ExecutionResult, ExecutionState,
     FailureClass, PersistenceMode,
 };
+use orchestrator_persistence::{CleanupDisposition, CleanupStage};
 use std::{
     any::Any,
     panic::AssertUnwindSafe,
@@ -72,9 +73,25 @@ pub(crate) async fn run_with_cancel(
         }
     }
     if retain_for_resume(&tracked, &outcome) {
+        let handles = cleanup_handles(&guard);
+        worker
+            .cleanup_authorities
+            .transition(
+                &execution.id,
+                CleanupDisposition::RetainRequested,
+                CleanupDisposition::Retained,
+                &handles,
+            )
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        worker
+            .reservations
+            .release_attempt(&execution.id, attempt_id)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
         return outcome;
     }
-    let cleanup_complete = match guard.cleanup().await {
+    let cleanup_complete = match cleanup_phases(worker, &tracked, &mut guard).await {
         Ok(()) => true,
         Err(error) => {
             cleanup_errors.push(error.to_string());
@@ -82,14 +99,33 @@ pub(crate) async fn run_with_cancel(
         }
     };
     if cleanup_complete {
-        let reservation_released = match worker.reservations.release(&execution.id).await {
-            Ok(()) => true,
+        let reservation_released = match worker
+            .reservations
+            .release_attempt(&execution.id, attempt_id)
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                cleanup_errors.push("reservation belongs to another attempt".into());
+                false
+            }
             Err(error) => {
                 cleanup_errors.push(error.to_string());
                 false
             }
         };
         if reservation_released {
+            if let Err(error) = transition_authority(
+                worker,
+                &tracked,
+                CleanupDisposition::StorageReleased,
+                CleanupDisposition::ReservationReleased,
+                &guard,
+            )
+            .await
+            {
+                cleanup_errors.push(error.to_string());
+            }
             if let Err(error) = worker.cleanup_authorities.resolve(&execution.id).await {
                 cleanup_errors.push(error.to_string());
             }
@@ -167,9 +203,25 @@ pub(crate) async fn run_adopted_with_cancel(
         });
     }
     if retain_for_resume(&tracked, &outcome) {
+        let handles = cleanup_handles(&guard);
+        worker
+            .cleanup_authorities
+            .transition(
+                &execution.id,
+                CleanupDisposition::RetainRequested,
+                CleanupDisposition::Retained,
+                &handles,
+            )
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        worker
+            .reservations
+            .release_attempt(&execution.id, attempt_id)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
         return outcome;
     }
-    let cleanup_complete = match guard.cleanup().await {
+    let cleanup_complete = match cleanup_phases(worker, &tracked, &mut guard).await {
         Ok(()) => true,
         Err(error) => {
             cleanup_errors.push(error.to_string());
@@ -177,7 +229,21 @@ pub(crate) async fn run_adopted_with_cancel(
         }
     };
     if cleanup_complete {
-        if let Err(error) = worker.reservations.release(&execution.id).await {
+        if let Err(error) = worker
+            .reservations
+            .release_attempt(&execution.id, attempt_id)
+            .await
+        {
+            cleanup_errors.push(error.to_string());
+        } else if let Err(error) = transition_authority(
+            worker,
+            &tracked,
+            CleanupDisposition::StorageReleased,
+            CleanupDisposition::ReservationReleased,
+            &guard,
+        )
+        .await
+        {
             cleanup_errors.push(error.to_string());
         } else if let Err(error) = worker.cleanup_authorities.resolve(&execution.id).await {
             cleanup_errors.push(error.to_string());
@@ -196,6 +262,81 @@ pub(crate) async fn run_adopted_with_cancel(
     outcome
 }
 
+async fn cleanup_phases(
+    worker: &Worker,
+    execution: &Execution,
+    guard: &mut CleanupGuard,
+) -> Result<(), WorkerError> {
+    let authority = worker
+        .cleanup_authorities
+        .get(&execution.id)
+        .await
+        .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+    let disposition = authority
+        .disposition()
+        .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+    if disposition != CleanupDisposition::CleanupPending {
+        transition_authority(
+            worker,
+            execution,
+            disposition,
+            CleanupDisposition::CleanupPending,
+            guard,
+        )
+        .await?;
+    }
+    guard.stop_runtime_process().await?;
+    transition_authority(
+        worker,
+        execution,
+        CleanupDisposition::CleanupPending,
+        CleanupDisposition::RuntimeStopped,
+        guard,
+    )
+    .await?;
+    guard.destroy_runtime().await?;
+    transition_authority(
+        worker,
+        execution,
+        CleanupDisposition::RuntimeStopped,
+        CleanupDisposition::RuntimeDestroyed,
+        guard,
+    )
+    .await?;
+    guard.destroy_worktree().await?;
+    transition_authority(
+        worker,
+        execution,
+        CleanupDisposition::RuntimeDestroyed,
+        CleanupDisposition::GitRecoveredCleaned,
+        guard,
+    )
+    .await?;
+    guard.release_storage().await?;
+    transition_authority(
+        worker,
+        execution,
+        CleanupDisposition::GitRecoveredCleaned,
+        CleanupDisposition::StorageReleased,
+        guard,
+    )
+    .await
+}
+
+async fn transition_authority(
+    worker: &Worker,
+    execution: &Execution,
+    expected: CleanupDisposition,
+    next: CleanupDisposition,
+    guard: &CleanupGuard,
+) -> Result<(), WorkerError> {
+    worker
+        .cleanup_authorities
+        .transition(&execution.id, expected, next, &cleanup_handles(guard))
+        .await
+        .map_err(|error| WorkerError::Persistence(error.to_string()))
+}
+
 fn retain_for_resume(
     execution: &Execution,
     outcome: &Result<ExecutionResult, WorkerError>,
@@ -211,7 +352,11 @@ async fn adopt_inner(
     guard: &mut CleanupGuard,
     cancelled: &AtomicBool,
 ) -> Result<ExecutionResult, WorkerError> {
-    if execution.state != ExecutionState::Running {
+    if execution.state == ExecutionState::Provisioning {
+        execution
+            .transition(ExecutionState::Running)
+            .map_err(|error| WorkerError::Invalid(error.to_string()))?;
+    } else if execution.state != ExecutionState::Running {
         return Err(WorkerError::Invalid(format!(
             "execution {} is {:?}, not RUNNING",
             execution.id, execution.state
@@ -223,7 +368,14 @@ async fn adopt_inner(
     guard.environment = Some(adopted.environment);
     guard.runtime_created = true;
     guard.session = Some(adopted.session.clone());
-    checkpoint_cleanup(worker, execution, guard, "RUNNING").await?;
+    transition_cleanup(
+        worker,
+        execution,
+        guard,
+        CleanupDisposition::Active(CleanupStage::Running),
+        CleanupDisposition::Active(CleanupStage::Running),
+    )
+    .await?;
     drive_running(
         worker,
         execution,
@@ -253,14 +405,28 @@ async fn run_inner(
     }
     let receipt = worker.lifecycle.allocate(execution).await?;
     guard.receipt = Some(receipt.clone());
-    checkpoint_cleanup(worker, execution, guard, "STORAGE_ALLOCATED").await?;
+    transition_cleanup(
+        worker,
+        execution,
+        guard,
+        CleanupDisposition::Active(CleanupStage::Reserved),
+        CleanupDisposition::Active(CleanupStage::Storage),
+    )
+    .await?;
     let worktree = worker
         .lifecycle
         .create_worktree(execution, &receipt)
         .await?;
     execution.worktree_path = Some(worktree.path.clone());
     guard.worktree = Some(worktree.clone());
-    checkpoint_cleanup(worker, execution, guard, "WORKTREE_CREATED").await?;
+    transition_cleanup(
+        worker,
+        execution,
+        guard,
+        CleanupDisposition::Active(CleanupStage::Storage),
+        CleanupDisposition::Active(CleanupStage::Worktree),
+    )
+    .await?;
     execution
         .transition(ExecutionState::Provisioning)
         .map_err(|error| WorkerError::Invalid(error.to_string()))?;
@@ -270,7 +436,14 @@ async fn run_inner(
         .await?;
     guard.environment = Some(environment.clone());
     guard.runtime_created = true;
-    checkpoint_cleanup(worker, execution, guard, "RUNTIME_CREATED").await?;
+    transition_cleanup(
+        worker,
+        execution,
+        guard,
+        CleanupDisposition::Active(CleanupStage::Worktree),
+        CleanupDisposition::Active(CleanupStage::Runtime),
+    )
+    .await?;
     record(worker, execution, ExecutionEventKind::EnvironmentReady).await?;
     let packet = execution.manifest.task_packet.as_ref().ok_or_else(|| {
         WorkerError::Invalid("execution manifest lacks compact TaskPacket".to_owned())
@@ -281,11 +454,25 @@ async fn run_inner(
         .await?;
     execution.session_id = Some(session.id.clone());
     guard.session = Some(session.clone());
-    checkpoint_cleanup(worker, execution, guard, "PI_STARTED").await?;
+    transition_cleanup(
+        worker,
+        execution,
+        guard,
+        CleanupDisposition::Active(CleanupStage::Runtime),
+        CleanupDisposition::Active(CleanupStage::PiStarted),
+    )
+    .await?;
     execution
         .transition(ExecutionState::Running)
         .map_err(|error| WorkerError::Invalid(error.to_string()))?;
-    checkpoint_cleanup(worker, execution, guard, "RUNNING").await?;
+    transition_cleanup(
+        worker,
+        execution,
+        guard,
+        CleanupDisposition::Active(CleanupStage::PiStarted),
+        CleanupDisposition::Active(CleanupStage::Running),
+    )
+    .await?;
     drive_running(worker, execution, guard, cancelled, &worktree, &session).await
 }
 
@@ -377,21 +564,57 @@ async fn drive_running(
         tests: None,
     };
     execution.result = Some(result.clone());
-    record(worker, execution, ExecutionEventKind::ReviewReady).await?;
-    checkpoint_cleanup(worker, execution, guard, "REVIEW_READY").await?;
+    transition_cleanup(
+        worker,
+        execution,
+        guard,
+        CleanupDisposition::Active(CleanupStage::Running),
+        CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent),
+    )
+    .await?;
+    let event = ExecutionEvent {
+        execution_id: execution.id.clone(),
+        attempt_id: execution.attempt_id.clone(),
+        sequence: 0,
+        at: Utc::now(),
+        state: execution.state,
+        kind: ExecutionEventKind::ReviewReady,
+    };
+    if execution.manifest.persistence == PersistenceMode::Resumable {
+        worker
+            .executions
+            .record_progress_and_request_retention(execution, &event)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+    } else {
+        worker
+            .executions
+            .record_progress(execution, &event)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        transition_cleanup(
+            worker,
+            execution,
+            guard,
+            CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent),
+            CleanupDisposition::CleanupPending,
+        )
+        .await?;
+    }
     Ok(result)
 }
 
-async fn checkpoint_cleanup(
+async fn transition_cleanup(
     worker: &Worker,
     execution: &Execution,
     guard: &CleanupGuard,
-    phase: &str,
+    expected: CleanupDisposition,
+    next: CleanupDisposition,
 ) -> Result<(), WorkerError> {
     let handles = cleanup_handles(guard);
     worker
         .cleanup_authorities
-        .checkpoint(&execution.id, phase, &handles)
+        .transition(&execution.id, expected, next, &handles)
         .await
         .map_err(|error| WorkerError::Persistence(error.to_string()))
 }

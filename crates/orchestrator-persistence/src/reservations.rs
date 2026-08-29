@@ -49,6 +49,15 @@ pub trait ReservationStore: Send + Sync {
             "lost-worker recovery is unavailable for {worker_id}"
         )))
     }
+    async fn fence_lost_attempt(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_id: &AttemptId,
+    ) -> Result<LostWorkerRecovery, StoreError> {
+        Err(StoreError::Conflict(format!(
+            "startup fencing is unavailable for {execution_id}/{attempt_id}"
+        )))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -305,7 +314,8 @@ impl ReservationStore for PgReservationStore {
             )));
         }
         let rows = sqlx::query(
-            "SELECT e.* FROM reservations r JOIN executions e ON e.id = r.execution_id \
+            "SELECT e.*, r.attempt_id AS reservation_attempt_id FROM reservations r \
+             JOIN executions e ON e.id = r.execution_id \
              WHERE r.worker_id = $1 ORDER BY r.created_at, r.execution_id FOR UPDATE OF e, r",
         )
         .bind(worker_id.as_str())
@@ -314,9 +324,7 @@ impl ReservationStore for PgReservationStore {
         let mut recovered = Vec::with_capacity(rows.len());
         for row in rows {
             let mut execution = decode_execution(&row)?;
-            let attempt_id = execution.attempt_id.clone().ok_or_else(|| {
-                StoreError::Conflict("reserved execution lacks attempt id".to_owned())
-            })?;
+            let attempt_id = AttemptId::new(row.try_get::<String, _>("reservation_attempt_id")?);
             let resumable = execution.manifest.persistence == PersistenceMode::Resumable;
             let attempt_result = ExecutionResult {
                 execution_id: execution.id.clone(),
@@ -407,5 +415,96 @@ impl ReservationStore for PgReservationStore {
             .await?;
         transaction.commit().await?;
         Ok(recovered)
+    }
+
+    async fn fence_lost_attempt(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_id: &AttemptId,
+    ) -> Result<LostWorkerRecovery, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT e.* FROM executions e JOIN reservations r ON r.execution_id = e.id \
+             WHERE e.id = $1 AND e.attempt_id = $2 AND r.attempt_id = $2 FOR UPDATE OF e, r",
+        )
+        .bind(execution_id.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "startup authority changed for {execution_id}/{attempt_id}"
+            ))
+        })?;
+        let mut execution = decode_execution(&row)?;
+        let worker_id = execution.worker_id.clone().ok_or_else(|| {
+            StoreError::Conflict("startup-fenced execution lacks worker authority".to_owned())
+        })?;
+        let result = ExecutionResult {
+            execution_id: execution.id.clone(),
+            state: ExecutionState::Failed,
+            failure: Some(FailureClass::WorkerLost),
+            branch: None,
+            base_sha: None,
+            diff_artifact: None,
+            artifacts: Vec::new(),
+            tests: None,
+        };
+        let fenced = sqlx::query(
+            "UPDATE execution_attempts SET state = 'FAILED', result = $4, updated_at = now(), \
+             finished_at = now() WHERE attempt_id = $1 AND execution_id = $2 AND worker_id = $3 \
+             AND finished_at IS NULL",
+        )
+        .bind(attempt_id.as_str())
+        .bind(execution_id.as_str())
+        .bind(worker_id.as_str())
+        .bind(to_json(&result)?)
+        .execute(&mut *transaction)
+        .await?;
+        if fenced.rows_affected() != 1 {
+            return Err(StoreError::Conflict(format!(
+                "attempt {attempt_id} was already fenced"
+            )));
+        }
+        let resumable = execution.manifest.persistence == PersistenceMode::Resumable;
+        let (next, persisted_result) = if resumable {
+            (ExecutionState::Queued, None)
+        } else {
+            execution.result = Some(result.clone());
+            (ExecutionState::Failed, Some(to_json(&result)?))
+        };
+        sqlx::query(
+            "UPDATE executions SET state = $2, worker_id = NULL, attempt_id = NULL, \
+             session_id = CASE WHEN $3 THEN session_id ELSE NULL END, \
+             worktree_path = CASE WHEN $3 THEN worktree_path ELSE NULL END, result = $4, \
+             updated_at = now(), version = version + 1 WHERE id = $1 AND attempt_id = $5",
+        )
+        .bind(execution_id.as_str())
+        .bind(enum_text(&next)?)
+        .bind(resumable)
+        .bind(persisted_result)
+        .bind(attempt_id.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        append_in_transaction(
+            &mut transaction,
+            &ExecutionEvent {
+                execution_id: execution_id.clone(),
+                attempt_id: Some(attempt_id.clone()),
+                sequence: 0,
+                at: Utc::now(),
+                state: next,
+                kind: ExecutionEventKind::ExecutionFailed {
+                    failure: FailureClass::WorkerLost,
+                },
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(if resumable {
+            LostWorkerRecovery::Requeued(execution_id.clone())
+        } else {
+            LostWorkerRecovery::Failed(execution_id.clone())
+        })
     }
 }

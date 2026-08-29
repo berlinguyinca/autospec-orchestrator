@@ -7,8 +7,12 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
-use orchestrator_core::{WorkerAdvertisement, WorkerId, WorkerRegistration, WorkerState};
-use orchestrator_persistence::{ReservationStore, StoreError, WorkerStore};
+use orchestrator_core::{
+    ExecutionId, WorkerAdvertisement, WorkerId, WorkerRegistration, WorkerState,
+};
+use orchestrator_persistence::{
+    CleanupAuthorityStore, CleanupDisposition, ReservationStore, StoreError, WorkerStore,
+};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -22,6 +26,7 @@ pub struct WorkerApiState {
     workers: Arc<dyn WorkerStore>,
     reservations: Arc<dyn ReservationStore>,
     token_validator: Arc<dyn ApiTokenValidator>,
+    cleanup_authorities: Option<Arc<dyn CleanupAuthorityStore>>,
 }
 
 impl WorkerApiState {
@@ -34,6 +39,7 @@ impl WorkerApiState {
             workers,
             reservations,
             token_validator: Arc::new(StaticApiTokenValidator::new(token)),
+            cleanup_authorities: None,
         }
     }
 
@@ -46,7 +52,16 @@ impl WorkerApiState {
             workers,
             reservations,
             token_validator,
+            cleanup_authorities: None,
         }
+    }
+
+    pub fn with_cleanup_authorities(
+        mut self,
+        cleanup_authorities: Arc<dyn CleanupAuthorityStore>,
+    ) -> Self {
+        self.cleanup_authorities = Some(cleanup_authorities);
+        self
     }
 
     pub async fn reap_stale(&self, now: DateTime<Utc>) -> Result<Vec<WorkerId>, StoreError> {
@@ -80,7 +95,35 @@ pub fn routes() -> Router<WorkerApiState> {
     Router::new()
         .route("/workers", get(list).post(register))
         .route("/workers/{id}/heartbeat", post(heartbeat))
+        .route("/executions/{id}/cleanup", post(request_cleanup))
         .layer(DefaultBodyLimit::max(WORKER_BODY_LIMIT))
+}
+
+async fn request_cleanup(
+    State(state): State<WorkerApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    authorize(&state, &headers)?;
+    let cleanup = state.cleanup_authorities.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CLEANUP_UNAVAILABLE",
+            "durable cleanup reconciliation is unavailable",
+        )
+    })?;
+    let execution_id = ExecutionId::new(id);
+    let authority = cleanup.get(&execution_id).await.map_err(ApiError::store)?;
+    cleanup
+        .transition(
+            &execution_id,
+            authority.disposition().map_err(ApiError::store)?,
+            CleanupDisposition::CleanupPending,
+            &authority.handles,
+        )
+        .await
+        .map_err(ApiError::store)?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn register(

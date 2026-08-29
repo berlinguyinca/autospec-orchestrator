@@ -4,7 +4,10 @@ use orchestrator_core::{
     RuntimeKind, WorkerCapabilities, WorkerCapabilityProof, WorkerId, WorkerRegistration,
     WorkerState,
 };
-use orchestrator_persistence::{PgReservationStore, PgWorkerStore, WorkerStore};
+use orchestrator_persistence::{
+    CleanupAuthorityStore, CleanupDisposition, CleanupStage, PgCleanupAuthorityStore,
+    PgReservationStore, PgWorkerStore, WorkerStore,
+};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -98,6 +101,106 @@ async fn authenticated_worker_routes_own_liveness_and_reap_after_ninety_seconds(
     assert_eq!(
         store.get(&advertised.id).await.unwrap().state,
         WorkerState::Unreachable
+    );
+}
+
+#[tokio::test]
+async fn authenticated_execution_cleanup_requests_durable_reconciliation() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
+        return;
+    };
+    let workers = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+    let execution_id = orchestrator_core::ExecutionId::new(format!(
+        "cleanup-api-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let attempt_id =
+        orchestrator_core::AttemptId::new(format!("attempt-{}", uuid::Uuid::new_v4().simple()));
+    let worker_id = WorkerId::new(format!("worker-{}", uuid::Uuid::new_v4().simple()));
+    cleanup
+        .begin(&execution_id, &attempt_id, &worker_id)
+        .await
+        .unwrap();
+    let handles = serde_json::json!({"session": "durable"});
+    let transitions = [
+        (
+            CleanupDisposition::Active(CleanupStage::Reserved),
+            CleanupDisposition::Active(CleanupStage::Storage),
+        ),
+        (
+            CleanupDisposition::Active(CleanupStage::Storage),
+            CleanupDisposition::Active(CleanupStage::Worktree),
+        ),
+        (
+            CleanupDisposition::Active(CleanupStage::Worktree),
+            CleanupDisposition::Active(CleanupStage::Runtime),
+        ),
+        (
+            CleanupDisposition::Active(CleanupStage::Runtime),
+            CleanupDisposition::Active(CleanupStage::PiStarted),
+        ),
+        (
+            CleanupDisposition::Active(CleanupStage::PiStarted),
+            CleanupDisposition::Active(CleanupStage::Running),
+        ),
+        (
+            CleanupDisposition::Active(CleanupStage::Running),
+            CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent),
+        ),
+        (
+            CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent),
+            CleanupDisposition::RetainRequested,
+        ),
+        (
+            CleanupDisposition::RetainRequested,
+            CleanupDisposition::Retained,
+        ),
+    ];
+    for (from, to) in transitions {
+        cleanup
+            .transition(&execution_id, from, to, &handles)
+            .await
+            .unwrap();
+    }
+    let state = WorkerApiState::new(workers, reservations, "secret".into())
+        .with_cleanup_authorities(cleanup.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/api/v1/executions/{execution_id}/cleanup");
+
+    assert_eq!(
+        client.post(&url).send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        cleanup
+            .get(&execution_id)
+            .await
+            .unwrap()
+            .disposition()
+            .unwrap(),
+        CleanupDisposition::CleanupPending
     );
 }
 

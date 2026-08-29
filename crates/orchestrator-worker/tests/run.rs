@@ -11,8 +11,8 @@ use orchestrator_core::{
     RepositoryReference, Role, RuntimeRequirement, SessionId, TaskPacket, WorkerId,
 };
 use orchestrator_persistence::{
-    CleanupAuthority, CleanupAuthorityStore, ExecutionStore, Reservation, ReservationStore,
-    StoreError,
+    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore, Reservation,
+    ReservationStore, StoreError,
 };
 use orchestrator_worker::{AdoptedExecution, ExecutionLifecycle, LifecycleError, Worker};
 use runtime_traits::{EnvironmentHandle, VerifiedAgentContainer};
@@ -111,6 +111,20 @@ impl CleanupAuthorityStore for FakeCleanupAuthorities {
             .lock()
             .unwrap()
             .push((phase.into(), handles.clone()));
+        Ok(())
+    }
+
+    async fn transition(
+        &self,
+        _: &ExecutionId,
+        _: CleanupDisposition,
+        next: CleanupDisposition,
+        handles: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        self.checkpoints
+            .lock()
+            .unwrap()
+            .push((next.to_string(), handles.clone()));
         Ok(())
     }
 
@@ -412,7 +426,10 @@ async fn restart_adoption_reuses_attempt_session_and_skips_all_creation_steps() 
             "persist-evidence",
         ]
     );
-    assert!(reservations.released.lock().unwrap().is_empty());
+    assert_eq!(
+        reservations.released.lock().unwrap().as_slice(),
+        &[ExecutionId::new("worker-run-test")]
+    );
 }
 
 #[tokio::test]
@@ -449,7 +466,13 @@ async fn failed_adoption_recovers_durable_authority_instead_of_releasing_live_la
 
     assert_eq!(
         order.lock().unwrap().as_slice(),
-        &["adopt", "authority-cleanup"]
+        &[
+            "adopt",
+            "authority-cleanup",
+            "authority-cleanup",
+            "authority-cleanup",
+            "authority-cleanup",
+        ]
     );
     assert_eq!(
         reservations.released.lock().unwrap().as_slice(),
@@ -516,18 +539,68 @@ async fn successful_run_uses_exact_order_and_persists_result_before_cleanup() {
             .map(|(phase, _)| phase.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "STORAGE_ALLOCATED",
-            "WORKTREE_CREATED",
-            "RUNTIME_CREATED",
-            "PI_STARTED",
-            "RUNNING",
-            "REVIEW_READY",
+            "ACTIVE:STORAGE",
+            "ACTIVE:WORKTREE",
+            "ACTIVE:RUNTIME",
+            "ACTIVE:PI_STARTED",
+            "ACTIVE:RUNNING",
+            "ACTIVE:POST_PI_BEFORE_EVENT",
+            "CLEANUP_PENDING",
+            "CLEANUP_PENDING",
+            "RUNTIME_STOPPED",
+            "RUNTIME_DESTROYED",
+            "GIT_RECOVERED_CLEANED",
+            "STORAGE_RELEASED",
+            "RESERVATION_RELEASED",
         ]
     );
     assert!(checkpoints[0].1["receipt"].is_object());
     assert!(checkpoints[1].1["worktree"].is_object());
     assert!(checkpoints[2].1["runtime"].is_object());
     assert!(checkpoints[3].1["session"].is_object());
+}
+
+#[tokio::test]
+async fn resumable_review_ready_retains_resources_but_releases_capacity() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::clone(&order),
+        fail_at: None,
+        poll_empty: false,
+        cleanup_fail: false,
+        hang_poll: false,
+    });
+    let store = Arc::new(FakeStore::default());
+    let reservations = Arc::new(FakeReservations::default());
+    let cleanup = Arc::new(FakeCleanupAuthorities::default());
+    let mut execution = execution();
+    execution.manifest.persistence = PersistenceMode::Resumable;
+    store.insert(&execution).await.unwrap();
+    let worker = worker_with_cleanup(lifecycle, store, reservations.clone(), cleanup.clone());
+
+    worker.run(&execution).await.unwrap();
+
+    assert_eq!(
+        reservations.released.lock().unwrap().as_slice(),
+        &[execution.id]
+    );
+    assert_eq!(
+        cleanup.checkpoints.lock().unwrap().last().unwrap().0,
+        CleanupDisposition::Retained.to_string()
+    );
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec![
+            "allocate",
+            "git-create",
+            "docker-provision",
+            "pi-start",
+            "pi-poll",
+            "pi-stop",
+            "git-capture",
+            "persist-evidence",
+        ]
+    );
 }
 
 #[tokio::test]

@@ -5,9 +5,9 @@ use orchestrator_core::{
     RepositoryReference, Role, RuntimeRequirement, WorkerId,
 };
 use orchestrator_persistence::{
-    CleanupAuthorityStore, EventLog, ExecutionStore, LostWorkerRecovery, PgCleanupAuthorityStore,
-    PgEventLog, PgExecutionStore, PgReservationStore, PgWorkerStore, ReservationStore, StoreError,
-    WorkerStore,
+    CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog, ExecutionStore,
+    LostWorkerRecovery, PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore,
+    PgWorkerStore, ReservationStore, StoreError, WorkerStore,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::sync::{Arc, OnceLock};
@@ -65,10 +65,22 @@ async fn cleanup_authority_is_durable_until_explicit_resolution() {
         "container_id": "sha256:container",
         "session_id": "session-1"
     });
-    store
-        .checkpoint(&execution_id, "PI_STARTED", &handles)
-        .await
-        .unwrap();
+    for (from, to) in [
+        (CleanupStage::Reserved, CleanupStage::Storage),
+        (CleanupStage::Storage, CleanupStage::Worktree),
+        (CleanupStage::Worktree, CleanupStage::Runtime),
+        (CleanupStage::Runtime, CleanupStage::PiStarted),
+    ] {
+        store
+            .transition(
+                &execution_id,
+                CleanupDisposition::Active(from),
+                CleanupDisposition::Active(to),
+                &handles,
+            )
+            .await
+            .unwrap();
+    }
     drop(store);
 
     let reopened = PgCleanupAuthorityStore::connect(&database_url)
@@ -76,14 +88,111 @@ async fn cleanup_authority_is_durable_until_explicit_resolution() {
         .unwrap();
     let pending = reopened.list_for_worker(&worker_id).await.unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].phase, "PI_STARTED");
+    assert_eq!(pending[0].phase, "ACTIVE:PI_STARTED");
     assert_eq!(pending[0].handles, handles);
+    let mut disposition = CleanupDisposition::Active(CleanupStage::PiStarted);
+    for next in [
+        CleanupDisposition::CleanupPending,
+        CleanupDisposition::RuntimeStopped,
+        CleanupDisposition::RuntimeDestroyed,
+        CleanupDisposition::GitRecoveredCleaned,
+        CleanupDisposition::StorageReleased,
+        CleanupDisposition::ReservationReleased,
+    ] {
+        reopened
+            .transition(&execution_id, disposition, next, &handles)
+            .await
+            .unwrap();
+        disposition = next;
+    }
     reopened.resolve(&execution_id).await.unwrap();
     assert!(reopened
         .list_for_worker(&worker_id)
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn cleanup_disposition_transitions_are_exact_and_idempotent() {
+    let _database_test = database_test_lock().lock().await;
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real PostgreSQL test");
+        return;
+    };
+    let store = PgCleanupAuthorityStore::connect(&database_url)
+        .await
+        .unwrap();
+    let worker_id = WorkerId::new(format!("worker-state-{}", uuid::Uuid::new_v4().simple()));
+    let execution_id =
+        ExecutionId::new(format!("execution-state-{}", uuid::Uuid::new_v4().simple()));
+    let attempt_id =
+        orchestrator_core::AttemptId::new(format!("attempt-{}", uuid::Uuid::new_v4().simple()));
+    store
+        .begin(&execution_id, &attempt_id, &worker_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get(&execution_id)
+            .await
+            .unwrap()
+            .disposition()
+            .unwrap(),
+        CleanupDisposition::Active(CleanupStage::Reserved)
+    );
+
+    store
+        .transition(
+            &execution_id,
+            CleanupDisposition::Active(CleanupStage::Reserved),
+            CleanupDisposition::Active(CleanupStage::Storage),
+            &serde_json::json!({"receipt": "durable"}),
+        )
+        .await
+        .unwrap();
+    store
+        .transition(
+            &execution_id,
+            CleanupDisposition::Active(CleanupStage::Reserved),
+            CleanupDisposition::Active(CleanupStage::Storage),
+            &serde_json::json!({"receipt": "durable"}),
+        )
+        .await
+        .expect("replayed exact transition is idempotent");
+    assert!(matches!(
+        store
+            .transition(
+                &execution_id,
+                CleanupDisposition::Active(CleanupStage::Reserved),
+                CleanupDisposition::RuntimeDestroyed,
+                &serde_json::json!({}),
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let authority = store.get(&execution_id).await.unwrap();
+    assert_eq!(
+        authority.disposition().unwrap(),
+        CleanupDisposition::Active(CleanupStage::Storage)
+    );
+    assert_eq!(authority.handles, serde_json::json!({"receipt": "durable"}));
+    let mut disposition = CleanupDisposition::Active(CleanupStage::Storage);
+    for next in [
+        CleanupDisposition::CleanupPending,
+        CleanupDisposition::RuntimeStopped,
+        CleanupDisposition::RuntimeDestroyed,
+        CleanupDisposition::GitRecoveredCleaned,
+        CleanupDisposition::StorageReleased,
+        CleanupDisposition::ReservationReleased,
+    ] {
+        store
+            .transition(&execution_id, disposition, next, &authority.handles)
+            .await
+            .unwrap();
+        disposition = next;
+    }
+    store.resolve(&execution_id).await.unwrap();
 }
 
 fn execution(state: ExecutionState) -> Execution {
@@ -435,6 +544,56 @@ async fn stale_attempt_cleanup_cannot_release_a_reassigned_reservation() {
 }
 
 #[tokio::test]
+async fn startup_fence_classifies_before_cleanup_releases_capacity() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let mut worker = registered_worker(
+        &format!("worker-startup-fence-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    let capability = format!("startup-fence-{}", uuid::Uuid::new_v4().simple());
+    worker.capabilities.capabilities.push(capability.clone());
+    workers.register(&worker).await.unwrap();
+    let mut queued = execution(ExecutionState::Queued);
+    queued.manifest.persistence = PersistenceMode::Resumable;
+    queued.manifest.runtime.capabilities.push(capability);
+    queued.created_at = Utc::now() - Duration::days(3_650);
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        reservations
+            .fence_lost_attempt(&reservation.execution.id, &reservation.attempt_id)
+            .await
+            .unwrap(),
+        LostWorkerRecovery::Requeued(id) if id == reservation.execution.id
+    ));
+    let classified = executions.get(&reservation.execution.id).await.unwrap();
+    assert_eq!(classified.state, ExecutionState::Queued);
+    assert!(classified.worker_id.is_none());
+    assert!(classified.attempt_id.is_none());
+    assert_eq!(
+        reservations
+            .list_for_worker(&worker.id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "old capacity remains fenced until exact physical cleanup completes"
+    );
+    assert!(reservations
+        .release_attempt(&reservation.execution.id, &reservation.attempt_id)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
 async fn progress_commit_persists_execution_attempt_and_event_atomically() {
     let _database_test = database_test_lock().lock().await;
     let Some((executions, workers, reservations)) = worker_stores().await else {
@@ -482,6 +641,103 @@ async fn progress_commit_persists_execution_attempt_and_event_atomically() {
         .unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].sequence, 1);
+}
+
+#[tokio::test]
+async fn review_ready_progress_and_retention_request_commit_atomically() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").unwrap();
+    let cleanup = PgCleanupAuthorityStore::connect(&database_url)
+        .await
+        .unwrap();
+    let worker = registered_worker(
+        &format!("worker-retain-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    let mut queued = execution(ExecutionState::Queued);
+    queued.manifest.persistence = PersistenceMode::Resumable;
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    cleanup
+        .begin(
+            &reservation.execution.id,
+            &reservation.attempt_id,
+            &worker.id,
+        )
+        .await
+        .unwrap();
+    let handles = serde_json::json!({"session": "session-1"});
+    let transitions = [
+        (CleanupStage::Reserved, CleanupStage::Storage),
+        (CleanupStage::Storage, CleanupStage::Worktree),
+        (CleanupStage::Worktree, CleanupStage::Runtime),
+        (CleanupStage::Runtime, CleanupStage::PiStarted),
+        (CleanupStage::PiStarted, CleanupStage::Running),
+        (CleanupStage::Running, CleanupStage::PostPiBeforeEvent),
+    ];
+    for (from, to) in transitions {
+        cleanup
+            .transition(
+                &reservation.execution.id,
+                CleanupDisposition::Active(from),
+                CleanupDisposition::Active(to),
+                &handles,
+            )
+            .await
+            .unwrap();
+    }
+    let mut running = reservation.execution;
+    running.transition(ExecutionState::Provisioning).unwrap();
+    executions
+        .record_progress(
+            &running,
+            &progress_event(&running, ExecutionEventKind::EnvironmentReady),
+        )
+        .await
+        .unwrap();
+    running.transition(ExecutionState::Running).unwrap();
+    executions
+        .record_progress(
+            &running,
+            &progress_event(
+                &running,
+                ExecutionEventKind::AgentStarted {
+                    session_id: orchestrator_core::SessionId::new("session-1"),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    running.transition(ExecutionState::ReviewReady).unwrap();
+    executions
+        .record_progress_and_request_retention(
+            &running,
+            &progress_event(&running, ExecutionEventKind::ReviewReady),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cleanup
+            .get(&running.id)
+            .await
+            .unwrap()
+            .disposition()
+            .unwrap(),
+        CleanupDisposition::RetainRequested
+    );
+    assert_eq!(
+        executions.get(&running.id).await.unwrap().state,
+        ExecutionState::ReviewReady
+    );
 }
 
 #[tokio::test]

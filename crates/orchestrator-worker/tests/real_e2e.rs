@@ -3,22 +3,26 @@ use execution_storage::{
     BackendCapability, BackendIdentity, BackendState, DockerBindCapability, DockerBindProof,
     DockerBindVerifier, ExecutionLayout, ExecutionStorage, StorageBackend, StorageError,
 };
-use git_worktree::GitWorktreeManager;
+use git_worktree::{GitWorktreeManager, Worktree};
+use harness_traits::SessionRef;
 use orchestrator_core::{
-    AgentAssignment, Execution, ExecutionId, ExecutionManifest, ExecutionState, HarnessKind,
-    ModelPolicy, OwnershipLabels, PersistenceMode, RepositoryReference, Role, RuntimeKind,
-    RuntimeRequirement, TaskPacket, WorkerCapabilities, WorkerCapabilityProof, WorkerId,
-    WorkerRegistration, WorkerState,
+    event::ExecutionEventKind, AgentAssignment, Execution, ExecutionEvent, ExecutionId,
+    ExecutionManifest, ExecutionResult, ExecutionState, HarnessKind, ModelPolicy, OwnershipLabels,
+    PersistenceMode, RepositoryReference, Role, RuntimeKind, RuntimeRequirement, TaskPacket,
+    WorkerCapabilities, WorkerCapabilityProof, WorkerId, WorkerRegistration, WorkerState,
 };
 use orchestrator_persistence::{
-    CleanupAuthorityStore, ExecutionStore, PgCleanupAuthorityStore, PgExecutionStore,
-    PgReservationStore, PgWorkerStore, ReservationStore, WorkerStore,
+    CleanupAuthorityStore, CleanupDisposition, CleanupStage, ExecutionStore,
+    PgCleanupAuthorityStore, PgExecutionStore, PgReservationStore, PgWorkerStore, ReservationStore,
+    WorkerStore,
 };
 use orchestrator_worker::{
-    FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
+    ExecutionLifecycle, FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
     VerifiedDockerRuntimeFactory, VerifiedPiHarnessFactory, Worker,
 };
 use runtime_docker::TrustedVerifierImage;
+use runtime_traits::EnvironmentHandle;
+use sqlx::{Connection, PgConnection};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -285,6 +289,7 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
         eprintln!("skipping real Task5 E2E: AUTOSPEC_DATABASE_URL is unset");
         return;
     };
+    let _serial = acquire_real_test_lock(&database_url).await;
     let Some((daemon_id, image_id)) = docker_capability() else {
         eprintln!("skipping real Task5 E2E: Docker or alpine:3.20 is unavailable");
         return;
@@ -432,18 +437,28 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
             .await
             .unwrap()
             .len(),
-        1
+        0
     );
     let authorities = cleanup.list_for_worker(&worker_id).await.unwrap();
     assert_eq!(authorities.len(), 1);
-    assert_eq!(authorities[0].phase, "REVIEW_READY");
+    assert_eq!(authorities[0].phase, "RETAINED");
     assert!(authorities[0].handles.get("receipt").is_some());
     assert!(authorities[0].handles.get("runtime").is_some());
     assert!(authorities[0].handles.get("session").is_some());
 
     let retained_execution = executions.get(&execution_id).await.unwrap();
+    cleanup
+        .transition(
+            &execution_id,
+            orchestrator_persistence::CleanupDisposition::Retained,
+            orchestrator_persistence::CleanupDisposition::CleanupPending,
+            &authorities[0].handles,
+        )
+        .await
+        .unwrap();
+    let requested = cleanup.get(&execution_id).await.unwrap();
     replacement
-        .recover_cleanup_authority(&authorities[0], &retained_execution)
+        .recover_cleanup_authority(&requested, &retained_execution)
         .await
         .unwrap();
     assert!(!released_layout.root.exists());
@@ -487,12 +502,510 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM workers WHERE id = $1")
-        .bind(worker_id.as_str())
-        .execute(&pool)
+    sqlx::query(
+        "DELETE FROM workers w
+         WHERE id = $1
+           AND NOT EXISTS (SELECT 1 FROM executions WHERE worker_id = w.id)
+           AND NOT EXISTS (SELECT 1 FROM execution_attempts WHERE worker_id = w.id)",
+    )
+    .bind(worker_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn real_failure_stage_matrix_reconciles_without_resource_leaks() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("skipping real Task5 matrix: AUTOSPEC_DATABASE_URL is unset");
+        return;
+    };
+    let _serial = acquire_real_test_lock(&database_url).await;
+    let Some((daemon_id, image_id)) = docker_capability() else {
+        eprintln!("skipping real Task5 matrix: Docker or alpine:3.20 is unavailable");
+        return;
+    };
+    for (stage_index, stage) in [
+        "post_reservation",
+        "post_storage",
+        "mid_git_create",
+        "post_runtime",
+        "post_pi_pre_event",
+        "review_ready_pre_retention",
+        "post_retention",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let suffix = format!(
+            "matrix-{stage_index}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let root = std::env::temp_dir().join(format!("autospec-task5-{suffix}"));
+        initialize_state_root(&root);
+        let root = root.canonicalize().unwrap();
+        let remote_root = root.join("remotes");
+        create_stub_repository(&remote_root);
+        let worker_id = WorkerId::new(format!("worker-{suffix}"));
+        let execution_id = ExecutionId::new(format!("execution-{suffix}"));
+        let capability = format!("capability-{suffix}");
+        let labels = OwnershipLabels {
+            execution_id: execution_id.clone(),
+            worker_id: worker_id.clone(),
+            repository: "owner/repo".into(),
+            issue: Some("task5-matrix".into()),
+        };
+        let workers = PgWorkerStore::connect(&database_url).await.unwrap();
+        workers
+            .register(&matrix_worker_registration(
+                worker_id.clone(),
+                capability.clone(),
+                &daemon_id,
+                &image_id,
+            ))
+            .await
+            .unwrap();
+        let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
+        let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+        let cleanup = Arc::new(
+            PgCleanupAuthorityStore::connect(&database_url)
+                .await
+                .unwrap(),
+        );
+        executions
+            .insert(&queued_execution(
+                execution_id.clone(),
+                labels,
+                image_id.clone(),
+                capability,
+            ))
+            .await
+            .unwrap();
+        let crashed = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "failure_stage_process_helper", "--nocapture"])
+            .env("AUTOSPEC_TASK5_MATRIX_HELPER", "1")
+            .env("AUTOSPEC_TASK5_MATRIX_STAGE", stage)
+            .env("AUTOSPEC_DATABASE_URL", &database_url)
+            .env("AUTOSPEC_TASK5_ROOT", &root)
+            .env("AUTOSPEC_TASK5_REMOTE", &remote_root)
+            .env("AUTOSPEC_TASK5_DAEMON", &daemon_id)
+            .env("AUTOSPEC_TASK5_IMAGE", &image_id)
+            .env("AUTOSPEC_TASK5_WORKER", worker_id.as_str())
+            .status()
+            .unwrap();
+        assert_eq!(crashed.code(), Some(77), "stage {stage}");
+
+        let mut authority = cleanup.get(&execution_id).await.unwrap();
+        let execution = executions.get(&execution_id).await.unwrap();
+        let replacement = Worker::new(
+            build_system_lifecycle(&root, &remote_root, &daemon_id, &image_id),
+            executions.clone(),
+            reservations.clone(),
+            cleanup.clone(),
+        );
+        match authority.disposition().unwrap() {
+            CleanupDisposition::RetainRequested => {
+                cleanup
+                    .transition(
+                        &execution_id,
+                        CleanupDisposition::RetainRequested,
+                        CleanupDisposition::Retained,
+                        &authority.handles,
+                    )
+                    .await
+                    .unwrap();
+                reservations
+                    .release_attempt(&execution_id, &authority.attempt_id)
+                    .await
+                    .unwrap();
+                authority = cleanup.get(&execution_id).await.unwrap();
+            }
+            CleanupDisposition::Retained => {}
+            _ => {
+                reservations
+                    .fence_lost_attempt(&execution_id, &authority.attempt_id)
+                    .await
+                    .unwrap();
+                replacement
+                    .recover_cleanup_authority(&authority, &execution)
+                    .await
+                    .unwrap();
+            }
+        }
+        if authority.disposition().unwrap() == CleanupDisposition::Retained {
+            assert!(ExecutionLayout::new(&root, &execution_id)
+                .unwrap()
+                .root
+                .exists());
+            assert!(reservations
+                .list_for_worker(&worker_id)
+                .await
+                .unwrap()
+                .is_empty());
+            cleanup
+                .transition(
+                    &execution_id,
+                    CleanupDisposition::Retained,
+                    CleanupDisposition::CleanupPending,
+                    &authority.handles,
+                )
+                .await
+                .unwrap();
+            authority = cleanup.get(&execution_id).await.unwrap();
+            replacement
+                .recover_cleanup_authority(&authority, &execution)
+                .await
+                .unwrap();
+        }
+        assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
+        delete_matrix_records(&database_url, &execution_id, &worker_id).await;
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("skipping real Task5 peer isolation: AUTOSPEC_DATABASE_URL is unset");
+        return;
+    };
+    let _serial = acquire_real_test_lock(&database_url).await;
+    let Some((daemon_id, image_id)) = docker_capability() else {
+        eprintln!("skipping real Task5 peer isolation: Docker or alpine:3.20 is unavailable");
+        return;
+    };
+    let suffix = format!(
+        "peer-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    let root = std::env::temp_dir().join(format!("autospec-task5-{suffix}"));
+    initialize_state_root(&root);
+    let root = root.canonicalize().unwrap();
+    let remote_root = root.join("remotes");
+    create_completing_stub_repository(&remote_root);
+    let worker_id = WorkerId::new(format!("worker-{suffix}"));
+    let peer_id = ExecutionId::new(format!("peer-{suffix}"));
+    let failed_id = ExecutionId::new(format!("failed-{suffix}"));
+    let peer_capability = format!("peer-capability-{suffix}");
+    let failed_capability = format!("failed-capability-{suffix}");
+    let mut registration = matrix_worker_registration(
+        worker_id.clone(),
+        peer_capability.clone(),
+        &daemon_id,
+        &image_id,
+    );
+    registration.capabilities.max_concurrent_executions = 2;
+    registration
+        .capabilities
+        .capabilities
+        .push(failed_capability.clone());
+    let workers = PgWorkerStore::connect(&database_url).await.unwrap();
+    workers.register(&registration).await.unwrap();
+    let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+    let mut peer_execution = queued_execution(
+        peer_id.clone(),
+        OwnershipLabels {
+            execution_id: peer_id.clone(),
+            worker_id: worker_id.clone(),
+            repository: "owner/repo".into(),
+            issue: Some("peer".into()),
+        },
+        image_id.clone(),
+        peer_capability,
+    );
+    peer_execution.manifest.repository.branch = Some(format!("peer-{suffix}"));
+    executions.insert(&peer_execution).await.unwrap();
+    let peer_reservation = reservations
+        .reserve_next(&worker_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(peer_reservation.execution.id, peer_id);
+    let mut failed_execution = queued_execution(
+        failed_id.clone(),
+        OwnershipLabels {
+            execution_id: failed_id.clone(),
+            worker_id: worker_id.clone(),
+            repository: "owner/repo".into(),
+            issue: Some("failed-peer".into()),
+        },
+        image_id.clone(),
+        failed_capability,
+    );
+    failed_execution.manifest.repository.branch = Some(format!("failed-{suffix}"));
+    executions.insert(&failed_execution).await.unwrap();
+    let lifecycle = build_system_lifecycle(&root, &remote_root, &daemon_id, &image_id);
+    let worker = Arc::new(Worker::new(
+        lifecycle,
+        executions.clone(),
+        reservations.clone(),
+        cleanup.clone(),
+    ));
+    let peer_task = worker.clone().spawn(peer_reservation.execution);
+    let crashed = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "failure_stage_process_helper", "--nocapture"])
+        .env("AUTOSPEC_TASK5_MATRIX_HELPER", "1")
+        .env("AUTOSPEC_TASK5_MATRIX_STAGE", "post_runtime")
+        .env("AUTOSPEC_DATABASE_URL", &database_url)
+        .env("AUTOSPEC_TASK5_ROOT", &root)
+        .env("AUTOSPEC_TASK5_REMOTE", &remote_root)
+        .env("AUTOSPEC_TASK5_DAEMON", &daemon_id)
+        .env("AUTOSPEC_TASK5_IMAGE", &image_id)
+        .env("AUTOSPEC_TASK5_WORKER", worker_id.as_str())
+        .status()
+        .unwrap();
+    assert_eq!(crashed.code(), Some(77));
+    let peer_result = peer_task.join().await.unwrap();
+    assert_eq!(peer_result.state, ExecutionState::ReviewReady);
+    assert!(peer_result
+        .diff_artifact
+        .as_ref()
+        .is_some_and(|path| Path::new(path).is_file()));
+
+    let failed_authority = cleanup.get(&failed_id).await.unwrap();
+    let failed_execution = executions.get(&failed_id).await.unwrap();
+    reservations
+        .fence_lost_attempt(&failed_id, &failed_authority.attempt_id)
         .await
         .unwrap();
-    fs::remove_dir_all(root).unwrap();
+    worker
+        .recover_cleanup_authority(&failed_authority, &failed_execution)
+        .await
+        .unwrap();
+    assert_matrix_case_clean(&root, &failed_id, &worker_id, &reservations, &cleanup).await;
+
+    let peer_layout = ExecutionLayout::new(&root, &peer_id).unwrap();
+    assert!(peer_layout.root.exists());
+    assert!(peer_result
+        .diff_artifact
+        .as_ref()
+        .is_some_and(|path| Path::new(path).is_file()));
+    let peer_authority = cleanup.get(&peer_id).await.unwrap();
+    assert_eq!(
+        peer_authority.disposition().unwrap(),
+        CleanupDisposition::Retained
+    );
+    cleanup
+        .transition(
+            &peer_id,
+            CleanupDisposition::Retained,
+            CleanupDisposition::CleanupPending,
+            &peer_authority.handles,
+        )
+        .await
+        .unwrap();
+    let requested = cleanup.get(&peer_id).await.unwrap();
+    let peer_execution = executions.get(&peer_id).await.unwrap();
+    worker
+        .recover_cleanup_authority(&requested, &peer_execution)
+        .await
+        .unwrap();
+    assert_matrix_case_clean(&root, &peer_id, &worker_id, &reservations, &cleanup).await;
+    delete_matrix_records(&database_url, &failed_id, &worker_id).await;
+    delete_matrix_records(&database_url, &peer_id, &worker_id).await;
+    if root.exists() {
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failure_stage_process_helper() {
+    if std::env::var_os("AUTOSPEC_TASK5_MATRIX_HELPER").is_none() {
+        return;
+    }
+    let stage = std::env::var("AUTOSPEC_TASK5_MATRIX_STAGE").unwrap();
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").unwrap();
+    let root = PathBuf::from(std::env::var_os("AUTOSPEC_TASK5_ROOT").unwrap());
+    let remote = PathBuf::from(std::env::var_os("AUTOSPEC_TASK5_REMOTE").unwrap());
+    let daemon = std::env::var("AUTOSPEC_TASK5_DAEMON").unwrap();
+    let image = std::env::var("AUTOSPEC_TASK5_IMAGE").unwrap();
+    let worker_id = WorkerId::new(std::env::var("AUTOSPEC_TASK5_WORKER").unwrap());
+    let executions = PgExecutionStore::connect(&database_url).await.unwrap();
+    let reservations = PgReservationStore::connect(&database_url).await.unwrap();
+    let cleanup = PgCleanupAuthorityStore::connect(&database_url)
+        .await
+        .unwrap();
+    let reservation = reservations
+        .reserve_next(&worker_id)
+        .await
+        .unwrap()
+        .expect("matrix helper reserves exact queued execution");
+    let mut execution = reservation.execution;
+    cleanup
+        .begin(&execution.id, &reservation.attempt_id, &worker_id)
+        .await
+        .unwrap();
+    if stage == "post_reservation" {
+        std::process::exit(77);
+    }
+    let lifecycle = build_system_lifecycle(&root, &remote, &daemon, &image);
+    let receipt = lifecycle.allocate(&execution).await.unwrap();
+    cleanup
+        .transition(
+            &execution.id,
+            CleanupDisposition::Active(CleanupStage::Reserved),
+            CleanupDisposition::Active(CleanupStage::Storage),
+            &matrix_handles(Some(&receipt), None, None, None),
+        )
+        .await
+        .unwrap();
+    if stage == "post_storage" {
+        std::process::exit(77);
+    }
+    if stage == "mid_git_create" {
+        write_interrupted_git_create(&root, &remote, &execution);
+        std::process::exit(77);
+    }
+    let worktree = lifecycle
+        .create_worktree(&execution, &receipt)
+        .await
+        .unwrap();
+    execution.worktree_path = Some(worktree.path.clone());
+    cleanup
+        .transition(
+            &execution.id,
+            CleanupDisposition::Active(CleanupStage::Storage),
+            CleanupDisposition::Active(CleanupStage::Worktree),
+            &matrix_handles(Some(&receipt), Some(&worktree), None, None),
+        )
+        .await
+        .unwrap();
+    execution.transition(ExecutionState::Provisioning).unwrap();
+    let environment = lifecycle
+        .provision(&execution, &receipt, &worktree)
+        .await
+        .unwrap();
+    cleanup
+        .transition(
+            &execution.id,
+            CleanupDisposition::Active(CleanupStage::Worktree),
+            CleanupDisposition::Active(CleanupStage::Runtime),
+            &matrix_handles(Some(&receipt), Some(&worktree), Some(&environment), None),
+        )
+        .await
+        .unwrap();
+    if stage == "post_runtime" {
+        std::process::exit(77);
+    }
+    executions
+        .record_progress(
+            &execution,
+            &matrix_event(&execution, ExecutionEventKind::EnvironmentReady),
+        )
+        .await
+        .unwrap();
+    let packet = execution.manifest.task_packet.clone().unwrap();
+    let session = lifecycle
+        .start(&execution, &receipt, &environment, &worktree, &packet)
+        .await
+        .unwrap();
+    execution.session_id = Some(session.id.clone());
+    cleanup
+        .transition(
+            &execution.id,
+            CleanupDisposition::Active(CleanupStage::Runtime),
+            CleanupDisposition::Active(CleanupStage::PiStarted),
+            &matrix_handles(
+                Some(&receipt),
+                Some(&worktree),
+                Some(&environment),
+                Some(&session),
+            ),
+        )
+        .await
+        .unwrap();
+    execution.transition(ExecutionState::Running).unwrap();
+    executions
+        .record_progress(
+            &execution,
+            &matrix_event(&execution, ExecutionEventKind::TestsStarted),
+        )
+        .await
+        .unwrap();
+    cleanup
+        .transition(
+            &execution.id,
+            CleanupDisposition::Active(CleanupStage::PiStarted),
+            CleanupDisposition::Active(CleanupStage::Running),
+            &matrix_handles(
+                Some(&receipt),
+                Some(&worktree),
+                Some(&environment),
+                Some(&session),
+            ),
+        )
+        .await
+        .unwrap();
+    lifecycle.stop(&execution, &session).await.unwrap();
+    let capture = lifecycle.capture(&worktree).await.unwrap();
+    let artifact = lifecycle
+        .persist_evidence(&execution, &capture)
+        .await
+        .unwrap();
+    execution.transition(ExecutionState::ReviewReady).unwrap();
+    execution.result = Some(ExecutionResult {
+        execution_id: execution.id.clone(),
+        state: ExecutionState::ReviewReady,
+        failure: None,
+        branch: Some(worktree.branch.clone()),
+        base_sha: Some(worktree.base_sha.clone()),
+        diff_artifact: Some(artifact),
+        artifacts: Vec::new(),
+        tests: None,
+    });
+    let handles = matrix_handles(
+        Some(&receipt),
+        Some(&worktree),
+        Some(&environment),
+        Some(&session),
+    );
+    cleanup
+        .transition(
+            &execution.id,
+            CleanupDisposition::Active(CleanupStage::Running),
+            CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent),
+            &handles,
+        )
+        .await
+        .unwrap();
+    if stage == "post_pi_pre_event" {
+        std::process::exit(77);
+    }
+    executions
+        .record_progress_and_request_retention(
+            &execution,
+            &matrix_event(&execution, ExecutionEventKind::ReviewReady),
+        )
+        .await
+        .unwrap();
+    if stage == "review_ready_pre_retention" {
+        std::process::exit(77);
+    }
+    cleanup
+        .transition(
+            &execution.id,
+            CleanupDisposition::RetainRequested,
+            CleanupDisposition::Retained,
+            &handles,
+        )
+        .await
+        .unwrap();
+    reservations
+        .release_attempt(&execution.id, &reservation.attempt_id)
+        .await
+        .unwrap();
+    std::process::exit(77);
 }
 
 #[tokio::test]
@@ -527,9 +1040,18 @@ async fn crash_process_helper() {
         cleanup,
     ));
     let running_worker = worker.clone();
-    tokio::spawn(async move { running_worker.run(&assigned).await });
-    wait_for_running_session(executions.as_ref(), &execution_id).await;
-    std::process::exit(77);
+    let task = tokio::spawn(async move { running_worker.run(&assigned).await });
+    for _ in 0..300 {
+        let execution = executions.get(&execution_id).await.unwrap();
+        if execution.state == ExecutionState::Running && execution.session_id.is_some() {
+            std::process::exit(77);
+        }
+        if task.is_finished() {
+            panic!("worker ended before durable Running: {:?}", task.await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("execution did not reach durable Running session");
 }
 
 async fn wait_for_running_session(store: &PgExecutionStore, id: &ExecutionId) -> Execution {
@@ -593,6 +1115,196 @@ fn build_system_lifecycle(
         )),
         Arc::new(FilesystemEvidenceStore::new(root)),
     ))
+}
+
+fn matrix_worker_registration(
+    id: WorkerId,
+    capability: String,
+    daemon_id: &str,
+    image_id: &str,
+) -> WorkerRegistration {
+    let trusted = TrustedVerifierImage::new(image_id, "/bin/stat").unwrap();
+    WorkerRegistration {
+        id,
+        capabilities: WorkerCapabilities {
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            cpu: 2,
+            memory_mib: 2048,
+            disk_gib: 1,
+            runtimes: vec![RuntimeKind::Docker],
+            capabilities: vec!["docker".into(), capability],
+            max_concurrent_executions: 1,
+        },
+        state: WorkerState::Ready,
+        running_executions: 0,
+        last_heartbeat: Utc::now(),
+        capability_proof: Some(WorkerCapabilityProof {
+            storage_backend: "fixed-test-filesystem".into(),
+            storage_pool_identity: "fixed-test-pool".into(),
+            docker_daemon_id: daemon_id.into(),
+            docker_verifier: image_id.into(),
+            docker_method_version: trusted.proof_method(),
+        }),
+    }
+}
+
+fn matrix_handles(
+    receipt: Option<&execution_storage::AllocationReceipt>,
+    worktree: Option<&Worktree>,
+    runtime: Option<&EnvironmentHandle>,
+    session: Option<&SessionRef>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "receipt": receipt,
+        "worktree": worktree.map(|worktree| serde_json::json!({
+            "execution_id": worktree.execution_id,
+            "path": worktree.path,
+            "branch": worktree.branch,
+            "base_sha": worktree.base_sha,
+            "repository": worktree.repository,
+        })),
+        "runtime": runtime.map(|runtime| serde_json::json!({
+            "execution_id": runtime.execution_id,
+            "network": runtime.network,
+            "agent_container": runtime.agent_container,
+            "container_id": runtime.verified_agent_container.container_id,
+            "daemon_id": runtime.verified_agent_container.daemon_id,
+            "labels": runtime.verified_agent_container.labels,
+            "mounts": runtime.verified_agent_container.mounts.iter().map(|mount| serde_json::json!({
+                "source": mount.source,
+                "target": mount.target,
+                "writable": mount.writable,
+            })).collect::<Vec<_>>(),
+            "service_containers": runtime.service_containers,
+            "volumes": runtime.volumes,
+            "credentials_path": runtime.credentials_path,
+        })),
+        "session": session.map(|session| serde_json::json!({
+            "id": session.id,
+            "path": session.path,
+            "execution_id": session.execution_id,
+            "worktree_path": session.worktree_path,
+        })),
+    })
+}
+
+fn matrix_event(execution: &Execution, kind: ExecutionEventKind) -> ExecutionEvent {
+    ExecutionEvent {
+        execution_id: execution.id.clone(),
+        attempt_id: execution.attempt_id.clone(),
+        sequence: 0,
+        at: Utc::now(),
+        state: execution.state,
+        kind,
+    }
+}
+
+fn write_interrupted_git_create(root: &Path, remote: &Path, execution: &Execution) {
+    let layout = ExecutionLayout::new(root, &execution.id).unwrap();
+    run(Command::new("git").args([
+        "clone",
+        &format!("file://{}/owner/repo.git", remote.display()),
+        layout.repository.to_str().unwrap(),
+    ]));
+    let metadata = root.join("worktrees");
+    fs::create_dir_all(&metadata).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&metadata, fs::Permissions::from_mode(0o700)).unwrap();
+    let base_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                layout.repository.to_str().unwrap(),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let intent = serde_json::json!({
+        "labels": execution.labels.to_map(),
+        "repository": execution.manifest.repository.repo,
+        "base_ref": execution.manifest.repository.base_ref,
+        "base_sha": base_sha,
+        "branch": execution.manifest.repository.branch.as_deref().unwrap(),
+        "repository_path": layout.repository,
+        "phase": "cloning",
+    });
+    let intent_path = metadata.join(format!(".create-{}.json", execution.id));
+    fs::write(&intent_path, serde_json::to_vec_pretty(&intent).unwrap()).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&intent_path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+async fn assert_matrix_case_clean(
+    root: &Path,
+    execution_id: &ExecutionId,
+    worker_id: &WorkerId,
+    reservations: &PgReservationStore,
+    cleanup: &PgCleanupAuthorityStore,
+) {
+    assert!(!ExecutionLayout::new(root, execution_id)
+        .unwrap()
+        .root
+        .exists());
+    assert!(!reservations
+        .list_for_worker(worker_id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|reservation| &reservation.execution.id == execution_id));
+    assert!(!cleanup
+        .list_for_worker(worker_id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|authority| &authority.execution_id == execution_id));
+    let docker = Command::new("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=autospec.execution_id={execution_id}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&docker.stdout).trim().is_empty());
+}
+
+async fn delete_matrix_records(
+    database_url: &str,
+    execution_id: &ExecutionId,
+    worker_id: &WorkerId,
+) {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(database_url)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cleanup_authorities WHERE execution_id = $1")
+        .bind(execution_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM executions WHERE id = $1")
+        .bind(execution_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "DELETE FROM workers w
+         WHERE id = $1
+           AND NOT EXISTS (SELECT 1 FROM executions WHERE worker_id = w.id)
+           AND NOT EXISTS (SELECT 1 FROM execution_attempts WHERE worker_id = w.id)",
+    )
+    .bind(worker_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
 }
 
 fn queued_execution(
@@ -686,7 +1398,24 @@ fn initialize_state_root(root: &Path) {
     }
 }
 
+async fn acquire_real_test_lock(database_url: &str) -> PgConnection {
+    let mut connection = PgConnection::connect(database_url).await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(870_051_003)")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection
+}
+
 fn create_stub_repository(remote_root: &Path) {
+    create_stub_repository_with_behavior(remote_root, true);
+}
+
+fn create_completing_stub_repository(remote_root: &Path) {
+    create_stub_repository_with_behavior(remote_root, false);
+}
+
+fn create_stub_repository_with_behavior(remote_root: &Path, block_first_run: bool) {
     let remote = remote_root.join("owner/repo.git");
     fs::create_dir_all(remote.parent().unwrap()).unwrap();
     run(Command::new("git").args(["init", "--bare", remote.to_str().unwrap()]));
@@ -701,9 +1430,16 @@ fn create_stub_repository(remote_root: &Path) {
         "task5@example.invalid",
     ]));
     let pi = seed.join("pi");
+    let first_run_gate = if block_first_run {
+        "if test \"$count\" -eq 1; then while :; do sleep 1; done; fi\n"
+    } else {
+        ""
+    };
     fs::write(
         &pi,
-        "#!/bin/sh\ncount=1\nif test -f /session/invocations; then count=$(( $(cat /session/invocations) + 1 )); fi\nprintf '%s\\n' \"$count\" > /session/invocations\nprintf '%s\\n' '{\"type\":\"session\",\"id\":\"e2e\"}' '{\"type\":\"agent_start\"}' '{\"type\":\"turn_start\"}'\nif test \"$count\" -eq 1; then while :; do sleep 1; done; fi\nprintf 'worker-e2e-%s\\n' \"$count\" > /workspace/result.txt\nprintf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"stopReason\":\"stop\"}}' '{\"type\":\"agent_settled\"}'\n",
+        format!(
+            "#!/bin/sh\ncount=1\nif test -f /session/invocations; then count=$(( $(cat /session/invocations) + 1 )); fi\nprintf '%s\\n' \"$count\" > /session/invocations\nprintf '%s\\n' '{{\"type\":\"session\",\"id\":\"e2e\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"turn_start\"}}'\n{first_run_gate}printf 'worker-e2e-%s\\n' \"$count\" > /workspace/result.txt\nprintf '%s\\n' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"stopReason\":\"stop\"}}}}' '{{\"type\":\"agent_settled\"}}'\n"
+        ),
     )
     .unwrap();
     #[cfg(unix)]

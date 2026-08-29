@@ -13,6 +13,7 @@ mod manager;
 
 use execution_storage::AllocationReceipt;
 use orchestrator_core::{ExecutionId, OwnershipLabels};
+use std::path::Path;
 use thiserror::Error;
 
 pub use filesystem::{SystemWorktreeFilesystem, WorktreeFilesystem, WorktreeFilesystemPoint};
@@ -86,6 +87,13 @@ pub trait WorktreeManager: Send + Sync {
 
     /// Remove exactly the independent repository this execution owns.
     fn destroy(&self, worktree: &Worktree) -> Result<(), WorktreeError>;
+
+    /// Recover an exact journaled create that failed before an owner record was durable.
+    fn recover_interrupted_create(
+        &self,
+        labels: &OwnershipLabels,
+        repository_root: &Path,
+    ) -> Result<(), WorktreeError>;
 
     /// Report repositories whose owning execution is no longer live.
     fn find_stale(&self, live: &[ExecutionId]) -> Result<Vec<Worktree>, WorktreeError>;

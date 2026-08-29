@@ -10,7 +10,7 @@ use harness_traits::{AgentHarness, SessionRef};
 use orchestrator_core::{
     Execution, ExecutionEvent, ExecutionId, OwnershipLabels, SessionId, TaskPacket,
 };
-use orchestrator_persistence::CleanupAuthority;
+use orchestrator_persistence::{CleanupAuthority, CleanupDisposition};
 use runtime_docker::{DockerRuntime, TrustedVerifierImage};
 use runtime_traits::{EnvironmentHandle, Runtime, VerifiedAgentContainer, VerifiedBindMount};
 use serde::Deserialize;
@@ -393,6 +393,41 @@ struct DurableSessionHandle {
     path: String,
     execution_id: ExecutionId,
     worktree_path: String,
+}
+
+fn durable_worktree(handle: DurableWorktreeHandle) -> Worktree {
+    Worktree {
+        execution_id: handle.execution_id,
+        path: handle.path,
+        branch: handle.branch,
+        base_sha: handle.base_sha,
+        repository: handle.repository,
+    }
+}
+
+fn durable_environment(handle: DurableRuntimeHandle) -> EnvironmentHandle {
+    EnvironmentHandle {
+        execution_id: handle.execution_id,
+        network: handle.network,
+        agent_container: handle.agent_container,
+        verified_agent_container: VerifiedAgentContainer {
+            container_id: handle.container_id,
+            daemon_id: handle.daemon_id,
+            labels: handle.labels,
+            mounts: handle
+                .mounts
+                .into_iter()
+                .map(|mount| VerifiedBindMount {
+                    source: mount.source,
+                    target: mount.target,
+                    writable: mount.writable,
+                })
+                .collect(),
+        },
+        service_containers: handle.service_containers,
+        volumes: handle.volumes,
+        credentials_path: handle.credentials_path,
+    }
 }
 
 #[derive(Deserialize)]
@@ -851,6 +886,23 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             .map_err(|error| LifecycleError::Step(error.to_string()))
     }
 
+    async fn recover_interrupted_worktree(
+        &self,
+        execution: &Execution,
+        _receipt: Option<&AllocationReceipt>,
+    ) -> Result<(), LifecycleError> {
+        let layout = ExecutionLayout::new(&self.state_root, &execution.id)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let manager = Arc::clone(&self.worktrees);
+        let labels = execution.labels.clone();
+        tokio::task::spawn_blocking(move || {
+            manager.recover_interrupted_create(&labels, &layout.repository)
+        })
+        .await
+        .map_err(|error| LifecycleError::Step(error.to_string()))?
+        .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
     async fn release_storage(&self, receipt: &AllocationReceipt) -> Result<(), LifecycleError> {
         let storage = Arc::clone(&self.storage);
         let receipt = receipt.clone();
@@ -1053,10 +1105,127 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         if let Some(worktree) = worktree {
             self.destroy_worktree(&worktree).await?;
         }
+        self.recover_interrupted_worktree(execution, receipt.as_ref())
+            .await?;
         if let Some(receipt) = receipt {
             self.release_storage(&receipt).await?;
         }
         Ok(())
+    }
+
+    async fn cleanup_authority_step(
+        &self,
+        authority: &CleanupAuthority,
+        execution: &Execution,
+        disposition: CleanupDisposition,
+    ) -> Result<CleanupDisposition, LifecycleError> {
+        let handles: DurableCleanupHandles = serde_json::from_value(authority.handles.clone())
+            .map_err(|error| LifecycleError::Step(format!("decode cleanup authority: {error}")))?;
+        let layout = ExecutionLayout::new(&self.state_root, &authority.execution_id)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        match disposition {
+            CleanupDisposition::CleanupPending => {
+                if let (Some(receipt), Some(runtime), Some(worktree)) =
+                    (handles.receipt, handles.runtime, handles.worktree)
+                {
+                    if receipt.labels.execution_id != authority.execution_id
+                        || runtime.execution_id != authority.execution_id
+                        || worktree.execution_id != authority.execution_id
+                    {
+                        return Err(LifecycleError::Step(
+                            "Pi cleanup handles belong to another execution".into(),
+                        ));
+                    }
+                    let environment = durable_environment(runtime);
+                    let worktree = durable_worktree(worktree);
+                    let harness = self
+                        .harnesses
+                        .build(execution, &receipt, &environment, &worktree)
+                        .await?;
+                    harness
+                        .recover_abandoned()
+                        .await
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                }
+                Ok(CleanupDisposition::RuntimeStopped)
+            }
+            CleanupDisposition::RuntimeStopped => {
+                if let Some(receipt) = handles.receipt {
+                    if receipt.labels.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "runtime cleanup receipt belongs to another execution".into(),
+                        ));
+                    }
+                    let runtime_present = !docker_resource_names(
+                        &self.docker_binary,
+                        self.docker_socket.as_deref(),
+                        &["ps", "-a"],
+                        &authority.execution_id,
+                        "{{.Names}}",
+                    )?
+                    .is_empty()
+                        || !docker_resource_names(
+                            &self.docker_binary,
+                            self.docker_socket.as_deref(),
+                            &["network", "ls"],
+                            &authority.execution_id,
+                            "{{.Name}}",
+                        )?
+                        .is_empty()
+                        || !docker_resource_names(
+                            &self.docker_binary,
+                            self.docker_socket.as_deref(),
+                            &["volume", "ls"],
+                            &authority.execution_id,
+                            "{{.Name}}",
+                        )?
+                        .is_empty();
+                    if runtime_present {
+                        self.runtimes
+                            .build(execution, &receipt)
+                            .await?
+                            .destroy(&receipt.labels)
+                            .await
+                            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                    }
+                }
+                Ok(CleanupDisposition::RuntimeDestroyed)
+            }
+            CleanupDisposition::RuntimeDestroyed => {
+                if let Some(worktree) = handles.worktree {
+                    let worktree = durable_worktree(worktree);
+                    if worktree.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "worktree cleanup handle belongs to another execution".into(),
+                        ));
+                    }
+                    self.destroy_worktree(&worktree).await?;
+                }
+                let manager = Arc::clone(&self.worktrees);
+                let labels = execution.labels.clone();
+                tokio::task::spawn_blocking(move || {
+                    manager.recover_interrupted_create(&labels, &layout.repository)
+                })
+                .await
+                .map_err(|error| LifecycleError::Step(error.to_string()))?
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                Ok(CleanupDisposition::GitRecoveredCleaned)
+            }
+            CleanupDisposition::GitRecoveredCleaned => {
+                if let Some(receipt) = handles.receipt {
+                    if receipt.labels.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "storage cleanup receipt belongs to another execution".into(),
+                        ));
+                    }
+                    self.release_storage(&receipt).await?;
+                }
+                Ok(CleanupDisposition::StorageReleased)
+            }
+            other => Err(LifecycleError::Step(format!(
+                "cleanup step cannot advance {other}"
+            ))),
+        }
     }
 
     async fn adopt(&self, execution: &Execution) -> Result<AdoptedExecution, LifecycleError> {

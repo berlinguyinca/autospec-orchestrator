@@ -9,7 +9,7 @@ mod workers;
 
 use axum::{routing::get, Router};
 use orchestrator_core::API_VERSION;
-use orchestrator_persistence::{PgReservationStore, PgWorkerStore};
+use orchestrator_persistence::{PgCleanupAuthorityStore, PgReservationStore, PgWorkerStore};
 use std::{env, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 
@@ -45,7 +45,10 @@ pub async fn serve(addr: &str) -> Result<()> {
         Arc::new(PgWorkerStore::connect(&database_url).await?),
         Arc::new(PgReservationStore::connect(&database_url).await?),
         token,
-    );
+    )
+    .with_cleanup_authorities(Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url).await?,
+    ));
     let reaper = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));

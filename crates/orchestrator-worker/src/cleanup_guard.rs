@@ -17,6 +17,7 @@ pub(crate) struct CleanupGuard {
     pub(crate) environment: Option<EnvironmentHandle>,
     pub(crate) session: Option<SessionRef>,
     pub(crate) runtime_created: bool,
+    agent_stopped: bool,
 }
 
 impl CleanupGuard {
@@ -29,10 +30,14 @@ impl CleanupGuard {
             environment: None,
             session: None,
             runtime_created: false,
+            agent_stopped: false,
         }
     }
 
     pub(crate) async fn stop_agent(&mut self) -> Result<(), WorkerError> {
+        if self.agent_stopped {
+            return Ok(());
+        }
         let Some(session) = self.session.as_ref().cloned() else {
             return Ok(());
         };
@@ -43,14 +48,18 @@ impl CleanupGuard {
         .await
         .map_err(|_| WorkerError::Cleanup("timed out stopping Pi".into()))?
         .map_err(WorkerError::from)?;
-        self.session = None;
+        self.agent_stopped = true;
         Ok(())
     }
 
-    pub(crate) async fn cleanup(&mut self) -> Result<(), WorkerError> {
-        if self.session.is_some() {
+    pub(crate) async fn stop_runtime_process(&mut self) -> Result<(), WorkerError> {
+        if self.session.is_some() && !self.agent_stopped {
             self.stop_agent().await?;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn destroy_runtime(&mut self) -> Result<(), WorkerError> {
         if self.runtime_created {
             tokio::time::timeout(
                 CLEANUP_TIMEOUT,
@@ -61,6 +70,10 @@ impl CleanupGuard {
             .map_err(WorkerError::from)?;
             self.runtime_created = false;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn destroy_worktree(&mut self) -> Result<(), WorkerError> {
         if let Some(worktree) = self.worktree.as_ref().cloned() {
             tokio::time::timeout(CLEANUP_TIMEOUT, self.lifecycle.destroy_worktree(&worktree))
                 .await
@@ -68,6 +81,13 @@ impl CleanupGuard {
                 .map_err(WorkerError::from)?;
             self.worktree = None;
         }
+        self.lifecycle
+            .recover_interrupted_worktree(&self.execution, self.receipt.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn release_storage(&mut self) -> Result<(), WorkerError> {
         if let Some(receipt) = self.receipt.as_ref().cloned() {
             tokio::time::timeout(CLEANUP_TIMEOUT, self.lifecycle.release_storage(&receipt))
                 .await

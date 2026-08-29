@@ -20,7 +20,7 @@ use git_worktree::{DiffCapture, Worktree};
 use harness_traits::SessionRef;
 use orchestrator_core::{Execution, ExecutionEvent, ExecutionResult, TaskPacket};
 use orchestrator_persistence::{
-    CleanupAuthority, CleanupAuthorityStore, ExecutionStore, ReservationStore,
+    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore, ReservationStore,
 };
 use runtime_traits::EnvironmentHandle;
 use std::sync::{
@@ -98,6 +98,13 @@ pub trait ExecutionLifecycle: Send + Sync {
     ) -> Result<String, LifecycleError>;
     async fn destroy_runtime(&self, execution: &Execution) -> Result<(), LifecycleError>;
     async fn destroy_worktree(&self, worktree: &Worktree) -> Result<(), LifecycleError>;
+    async fn recover_interrupted_worktree(
+        &self,
+        _execution: &Execution,
+        _receipt: Option<&AllocationReceipt>,
+    ) -> Result<(), LifecycleError> {
+        Ok(())
+    }
     async fn release_storage(&self, receipt: &AllocationReceipt) -> Result<(), LifecycleError>;
     async fn cleanup_authority(
         &self,
@@ -107,6 +114,24 @@ pub trait ExecutionLifecycle: Send + Sync {
         Err(LifecycleError::Step(
             "execution lifecycle does not support durable authority cleanup".into(),
         ))
+    }
+
+    async fn cleanup_authority_step(
+        &self,
+        authority: &CleanupAuthority,
+        execution: &Execution,
+        disposition: CleanupDisposition,
+    ) -> Result<CleanupDisposition, LifecycleError> {
+        self.cleanup_authority(authority, execution).await?;
+        match disposition {
+            CleanupDisposition::CleanupPending => Ok(CleanupDisposition::RuntimeStopped),
+            CleanupDisposition::RuntimeStopped => Ok(CleanupDisposition::RuntimeDestroyed),
+            CleanupDisposition::RuntimeDestroyed => Ok(CleanupDisposition::GitRecoveredCleaned),
+            CleanupDisposition::GitRecoveredCleaned => Ok(CleanupDisposition::StorageReleased),
+            other => Err(LifecycleError::Step(format!(
+                "cleanup step cannot advance {other}"
+            ))),
+        }
     }
 
     async fn adopt(&self, _execution: &Execution) -> Result<AdoptedExecution, LifecycleError> {
@@ -195,16 +220,76 @@ impl Worker {
         authority: &CleanupAuthority,
         execution: &Execution,
     ) -> Result<(), WorkerError> {
-        self.lifecycle
-            .cleanup_authority(authority, execution)
-            .await?;
-        self.reservations
-            .release_attempt(&authority.execution_id, &authority.attempt_id)
-            .await
+        let mut disposition = authority
+            .disposition()
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
-        self.cleanup_authorities
-            .resolve(&authority.execution_id)
-            .await
-            .map_err(|error| WorkerError::Persistence(error.to_string()))
+        if disposition == CleanupDisposition::Retained {
+            return Ok(());
+        }
+        if !matches!(
+            disposition,
+            CleanupDisposition::RuntimeStopped
+                | CleanupDisposition::RuntimeDestroyed
+                | CleanupDisposition::GitRecoveredCleaned
+                | CleanupDisposition::StorageReleased
+                | CleanupDisposition::ReservationReleased
+        ) && disposition != CleanupDisposition::CleanupPending
+        {
+            self.cleanup_authorities
+                .transition(
+                    &authority.execution_id,
+                    disposition,
+                    CleanupDisposition::CleanupPending,
+                    &authority.handles,
+                )
+                .await
+                .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+            disposition = CleanupDisposition::CleanupPending;
+        }
+        while matches!(
+            disposition,
+            CleanupDisposition::CleanupPending
+                | CleanupDisposition::RuntimeStopped
+                | CleanupDisposition::RuntimeDestroyed
+                | CleanupDisposition::GitRecoveredCleaned
+        ) {
+            let next = self
+                .lifecycle
+                .cleanup_authority_step(authority, execution, disposition)
+                .await?;
+            self.cleanup_authorities
+                .transition(
+                    &authority.execution_id,
+                    disposition,
+                    next,
+                    &authority.handles,
+                )
+                .await
+                .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+            disposition = next;
+        }
+        if disposition == CleanupDisposition::StorageReleased {
+            self.reservations
+                .release_attempt(&authority.execution_id, &authority.attempt_id)
+                .await
+                .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+            self.cleanup_authorities
+                .transition(
+                    &authority.execution_id,
+                    CleanupDisposition::StorageReleased,
+                    CleanupDisposition::ReservationReleased,
+                    &authority.handles,
+                )
+                .await
+                .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+            disposition = CleanupDisposition::ReservationReleased;
+        }
+        if disposition == CleanupDisposition::ReservationReleased {
+            self.cleanup_authorities
+                .resolve(&authority.execution_id)
+                .await
+                .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        }
+        Ok(())
     }
 }

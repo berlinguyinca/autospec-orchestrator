@@ -1236,6 +1236,41 @@ fn create_intent_recovers_partial_clone_after_restart() {
 }
 
 #[test]
+fn interrupted_create_can_be_cleaned_without_a_worktree_owner() {
+    let repository = TestRepository::new();
+    let state = tempfile::tempdir().expect("create state root");
+    let filesystem = Arc::new(InjectedFilesystem::new(
+        InjectedFailure::CloneAndRollbackRemove,
+    ));
+    let manager = manager_with_filesystem(&state, &repository, filesystem);
+    let execution_id = "project-11-impl-recover-only";
+    let labels = labels(execution_id, repository.canonical());
+    let root = bounded_repository_root(&state, execution_id);
+    let receipt = allocation_receipt(state.path(), &labels);
+    manager
+        .create_in(
+            &labels,
+            repository.canonical(),
+            "HEAD",
+            "autospec/project-11-impl-recover-only",
+            &receipt,
+        )
+        .expect_err("leave durable create intent and partial repository");
+    let intent = state
+        .path()
+        .join("worktrees/.create-project-11-impl-recover-only.json");
+    assert!(intent.is_file());
+    assert!(!root.join(".autospec-owner.json").exists());
+
+    manager
+        .recover_interrupted_create(&labels, &root)
+        .expect("recover exact journal without synthesized worktree");
+
+    assert!(!intent.exists());
+    assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+}
+
+#[test]
 fn create_intent_recovery_requires_live_verification_before_mutation() {
     let repository = TestRepository::new();
     let state = tempfile::tempdir().expect("create state root");

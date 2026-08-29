@@ -29,27 +29,41 @@ Round 2 hardening additionally provides:
 - daemon per-record recovery isolation, reservation-error backoff without dropping active tasks, and heartbeat-404 re-registration;
 - removal of the scheduler's pre-capability `LIMIT 64`, which could starve compatible work behind older incompatible queued rows.
 
+Round 3 closes the remaining disposition and crash-recovery gaps:
+
+- one typed, transactional cleanup state machine: `ACTIVE:<stage>` → `RETAIN_REQUESTED` / `CLEANUP_PENDING` → physical cleanup checkpoints → `RESERVATION_RELEASED` → `RESOLVED`;
+- atomic `ReviewReady` progress, event allocation, and retention request, followed by unconditional capacity release for retained resumable executions;
+- authenticated explicit cleanup requests plus daemon startup and periodic reconciliation of retained/pending authorities;
+- startup fencing and persistence-mode classification before capacity release, including adoption of valid resumable post-Pi authority while the execution row is still `Provisioning`;
+- physical cleanup checkpointing after Pi stop, runtime destroy, interrupted Git-create recovery, storage release, and reservation release, so later database failures resume below already-confirmed boundaries;
+- journal-aware recovery of partial Git creation even when no worktree owner record was committed;
+- a real seven-stage child-process crash matrix and a concurrent peer-isolation scenario over PostgreSQL, Git, Docker, execution storage, and stub Pi.
+
 ## Commits
 
 - `8ac7143` — Prevent worker oversubscription with durable capability-backed reservations
 - `4de91d9` — Keep execution failures isolated while preserving recovery authority
 - `194680f8e170c1c02e73b937e69dad3cd44809ee` — Fence worker control and cleanup authority at durable boundaries
-- This report's commit — Resume exact Pi authority after worker process loss
+- `4567709` — Resume exact Pi authority after worker process loss
+- `1c2e8f9` — Keep worker recovery authoritative across every durable boundary
+- This report's commit — Make worker cleanup disposition durable across crashes
 
 ## Verification
 
-- `cargo fmt --all` and `git diff --check` — passed.
-- Current stable exact-source verification passed as an equivalent segmented workspace gate: `cargo test --workspace --exclude harness-pi --exclude runtime-docker -- --test-threads=1`, `cargo test -p harness-pi --test pi_harness`, and the 18-test runtime-docker integration suite.
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
+- `AUTOSPEC_DATABASE_URL=… cargo test --workspace` — passed on current stable, including 38 real Docker/Pi, 18 real Docker runtime, 59 real Git, 18 real PostgreSQL, 11 worker lifecycle, and 5 worker real-E2E tests.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed on current stable.
+- `AUTOSPEC_DATABASE_URL=… cargo +1.85.0 test --workspace` — passed in full with the same real boundary suites.
 - `cargo +1.85.0 clippy --workspace --all-targets -- -D warnings` — passed.
-- `AUTOSPEC_DATABASE_URL=… cargo +1.85.0 test --workspace -- --test-threads=1` — passed in full, including 38 real Docker/Pi, 18 real Docker runtime, 58 real Git, and 15 real PostgreSQL tests.
-- Focused Task 5 suite — passed: API route integration 2/2, autospec-worker 3/3, scheduler 4/4, worker lifecycle 10/10, health 3/3, recovery/evidence 3/3, and PostgreSQL 15/15.
-- Separate-process crash/restart E2E — passed 2/2: a helper process reserves and starts Pi, exits without `Drop`, and a fresh lifecycle/storage/worker instance adopts the exact session and attempt, observes two total Pi invocations (initial plus resume), persists diff/evidence, and removes runtime resources.
+- Focused Task 5 suite — passed: API route integration 3/3, autospec-worker 3/3, scheduler 4/4, worker lifecycle 11/11, health 3/3, recovery/evidence 3/3, PostgreSQL 18/18, and Git worktree 59/59.
+- Worker real-E2E target — passed 5/5. Three are substantive tests: `crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cleanup`, `real_failure_stage_matrix_reconciles_without_resource_leaks`, and `real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer`; two are child-process helpers and are not counted as scenarios.
+- The seven-stage matrix crashes after reservation, storage, interrupted Git create, runtime, Pi-before-event, ReviewReady-before-retention, and retention; each fresh manager reconciliation proves the required retained/resolved disposition, released reservation, and absence of exact Docker/Git/storage/Pi leaks after explicit cleanup.
+- The peer-isolation test runs two real executions concurrently, crashes one after runtime creation, proves the other reaches `ReviewReady` with durable evidence and intact retained resources, then reconciles and cleans each exact authority independently.
 - PostgreSQL concurrency test launched 16 simultaneous reservations against four slots and assigned exactly four unique executions.
-- Concurrent workspace-wide Docker gates from another process caused one anonymous-volume observation and one 90-second E2E startup timeout. Both failed cases passed immediately in isolation; the exact-source segmented current gate and complete Rust 1.85 gate passed after removing only aborted, exactly identified test resources.
 
 ## Concerns
 
 - The monolithic E2E uses a test-only fixed-capacity filesystem backend so it can run safely where an APFS/LVM pool is unavailable. Production storage remains configured through APFS/LVM and fails closed when that capability is absent.
+- PostgreSQL advisory locking serializes the three production-shaped real worker scenarios inside one test binary; their subprocess helpers do not acquire the lock and are excluded from the scenario count.
 - Startup adoption accepts only exact, live authority: a Ready storage receipt, pinned worktree/session layout, matching Git owner, immutable Docker container proof and mounts, the complete manifest resource set, and one matching Pi hold. One invalid record is retained or cleaned independently and does not abort the daemon or create a duplicate workload.
 - Recovery policy remains authority classification only. Retry and workflow decisions remain outside this repository as required.
