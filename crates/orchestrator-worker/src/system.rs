@@ -8,7 +8,7 @@ use git_worktree::{DiffCapture, Worktree, WorktreeManager};
 use harness_pi::{PiHarness, PiHarnessConfig};
 use harness_traits::{AgentHarness, SessionRef};
 use orchestrator_core::{
-    Execution, ExecutionEvent, ExecutionId, ExecutionState, OwnershipLabels, SessionId, TaskPacket,
+    Execution, ExecutionEvent, ExecutionId, OwnershipLabels, SessionId, TaskPacket,
 };
 use orchestrator_persistence::{ArtifactStore, CleanupAuthority, CleanupDisposition};
 use runtime_docker::{DockerRuntime, TrustedVerifierImage};
@@ -100,10 +100,13 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
                 .path
                 .starts_with(receipt.mount_path.join("credentials"))
         {
-            let _ = self.credentials.revoke(&execution.id).await;
-            return Err(LifecycleError::Step(
-                "credential broker returned invalid execution authority".into(),
-            ));
+            let revocation = self.credentials.revoke(&execution.id).await;
+            return Err(LifecycleError::Step(match revocation {
+                Ok(()) => "credential broker returned invalid execution authority".into(),
+                Err(error) => format!(
+                    "credential broker returned invalid execution authority; credential revocation failed: {error}"
+                ),
+            }));
         }
         match DockerRuntime::connect_with_verified_execution_storage(
             self.socket.as_deref(),
@@ -215,6 +218,18 @@ impl HarnessFactory for VerifiedPiHarnessFactory {
         config.pi_executable = self.pi_executable.clone();
         config.tools = self.tools.clone();
         config.skills = self.skills.clone();
+        let credential_path = environment
+            .credentials_path
+            .as_ref()
+            .ok_or_else(|| LifecycleError::Step("Pi harness lacks credential authority".into()))?;
+        let credential = std::fs::read(credential_path)
+            .map_err(|error| LifecycleError::Step(format!("read Pi credential: {error}")))?;
+        let token = credential
+            .split(|byte| *byte == b'\n')
+            .next()
+            .filter(|token| token.len() >= 32)
+            .ok_or_else(|| LifecycleError::Step("Pi credential is malformed".into()))?;
+        config.credential_redactions = vec![token.to_vec()];
         config.model_policy = Some(execution.manifest.agent.model_policy.clone());
         Ok(Arc::new(PiHarness::new(config)))
     }
@@ -350,6 +365,11 @@ fn validate_evidence_component(value: &str, purpose: &str) -> Result<(), Lifecyc
 
 /// Production composition of the worker lifecycle's independently testable
 /// storage, Git, runtime, harness, and evidence boundaries.
+struct KnownSecret {
+    token: Vec<u8>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
 pub struct SystemExecutionLifecycle {
     state_root: PathBuf,
     verifier: Arc<dyn ReadyAllocationVerifier>,
@@ -362,6 +382,7 @@ pub struct SystemExecutionLifecycle {
     evidence: Arc<dyn EvidenceStore>,
     active_runtimes: Mutex<BTreeMap<ExecutionId, Arc<dyn Runtime>>>,
     active_harnesses: Mutex<BTreeMap<ExecutionId, Arc<dyn AgentHarness>>>,
+    known_secrets: Mutex<BTreeMap<ExecutionId, KnownSecret>>,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +414,7 @@ impl SystemExecutionLifecycle {
             evidence,
             active_runtimes: Mutex::new(BTreeMap::new()),
             active_harnesses: Mutex::new(BTreeMap::new()),
+            known_secrets: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -413,6 +435,84 @@ impl SystemExecutionLifecycle {
             .cloned()
             .ok_or_else(|| LifecycleError::Step(format!("harness is not active for {id}")))
     }
+
+    fn remember_and_validate_credentials(
+        &self,
+        execution: &Execution,
+        environment: &EnvironmentHandle,
+    ) -> Result<(), LifecycleError> {
+        let path = environment.credentials_path.as_ref().ok_or_else(|| {
+            LifecycleError::Step("execution runtime lacks credential authority".into())
+        })?;
+        let bytes = std::fs::read(path)
+            .map_err(|error| LifecycleError::Step(format!("read credential authority: {error}")))?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| LifecycleError::Step("credential authority is malformed".into()))?;
+        let mut lines = text.lines();
+        let token = lines
+            .next()
+            .filter(|token| token.len() >= 32)
+            .ok_or_else(|| LifecycleError::Step("credential authority is malformed".into()))?;
+        let expires_at = lines
+            .next()
+            .and_then(|expiry| expiry.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .ok_or_else(|| LifecycleError::Step("credential authority is malformed".into()))?;
+        if expires_at <= chrono::Utc::now() {
+            return Err(LifecycleError::Step(
+                "execution credential expired before use".into(),
+            ));
+        }
+        self.known_secrets
+            .lock()
+            .map_err(|_| LifecycleError::Step("secret registry lock poisoned".into()))?
+            .insert(
+                execution.id.clone(),
+                KnownSecret {
+                    token: token.as_bytes().to_vec(),
+                    expires_at,
+                },
+            );
+        Ok(())
+    }
+
+    fn ensure_credentials_live(&self, id: &ExecutionId) -> Result<(), LifecycleError> {
+        let secrets = self
+            .known_secrets
+            .lock()
+            .map_err(|_| LifecycleError::Step("secret registry lock poisoned".into()))?;
+        let secret = secrets
+            .get(id)
+            .ok_or_else(|| LifecycleError::Step("credential authority is unavailable".into()))?;
+        if secret.expires_at <= chrono::Utc::now() {
+            return Err(LifecycleError::Step(
+                "execution credential expired before use".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_secret(&self, id: &ExecutionId, bytes: &[u8]) -> Result<(), LifecycleError> {
+        let secrets = self
+            .known_secrets
+            .lock()
+            .map_err(|_| LifecycleError::Step("secret registry lock poisoned".into()))?;
+        if secrets
+            .get(id)
+            .is_some_and(|secret| contains_bytes(bytes, &secret.token))
+        {
+            return Err(LifecycleError::Step(
+                "credential exfiltration was rejected".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 #[derive(Deserialize)]
@@ -759,6 +859,30 @@ fn docker_resource_names(
         .collect())
 }
 
+fn docker_container_id(
+    docker: &Path,
+    socket: Option<&str>,
+    container: &str,
+) -> Result<String, LifecycleError> {
+    let output = docker_command(docker, socket)
+        .args([
+            "inspect",
+            "--type",
+            "container",
+            "--format={{.Id}}",
+            container,
+        ])
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !output.status.success() || id.is_empty() {
+        return Err(LifecycleError::Step(
+            "durable agent container identity is unavailable".into(),
+        ));
+    }
+    Ok(id)
+}
+
 fn docker_command(binary: &Path, socket: Option<&str>) -> Command {
     let mut command = Command::new(binary);
     if let Some(socket) = socket {
@@ -813,14 +937,23 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         _: &Worktree,
     ) -> Result<EnvironmentHandle, LifecycleError> {
         let runtime = self.runtimes.build(execution, receipt).await?;
-        let environment = runtime
+        let environment = match runtime
             .provision(
                 &execution.labels,
                 &execution.manifest.runtime,
                 &execution.manifest.services,
             )
             .await
-            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        {
+            Ok(environment) => environment,
+            Err(error) => {
+                let revocation = self.runtimes.revoke_credentials(&execution.id).await;
+                return Err(LifecycleError::Step(match revocation {
+                    Ok(()) => error.to_string(),
+                    Err(revoke) => format!("{error}; credential revocation failed: {revoke}"),
+                }));
+            }
+        };
         self.active_runtimes
             .lock()
             .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
@@ -836,6 +969,11 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         worktree: &Worktree,
         packet: &TaskPacket,
     ) -> Result<SessionRef, LifecycleError> {
+        self.remember_and_validate_credentials(execution, environment)?;
+        self.reject_secret(
+            &execution.id,
+            &serde_json::to_vec(packet).map_err(|error| LifecycleError::Step(error.to_string()))?,
+        )?;
         let packet_directory = Path::new(&worktree.path).join(".autospec");
         match std::fs::create_dir(&packet_directory) {
             Ok(()) => {}
@@ -879,11 +1017,12 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         &self,
         execution: &Execution,
         _: &AllocationReceipt,
-        _: &EnvironmentHandle,
+        environment: &EnvironmentHandle,
         session: &SessionRef,
     ) -> Result<(), LifecycleError> {
+        self.remember_and_validate_credentials(execution, environment)?;
         self.harness(&execution.id)?
-            .resume(session)
+            .resume_interactive(session)
             .await
             .map_err(|error| LifecycleError::Step(error.to_string()))
     }
@@ -903,9 +1042,11 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         &self,
         execution: &Execution,
         session: &SessionRef,
+        target: &SessionId,
     ) -> Result<SessionRef, LifecycleError> {
+        self.ensure_credentials_live(&execution.id)?;
         self.harness(&execution.id)?
-            .fork_conversation(session)
+            .fork_conversation_as(session, target)
             .await
             .map_err(|error| LifecycleError::Step(error.to_string()))
     }
@@ -915,10 +1056,18 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         execution: &Execution,
         session: &SessionRef,
     ) -> Result<Vec<ExecutionEvent>, LifecycleError> {
-        self.harness(&execution.id)?
+        self.ensure_credentials_live(&execution.id)?;
+        let events = self
+            .harness(&execution.id)?
             .poll_events(session)
             .await
-            .map_err(|error| LifecycleError::Step(error.to_string()))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        self.reject_secret(
+            &execution.id,
+            &serde_json::to_vec(&events)
+                .map_err(|error| LifecycleError::Step(error.to_string()))?,
+        )?;
+        Ok(events)
     }
 
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError> {
@@ -945,10 +1094,43 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
     async fn capture(&self, worktree: &Worktree) -> Result<DiffCapture, LifecycleError> {
         let manager = Arc::clone(&self.worktrees);
         let worktree = worktree.clone();
-        tokio::task::spawn_blocking(move || manager.capture_diff(&worktree))
+        let execution_id = worktree.execution_id.clone();
+        let worktree_path = worktree.path.clone();
+        let capture = tokio::task::spawn_blocking(move || manager.capture_diff(&worktree))
             .await
             .map_err(|error| LifecycleError::Step(error.to_string()))?
-            .map_err(|error| LifecycleError::Step(error.to_string()))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        self.reject_secret(&execution_id, capture.patch.as_bytes())?;
+        let root = Path::new(&worktree_path)
+            .canonicalize()
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        for changed in &capture.changed_files {
+            let candidate = root.join(changed);
+            let metadata = match std::fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(LifecycleError::Step(error.to_string())),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(LifecycleError::Step(
+                    "changed evidence path is not a regular file".into(),
+                ));
+            }
+            let canonical = candidate
+                .canonicalize()
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+            if !canonical.starts_with(&root) {
+                return Err(LifecycleError::Step(
+                    "changed evidence path escaped its worktree".into(),
+                ));
+            }
+            self.reject_secret(
+                &execution_id,
+                &std::fs::read(canonical)
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?,
+            )?;
+        }
+        Ok(capture)
     }
 
     async fn persist_evidence(
@@ -956,6 +1138,7 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         execution: &Execution,
         capture: &DiffCapture,
     ) -> Result<String, LifecycleError> {
+        self.reject_secret(&execution.id, capture.patch.as_bytes())?;
         self.evidence.persist(execution, capture).await
     }
 
@@ -967,6 +1150,10 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             self.active_runtimes
                 .lock()
                 .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
+                .remove(&execution.id);
+            self.known_secrets
+                .lock()
+                .map_err(|_| LifecycleError::Step("secret registry lock poisoned".into()))?
                 .remove(&execution.id);
             return Ok(());
         }
@@ -1486,19 +1673,20 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         let holds = ExecutionLifecycleHoldStore::new(&self.state_root)
             .and_then(|holds| holds.list(&execution.id))
             .map_err(|error| LifecycleError::Step(error.to_string()))?;
-        let matching: Vec<_> = holds
-            .into_iter()
-            .filter(|hold| {
-                hold.labels == execution.labels && hold.session_id == session_id.as_str()
-            })
-            .collect();
-        if matching.len() != 1 {
-            return Err(LifecycleError::Step(format!(
-                "restart adoption requires exactly one matching Pi lifecycle hold, found {}",
-                matching.len()
-            )));
+        let agent_container = DockerRuntime::agent_container_name(&execution.id);
+        let container_id = docker_container_id(
+            &self.docker_binary,
+            self.docker_socket.as_deref(),
+            &agent_container,
+        )?;
+        if holds
+            .iter()
+            .any(|hold| hold.labels != execution.labels || hold.container_id != container_id)
+        {
+            return Err(LifecycleError::Step(
+                "restart adoption found a foreign Pi lifecycle hold".into(),
+            ));
         }
-        let container_id = matching[0].container_id.clone();
         let container = docker_container_capability(
             &self.docker_binary,
             self.docker_socket.as_deref(),
@@ -1515,7 +1703,7 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         let environment = EnvironmentHandle {
             execution_id: execution.id.clone(),
             network: DockerRuntime::network_name(&execution.id),
-            agent_container: DockerRuntime::agent_container_name(&execution.id),
+            agent_container,
             verified_agent_container: container,
             service_containers: execution
                 .manifest
@@ -1531,17 +1719,26 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
             .harnesses
             .build(execution, &receipt, &environment, &worktree)
             .await?;
+        self.remember_and_validate_credentials(execution, &environment)?;
         let session = SessionRef {
             id: session_id,
             path: layout.session.to_string_lossy().into_owned(),
             execution_id: execution.id.clone(),
             worktree_path: layout.repository.to_string_lossy().into_owned(),
         };
-        if execution.state == ExecutionState::Running {
+        if !holds.is_empty() {
             harness
-                .resume(&session)
+                .recover_abandoned()
                 .await
                 .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        }
+        let remaining_holds = ExecutionLifecycleHoldStore::new(&self.state_root)
+            .and_then(|holds| holds.list(&execution.id))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        if !remaining_holds.is_empty() {
+            return Err(LifecycleError::Step(
+                "restart adoption did not quiesce abandoned Pi authority".into(),
+            ));
         }
         self.active_runtimes
             .lock()

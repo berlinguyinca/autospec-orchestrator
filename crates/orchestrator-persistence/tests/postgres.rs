@@ -78,6 +78,18 @@ async fn interactive_intents_are_ordered_restart_visible_and_complete_exactly_on
     let mut paused = running.clone();
     paused.transition(ExecutionState::PausedForHuman).unwrap();
     let paused_event = progress_event(&paused, ExecutionEventKind::ExecutionPaused);
+    executions
+        .begin_control(
+            pause.request.request_id,
+            &worker.id,
+            running.attempt_id.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    executions
+        .mark_control_side_effect_applied(pause.request.request_id, None)
+        .await
+        .unwrap();
     assert!(executions
         .complete_control(pause.request.request_id, &paused, &paused_event)
         .await
@@ -98,7 +110,28 @@ async fn interactive_intents_are_ordered_restart_visible_and_complete_exactly_on
         .await
         .unwrap();
     let mut forked = paused.clone();
-    forked.session_id = Some(SessionId::new("session-fork"));
+    let fork_target = executions
+        .list_pending_controls(&worker.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|control| control.request.request_id == fork.request.request_id)
+        .unwrap()
+        .target_session_id
+        .unwrap();
+    executions
+        .begin_control(
+            fork.request.request_id,
+            &worker.id,
+            running.attempt_id.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    executions
+        .mark_control_side_effect_applied(fork.request.request_id, Some(&fork_target))
+        .await
+        .unwrap();
+    forked.session_id = Some(fork_target.clone());
     forked.updated_at = Utc::now();
     executions
         .complete_control(
@@ -107,7 +140,7 @@ async fn interactive_intents_are_ordered_restart_visible_and_complete_exactly_on
             &progress_event(
                 &forked,
                 ExecutionEventKind::ConversationForked {
-                    session_id: SessionId::new("session-fork"),
+                    session_id: fork_target.clone(),
                 },
             ),
         )
@@ -117,7 +150,7 @@ async fn interactive_intents_are_ordered_restart_visible_and_complete_exactly_on
     assert_eq!(persisted_fork.worktree_path, running.worktree_path);
     assert_eq!(
         persisted_fork.session_id.as_ref().map(SessionId::as_str),
-        Some("session-fork")
+        Some(fork_target.as_str())
     );
 
     let resume = executions
@@ -126,6 +159,18 @@ async fn interactive_intents_are_ordered_restart_visible_and_complete_exactly_on
         .unwrap();
     let mut resumed = forked;
     resumed.transition(ExecutionState::Running).unwrap();
+    executions
+        .begin_control(
+            resume.request.request_id,
+            &worker.id,
+            running.attempt_id.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    executions
+        .mark_control_side_effect_applied(resume.request.request_id, None)
+        .await
+        .unwrap();
     executions
         .complete_control(
             resume.request.request_id,
@@ -151,10 +196,206 @@ async fn interactive_intents_are_ordered_restart_visible_and_complete_exactly_on
         .iter()
         .all(|control| control.execution.id != running.id));
 }
+
+#[tokio::test]
+async fn interactive_control_is_fenced_phased_and_completion_matrix_is_exact() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let worker = registered_worker(
+        &format!("worker-control-fence-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    let mut queued = execution(ExecutionState::Queued);
+    queued.manifest.persistence = PersistenceMode::Resumable;
+    executions.insert(&queued).await.unwrap();
+    let mut running = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .execution;
+    running.transition(ExecutionState::Provisioning).unwrap();
+    running.worktree_path = Some("/bounded/fenced/repository".into());
+    executions
+        .record_progress(
+            &running,
+            &progress_event(&running, ExecutionEventKind::EnvironmentReady),
+        )
+        .await
+        .unwrap();
+    running.transition(ExecutionState::Running).unwrap();
+    running.session_id = Some(SessionId::new("session-fenced"));
+    executions
+        .record_progress(
+            &running,
+            &progress_event(
+                &running,
+                ExecutionEventKind::AgentStarted {
+                    session_id: SessionId::new("session-fenced"),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    let pause = executions
+        .request_control(&running.id, ExecutionControlAction::Pause, "fenced-pause")
+        .await
+        .unwrap();
+    let pending = executions
+        .list_pending_controls(&worker.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|control| control.request.request_id == pause.request.request_id)
+        .unwrap();
+    assert_eq!(pending.phase, ExecutionControlPhase::Accepted);
+    assert_eq!(pending.accepted_worker_id, worker.id);
+    assert_eq!(
+        pending.accepted_attempt_id,
+        running.attempt_id.clone().unwrap()
+    );
+    assert_eq!(pending.source_session_id, SessionId::new("session-fenced"));
+    assert_eq!(pending.worktree_path, "/bounded/fenced/repository");
+    assert_eq!(pending.accepted_state, ExecutionState::Running);
+
+    let mut paused = running.clone();
+    paused.transition(ExecutionState::PausedForHuman).unwrap();
+    let event = progress_event(&paused, ExecutionEventKind::ExecutionPaused);
+    assert!(executions
+        .complete_control(pause.request.request_id, &paused, &event)
+        .await
+        .is_err());
+    executions
+        .begin_control(
+            pause.request.request_id,
+            &worker.id,
+            running.attempt_id.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    executions
+        .mark_control_side_effect_applied(pause.request.request_id, None)
+        .await
+        .unwrap();
+    let wrong_event = progress_event(&paused, ExecutionEventKind::ExecutionResumed);
+    assert!(executions
+        .complete_control(pause.request.request_id, &paused, &wrong_event)
+        .await
+        .is_err());
+    assert!(executions
+        .complete_control(pause.request.request_id, &paused, &event)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(executions
+        .complete_control(pause.request.request_id, &paused, &event)
+        .await
+        .unwrap()
+        .is_none());
+
+    let resume = executions
+        .request_control(&paused.id, ExecutionControlAction::Resume, "stale-version")
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new()
+        .connect(&std::env::var("AUTOSPEC_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE executions SET version = version + 1 WHERE id = $1")
+        .bind(paused.id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        executions
+            .begin_control(
+                resume.request.request_id,
+                &worker.id,
+                paused.attempt_id.as_ref().unwrap(),
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let stale: (String, Option<String>) = sqlx::query_as(
+        "SELECT phase, stale_reason FROM execution_control_requests WHERE request_id = $1",
+    )
+    .bind(resume.request.request_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stale.0, "STALE");
+    assert!(stale.1.is_some());
+    assert!(executions
+        .list_pending_controls(&worker.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .all(|control| control.request.request_id != resume.request.request_id));
+}
+
+#[tokio::test]
+async fn attachment_snapshot_is_atomic_opaque_and_rejects_non_attachable_authority() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let worker = registered_worker(
+        &format!("worker-attach-snapshot-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    let queued = execution(ExecutionState::Queued);
+    executions.insert(&queued).await.unwrap();
+    assert!(executions.attachment_snapshot(&queued.id).await.is_err());
+    let mut running = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .execution;
+    running.transition(ExecutionState::Provisioning).unwrap();
+    running.worktree_path = Some("/secret/host/path".into());
+    executions
+        .record_progress(
+            &running,
+            &progress_event(&running, ExecutionEventKind::EnvironmentReady),
+        )
+        .await
+        .unwrap();
+    running.transition(ExecutionState::Running).unwrap();
+    running.session_id = Some(SessionId::new("attach-session"));
+    executions
+        .record_progress(
+            &running,
+            &progress_event(
+                &running,
+                ExecutionEventKind::AgentStarted {
+                    session_id: SessionId::new("attach-session"),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let snapshot = executions.attachment_snapshot(&running.id).await.unwrap();
+    assert_eq!(snapshot.session_id, SessionId::new("attach-session"));
+    assert_eq!(
+        snapshot.workspace_ref,
+        format!("execution:{}:workspace", running.id)
+    );
+    assert!(!serde_json::to_string(&snapshot)
+        .unwrap()
+        .contains("/secret/host/path"));
+    assert!(snapshot.event_cursor > 0);
+}
 use orchestrator_persistence::{
     ArtifactStore, CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog,
-    ExecutionStore, LostWorkerRecovery, PgArtifactStore, PgCleanupAuthorityStore, PgEventLog,
-    PgExecutionStore, PgReservationStore, PgWorkerStore, ReservationStore, StoreError, WorkerStore,
+    ExecutionControlPhase, ExecutionStore, LostWorkerRecovery, PgArtifactStore,
+    PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore, PgWorkerStore,
+    ReservationStore, StoreError, WorkerStore,
 };
 use sqlx::{postgres::PgPoolOptions, Connection, PgConnection, Row};
 use std::{
@@ -466,6 +707,101 @@ async fn current_migrator_fills_vacant_task6_versions_without_losing_pre_task6_r
     .fetch_one(&mut connection)
     .await
     .unwrap());
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn migration_0011_to_0012_preserves_execution_authority_and_installs_control_fences() {
+    let _database_test = database_test_lock().lock().await;
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        return;
+    };
+    let schema = format!("task7_upgrade_{}", uuid::Uuid::new_v4().simple());
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::raw_sql(&format!(
+        "CREATE SCHEMA {schema}; SET search_path TO {schema}"
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    let current = sqlx::migrate!();
+    let through_0011 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            current
+                .migrations
+                .iter()
+                .filter(|migration| migration.version <= 11)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: false,
+        no_tx: false,
+    };
+    through_0011.run(&mut connection).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO workers (id, capabilities, capability_proof, state, last_heartbeat) \
+         VALUES ('upgrade-worker', '{}'::jsonb, '{}'::jsonb, 'READY', now()); \
+         INSERT INTO executions \
+         (id, role, state, manifest, worker_id, attempt_id, session_id, worktree_path, labels, created_at, updated_at, version) \
+         VALUES ('upgrade-execution', 'implementation', 'RUNNING', '{}'::jsonb, \
+                 'upgrade-worker', 'upgrade-attempt', 'upgrade-session', '/bounded/repository', \
+                 '{}'::jsonb, now(), now(), 7); \
+         INSERT INTO execution_attempts \
+         (attempt_id, execution_id, worker_id, state, worktree_path, session_id) \
+         VALUES ('upgrade-attempt', 'upgrade-execution', 'upgrade-worker', 'RUNNING', \
+                 '/bounded/repository', 'upgrade-session')",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    current.run(&mut connection).await.unwrap();
+
+    let preserved: (String, i64, String, String) = sqlx::query_as(
+        "SELECT state, version, session_id, worktree_path FROM executions WHERE id = 'upgrade-execution'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        preserved,
+        (
+            "RUNNING".into(),
+            7,
+            "upgrade-session".into(),
+            "/bounded/repository".into()
+        )
+    );
+    sqlx::query(
+        "INSERT INTO execution_control_requests \
+         (execution_id, action, idempotency_key, accepted_worker_id, accepted_attempt_id, \
+          source_session_id, worktree_path, accepted_execution_version, accepted_state) \
+         VALUES ('upgrade-execution', 'pause', 'upgrade-control', 'upgrade-worker', \
+                 'upgrade-attempt', 'upgrade-session', '/bounded/repository', 7, 'RUNNING')",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT to_regclass('execution_control_requests_pending_order_idx') IS NOT NULL"
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap());
+    assert!(sqlx::query(
+        "INSERT INTO execution_control_requests \
+         (execution_id, action, idempotency_key, accepted_worker_id, accepted_attempt_id, \
+          source_session_id, worktree_path, accepted_execution_version, accepted_state) \
+         VALUES ('upgrade-execution', 'fork-conversation', 'invalid-fork', 'upgrade-worker', \
+                 'upgrade-attempt', 'upgrade-session', '/bounded/repository', 7, 'RUNNING')"
+    )
+    .execute(&mut connection)
+    .await
+    .is_err());
     sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&mut connection)
         .await

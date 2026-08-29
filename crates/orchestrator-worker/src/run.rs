@@ -1,14 +1,14 @@
 use crate::{
-    cleanup_guard::CleanupGuard, HealthAssessment, HealthMonitor, LifecycleError, Worker,
-    WorkerError,
+    cleanup_guard::CleanupGuard, ControlCheckpoint, HealthAssessment, HealthMonitor,
+    LifecycleError, Worker, WorkerError,
 };
 use chrono::Utc;
 use futures_util::FutureExt;
 use orchestrator_core::{
-    event::ExecutionEventKind, Execution, ExecutionControlAction, ExecutionControlRequest,
-    ExecutionEvent, ExecutionResult, ExecutionState, FailureClass, PersistenceMode,
+    event::ExecutionEventKind, Execution, ExecutionControlAction, ExecutionEvent, ExecutionResult,
+    ExecutionState, FailureClass, PersistenceMode,
 };
-use orchestrator_persistence::{CleanupDisposition, CleanupStage};
+use orchestrator_persistence::{CleanupDisposition, CleanupStage, PendingExecutionControl};
 use std::{
     any::Any,
     panic::AssertUnwindSafe,
@@ -28,7 +28,7 @@ pub(crate) async fn run_with_cancel_and_controls(
     worker: &Worker,
     execution: &Execution,
     cancelled: &AtomicBool,
-    controls: tokio::sync::mpsc::UnboundedReceiver<ExecutionControlRequest>,
+    controls: tokio::sync::mpsc::UnboundedReceiver<PendingExecutionControl>,
 ) -> Result<ExecutionResult, WorkerError> {
     let attempt_id = execution
         .attempt_id
@@ -166,7 +166,7 @@ pub(crate) async fn run_adopted_with_cancel_and_controls(
     worker: &Worker,
     execution: &Execution,
     cancelled: &AtomicBool,
-    controls: tokio::sync::mpsc::UnboundedReceiver<ExecutionControlRequest>,
+    controls: tokio::sync::mpsc::UnboundedReceiver<PendingExecutionControl>,
 ) -> Result<ExecutionResult, WorkerError> {
     let attempt_id = execution
         .attempt_id
@@ -389,7 +389,7 @@ async fn adopt_inner(
     execution: &mut Execution,
     guard: &mut CleanupGuard,
     cancelled: &AtomicBool,
-    controls: tokio::sync::mpsc::UnboundedReceiver<ExecutionControlRequest>,
+    controls: tokio::sync::mpsc::UnboundedReceiver<PendingExecutionControl>,
 ) -> Result<ExecutionResult, WorkerError> {
     if execution.state == ExecutionState::Provisioning {
         execution
@@ -410,6 +410,31 @@ async fn adopt_inner(
     guard.environment = Some(adopted.environment);
     guard.runtime_created = true;
     guard.session = Some(adopted.session.clone());
+    let worker_id = execution
+        .worker_id
+        .as_ref()
+        .ok_or_else(|| WorkerError::Invalid("adopted execution lacks worker authority".into()))?;
+    let has_pending_control = worker
+        .executions
+        .list_pending_controls(worker_id)
+        .await
+        .map_err(|error| WorkerError::Persistence(error.to_string()))?
+        .iter()
+        .any(|control| control.request.execution_id == execution.id);
+    if execution.state == ExecutionState::Running && !has_pending_control {
+        let receipt = guard
+            .receipt
+            .as_ref()
+            .ok_or_else(|| WorkerError::Invalid("adopted execution lacks receipt".into()))?;
+        let environment = guard
+            .environment
+            .as_ref()
+            .ok_or_else(|| WorkerError::Invalid("adopted execution lacks runtime".into()))?;
+        worker
+            .lifecycle
+            .resume(execution, receipt, environment, &adopted.session)
+            .await?;
+    }
     transition_cleanup(
         worker,
         execution,
@@ -435,7 +460,7 @@ async fn run_inner(
     execution: &mut Execution,
     guard: &mut CleanupGuard,
     cancelled: &AtomicBool,
-    controls: tokio::sync::mpsc::UnboundedReceiver<ExecutionControlRequest>,
+    controls: tokio::sync::mpsc::UnboundedReceiver<PendingExecutionControl>,
 ) -> Result<ExecutionResult, WorkerError> {
     if execution.state != ExecutionState::WorkerAssigned {
         return Err(WorkerError::Invalid(format!(
@@ -529,7 +554,7 @@ async fn drive_running(
     cancelled: &AtomicBool,
     worktree: &git_worktree::Worktree,
     mut session: harness_traits::SessionRef,
-    mut controls: tokio::sync::mpsc::UnboundedReceiver<ExecutionControlRequest>,
+    mut controls: tokio::sync::mpsc::UnboundedReceiver<PendingExecutionControl>,
 ) -> Result<ExecutionResult, WorkerError> {
     let mut health = HealthMonitor::default_at(Instant::now());
     'events: loop {
@@ -542,7 +567,7 @@ async fn drive_running(
                     let control = control.ok_or_else(|| WorkerError::Invalid(
                         "interactive control channel closed while paused".into()
                     ))?;
-                    handle_control(worker, execution, guard, &mut session, control).await?;
+                    handle_control(worker, execution, guard, &mut health, &mut session, control).await?;
                     continue;
                 }
                 () = cancellation_signal(cancelled) => return Err(WorkerError::Cancelled),
@@ -562,7 +587,7 @@ async fn drive_running(
                 let control = control.ok_or_else(|| WorkerError::Invalid(
                     "interactive control channel closed while running".into()
                 ))?;
-                handle_control(worker, execution, guard, &mut session, control).await?;
+                handle_control(worker, execution, guard, &mut health, &mut session, control).await?;
                 continue;
             }
             () = cancellation => {
@@ -574,7 +599,17 @@ async fn drive_running(
         } else {
             health.record_event(Instant::now());
         }
-        let cpu_percent = worker.lifecycle.cpu_percent(execution).await?;
+        let cpu_percent = tokio::select! {
+            cpu_percent = worker.lifecycle.cpu_percent(execution) => cpu_percent?,
+            control = controls.recv() => {
+                let control = control.ok_or_else(|| WorkerError::Invalid(
+                    "interactive control channel closed during health probe".into()
+                ))?;
+                handle_control(worker, execution, guard, &mut health, &mut session, control).await?;
+                continue;
+            }
+            () = cancellation_signal(cancelled) => return Err(WorkerError::Cancelled),
+        };
         match health.assess(Instant::now(), cpu_percent) {
             HealthAssessment::Healthy => {}
             HealthAssessment::InactiveWarning { seconds } => {
@@ -676,20 +711,45 @@ async fn handle_control(
     worker: &Worker,
     execution: &mut Execution,
     guard: &mut CleanupGuard,
+    health: &mut HealthMonitor,
     session: &mut harness_traits::SessionRef,
-    control: ExecutionControlRequest,
+    control: PendingExecutionControl,
 ) -> Result<(), WorkerError> {
-    if control.execution_id != execution.id {
+    if control.request.execution_id != execution.id {
         return Err(WorkerError::Invalid(
             "interactive control belongs to another execution".into(),
         ));
     }
-    let kind = match control.action {
+    let attempt_id = execution
+        .attempt_id
+        .as_ref()
+        .ok_or_else(|| WorkerError::Invalid("interactive control lacks attempt".into()))?;
+    let worker_id = execution
+        .worker_id
+        .as_ref()
+        .ok_or_else(|| WorkerError::Invalid("interactive control lacks worker".into()))?;
+    worker
+        .executions
+        .begin_control(control.request.request_id, worker_id, attempt_id)
+        .await
+        .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+    worker
+        .control_checkpoints
+        .reached(ControlCheckpoint::ApplyingPersisted);
+    let already_applied =
+        control.phase == orchestrator_persistence::ExecutionControlPhase::SideEffectApplied;
+    let kind = match control.request.action {
         ExecutionControlAction::Pause => {
             if execution.state != ExecutionState::Running {
                 return Err(WorkerError::Invalid("pause requires RUNNING".into()));
             }
-            worker.lifecycle.pause(execution, session).await?;
+            if !already_applied {
+                worker.lifecycle.pause(execution, session).await?;
+                worker
+                    .control_checkpoints
+                    .reached(ControlCheckpoint::PauseStopped);
+            }
+            health.pause(Instant::now());
             execution
                 .transition(ExecutionState::PausedForHuman)
                 .map_err(|error| WorkerError::Invalid(error.to_string()))?;
@@ -709,10 +769,16 @@ async fn handle_control(
                 .environment
                 .as_ref()
                 .ok_or_else(|| WorkerError::Invalid("resume lacks runtime authority".into()))?;
-            worker
-                .lifecycle
-                .resume(execution, receipt, environment, session)
-                .await?;
+            if !already_applied {
+                worker
+                    .lifecycle
+                    .resume(execution, receipt, environment, session)
+                    .await?;
+                worker
+                    .control_checkpoints
+                    .reached(ControlCheckpoint::ResumeLaunched);
+            }
+            health.resume(Instant::now());
             execution
                 .transition(ExecutionState::Running)
                 .map_err(|error| WorkerError::Invalid(error.to_string()))?;
@@ -720,10 +786,45 @@ async fn handle_control(
         }
         ExecutionControlAction::ForkConversation => {
             let original_worktree = session.worktree_path.clone();
-            let forked = worker
-                .lifecycle
-                .fork_conversation(execution, session)
-                .await?;
+            let target = control.target_session_id.as_ref().ok_or_else(|| {
+                WorkerError::Invalid("conversation fork lacks fenced target".into())
+            })?;
+            let was_running = execution.state == ExecutionState::Running;
+            let forked = if already_applied {
+                harness_traits::SessionRef {
+                    id: target.clone(),
+                    path: session.path.clone(),
+                    execution_id: execution.id.clone(),
+                    worktree_path: original_worktree.clone(),
+                }
+            } else {
+                if was_running {
+                    worker.lifecycle.pause(execution, session).await?;
+                    health.pause(Instant::now());
+                }
+                let forked = worker
+                    .lifecycle
+                    .fork_conversation(execution, session, target)
+                    .await?;
+                worker
+                    .control_checkpoints
+                    .reached(ControlCheckpoint::ForkLaunched);
+                worker.lifecycle.pause(execution, &forked).await?;
+                if was_running {
+                    let receipt = guard.receipt.as_ref().ok_or_else(|| {
+                        WorkerError::Invalid("fork resume lacks storage authority".into())
+                    })?;
+                    let environment = guard.environment.as_ref().ok_or_else(|| {
+                        WorkerError::Invalid("fork resume lacks runtime authority".into())
+                    })?;
+                    worker
+                        .lifecycle
+                        .resume(execution, receipt, environment, &forked)
+                        .await?;
+                    health.resume(Instant::now());
+                }
+                forked
+            };
             if forked.execution_id != execution.id
                 || forked.worktree_path != original_worktree
                 || forked.id == session.id
@@ -731,9 +832,6 @@ async fn handle_control(
                 return Err(WorkerError::Invalid(
                     "conversation fork changed execution/workspace authority".into(),
                 ));
-            }
-            if execution.state == ExecutionState::PausedForHuman {
-                worker.lifecycle.pause(execution, &forked).await?;
             }
             *session = forked;
             guard.session = Some(session.clone());
@@ -744,6 +842,14 @@ async fn handle_control(
             }
         }
     };
+    worker
+        .executions
+        .mark_control_side_effect_applied(control.request.request_id, execution.session_id.as_ref())
+        .await
+        .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+    worker
+        .control_checkpoints
+        .reached(ControlCheckpoint::SideEffectPersisted);
     let event = ExecutionEvent {
         execution_id: execution.id.clone(),
         attempt_id: execution.attempt_id.clone(),
@@ -753,8 +859,11 @@ async fn handle_control(
         kind,
     };
     worker
+        .control_checkpoints
+        .reached(ControlCheckpoint::BeforeCompletion);
+    worker
         .executions
-        .complete_control(control.request_id, execution, &event)
+        .complete_control(control.request.request_id, execution, &event)
         .await
         .map_err(|error| WorkerError::Persistence(error.to_string()))?;
     Ok(())

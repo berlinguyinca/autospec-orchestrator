@@ -102,6 +102,13 @@ struct Cli {
     docker_socket: Option<String>,
     #[arg(long, default_value = "pi")]
     pi_executable: String,
+    /// Explicitly permits the local development-only credential issuer.
+    #[arg(
+        long,
+        env = "AUTOSPEC_ALLOW_LOCAL_DEVELOPMENT_CREDENTIALS",
+        default_value_t = false
+    )]
+    allow_local_development_credentials: bool,
 }
 
 #[tokio::main]
@@ -112,6 +119,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    ensure_local_development_credentials_allowed(&cli)?;
     let storage = build_storage(&cli)?;
     let proof = match probe_capabilities(&cli, storage.as_ref()) {
         Ok(proof) => Some(proof),
@@ -432,6 +440,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn ensure_local_development_credentials_allowed(cli: &Cli) -> Result<()> {
+    anyhow::ensure!(
+        cli.allow_local_development_credentials,
+        "no production credential issuer is configured; local development credentials require --allow-local-development-credentials"
+    );
+    Ok(())
+}
+
 fn advertisement(cli: &Cli, proof: Option<WorkerCapabilityProof>) -> Result<WorkerAdvertisement> {
     if cli.concurrency == 0 || cli.concurrency > 64 {
         anyhow::bail!("worker concurrency must be between 1 and 64");
@@ -642,7 +658,16 @@ mod tests {
             clone_base: "https://github.com".into(),
             docker_socket: None,
             pi_executable: "pi".into(),
+            allow_local_development_credentials: false,
         }
+    }
+
+    #[test]
+    fn production_startup_fails_closed_without_explicit_local_credential_opt_in() {
+        let mut cli = cli();
+        assert!(ensure_local_development_credentials_allowed(&cli).is_err());
+        cli.allow_local_development_credentials = true;
+        ensure_local_development_credentials_allowed(&cli).unwrap();
     }
 
     #[test]

@@ -112,3 +112,69 @@ async fn revoke_remains_idempotent_after_execution_storage_is_already_absent() {
     broker.revoke(&execution.id).await.unwrap();
     broker.revoke(&execution.id).await.unwrap();
 }
+
+#[tokio::test]
+async fn concurrent_mint_reuses_one_atomic_winner() {
+    let root = TempDir::new().unwrap();
+    let execution = execution("repo-7-race-01");
+    execution_root(&root, execution.id.as_str());
+    let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
+    let (left, right) = tokio::join!(broker.mint(&execution), broker.mint(&execution));
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_eq!(left.path, right.path);
+    assert_eq!(left.expires_at, right.expires_at);
+    assert_eq!(
+        fs::read(&left.path).unwrap(),
+        fs::read(&right.path).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn expired_bound_credential_is_rejected_without_replacing_its_inode() {
+    let root = TempDir::new().unwrap();
+    let execution = execution("repo-7-expired-01");
+    let execution_root = execution_root(&root, execution.id.as_str());
+    let credential = execution_root.join("credentials/inferweave.credential");
+    fs::write(&credential, "expired\n2020-01-01T00:00:00Z\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+        let inode = fs::metadata(&credential).unwrap().ino();
+        let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
+        assert!(broker.mint(&execution).await.is_err());
+        assert_eq!(fs::metadata(&credential).unwrap().ino(), inode);
+        assert_eq!(
+            fs::read_to_string(&credential).unwrap(),
+            "expired\n2020-01-01T00:00:00Z\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn revoke_removes_exact_malformed_file_but_rejects_symlink_authority() {
+    let root = TempDir::new().unwrap();
+    let malformed = execution("repo-7-malformed-01");
+    let malformed_root = execution_root(&root, malformed.id.as_str());
+    let malformed_path = malformed_root.join("credentials/inferweave.credential");
+    fs::write(&malformed_path, "not-a-credential").unwrap();
+    let broker = LocalCredentialBroker::new(root.path(), Duration::minutes(5)).unwrap();
+    broker.revoke(&malformed.id).await.unwrap();
+    assert!(!malformed_path.exists());
+
+    #[cfg(unix)]
+    {
+        let symlinked = execution("repo-7-symlink-01");
+        let symlinked_root = execution_root(&root, symlinked.id.as_str());
+        let target = root.path().join("foreign-secret");
+        fs::write(&target, "preserve").unwrap();
+        std::os::unix::fs::symlink(
+            &target,
+            symlinked_root.join("credentials/inferweave.credential"),
+        )
+        .unwrap();
+        assert!(broker.revoke(&symlinked.id).await.is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "preserve");
+    }
+}

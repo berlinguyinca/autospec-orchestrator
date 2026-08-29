@@ -68,3 +68,57 @@ fn classifies_only_sustained_cpu_saturation() {
         HealthAssessment::Failed(FailureClass::ResourceViolation)
     );
 }
+
+#[test]
+fn human_pause_suspends_inactivity_wall_clock_and_cpu_windows() {
+    let start = Instant::now();
+    let mut monitor = HealthMonitor::new_at(
+        start,
+        Duration::from_secs(100),
+        Duration::from_secs(200),
+        Duration::from_secs(50),
+    );
+    assert_eq!(
+        monitor.assess(start + Duration::from_secs(20), 100.0),
+        HealthAssessment::Healthy
+    );
+    monitor.pause(start + Duration::from_secs(30));
+    assert_eq!(
+        monitor.assess(start + Duration::from_secs(10_000), 100.0),
+        HealthAssessment::Healthy
+    );
+    monitor.resume(start + Duration::from_secs(10_030));
+    assert_eq!(
+        monitor.assess(start + Duration::from_secs(10_049), 100.0),
+        HealthAssessment::Healthy
+    );
+    assert_eq!(
+        monitor.assess(start + Duration::from_secs(10_080), 0.0),
+        HealthAssessment::InactiveWarning { seconds: 80 }
+    );
+}
+
+#[test]
+fn repeated_human_pauses_are_idempotent_and_accumulate_suspended_time() {
+    let start = Instant::now();
+    let mut monitor = HealthMonitor::new_at(
+        start,
+        Duration::from_secs(100),
+        Duration::from_secs(200),
+        Duration::from_secs(50),
+    );
+    monitor.pause(start + Duration::from_secs(10));
+    monitor.pause(start + Duration::from_secs(20));
+    monitor.resume(start + Duration::from_secs(1_010));
+    monitor.resume(start + Duration::from_secs(1_020));
+    monitor.pause(start + Duration::from_secs(1_020));
+    monitor.resume(start + Duration::from_secs(2_020));
+    assert_eq!(
+        monitor.assess(start + Duration::from_secs(2_099), 0.0),
+        HealthAssessment::InactiveWarning { seconds: 99 }
+    );
+    assert_eq!(
+        monitor.assess(start + Duration::from_secs(2_101), 0.0),
+        HealthAssessment::Failed(FailureClass::Inactivity)
+    );
+}

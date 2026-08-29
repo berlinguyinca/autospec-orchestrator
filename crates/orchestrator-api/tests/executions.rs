@@ -151,7 +151,11 @@ async fn interactive_routes_are_authenticated_idempotent_bounded_and_metadata_on
     assert_eq!(attach.status(), reqwest::StatusCode::OK);
     let attach = attach.json::<serde_json::Value>().await.unwrap();
     assert_eq!(attach["session_id"], "session-interactive");
-    assert_eq!(attach["worktree_path"], "/bounded/execution/repository");
+    assert_eq!(
+        attach["workspace_ref"],
+        format!("execution:{}:workspace", execution.id)
+    );
+    assert!(attach.get("worktree_path").is_none());
     assert!(attach.get("event_cursor").is_some());
     assert!(attach.get("events").is_none());
     assert!(attach.get("artifacts").is_none());

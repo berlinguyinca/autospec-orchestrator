@@ -67,29 +67,12 @@ async fn attach(
 ) -> Result<Json<ExecutionAttachment>, ApiError> {
     authorize_api(&state, &headers)?;
     let id = ExecutionId::new(id);
-    let execution = state
+    let attachment = state
         .executions
-        .get(&id)
+        .attachment_snapshot(&id)
         .await
         .map_err(|error| ApiError::store_for(error, id.as_str()))?;
-    let session_id = execution
-        .session_id
-        .ok_or_else(|| ApiError::conflict("execution has no attachable Pi session"))?;
-    let worktree_path = execution
-        .worktree_path
-        .ok_or_else(|| ApiError::conflict("execution has no attachable workspace"))?;
-    let event_cursor = state
-        .events
-        .latest_sequence(&id)
-        .await
-        .map_err(ApiError::store)?;
-    Ok(Json(ExecutionAttachment {
-        execution_id: id,
-        state: execution.state,
-        session_id,
-        worktree_path,
-        event_cursor,
-    }))
+    Ok(Json(attachment))
 }
 
 async fn fork(

@@ -20,7 +20,7 @@ pub use workers::{PgWorkerStore, WorkerStore};
 use async_trait::async_trait;
 use event_log::append_in_transaction;
 use orchestrator_core::{
-    event::ExecutionEventKind, AttemptId, Execution, ExecutionControlAction,
+    event::ExecutionEventKind, AttemptId, Execution, ExecutionAttachment, ExecutionControlAction,
     ExecutionControlRequest, ExecutionEvent, ExecutionId, ExecutionResult, ExecutionState,
     FailureClass, OwnershipLabels, Role, SessionId, WorkerId,
 };
@@ -123,6 +123,25 @@ pub trait ExecutionStore: Send + Sync {
     ) -> Result<Vec<PendingExecutionControl>, StoreError> {
         Ok(Vec::new())
     }
+    async fn begin_control(
+        &self,
+        _request_id: i64,
+        _worker_id: &WorkerId,
+        _attempt_id: &AttemptId,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Conflict(
+            "durable interactive control phases are unavailable".to_owned(),
+        ))
+    }
+    async fn mark_control_side_effect_applied(
+        &self,
+        _request_id: i64,
+        _session_id: Option<&SessionId>,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Conflict(
+            "durable interactive control phases are unavailable".to_owned(),
+        ))
+    }
     async fn complete_control(
         &self,
         _request_id: i64,
@@ -132,6 +151,14 @@ pub trait ExecutionStore: Send + Sync {
         Err(StoreError::Conflict(
             "durable interactive controls are unavailable".to_owned(),
         ))
+    }
+    async fn attachment_snapshot(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<ExecutionAttachment, StoreError> {
+        Err(StoreError::Conflict(format!(
+            "atomic attachment snapshots are unavailable for {id}"
+        )))
     }
 }
 
@@ -159,6 +186,22 @@ pub struct IdempotentExecutionControl {
 pub struct PendingExecutionControl {
     pub request: ExecutionControlRequest,
     pub execution: Execution,
+    pub phase: ExecutionControlPhase,
+    pub accepted_worker_id: WorkerId,
+    pub accepted_attempt_id: AttemptId,
+    pub source_session_id: SessionId,
+    pub worktree_path: String,
+    pub accepted_version: i64,
+    pub accepted_state: ExecutionState,
+    pub target_session_id: Option<SessionId>,
+    pub side_effect_session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionControlPhase {
+    Accepted,
+    Applying,
+    SideEffectApplied,
 }
 
 #[derive(Debug, Clone)]
@@ -694,8 +737,8 @@ impl ExecutionStore for PgExecutionStore {
             .await?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
         let execution = decode_execution(&row)?;
-        let pending_actions = sqlx::query_scalar::<_, String>(
-            "SELECT action FROM execution_control_requests \
+        let pending_actions = sqlx::query(
+            "SELECT action, target_session_id FROM execution_control_requests \
              WHERE execution_id = $1 AND completed_at IS NULL \
              ORDER BY requested_at, request_id",
         )
@@ -703,8 +746,16 @@ impl ExecutionStore for PgExecutionStore {
         .fetch_all(&mut *transaction)
         .await?;
         let mut projected_state = execution.state;
+        let mut projected_session = execution.session_id.clone().ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "execution {id} lacks durable interactive authority"
+            ))
+        })?;
+        let current_version: i64 = row.try_get("version")?;
+        let mut projected_version = current_version;
         for pending in pending_actions {
-            match decode_control_action(pending)? {
+            let pending_action = decode_control_action(pending.try_get("action")?)?;
+            match pending_action {
                 ExecutionControlAction::Pause if projected_state == ExecutionState::Running => {
                     projected_state = ExecutionState::PausedForHuman;
                 }
@@ -717,13 +768,25 @@ impl ExecutionStore for PgExecutionStore {
                     if matches!(
                         projected_state,
                         ExecutionState::Running | ExecutionState::PausedForHuman
-                    ) => {}
+                    ) =>
+                {
+                    projected_session = SessionId::new(
+                        pending
+                            .try_get::<Option<String>, _>("target_session_id")?
+                            .ok_or_else(|| {
+                                StoreError::Conflict(
+                                    "pending fork lacks a target session".to_owned(),
+                                )
+                            })?,
+                    );
+                }
                 pending => {
                     return Err(StoreError::Conflict(format!(
                         "pending {pending:?} is invalid for projected state {projected_state:?}"
                     )))
                 }
             }
+            projected_version += 1;
         }
         let allowed = match action {
             ExecutionControlAction::Pause => projected_state == ExecutionState::Running,
@@ -739,23 +802,47 @@ impl ExecutionStore for PgExecutionStore {
                 projected_state
             )));
         }
-        if execution.worker_id.is_none()
-            || execution.attempt_id.is_none()
-            || execution.session_id.is_none()
-            || execution.worktree_path.is_none()
-        {
-            return Err(StoreError::Conflict(format!(
+        let worker_id = execution.worker_id.as_ref().ok_or_else(|| {
+            StoreError::Conflict(format!(
                 "execution {id} lacks durable interactive authority"
-            )));
-        }
+            ))
+        })?;
+        let attempt_id = execution.attempt_id.as_ref().ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "execution {id} lacks durable interactive authority"
+            ))
+        })?;
+        let worktree_path = execution.worktree_path.as_deref().ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "execution {id} lacks durable interactive authority"
+            ))
+        })?;
+        let request_id: i64 = sqlx::query_scalar(
+            "SELECT nextval(pg_get_serial_sequence('execution_control_requests', 'request_id'))",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        let target_session = (action == ExecutionControlAction::ForkConversation)
+            .then(|| SessionId::new(format!("{}-fork-{request_id}", projected_session.as_str())));
         let inserted = sqlx::query(
             "INSERT INTO execution_control_requests \
-             (execution_id, action, idempotency_key) VALUES ($1, $2, $3) \
+             (request_id, execution_id, action, idempotency_key, accepted_worker_id, \
+              accepted_attempt_id, source_session_id, worktree_path, \
+              accepted_execution_version, accepted_state, target_session_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              RETURNING request_id, action, requested_at, completed_at",
         )
+        .bind(request_id)
         .bind(id.as_str())
         .bind(action_text)
         .bind(idempotency_key)
+        .bind(worker_id.as_str())
+        .bind(attempt_id.as_str())
+        .bind(projected_session.as_str())
+        .bind(worktree_path)
+        .bind(projected_version)
+        .bind(enum_text(&projected_state)?)
+        .bind(target_session.as_ref().map(SessionId::as_str))
         .fetch_one(&mut *transaction)
         .await
         .map_err(map_conflict)?;
@@ -774,10 +861,19 @@ impl ExecutionStore for PgExecutionStore {
         let rows = sqlx::query(
             "SELECT c.request_id AS control_request_id, c.action AS control_action, \
                     c.requested_at AS control_requested_at, \
-                    c.completed_at AS control_completed_at, e.* \
+                    c.completed_at AS control_completed_at, c.phase AS control_phase, \
+                    c.accepted_worker_id AS control_worker_id, \
+                    c.accepted_attempt_id AS control_attempt_id, \
+                    c.source_session_id AS control_source_session_id, \
+                    c.worktree_path AS control_worktree_path, \
+                    c.accepted_execution_version AS control_execution_version, \
+                    c.accepted_state AS control_accepted_state, \
+                    c.target_session_id AS control_target_session_id, \
+                    c.side_effect_session_id AS control_side_effect_session_id, e.* \
              FROM execution_control_requests c \
              JOIN executions e ON e.id = c.execution_id \
-             WHERE c.completed_at IS NULL AND e.worker_id = $1 \
+             WHERE c.phase NOT IN ('COMPLETED', 'STALE') \
+               AND (c.accepted_worker_id = $1 OR e.worker_id = $1) \
              ORDER BY c.requested_at, c.request_id",
         )
         .bind(worker_id.as_str())
@@ -796,9 +892,164 @@ impl ExecutionStore for PgExecutionStore {
                         completed_at: row.try_get("control_completed_at")?,
                     },
                     execution,
+                    phase: decode_control_phase(row.try_get("control_phase")?)?,
+                    accepted_worker_id: WorkerId::new(
+                        row.try_get::<String, _>("control_worker_id")?,
+                    ),
+                    accepted_attempt_id: AttemptId::new(
+                        row.try_get::<String, _>("control_attempt_id")?,
+                    ),
+                    source_session_id: SessionId::new(
+                        row.try_get::<String, _>("control_source_session_id")?,
+                    ),
+                    worktree_path: row.try_get("control_worktree_path")?,
+                    accepted_version: row.try_get("control_execution_version")?,
+                    accepted_state: decode_execution_state(row.try_get("control_accepted_state")?)?,
+                    target_session_id: row
+                        .try_get::<Option<String>, _>("control_target_session_id")?
+                        .map(SessionId::new),
+                    side_effect_session_id: row
+                        .try_get::<Option<String>, _>("control_side_effect_session_id")?
+                        .map(SessionId::new),
                 })
             })
             .collect()
+    }
+
+    async fn begin_control(
+        &self,
+        request_id: i64,
+        worker_id: &WorkerId,
+        attempt_id: &AttemptId,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT c.phase, c.accepted_worker_id, c.accepted_attempt_id, \
+                    c.source_session_id, c.worktree_path, c.accepted_execution_version, \
+                    c.accepted_state, e.worker_id AS current_worker_id, \
+                    e.attempt_id AS current_attempt_id, e.session_id AS current_session_id, \
+                    e.worktree_path AS current_worktree_path, e.version AS current_version, \
+                    e.state AS current_state \
+             FROM execution_control_requests c JOIN executions e ON e.id = c.execution_id \
+             WHERE c.request_id = $1 FOR UPDATE OF c, e",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("control request {request_id}")))?;
+        let phase: String = row.try_get("phase")?;
+        if phase == "APPLYING" || phase == "SIDE_EFFECT_APPLIED" {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        if phase != "ACCEPTED" {
+            return Err(StoreError::Conflict(format!(
+                "control request {request_id} is terminal: {phase}"
+            )));
+        }
+        let accepted_worker: String = row.try_get("accepted_worker_id")?;
+        let accepted_attempt: String = row.try_get("accepted_attempt_id")?;
+        let fenced = accepted_worker == worker_id.as_str()
+            && accepted_attempt == attempt_id.as_str()
+            && row
+                .try_get::<Option<String>, _>("current_worker_id")?
+                .as_deref()
+                == Some(accepted_worker.as_str())
+            && row
+                .try_get::<Option<String>, _>("current_attempt_id")?
+                .as_deref()
+                == Some(accepted_attempt.as_str())
+            && row
+                .try_get::<Option<String>, _>("current_session_id")?
+                .as_deref()
+                == Some(row.try_get::<String, _>("source_session_id")?.as_str())
+            && row
+                .try_get::<Option<String>, _>("current_worktree_path")?
+                .as_deref()
+                == Some(row.try_get::<String, _>("worktree_path")?.as_str())
+            && row.try_get::<i64, _>("current_version")?
+                == row.try_get::<i64, _>("accepted_execution_version")?
+            && row.try_get::<String, _>("current_state")?
+                == row.try_get::<String, _>("accepted_state")?;
+        if !fenced {
+            sqlx::query(
+                "UPDATE execution_control_requests SET phase = 'STALE', \
+                 stale_reason = 'accepted execution authority changed', completed_at = now() \
+                 WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Err(StoreError::Conflict(
+                "accepted interactive control authority is stale".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE execution_control_requests SET phase = 'APPLYING' WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn mark_control_side_effect_applied(
+        &self,
+        request_id: i64,
+        session_id: Option<&SessionId>,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT action, phase, source_session_id, target_session_id, \
+                    side_effect_session_id FROM execution_control_requests \
+             WHERE request_id = $1 FOR UPDATE",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("control request {request_id}")))?;
+        let phase: String = row.try_get("phase")?;
+        let action = decode_control_action(row.try_get("action")?)?;
+        let expected = match action {
+            ExecutionControlAction::ForkConversation => row
+                .try_get::<Option<String>, _>("target_session_id")?
+                .ok_or_else(|| StoreError::Conflict("fork target session is missing".to_owned()))?,
+            _ => row.try_get("source_session_id")?,
+        };
+        let supplied = session_id
+            .map(SessionId::as_str)
+            .unwrap_or(expected.as_str());
+        if supplied != expected {
+            return Err(StoreError::Conflict(
+                "control side effect belongs to a different session".to_owned(),
+            ));
+        }
+        if phase == "SIDE_EFFECT_APPLIED"
+            && row
+                .try_get::<Option<String>, _>("side_effect_session_id")?
+                .as_deref()
+                == Some(expected.as_str())
+        {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        if phase != "APPLYING" {
+            return Err(StoreError::Conflict(format!(
+                "control request {request_id} cannot record a side effect from {phase}"
+            )));
+        }
+        sqlx::query(
+            "UPDATE execution_control_requests SET phase = 'SIDE_EFFECT_APPLIED', \
+             side_effect_session_id = $2 WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .bind(expected)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     async fn complete_control(
@@ -818,7 +1069,11 @@ impl ExecutionStore for PgExecutionStore {
         }
         let mut transaction = self.pool.begin().await?;
         let control = sqlx::query(
-            "SELECT execution_id, action, completed_at FROM execution_control_requests \
+            "SELECT execution_id, action, phase, completed_at, accepted_worker_id, \
+                    accepted_attempt_id, source_session_id, worktree_path, \
+                    accepted_execution_version, accepted_state, target_session_id, \
+                    side_effect_session_id \
+             FROM execution_control_requests \
              WHERE request_id = $1 FOR UPDATE",
         )
         .bind(request_id)
@@ -830,23 +1085,67 @@ impl ExecutionStore for PgExecutionStore {
                 "interactive control belongs to another execution".to_owned(),
             ));
         }
-        if control
-            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")?
-            .is_some()
-        {
+        let phase: String = control.try_get("phase")?;
+        if phase == "COMPLETED" {
             transaction.commit().await?;
             return Ok(None);
         }
+        if phase != "SIDE_EFFECT_APPLIED" {
+            return Err(StoreError::Conflict(format!(
+                "control request {request_id} cannot complete from {phase}"
+            )));
+        }
         let action = decode_control_action(control.try_get("action")?)?;
+        let accepted_state = decode_execution_state(control.try_get("accepted_state")?)?;
+        let source_session = SessionId::new(control.try_get::<String, _>("source_session_id")?);
+        let expected_session = match action {
+            ExecutionControlAction::ForkConversation => SessionId::new(
+                control
+                    .try_get::<Option<String>, _>("target_session_id")?
+                    .ok_or_else(|| {
+                        StoreError::Conflict("fork target session is missing".to_owned())
+                    })?,
+            ),
+            _ => source_session.clone(),
+        };
+        if control
+            .try_get::<Option<String>, _>("side_effect_session_id")?
+            .as_deref()
+            != Some(expected_session.as_str())
+        {
+            return Err(StoreError::Conflict(
+                "control side effect session is not the accepted target".to_owned(),
+            ));
+        }
         let expected_state = match action {
             ExecutionControlAction::Pause => ExecutionState::PausedForHuman,
             ExecutionControlAction::Resume => ExecutionState::Running,
-            ExecutionControlAction::ForkConversation => execution.state,
+            ExecutionControlAction::ForkConversation => accepted_state,
         };
-        if execution.state != expected_state {
+        let event_matches_action = matches!(
+            (&action, &event.kind),
+            (
+                ExecutionControlAction::Pause,
+                ExecutionEventKind::ExecutionPaused
+            ) | (
+                ExecutionControlAction::Resume,
+                ExecutionEventKind::ExecutionResumed
+            )
+        ) || matches!(
+            (&action, &event.kind),
+            (
+                ExecutionControlAction::ForkConversation,
+                ExecutionEventKind::ConversationForked { session_id }
+            ) if session_id == &expected_session
+        );
+        if execution.state != expected_state
+            || execution.session_id.as_ref() != Some(&expected_session)
+            || execution.worktree_path.as_deref()
+                != Some(control.try_get::<String, _>("worktree_path")?.as_str())
+            || !event_matches_action
+        {
             return Err(StoreError::Conflict(format!(
-                "completed {action:?} has unexpected state {:?}",
-                execution.state
+                "completed {action:?} does not match its accepted state/session/worktree/event"
             )));
         }
         let row = sqlx::query("SELECT * FROM executions WHERE id = $1 FOR UPDATE")
@@ -854,8 +1153,19 @@ impl ExecutionStore for PgExecutionStore {
             .fetch_one(&mut *transaction)
             .await?;
         let persisted = decode_execution(&row)?;
-        if persisted.worker_id != execution.worker_id
-            || persisted.attempt_id != execution.attempt_id
+        let persisted_version: i64 = row.try_get("version")?;
+        if persisted.worker_id.as_ref().map(WorkerId::as_str)
+            != Some(control.try_get::<String, _>("accepted_worker_id")?.as_str())
+            || persisted.attempt_id.as_ref().map(AttemptId::as_str)
+                != Some(
+                    control
+                        .try_get::<String, _>("accepted_attempt_id")?
+                        .as_str(),
+                )
+            || persisted.session_id.as_ref() != Some(&source_session)
+            || persisted.worktree_path != execution.worktree_path
+            || persisted.state != accepted_state
+            || persisted_version != control.try_get::<i64, _>("accepted_execution_version")?
         {
             return Err(StoreError::Conflict(
                 "interactive control attempt authority changed".to_owned(),
@@ -868,13 +1178,6 @@ impl ExecutionStore for PgExecutionStore {
                 from: persisted.state,
                 to: execution.state,
             });
-        }
-        if action == ExecutionControlAction::ForkConversation
-            && persisted.worktree_path != execution.worktree_path
-        {
-            return Err(StoreError::Conflict(
-                "conversation fork changed the workspace boundary".to_owned(),
-            ));
         }
         sqlx::query(
             "UPDATE executions SET state = $2, session_id = $3, updated_at = $4, \
@@ -899,7 +1202,8 @@ impl ExecutionStore for PgExecutionStore {
         .await?;
         let sequence = append_in_transaction(&mut transaction, event).await?;
         sqlx::query(
-            "UPDATE execution_control_requests SET completed_at = $2 WHERE request_id = $1",
+            "UPDATE execution_control_requests SET phase = 'COMPLETED', completed_at = $2 \
+             WHERE request_id = $1",
         )
         .bind(request_id)
         .bind(execution.updated_at)
@@ -907,6 +1211,56 @@ impl ExecutionStore for PgExecutionStore {
         .await?;
         transaction.commit().await?;
         Ok(Some(sequence))
+    }
+
+    async fn attachment_snapshot(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<ExecutionAttachment, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT e.*, \
+                    COALESCE((SELECT MAX(sequence) FROM execution_events \
+                              WHERE execution_id = e.id), 0) AS attachment_cursor, \
+                    EXISTS(SELECT 1 FROM cleanup_authorities c \
+                           WHERE c.execution_id = e.id AND c.phase = 'RETAINED') AS retained \
+             FROM executions e WHERE e.id = $1 FOR SHARE OF e",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let execution = decode_execution(&row)?;
+        let active = matches!(
+            execution.state,
+            ExecutionState::Running | ExecutionState::PausedForHuman
+        ) && execution.worker_id.is_some()
+            && execution.attempt_id.is_some();
+        let retained =
+            execution.state == ExecutionState::ReviewReady && row.try_get::<bool, _>("retained")?;
+        if !active && !retained {
+            return Err(StoreError::Conflict(format!(
+                "execution {id} has no live or retained attachment authority"
+            )));
+        }
+        let session_id = execution.session_id.ok_or_else(|| {
+            StoreError::Conflict(format!("execution {id} lacks an attachable session"))
+        })?;
+        if execution.worktree_path.is_none() {
+            return Err(StoreError::Conflict(format!(
+                "execution {id} lacks an attachable workspace"
+            )));
+        }
+        let cursor = u64::try_from(row.try_get::<i64, _>("attachment_cursor")?)
+            .map_err(|_| StoreError::Conflict("negative attachment cursor".to_owned()))?;
+        transaction.commit().await?;
+        Ok(ExecutionAttachment {
+            execution_id: id.clone(),
+            state: execution.state,
+            session_id,
+            workspace_ref: format!("execution:{id}:workspace"),
+            event_cursor: cursor,
+        })
     }
 }
 
@@ -926,6 +1280,22 @@ fn decode_control_request(
 fn decode_control_action(value: String) -> Result<ExecutionControlAction, StoreError> {
     serde_json::from_value(Value::String(value))
         .map_err(|error| StoreError::Conflict(format!("invalid execution control action: {error}")))
+}
+
+fn decode_control_phase(value: String) -> Result<ExecutionControlPhase, StoreError> {
+    match value.as_str() {
+        "ACCEPTED" => Ok(ExecutionControlPhase::Accepted),
+        "APPLYING" => Ok(ExecutionControlPhase::Applying),
+        "SIDE_EFFECT_APPLIED" => Ok(ExecutionControlPhase::SideEffectApplied),
+        _ => Err(StoreError::Conflict(format!(
+            "invalid pending execution control phase: {value}"
+        ))),
+    }
+}
+
+fn decode_execution_state(value: String) -> Result<ExecutionState, StoreError> {
+    serde_json::from_value(Value::String(value))
+        .map_err(|error| StoreError::Conflict(format!("invalid execution state: {error}")))
 }
 
 fn cancelled_result(id: &ExecutionId) -> ExecutionResult {

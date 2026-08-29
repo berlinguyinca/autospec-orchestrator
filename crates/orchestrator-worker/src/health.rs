@@ -17,6 +17,7 @@ pub struct HealthMonitor {
     started_at: Instant,
     last_event_at: Instant,
     saturated_since: Option<Instant>,
+    paused_at: Option<Instant>,
     warned_for_event_window: bool,
     inactivity: Duration,
     wall_clock: Duration,
@@ -49,6 +50,7 @@ impl HealthMonitor {
             started_at,
             last_event_at: started_at,
             saturated_since: None,
+            paused_at: None,
             warned_for_event_window: false,
             inactivity,
             wall_clock,
@@ -61,7 +63,28 @@ impl HealthMonitor {
         self.warned_for_event_window = false;
     }
 
+    pub fn pause(&mut self, at: Instant) {
+        if self.paused_at.is_none() {
+            self.paused_at = Some(at);
+        }
+    }
+
+    pub fn resume(&mut self, at: Instant) {
+        let Some(paused_at) = self.paused_at.take() else {
+            return;
+        };
+        let suspended = at.saturating_duration_since(paused_at);
+        self.started_at += suspended;
+        self.last_event_at += suspended;
+        if let Some(saturated_since) = &mut self.saturated_since {
+            *saturated_since += suspended;
+        }
+    }
+
     pub fn assess(&mut self, now: Instant, cpu_percent: f64) -> HealthAssessment {
+        if self.paused_at.is_some() {
+            return HealthAssessment::Healthy;
+        }
         if now.duration_since(self.started_at) > self.wall_clock {
             return HealthAssessment::Failed(FailureClass::Timeout);
         }

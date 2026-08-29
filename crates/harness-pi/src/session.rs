@@ -266,7 +266,8 @@ pub(crate) fn spawn(
     }
     let session_dir = Path::new(&session.path);
     let events = open_private_append(&live_events_path(session))?;
-    let stderr = open_private_append(&session_dir.join(format!("pi.stderr-{}.log", session.id)))?;
+    let mut stderr =
+        open_private_append(&session_dir.join(format!("pi.stderr-{}.log", session.id)))?;
     let supervisor_token = supervisor_token()?;
     let lifecycle_holds = ExecutionLifecycleHoldStore::new(&harness.config.state_root)
         .map_err(crate::storage_error)?;
@@ -300,7 +301,7 @@ pub(crate) fn spawn(
         .args(pi_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(stderr);
+        .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {
         let _ = lifecycle_holds.remove(&harness.config.labels.execution_id, &hold_id);
         if error.kind() == io::ErrorKind::NotFound {
@@ -313,6 +314,10 @@ pub(crate) fn spawn(
         .stdout
         .take()
         .ok_or_else(|| HarnessError::Start("docker exec stdout was not piped".to_owned()))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| HarnessError::Start("docker exec stderr was not piped".to_owned()))?;
     let mut supervisor_input = child
         .stdin
         .take()
@@ -322,6 +327,43 @@ pub(crate) fn spawn(
     let pump_docker = harness.processes.docker.clone();
     let pump_container = harness.config.agent_container.clone();
     let expected_supervisor_token = supervisor_token.clone();
+    let credential_redactions = harness.config.credential_redactions.clone();
+    let stderr_redactions = credential_redactions.clone();
+    let stderr_thread = thread::Builder::new()
+        .name(format!("pi-stderr-{}", session.id))
+        .spawn(move || {
+            let mut reader = BufReader::new(stderr_pipe);
+            let mut record = Vec::new();
+            loop {
+                record.clear();
+                match reader.read_until(b'\n', &mut record) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        for secret in &stderr_redactions {
+                            redact_bytes(&mut record, secret);
+                        }
+                        if stderr.write_all(&record).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = stderr.flush();
+        });
+    if let Err(error) = stderr_thread {
+        drop(supervisor_input);
+        cleanup_failed_start(
+            harness,
+            &supervisor_token,
+            None,
+            child,
+            storage.lease,
+            lifecycle_holds,
+            hold_id,
+        );
+        return Err(HarnessError::Start(error.to_string()));
+    }
     let event_thread = thread::Builder::new().name(format!("pi-events-{}", session.id));
     if let Err(error) = event_thread.spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -355,7 +397,20 @@ pub(crate) fn spawn(
                 return;
             }
             let mut events = events;
-            if let Err(error) = io::copy(&mut reader, &mut events) {
+            let copy_result = (|| -> io::Result<()> {
+                let mut record = Vec::new();
+                loop {
+                    record.clear();
+                    if reader.read_until(b'\n', &mut record)? == 0 {
+                        return Ok(());
+                    }
+                    for secret in &credential_redactions {
+                        redact_bytes(&mut record, secret);
+                    }
+                    events.write_all(&record)?;
+                }
+            })();
+            if let Err(error) = copy_result {
                 if let Some(pgid) = pgid {
                     let cleanup =
                         cleanup_container_authority(&pump_docker, &pump_container, Some(pgid), "");
@@ -514,6 +569,19 @@ pub(crate) fn spawn(
         }),
     );
     Ok(())
+}
+
+fn redact_bytes(bytes: &mut Vec<u8>, secret: &[u8]) {
+    const REDACTION: &[u8] = b"[REDACTED_CREDENTIAL]";
+    if secret.is_empty() {
+        return;
+    }
+    while let Some(index) = bytes
+        .windows(secret.len())
+        .position(|window| window == secret)
+    {
+        bytes.splice(index..index + secret.len(), REDACTION.iter().copied());
+    }
 }
 
 pub(crate) async fn stop(harness: &PiHarness, session: &SessionRef) -> Result<(), HarnessError> {
@@ -1482,4 +1550,28 @@ fn restrict_private_file(file: &File) -> Result<(), HarnessError> {
 
 pub(crate) fn io_error(error: io::Error) -> HarnessError {
     HarnessError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::redact_bytes;
+
+    #[test]
+    fn credential_is_removed_from_every_occurrence_before_durable_output() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let mut record = [
+            b"before ".as_slice(),
+            secret,
+            b" middle ",
+            secret,
+            b" after\n",
+        ]
+        .concat();
+        redact_bytes(&mut record, secret);
+        assert!(!record.windows(secret.len()).any(|window| window == secret));
+        assert_eq!(
+            String::from_utf8(record).unwrap(),
+            "before [REDACTED_CREDENTIAL] middle [REDACTED_CREDENTIAL] after\n"
+        );
+    }
 }

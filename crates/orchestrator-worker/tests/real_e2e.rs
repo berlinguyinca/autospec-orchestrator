@@ -10,8 +10,8 @@ use orchestrator_core::{
     event::ExecutionEventKind, AgentAssignment, Execution, ExecutionControlAction, ExecutionEvent,
     ExecutionId, ExecutionManifest, ExecutionResult, ExecutionState, HarnessKind, ModelPolicy,
     OwnershipLabels, PersistenceMode, RepositoryReference, Role, RuntimeKind, RuntimeRequirement,
-    TaskPacket, WorkerAdvertisement, WorkerCapabilities, WorkerCapabilityProof, WorkerId,
-    WorkerRegistration, WorkerState,
+    ServiceRequirement, TaskPacket, WorkerAdvertisement, WorkerCapabilities, WorkerCapabilityProof,
+    WorkerId, WorkerRegistration, WorkerState,
 };
 use orchestrator_persistence::{
     CleanupAuthorityStore, CleanupDisposition, CleanupStage, EventLog, ExecutionStore,
@@ -19,19 +19,31 @@ use orchestrator_persistence::{
     PgWorkerStore, ReservationStore, WorkerStore,
 };
 use orchestrator_worker::{
-    ExecutionLifecycle, FilesystemEvidenceStore, SystemExecutionLifecycle, SystemRecoveryConfig,
-    VerifiedDockerRuntimeFactory, VerifiedPiHarnessFactory, Worker,
+    ControlCheckpoint, ControlCheckpointObserver, ExecutionLifecycle, FilesystemEvidenceStore,
+    SystemExecutionLifecycle, SystemRecoveryConfig, VerifiedDockerRuntimeFactory,
+    VerifiedPiHarnessFactory, Worker,
 };
 use runtime_docker::{DockerRuntime, LocalCredentialBroker, TrustedVerifierImage};
 use runtime_traits::{CredentialBroker, EnvironmentHandle};
 use sqlx::{Connection, PgConnection};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
 };
 use tokio::net::TcpListener;
+
+struct ExitAtControlCheckpoint(ControlCheckpoint);
+
+impl ControlCheckpointObserver for ExitAtControlCheckpoint {
+    fn reached(&self, checkpoint: ControlCheckpoint) {
+        if checkpoint == self.0 {
+            std::process::exit(77);
+        }
+    }
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -287,7 +299,7 @@ impl DockerBindVerifier for TestDockerBindVerifier {
 }
 
 #[tokio::test]
-async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cleanup() {
+async fn paused_worker_is_adopted_across_a_separate_process_with_zero_live_pi_holds() {
     let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
         eprintln!("skipping real Task5 E2E: AUTOSPEC_DATABASE_URL is unset");
         return;
@@ -370,10 +382,16 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
         .env("AUTOSPEC_TASK5_DAEMON", &daemon_id)
         .env("AUTOSPEC_TASK5_IMAGE", &image_id)
         .env("AUTOSPEC_TASK5_WORKER", worker_id.as_str())
+        .env("AUTOSPEC_TASK7_PAUSE_BEFORE_CRASH", "1")
         .status()
         .unwrap();
     assert_eq!(crashed_child.code(), Some(77));
-    let crashed = wait_for_running_session(executions.as_ref(), &execution_id).await;
+    let crashed = wait_for_exact_state(
+        executions.as_ref(),
+        &execution_id,
+        ExecutionState::PausedForHuman,
+    )
+    .await;
     let original_attempt = crashed.attempt_id.clone();
     let original_session = crashed.session_id.clone();
     assert_eq!(
@@ -382,7 +400,7 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
             .list(&execution_id)
             .unwrap()
             .len(),
-        1
+        0
     );
     let adopted = executions.get(&execution_id).await.unwrap();
     let replacement = Arc::new(Worker::new(
@@ -391,12 +409,20 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
         reservations.clone(),
         cleanup.clone(),
     ));
-    let result = replacement
-        .clone()
-        .spawn_adopted(adopted)
-        .join()
+    let task = replacement.clone().spawn_adopted(adopted);
+    executions
+        .request_control(
+            &execution_id,
+            ExecutionControlAction::Resume,
+            "resume-after-paused-restart",
+        )
         .await
         .unwrap();
+    replacement
+        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+        .await
+        .unwrap();
+    let result = task.join().await.unwrap();
 
     assert_eq!(result.state, ExecutionState::ReviewReady);
     assert!(result
@@ -551,6 +577,162 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
     .await
     .unwrap();
     fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_side_effect_crash_cuts_reconcile_in_a_fresh_process_exactly_once() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("skipping real Task7 control crash cuts: AUTOSPEC_DATABASE_URL is unset");
+        return;
+    };
+    let _serial = acquire_real_test_lock(&database_url).await;
+    let Some((daemon_id, image_id)) = docker_capability() else {
+        eprintln!("skipping real Task7 control crash cuts: Docker is unavailable");
+        return;
+    };
+    for stage in ["pause", "resume", "fork", "completion"] {
+        let suffix = format!(
+            "control-crash-{stage}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let root = std::env::temp_dir().join(format!("autospec-task7-{suffix}"));
+        initialize_state_root(&root);
+        let root = root.canonicalize().unwrap();
+        let remote = root.join("remotes");
+        create_stub_repository(&remote);
+        let worker_id = WorkerId::new(format!("worker-{suffix}"));
+        let execution_id = ExecutionId::new(format!("execution-{suffix}"));
+        let capability = format!("capability-{suffix}");
+        PgWorkerStore::connect(&database_url)
+            .await
+            .unwrap()
+            .register(&matrix_worker_registration(
+                worker_id.clone(),
+                capability.clone(),
+                &daemon_id,
+                &image_id,
+            ))
+            .await
+            .unwrap();
+        let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
+        let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+        let cleanup = Arc::new(
+            PgCleanupAuthorityStore::connect(&database_url)
+                .await
+                .unwrap(),
+        );
+        let mut queued = queued_execution(
+            execution_id.clone(),
+            OwnershipLabels {
+                execution_id: execution_id.clone(),
+                worker_id: worker_id.clone(),
+                repository: "owner/repo".into(),
+                issue: Some(stage.into()),
+            },
+            image_id.clone(),
+            capability,
+        );
+        queued.role = Role::Interactive;
+        queued.manifest.role = Role::Interactive;
+        queued.manifest.persistence = PersistenceMode::Resumable;
+        queued.manifest.repository.branch = Some(format!("branch-{suffix}"));
+        executions.insert(&queued).await.unwrap();
+        let crashed = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_process_helper", "--nocapture"])
+            .env("AUTOSPEC_TASK5_CRASH_HELPER", "1")
+            .env("AUTOSPEC_TASK7_CONTROL_CRASH", stage)
+            .env("AUTOSPEC_DATABASE_URL", &database_url)
+            .env("AUTOSPEC_TASK5_ROOT", &root)
+            .env("AUTOSPEC_TASK5_REMOTE", &remote)
+            .env("AUTOSPEC_TASK5_DAEMON", &daemon_id)
+            .env("AUTOSPEC_TASK5_IMAGE", &image_id)
+            .env("AUTOSPEC_TASK5_WORKER", worker_id.as_str())
+            .status()
+            .unwrap();
+        assert_eq!(crashed.code(), Some(77), "stage {stage}");
+        let pending = executions.list_pending_controls(&worker_id).await.unwrap();
+        assert_eq!(pending.len(), 1, "stage {stage}");
+        let expected_phase = if stage == "completion" {
+            orchestrator_persistence::ExecutionControlPhase::SideEffectApplied
+        } else {
+            orchestrator_persistence::ExecutionControlPhase::Applying
+        };
+        assert_eq!(pending[0].phase, expected_phase, "crash phase: {stage}");
+
+        let replacement = Arc::new(Worker::new(
+            build_system_lifecycle(&root, &remote, &daemon_id, &image_id),
+            executions.clone(),
+            reservations.clone(),
+            cleanup.clone(),
+        ));
+        let adopted = executions.get(&execution_id).await.unwrap();
+        let task = replacement.clone().spawn_adopted(adopted);
+        let tick = replacement
+            .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+            .await;
+        if let Err(error) = tick {
+            let task_error = task.join().await.unwrap_err();
+            panic!("fresh {stage} tick failed: {error}; adopted task: {task_error}");
+        }
+        if matches!(stage, "pause" | "completion") {
+            wait_for_exact_state(
+                executions.as_ref(),
+                &execution_id,
+                ExecutionState::PausedForHuman,
+            )
+            .await;
+            executions
+                .request_control(
+                    &execution_id,
+                    ExecutionControlAction::Resume,
+                    "finish-after-pause-cut",
+                )
+                .await
+                .unwrap();
+            replacement
+                .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), task.join())
+            .await
+            .expect("fresh process must reconcile the control")
+            .unwrap();
+        assert_eq!(result.state, ExecutionState::ReviewReady, "stage {stage}");
+        let events = PgEventLog::connect(&database_url)
+            .await
+            .unwrap()
+            .since(&execution_id, 0)
+            .await
+            .unwrap();
+        let matching = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    (&event.kind, stage),
+                    (ExecutionEventKind::ExecutionPaused, "pause" | "completion")
+                        | (ExecutionEventKind::ExecutionResumed, "resume")
+                        | (ExecutionEventKind::ConversationForked { .. }, "fork")
+                )
+            })
+            .count();
+        assert_eq!(matching, 1, "control event must be exactly once: {stage}");
+
+        executions
+            .request_cancellation(&execution_id)
+            .await
+            .unwrap();
+        replacement
+            .reconcile_daemon_tick(&worker_id, &[])
+            .await
+            .unwrap();
+        assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
+        delete_matrix_records(&database_url, &execution_id, &worker_id).await;
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1235,6 +1417,11 @@ async fn real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer() {
         peer_capability,
     );
     peer_execution.manifest.repository.branch = Some(format!("peer-{suffix}"));
+    peer_execution.manifest.services.push(ServiceRequirement {
+        name: "cache".into(),
+        image: "redis:7-alpine".into(),
+        env: BTreeMap::new(),
+    });
     peer_execution.role = Role::Review;
     peer_execution.manifest.role = Role::Review;
     executions.insert(&peer_execution).await.unwrap();
@@ -1256,6 +1443,11 @@ async fn real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer() {
         failed_capability,
     );
     failed_execution.manifest.repository.branch = Some(format!("failed-{suffix}"));
+    failed_execution.manifest.services.push(ServiceRequirement {
+        name: "cache".into(),
+        image: "redis:7-alpine".into(),
+        env: BTreeMap::new(),
+    });
     executions.insert(&failed_execution).await.unwrap();
     let lifecycle = build_system_lifecycle(&root, &remote_root, &daemon_id, &image_id);
     let worker = Arc::new(Worker::new(
@@ -1343,6 +1535,11 @@ async fn real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer() {
         "network",
         &DockerRuntime::network_name(&peer_id)
     ));
+    assert_service_mounts_and_network_bounded(
+        &peer_id,
+        &peer_layout.root,
+        &ExecutionLayout::new(&root, &failed_id).unwrap().root,
+    );
     assert!(peer_result
         .diff_artifact
         .as_ref()
@@ -1376,7 +1573,7 @@ async fn real_cleanup_uncertainty_does_not_destabilize_a_concurrent_peer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_daemon_reconciles_pause_fork_resume_without_replaying_the_task_packet() {
+async fn real_daemon_forks_a_running_conversation_by_quiescing_and_resuming_the_target() {
     let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
         eprintln!("skipping real Task7 interactive controls: AUTOSPEC_DATABASE_URL is unset");
         return;
@@ -1444,16 +1641,6 @@ async fn real_daemon_reconciles_pause_fork_resume_without_replaying_the_task_pac
     let original_worktree = running.worktree_path.clone();
 
     executions
-        .request_control(&execution_id, ExecutionControlAction::Pause, "pause-real")
-        .await
-        .unwrap();
-    worker
-        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
-        .await
-        .unwrap();
-    wait_for_exact_state(&executions, &execution_id, ExecutionState::PausedForHuman).await;
-
-    executions
         .request_control(
             &execution_id,
             ExecutionControlAction::ForkConversation,
@@ -1466,17 +1653,8 @@ async fn real_daemon_reconciles_pause_fork_resume_without_replaying_the_task_pac
         .await
         .unwrap();
     let forked = wait_for_new_session(&executions, &execution_id, &original_session).await;
-    assert_eq!(forked.state, ExecutionState::PausedForHuman);
+    assert_eq!(forked.state, ExecutionState::Running);
     assert_eq!(forked.worktree_path, original_worktree);
-
-    executions
-        .request_control(&execution_id, ExecutionControlAction::Resume, "resume-real")
-        .await
-        .unwrap();
-    worker
-        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
-        .await
-        .unwrap();
     let result = task.join().await.unwrap();
     assert_eq!(result.state, ExecutionState::ReviewReady);
     let interactive_events = events.since(&execution_id, 0).await.unwrap();
@@ -1485,14 +1663,14 @@ async fn real_daemon_reconciles_pause_fork_resume_without_replaying_the_task_pac
             .iter()
             .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionPaused))
             .count(),
-        1
+        0
     );
     assert_eq!(
         interactive_events
             .iter()
             .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionResumed))
             .count(),
-        1
+        0
     );
     assert_eq!(
         interactive_events
@@ -1527,6 +1705,104 @@ async fn real_daemon_reconciles_pause_fork_resume_without_replaying_the_task_pac
         )
         .await
         .unwrap();
+    assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
+    delete_matrix_records(&database_url, &execution_id, &worker_id).await;
+    if root.exists() {
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adversarial_agent_credential_echo_and_copy_are_not_durably_exfiltrated() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("skipping real Task7 credential exfiltration: AUTOSPEC_DATABASE_URL is unset");
+        return;
+    };
+    let _serial = acquire_real_test_lock(&database_url).await;
+    let Some((daemon_id, image_id)) = docker_capability() else {
+        eprintln!("skipping real Task7 credential exfiltration: Docker is unavailable");
+        return;
+    };
+    let suffix = format!(
+        "secret-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    let root = std::env::temp_dir().join(format!("autospec-task7-{suffix}"));
+    initialize_state_root(&root);
+    let root = root.canonicalize().unwrap();
+    let remote_root = root.join("remotes");
+    create_secret_exfiltrating_stub_repository(&remote_root);
+    let worker_id = WorkerId::new(format!("worker-{suffix}"));
+    let execution_id = ExecutionId::new(format!("execution-{suffix}"));
+    let capability = format!("secret-capability-{suffix}");
+    let registration =
+        matrix_worker_registration(worker_id.clone(), capability.clone(), &daemon_id, &image_id);
+    PgWorkerStore::connect(&database_url)
+        .await
+        .unwrap()
+        .register(&registration)
+        .await
+        .unwrap();
+    let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+    let mut queued = queued_execution(
+        execution_id.clone(),
+        OwnershipLabels {
+            execution_id: execution_id.clone(),
+            worker_id: worker_id.clone(),
+            repository: "owner/repo".into(),
+            issue: Some("secret".into()),
+        },
+        image_id.clone(),
+        capability,
+    );
+    queued.manifest.persistence = PersistenceMode::Ephemeral;
+    queued.manifest.repository.branch = Some(format!("secret-{suffix}"));
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let worker = Arc::new(Worker::new(
+        build_system_lifecycle(&root, &remote_root, &daemon_id, &image_id),
+        executions.clone(),
+        reservations.clone(),
+        cleanup.clone(),
+    ));
+    let task = worker.spawn(reservation.execution);
+    wait_for_running_session(&executions, &execution_id).await;
+    let layout = ExecutionLayout::new(&root, &execution_id).unwrap();
+    for _ in 0..300 {
+        if layout.repository.join("leaked.txt").is_file() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let credential = fs::read_to_string(layout.credentials.join("inferweave.credential")).unwrap();
+    let token = credential.lines().next().unwrap().to_owned();
+    assert_eq!(
+        fs::read_to_string(layout.repository.join("leaked.txt")).unwrap(),
+        token
+    );
+    let error = tokio::time::timeout(std::time::Duration::from_secs(30), task.join())
+        .await
+        .expect("recognized terminal event must finish the execution")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("credential") || error.contains("secret"),
+        "exfiltration must fail closed: {error}"
+    );
+    assert!(!error.contains(&token));
+    assert_secret_absent_from_durable_records(&database_url, &token).await;
+    assert!(!layout.root.exists(), "failed exfiltration must be cleaned");
     assert_matrix_case_clean(&root, &execution_id, &worker_id, &reservations, &cleanup).await;
     delete_matrix_records(&database_url, &execution_id, &worker_id).await;
     if root.exists() {
@@ -1868,21 +2144,101 @@ async fn crash_process_helper() {
         .expect("child should reserve queued execution")
         .execution;
     let execution_id = assigned.id.clone();
-    let worker = Arc::new(Worker::new(
+    let mut worker = Worker::new(
         build_system_lifecycle(&root, &remote, &daemon, &image),
         executions.clone(),
         reservations,
         cleanup,
-    ));
-    let running_worker = worker.clone();
-    let task = tokio::spawn(async move { running_worker.run(&assigned).await });
+    );
+    if let Ok(stage) = std::env::var("AUTOSPEC_TASK7_CONTROL_CRASH") {
+        let checkpoint = match stage.as_str() {
+            "pause" => ControlCheckpoint::PauseStopped,
+            "resume" => ControlCheckpoint::ResumeLaunched,
+            "fork" => ControlCheckpoint::ForkLaunched,
+            "completion" => ControlCheckpoint::BeforeCompletion,
+            other => panic!("unknown control crash stage {other}"),
+        };
+        worker =
+            worker.with_control_checkpoint_observer(Arc::new(ExitAtControlCheckpoint(checkpoint)));
+    }
+    let worker = Arc::new(worker);
+    let task = worker.clone().spawn(assigned);
     for _ in 0..300 {
         let execution = executions.get(&execution_id).await.unwrap();
         if execution.state == ExecutionState::Running && execution.session_id.is_some() {
+            if let Ok(stage) = std::env::var("AUTOSPEC_TASK7_CONTROL_CRASH") {
+                if stage == "resume" {
+                    executions
+                        .request_control(
+                            &execution_id,
+                            ExecutionControlAction::Pause,
+                            "prepare-resume-crash",
+                        )
+                        .await
+                        .unwrap();
+                    worker
+                        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+                        .await
+                        .unwrap();
+                    wait_for_exact_state(
+                        executions.as_ref(),
+                        &execution_id,
+                        ExecutionState::PausedForHuman,
+                    )
+                    .await;
+                }
+                let action = match stage.as_str() {
+                    "pause" | "completion" => ExecutionControlAction::Pause,
+                    "resume" => ExecutionControlAction::Resume,
+                    "fork" => ExecutionControlAction::ForkConversation,
+                    _ => unreachable!(),
+                };
+                executions
+                    .request_control(&execution_id, action, &format!("crash-{stage}"))
+                    .await
+                    .unwrap();
+                worker
+                    .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+                    .await
+                    .unwrap();
+                for _ in 0..300 {
+                    if task.is_finished() {
+                        panic!("worker ended before control crash hook at {stage}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                panic!("control crash hook did not exit at {stage}");
+            }
+            if std::env::var_os("AUTOSPEC_TASK7_PAUSE_BEFORE_CRASH").is_some() {
+                executions
+                    .request_control(
+                        &execution_id,
+                        ExecutionControlAction::Pause,
+                        "pause-before-process-crash",
+                    )
+                    .await
+                    .unwrap();
+                worker
+                    .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+                    .await
+                    .unwrap();
+                let paused = wait_for_exact_state(
+                    executions.as_ref(),
+                    &execution_id,
+                    ExecutionState::PausedForHuman,
+                )
+                .await;
+                assert_eq!(paused.session_id, execution.session_id);
+                assert!(execution_storage::ExecutionLifecycleHoldStore::new(&root)
+                    .unwrap()
+                    .list(&execution_id)
+                    .unwrap()
+                    .is_empty());
+            }
             std::process::exit(77);
         }
         if task.is_finished() {
-            panic!("worker ended before durable Running: {:?}", task.await);
+            panic!("worker ended before durable Running");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -1978,6 +2334,18 @@ fn assert_execution_boundaries_are_disjoint(
     );
     assert_agent_mounts_bounded(implementation_id, &implementation.root, &review.root);
     assert_agent_mounts_bounded(review_id, &review.root, &implementation.root);
+    assert_service_mounts_and_network_bounded(
+        implementation_id,
+        &implementation.root,
+        &review.root,
+    );
+    assert_service_mounts_and_network_bounded(review_id, &review.root, &implementation.root);
+    let implementation_service = docker_container_id_by_name(
+        &DockerRuntime::service_container_name(implementation_id, "cache"),
+    );
+    let review_service =
+        docker_container_id_by_name(&DockerRuntime::service_container_name(review_id, "cache"));
+    assert_ne!(implementation_service, review_service);
     for id in [implementation_id, review_id] {
         let volumes = Command::new("docker")
             .args([
@@ -1994,6 +2362,44 @@ fn assert_execution_boundaries_are_disjoint(
             .unwrap();
         assert!(volumes.status.success());
         assert!(String::from_utf8(volumes.stdout).unwrap().trim().is_empty());
+    }
+}
+
+fn docker_container_id_by_name(name: &str) -> String {
+    let output = Command::new("docker")
+        .args(["inspect", "--type", "container", "--format={{.Id}}", name])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "missing container {name}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn assert_service_mounts_and_network_bounded(id: &ExecutionId, own_root: &Path, peer_root: &Path) {
+    let name = DockerRuntime::service_container_name(id, "cache");
+    let output = Command::new("docker")
+        .args(["inspect", "--type", "container", &name])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "missing service container {name}");
+    let inspect: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let inspect = &inspect[0];
+    let networks = inspect["NetworkSettings"]["Networks"].as_object().unwrap();
+    assert_eq!(networks.len(), 1);
+    assert!(networks.contains_key(&DockerRuntime::network_name(id)));
+    for mount in inspect["Mounts"].as_array().unwrap() {
+        assert_eq!(mount["Type"], "bind");
+        assert_ne!(mount["Destination"], "/autospec-credential");
+        let source = PathBuf::from(mount["Source"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert!(
+            source.starts_with(own_root),
+            "foreign service bind: {source:?}"
+        );
+        assert!(
+            !source.starts_with(peer_root),
+            "peer service bind: {source:?}"
+        );
     }
 }
 
@@ -2393,6 +2799,46 @@ fn create_stub_repository(remote_root: &Path) {
 
 fn create_completing_stub_repository(remote_root: &Path) {
     create_stub_repository_with_behavior(remote_root, false);
+}
+
+fn create_secret_exfiltrating_stub_repository(remote_root: &Path) {
+    let remote = remote_root.join("owner/repo.git");
+    fs::create_dir_all(remote.parent().unwrap()).unwrap();
+    run(Command::new("git").args(["init", "--bare", remote.to_str().unwrap()]));
+    let seed = remote_root.join("seed");
+    run(Command::new("git").args(["init", seed.to_str().unwrap()]));
+    run(Command::new("git")
+        .current_dir(&seed)
+        .args(["config", "user.name", "Task7 E2E"]));
+    run(Command::new("git").current_dir(&seed).args([
+        "config",
+        "user.email",
+        "task7@example.invalid",
+    ]));
+    let pi = seed.join("pi");
+    fs::write(
+        &pi,
+        "#!/bin/sh\nsession_id=\nsource_session=\nwhile test \"$#\" -gt 0; do\n  case \"$1\" in\n    --session-id) session_id=$2; shift 2 ;;\n    --session|--fork) source_session=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nif test -z \"$session_id\" && test -n \"$source_session\"; then\n  session_id=$(sed -n '1s/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p' \"$source_session\")\nfi\nif test -n \"$session_id\" && test ! -s \"/session/session_${session_id}.jsonl\"; then\n  printf '{\"type\":\"session\",\"version\":3,\"id\":\"%s\",\"cwd\":\"/workspace\"}\\n' \"$session_id\" > \"/session/session_${session_id}.jsonl\"\nfi\ncount=1\nif test -f /session/invocations; then count=$(( $(cat /session/invocations) + 1 )); fi\nprintf '%s\\n' \"$count\" > /session/invocations\nprintf '%s\\n' '{\"type\":\"session\",\"id\":\"e2e\"}' '{\"type\":\"agent_start\"}' '{\"type\":\"turn_start\"}'\nsecret=$(sed -n '1p' \"$INFERWEAVE_CREDENTIAL_FILE\")\nprintf '%s' \"$secret\" > /workspace/leaked.txt\nprintf '%s\\n' \"$secret\" >&2\nprintf 'worker-e2e-%s\\n' \"$count\" > /workspace/result.txt\nprintf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"stopReason\":\"stop\"}}' '{\"type\":\"agent_settled\"}'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
+    run(Command::new("git").current_dir(&seed).args(["add", "pi"]));
+    run(Command::new("git")
+        .current_dir(&seed)
+        .args(["commit", "-m", "seed"]));
+    run(Command::new("git")
+        .current_dir(&seed)
+        .args(["branch", "-M", "main"]));
+    run(Command::new("git").current_dir(&seed).args([
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    run(Command::new("git")
+        .current_dir(&seed)
+        .args(["push", "-u", "origin", "main"]));
 }
 
 fn create_stub_repository_with_behavior(remote_root: &Path, block_first_run: bool) {

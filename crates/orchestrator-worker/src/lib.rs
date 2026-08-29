@@ -19,12 +19,11 @@ use execution_storage::AllocationReceipt;
 use git_worktree::{DiffCapture, Worktree};
 use harness_traits::SessionRef;
 use orchestrator_core::{
-    Execution, ExecutionControlRequest, ExecutionEvent, ExecutionId, ExecutionResult, TaskPacket,
-    WorkerId,
+    Execution, ExecutionEvent, ExecutionId, ExecutionResult, TaskPacket, WorkerId,
 };
 use orchestrator_persistence::{
     CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore,
-    PendingCancellation, ReservationStore, StoreError,
+    PendingCancellation, PendingExecutionControl, ReservationStore, StoreError,
 };
 use runtime_traits::EnvironmentHandle;
 use std::sync::{
@@ -100,6 +99,7 @@ pub trait ExecutionLifecycle: Send + Sync {
         &self,
         _execution: &Execution,
         _session: &SessionRef,
+        _target: &orchestrator_core::SessionId,
     ) -> Result<SessionRef, LifecycleError> {
         Err(LifecycleError::Step(
             "execution lifecycle does not support conversation fork".into(),
@@ -189,19 +189,40 @@ pub struct AdoptedExecution {
     pub session: SessionRef,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlCheckpoint {
+    ApplyingPersisted,
+    PauseStopped,
+    ResumeLaunched,
+    ForkLaunched,
+    SideEffectPersisted,
+    BeforeCompletion,
+}
+
+pub trait ControlCheckpointObserver: Send + Sync {
+    fn reached(&self, checkpoint: ControlCheckpoint);
+}
+
+struct NoopControlCheckpointObserver;
+
+impl ControlCheckpointObserver for NoopControlCheckpointObserver {
+    fn reached(&self, _: ControlCheckpoint) {}
+}
+
 #[derive(Clone)]
 pub struct Worker {
     lifecycle: Arc<dyn ExecutionLifecycle>,
     executions: Arc<dyn ExecutionStore>,
     reservations: Arc<dyn ReservationStore>,
     cleanup_authorities: Arc<dyn CleanupAuthorityStore>,
+    control_checkpoints: Arc<dyn ControlCheckpointObserver>,
 }
 
 pub struct ExecutionTask {
     execution_id: ExecutionId,
     cancelled: Arc<AtomicBool>,
     join: tokio::task::JoinHandle<Result<ExecutionResult, WorkerError>>,
-    controls: tokio::sync::mpsc::UnboundedSender<ExecutionControlRequest>,
+    controls: tokio::sync::mpsc::UnboundedSender<PendingExecutionControl>,
     signalled_controls: Mutex<BTreeSet<i64>>,
 }
 
@@ -214,16 +235,16 @@ impl ExecutionTask {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 
-    fn signal_control(&self, request: ExecutionControlRequest) -> Result<(), WorkerError> {
+    fn signal_control(&self, control: PendingExecutionControl) -> Result<(), WorkerError> {
         let mut signalled = self
             .signalled_controls
             .lock()
             .map_err(|_| WorkerError::Invalid("control signal lock poisoned".into()))?;
-        if !signalled.insert(request.request_id) {
+        if !signalled.insert(control.request.request_id) {
             return Ok(());
         }
         self.controls
-            .send(request)
+            .send(control)
             .map_err(|_| WorkerError::Invalid("execution control channel closed".into()))
     }
 
@@ -263,7 +284,16 @@ impl Worker {
             executions,
             reservations,
             cleanup_authorities,
+            control_checkpoints: Arc::new(NoopControlCheckpointObserver),
         }
+    }
+
+    pub fn with_control_checkpoint_observer(
+        mut self,
+        observer: Arc<dyn ControlCheckpointObserver>,
+    ) -> Self {
+        self.control_checkpoints = observer;
+        self
     }
 
     pub async fn run(&self, execution: &Execution) -> Result<ExecutionResult, WorkerError> {
@@ -345,7 +375,16 @@ impl Worker {
                 .iter()
                 .find(|task| task.execution_id() == &control.execution.id)
             {
-                task.signal_control(control.request)?;
+                task.signal_control(control)?;
+            } else {
+                self.executions
+                    .begin_control(
+                        control.request.request_id,
+                        &control.accepted_worker_id,
+                        &control.accepted_attempt_id,
+                    )
+                    .await
+                    .map_err(|error| WorkerError::Persistence(error.to_string()))?;
             }
         }
 

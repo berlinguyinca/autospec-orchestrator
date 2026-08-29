@@ -19,6 +19,21 @@ enum DurableSession {
 }
 
 pub(crate) fn resume(harness: &PiHarness, session: &SessionRef) -> Result<(), HarnessError> {
+    resume_with_budget(harness, session, true)
+}
+
+pub(crate) fn resume_interactive(
+    harness: &PiHarness,
+    session: &SessionRef,
+) -> Result<(), HarnessError> {
+    resume_with_budget(harness, session, false)
+}
+
+fn resume_with_budget(
+    harness: &PiHarness,
+    session: &SessionRef,
+    consume_automatic_budget: bool,
+) -> Result<(), HarnessError> {
     let storage = prepare_launch(harness)?;
     harness.validate_session(session)?;
     validate_owner(harness, session)?;
@@ -30,7 +45,7 @@ pub(crate) fn resume(harness: &PiHarness, session: &SessionRef) -> Result<(), Ha
         .trim()
         .parse::<u64>()
         .map_err(|error| HarnessError::NotResumable(error.to_string()))?;
-    if current >= MAX_RESUMES {
+    if consume_automatic_budget && current >= MAX_RESUMES {
         return Err(HarnessError::NotResumable(format!(
             "resume limit {MAX_RESUMES} exceeded"
         )));
@@ -39,8 +54,10 @@ pub(crate) fn resume(harness: &PiHarness, session: &SessionRef) -> Result<(), Ha
         Some(path) => validate_and_repair(&path)?,
         None => DurableSession::Empty,
     };
-    let next = current + 1;
-    atomic_write(&count_path, format!("{next}\n").as_bytes())?;
+    if consume_automatic_budget {
+        let next = current + 1;
+        atomic_write(&count_path, format!("{next}\n").as_bytes())?;
+    }
     let mut args = base_args(harness)?;
     match source {
         DurableSession::Ready(path) => {
@@ -71,6 +88,19 @@ pub(crate) fn fork_conversation(
     harness: &PiHarness,
     session: &SessionRef,
 ) -> Result<SessionRef, HarnessError> {
+    let fork_id = SessionId::new(format!(
+        "{}-fork-{}",
+        session.execution_id,
+        uuid::Uuid::new_v4().simple()
+    ));
+    fork_conversation_as(harness, session, &fork_id)
+}
+
+pub(crate) fn fork_conversation_as(
+    harness: &PiHarness,
+    session: &SessionRef,
+    fork_id: &SessionId,
+) -> Result<SessionRef, HarnessError> {
     let storage = prepare_launch(harness)?;
     harness.validate_session(session)?;
     validate_owner(harness, session)?;
@@ -83,17 +113,20 @@ pub(crate) fn fork_conversation(
             "cannot fork an empty Pi conversation".to_owned(),
         ));
     }
-    let fork_id = SessionId::new(format!(
-        "{}-fork-{}",
-        session.execution_id,
-        uuid::Uuid::new_v4().simple()
-    ));
     let fork = SessionRef {
-        id: fork_id,
+        id: fork_id.clone(),
         path: session.path.clone(),
         execution_id: session.execution_id.clone(),
         worktree_path: session.worktree_path.clone(),
     };
+    if let Some(existing) = find_session_file(&conversation_dir, fork.id.as_str())? {
+        if matches!(validate_and_repair(&existing)?, DurableSession::Ready(_)) {
+            return Ok(fork);
+        }
+        return Err(HarnessError::NotResumable(
+            "fenced fork target exists without a durable conversation".to_owned(),
+        ));
+    }
     let name = source
         .file_name()
         .and_then(|name| name.to_str())

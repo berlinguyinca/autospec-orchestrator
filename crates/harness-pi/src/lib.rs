@@ -40,6 +40,8 @@ pub struct PiHarnessConfig {
     pub tools: Vec<String>,
     /// Additional explicit skill paths. Package discovery remains disabled.
     pub skills: Vec<PathBuf>,
+    /// Exact in-memory values removed before Pi output reaches durable JSONL.
+    pub credential_redactions: Vec<Vec<u8>>,
     pub stop_timeout: Duration,
     storage: Option<VerifiedAllocationConfig>,
 }
@@ -79,6 +81,7 @@ impl PiHarnessConfig {
                 "write".to_owned(),
             ],
             skills: Vec::new(),
+            credential_redactions: Vec::new(),
             stop_timeout: Duration::from_secs(10),
             storage: None,
         }
@@ -124,6 +127,7 @@ impl PiHarnessConfig {
                 "write".to_owned(),
             ],
             skills: Vec::new(),
+            credential_redactions: Vec::new(),
             stop_timeout: Duration::from_secs(10),
             storage: Some(VerifiedAllocationConfig {
                 verifier,
@@ -398,6 +402,10 @@ impl AgentHarness for PiHarness {
         resume::resume(self, session)
     }
 
+    async fn resume_interactive(&self, session: &SessionRef) -> Result<(), HarnessError> {
+        resume::resume_interactive(self, session)
+    }
+
     async fn recover_abandoned(&self) -> Result<(), HarnessError> {
         let _storage = session::prepare_launch(self)?;
         Ok(())
@@ -405,6 +413,14 @@ impl AgentHarness for PiHarness {
 
     async fn fork_conversation(&self, session: &SessionRef) -> Result<SessionRef, HarnessError> {
         resume::fork_conversation(self, session)
+    }
+
+    async fn fork_conversation_as(
+        &self,
+        session: &SessionRef,
+        target: &orchestrator_core::SessionId,
+    ) -> Result<SessionRef, HarnessError> {
+        resume::fork_conversation_as(self, session, target)
     }
 
     async fn poll_events(&self, session: &SessionRef) -> Result<Vec<ExecutionEvent>, HarnessError> {

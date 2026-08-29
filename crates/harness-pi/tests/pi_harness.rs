@@ -900,6 +900,51 @@ async fn harness_state_and_task_packet_stay_inside_the_verified_allocation() {
     harness.stop(&session).await.unwrap();
 }
 
+#[tokio::test]
+async fn credential_echo_is_scrubbed_from_stdout_and_stderr_before_terminal_poll() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    let secret = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    fixture.set_event_phases(
+        &format!(
+            "{{\"type\":\"session\",\"id\":\"e2e\"}}\n{{\"type\":\"agent_start\"}}\n{{\"type\":\"message_update\",\"text\":\"{}\"}}\n{{\"type\":\"agent_settled\"}}\n",
+            String::from_utf8_lossy(secret)
+        ),
+        "",
+    );
+    fs::write(fixture.worktree_dir().join("pi-stderr-input"), secret).unwrap();
+    let mut config = fixture.harness().config().clone();
+    config.credential_redactions = vec![secret.to_vec()];
+    let harness = PiHarness::new(config);
+    let session = harness.start(&packet()).await.unwrap();
+    let events_path = fixture
+        .session_dir()
+        .join(format!("pi.events-{}.jsonl", fixture.execution_id));
+    wait_for_content(&events_path, "agent_settled").await;
+    let events = harness.poll_events(&session).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, ExecutionEventKind::ReviewReady)));
+    let stdout = fs::read_to_string(&events_path).unwrap();
+    let stderr = fs::read_to_string(
+        fixture
+            .session_dir()
+            .join(format!("pi.stderr-{}.log", fixture.execution_id)),
+    )
+    .unwrap();
+    for durable in [&stdout, &stderr] {
+        assert!(!durable
+            .as_bytes()
+            .windows(secret.len())
+            .any(|bytes| bytes == secret));
+        assert!(durable.contains("[REDACTED_CREDENTIAL]"));
+    }
+    let cursor = fs::read_to_string(fixture.session_dir().join(".cursor")).unwrap();
+    assert!(cursor.contains("\"terminal\":\"review_ready\""));
+    harness.stop(&session).await.unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn symlinked_conversation_is_rejected_before_harness_writes() {
@@ -1867,6 +1912,10 @@ if [ ! -s "$session_file" ]; then
   printf '{"type":"session","version":3,"id":"%s","timestamp":"2026-08-28T00:00:00Z","cwd":"/workspace"}\n' "$session_id" > "$session_file"
 fi
 cat /workspace/pi-json-events.jsonl
+if [ -f /workspace/pi-stderr-input ]; then
+  cat /workspace/pi-stderr-input >&2
+  printf '\n' >&2
+fi
 if [ -f /workspace/pi-json-events-2.jsonl ]; then
   while [ ! -f /workspace/continue-events ]; do sleep 0.01; done
   cat /workspace/pi-json-events-2.jsonl

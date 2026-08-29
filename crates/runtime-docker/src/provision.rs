@@ -766,19 +766,7 @@ async fn verify_with_trusted_container(
     let canonical_root = fs::canonicalize(execution_root).map_err(|error| {
         RuntimeError::ResourceLimit(format!("canonicalize execution root: {error}"))
     })?;
-    let mut sources = vec![canonical_root.clone()];
-    for source in workload_mounts
-        .iter()
-        .filter_map(|mount| mount.source.as_deref())
-        .map(Path::new)
-        .map(fs::canonicalize)
-        .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(|error| RuntimeError::ResourceLimit(format!("canonicalize proof bind: {error}")))?
-    {
-        if source != canonical_root {
-            sources.push(source);
-        }
-    }
+    let sources = verifier_sources(&canonical_root, workload_mounts)?;
     let proof_mounts = sources
         .iter()
         .enumerate()
@@ -901,11 +889,6 @@ async fn verify_with_trusted_container(
             })?
             .docker_bind
             .filesystem_id;
-        if identities.first() != Some(expected) {
-            return Err(RuntimeError::ResourceLimit(
-                "trusted verifier execution-root identity differs from the Ready proof".to_owned(),
-            ));
-        }
         let expected_device = expected.split(':').next().unwrap_or_default();
         if identities
             .iter()
@@ -939,6 +922,32 @@ async fn verify_with_trusted_container(
                 .unwrap_or_else(|| "ok".to_owned()),
         ))),
     }
+}
+
+fn verifier_sources(
+    canonical_root: &Path,
+    workload_mounts: &[Mount],
+) -> Result<Vec<std::path::PathBuf>, RuntimeError> {
+    let workload_sources = workload_mounts
+        .iter()
+        .filter(|mount| mount.target.as_deref() != Some(CONTAINER_CREDENTIAL))
+        .filter_map(|mount| mount.source.as_deref())
+        .map(Path::new)
+        .map(fs::canonicalize)
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| {
+            RuntimeError::ResourceLimit(format!("canonicalize proof bind: {error}"))
+        })?;
+    if workload_sources.is_empty()
+        || workload_sources
+            .iter()
+            .any(|source| !source.starts_with(canonical_root))
+    {
+        return Err(RuntimeError::ResourceLimit(
+            "trusted verifier sources escaped or omitted execution storage".to_owned(),
+        ));
+    }
+    Ok(workload_sources.into_iter().collect())
 }
 
 pub(crate) async fn verify_container_mount_sources(
@@ -1385,5 +1394,11 @@ mod tests {
             std::fs::canonicalize(credential_mount.source.as_deref().unwrap()).unwrap(),
             std::fs::canonicalize(&credential).unwrap()
         );
+        let verifier = verifier_sources(&layout.root.canonicalize().unwrap(), &mounts)
+            .expect("verifier sources");
+        assert!(!verifier.contains(&credential.canonicalize().unwrap()));
+        assert!(verifier
+            .iter()
+            .all(|source| !layout.credentials.starts_with(source)));
     }
 }

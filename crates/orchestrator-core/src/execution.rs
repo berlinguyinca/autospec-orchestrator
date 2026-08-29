@@ -115,7 +115,7 @@ pub struct ExecutionAttachment {
     pub execution_id: ExecutionId,
     pub state: ExecutionState,
     pub session_id: SessionId,
-    pub worktree_path: String,
+    pub workspace_ref: String,
     pub event_cursor: u64,
 }
 

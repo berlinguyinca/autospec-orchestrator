@@ -12,8 +12,9 @@ use orchestrator_core::{
     RuntimeRequirement, SessionId, TaskPacket, WorkerId,
 };
 use orchestrator_persistence::{
-    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore,
-    PendingCancellation, PendingExecutionControl, Reservation, ReservationStore, StoreError,
+    CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionControlPhase,
+    ExecutionStore, PendingCancellation, PendingExecutionControl, Reservation, ReservationStore,
+    StoreError,
 };
 use orchestrator_worker::{AdoptedExecution, ExecutionLifecycle, LifecycleError, Worker};
 use runtime_traits::{EnvironmentHandle, VerifiedAgentContainer};
@@ -60,6 +61,16 @@ impl ExecutionStore for FakeStore {
         _: &WorkerId,
     ) -> Result<Vec<PendingExecutionControl>, StoreError> {
         Ok(self.pending_controls.lock().unwrap().clone())
+    }
+    async fn begin_control(&self, _: i64, _: &WorkerId, _: &AttemptId) -> Result<(), StoreError> {
+        Ok(())
+    }
+    async fn mark_control_side_effect_applied(
+        &self,
+        _: i64,
+        _: Option<&SessionId>,
+    ) -> Result<(), StoreError> {
+        Ok(())
     }
     async fn complete_control(
         &self,
@@ -345,10 +356,11 @@ impl ExecutionLifecycle for FakeLifecycle {
         &self,
         execution: &Execution,
         session: &SessionRef,
+        target: &SessionId,
     ) -> Result<SessionRef, LifecycleError> {
         self.step("pi-fork")?;
         Ok(SessionRef {
-            id: SessionId::new(format!("{}-fork", session.id)),
+            id: target.clone(),
             path: format!("{}/fork", session.path),
             execution_id: execution.id.clone(),
             worktree_path: session.worktree_path.clone(),
@@ -511,6 +523,7 @@ async fn restart_adoption_reuses_attempt_session_and_skips_all_creation_steps() 
         *order.lock().unwrap(),
         vec![
             "adopt",
+            "pi-resume",
             "pi-poll",
             "pi-stop",
             "git-capture",
@@ -1102,16 +1115,35 @@ async fn durable_pause_resume_and_conversation_fork_interrupt_poll_without_works
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    let mut durable = execution.clone();
+    durable.state = ExecutionState::Running;
+    durable.worktree_path = Some("/allocation/repository".into());
+    durable.session_id = Some(SessionId::new(execution.id.to_string()));
+    *store.execution.lock().unwrap() = Some(durable);
 
-    let pending = |request_id, action| PendingExecutionControl {
-        request: ExecutionControlRequest {
-            request_id,
-            execution_id: execution.id.clone(),
-            action,
-            requested_at: Utc::now(),
-            completed_at: None,
-        },
-        execution: store.execution.lock().unwrap().clone().unwrap(),
+    let pending = |request_id, action| {
+        let current = store.execution.lock().unwrap().clone().unwrap();
+        let source_session_id = current.session_id.clone().unwrap();
+        PendingExecutionControl {
+            request: ExecutionControlRequest {
+                request_id,
+                execution_id: execution.id.clone(),
+                action,
+                requested_at: Utc::now(),
+                completed_at: None,
+            },
+            execution: current.clone(),
+            phase: ExecutionControlPhase::Accepted,
+            accepted_worker_id: current.worker_id.clone().unwrap(),
+            accepted_attempt_id: current.attempt_id.clone().unwrap(),
+            source_session_id: source_session_id.clone(),
+            worktree_path: current.worktree_path.clone().unwrap(),
+            accepted_version: request_id,
+            accepted_state: current.state,
+            target_session_id: (action == ExecutionControlAction::ForkConversation)
+                .then(|| SessionId::new(format!("{source_session_id}-fork-{request_id}"))),
+            side_effect_session_id: None,
+        }
     };
     store
         .pending_controls
@@ -1147,7 +1179,7 @@ async fn durable_pause_resume_and_conversation_fork_interrupt_poll_without_works
     assert!(forked
         .session_id
         .as_ref()
-        .is_some_and(|session| session.as_str().ends_with("-fork")));
+        .is_some_and(|session| session.as_str().ends_with("-fork-2")));
     assert_eq!(
         order
             .lock()
@@ -1170,6 +1202,93 @@ async fn durable_pause_resume_and_conversation_fork_interrupt_poll_without_works
         .unwrap();
     wait_for_state(&store, ExecutionState::Running).await;
     assert!(order.lock().unwrap().contains(&"pi-resume"));
+    task.cancel();
+    let _ = task.join().await;
+}
+
+#[tokio::test]
+async fn running_conversation_fork_quiesces_source_and_resumes_exact_target() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::clone(&order),
+        fail_at: None,
+        poll_empty: false,
+        cleanup_fail: false,
+        hang_poll: true,
+    });
+    let store = Arc::new(FakeStore::default());
+    let execution = execution();
+    let worker_id = execution.worker_id.clone().unwrap();
+    store.insert(&execution).await.unwrap();
+    let worker = Arc::new(worker(
+        lifecycle,
+        store.clone(),
+        Arc::new(FakeReservations::default()),
+    ));
+    let task = worker.clone().spawn(execution.clone());
+    for _ in 0..100 {
+        if order.lock().unwrap().contains(&"pi-poll") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut current = execution.clone();
+    current.state = ExecutionState::Running;
+    current.worktree_path = Some("/allocation/repository".into());
+    current.session_id = Some(SessionId::new(execution.id.to_string()));
+    let target = SessionId::new(format!("{}-fork-44", current.session_id.as_ref().unwrap()));
+    store
+        .pending_controls
+        .lock()
+        .unwrap()
+        .push(PendingExecutionControl {
+            request: ExecutionControlRequest {
+                request_id: 44,
+                execution_id: execution.id.clone(),
+                action: ExecutionControlAction::ForkConversation,
+                requested_at: Utc::now(),
+                completed_at: None,
+            },
+            execution: current.clone(),
+            phase: ExecutionControlPhase::Accepted,
+            accepted_worker_id: current.worker_id.clone().unwrap(),
+            accepted_attempt_id: current.attempt_id.clone().unwrap(),
+            source_session_id: current.session_id.clone().unwrap(),
+            worktree_path: current.worktree_path.clone().unwrap(),
+            accepted_version: 1,
+            accepted_state: ExecutionState::Running,
+            target_session_id: Some(target.clone()),
+            side_effect_session_id: None,
+        });
+    worker
+        .reconcile_daemon_tick(&worker_id, std::slice::from_ref(&task))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if store.get(&execution.id).await.unwrap().session_id.as_ref() == Some(&target) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        store.get(&execution.id).await.unwrap().state,
+        ExecutionState::Running
+    );
+    assert_eq!(
+        store.get(&execution.id).await.unwrap().session_id,
+        Some(target)
+    );
+    let control_steps = order
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|step| matches!(*step, "pi-pause" | "pi-fork" | "pi-resume"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        control_steps,
+        vec!["pi-pause", "pi-fork", "pi-pause", "pi-resume"]
+    );
     task.cancel();
     let _ = task.join().await;
 }

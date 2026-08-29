@@ -116,7 +116,7 @@ impl LocalCredentialBroker {
         Ok((expires_at > Utc::now()).then_some(expires_at))
     }
 
-    fn create(&self, path: &Path, expires_at: DateTime<Utc>) -> Result<(), RuntimeError> {
+    fn random_hex(&self) -> Result<String, RuntimeError> {
         let mut entropy = [0u8; 32];
         File::open("/dev/urandom")
             .and_then(|mut source| source.read_exact(&mut entropy))
@@ -127,6 +127,17 @@ impl LocalCredentialBroker {
         for byte in entropy {
             write!(token, "{byte:02x}").expect("writing to a String cannot fail");
         }
+        Ok(token)
+    }
+
+    fn create_candidate(
+        &self,
+        parent: &Path,
+        expires_at: DateTime<Utc>,
+    ) -> Result<PathBuf, RuntimeError> {
+        let token = self.random_hex()?;
+        let suffix = self.random_hex()?;
+        let path = parent.join(format!(".{CREDENTIAL_FILE}.{suffix}.tmp"));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -134,7 +145,7 @@ impl LocalCredentialBroker {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(path).map_err(|error| {
+        let mut file = options.open(&path).map_err(|error| {
             RuntimeError::Provisioning(format!("create execution credential: {error}"))
         })?;
         write!(file, "{token}\n{}\n", expires_at.to_rfc3339())
@@ -142,12 +153,13 @@ impl LocalCredentialBroker {
             .map_err(|error| {
                 RuntimeError::Provisioning(format!("persist execution credential: {error}"))
             })?;
-        File::open(path.parent().expect("credential has a parent"))
+        Ok(path)
+    }
+
+    fn sync_directory(parent: &Path, operation: &str) -> Result<(), RuntimeError> {
+        File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                RuntimeError::Provisioning(format!("sync credential directory: {error}"))
-            })?;
-        Ok(())
+            .map_err(|error| RuntimeError::Provisioning(format!("{operation}: {error}")))
     }
 }
 
@@ -159,36 +171,66 @@ impl CredentialBroker for LocalCredentialBroker {
         if let Some(expires_at) = self.read_live(&path)? {
             return Ok(ExecutionCredentials { path, expires_at });
         }
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(RuntimeError::Provisioning(format!(
-                    "remove expired credential: {error}"
-                )))
-            }
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(RuntimeError::ResourceLimit(
+                "execution credential is expired and remains bound until cleanup".to_owned(),
+            ));
         }
         let expires_at = Utc::now() + self.ttl;
-        self.create(&path, expires_at)?;
-        Ok(ExecutionCredentials { path, expires_at })
+        let candidate = self.create_candidate(&parent, expires_at)?;
+        match fs::hard_link(&candidate, &path) {
+            Ok(()) => {
+                fs::remove_file(&candidate).map_err(|error| {
+                    RuntimeError::Provisioning(format!(
+                        "remove linked credential candidate: {error}"
+                    ))
+                })?;
+                Self::sync_directory(&parent, "sync credential directory")?;
+                Ok(ExecutionCredentials { path, expires_at })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&candidate).map_err(|remove_error| {
+                    RuntimeError::Provisioning(format!(
+                        "remove losing credential candidate: {remove_error}"
+                    ))
+                })?;
+                let expires_at = self.read_live(&path)?.ok_or_else(|| {
+                    RuntimeError::ResourceLimit(
+                        "concurrent credential winner is expired".to_owned(),
+                    )
+                })?;
+                Ok(ExecutionCredentials { path, expires_at })
+            }
+            Err(error) => Err(RuntimeError::Provisioning(format!(
+                "publish execution credential: {error}"
+            ))),
+        }
     }
 
     async fn revoke(&self, id: &ExecutionId) -> Result<(), RuntimeError> {
         let path = self.credential_path(id)?;
-        if self.read_live(&path)?.is_none() && !path.exists() {
-            return Ok(());
-        }
         let parent = match self.verified_parent(id) {
             Ok(parent) => parent,
-            Err(_error) if !path.exists() => return Ok(()),
+            Err(_error) if fs::symlink_metadata(&path).is_err() => return Ok(()),
             Err(error) => return Err(error),
         };
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(RuntimeError::Cleanup(format!(
+                    "inspect execution credential for revocation: {error}"
+                )))
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(RuntimeError::ResourceLimit(
+                "execution credential revocation authority is not a regular file".to_owned(),
+            ));
+        }
         match fs::remove_file(&path) {
-            Ok(()) => File::open(&parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| {
-                    RuntimeError::Cleanup(format!("sync credential revocation: {error}"))
-                }),
+            Ok(()) => Self::sync_directory(&parent, "sync credential revocation")
+                .map_err(|error| RuntimeError::Cleanup(error.to_string())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(RuntimeError::Cleanup(format!(
                 "revoke execution credential: {error}"
