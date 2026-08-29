@@ -136,6 +136,8 @@ impl ReservationStore for PgReservationStore {
         }
         let rows = sqlx::query(
             "SELECT * FROM executions WHERE state = 'QUEUED' \
+             AND NOT EXISTS (SELECT 1 FROM execution_cancellation_requests r \
+                 WHERE r.execution_id = executions.id AND r.completed_at IS NULL) \
              AND NOT EXISTS (SELECT 1 FROM cleanup_authorities c \
                  WHERE c.execution_id = executions.id AND c.phase <> 'RESOLVED') \
              ORDER BY created_at, id FOR UPDATE SKIP LOCKED",
@@ -292,6 +294,18 @@ impl ReservationStore for PgReservationStore {
             .await?
             .ok_or_else(|| StoreError::NotFound(execution_id.to_string()))?;
         let execution = decode_execution(&execution)?;
+        let cancellation_pending = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM execution_cancellation_requests \
+             WHERE execution_id = $1 AND completed_at IS NULL)",
+        )
+        .bind(execution_id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if cancellation_pending {
+            return Err(StoreError::Conflict(format!(
+                "execution {execution_id} has a pending cancellation request"
+            )));
+        }
         if execution.state != ExecutionState::ReviewReady
             || execution.manifest.persistence != PersistenceMode::Resumable
             || execution.attempt_id.as_ref() != Some(attempt_id)

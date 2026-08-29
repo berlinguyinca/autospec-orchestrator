@@ -16,7 +16,7 @@ use std::{
 };
 
 #[tokio::test]
-async fn cancellation_request_is_durable_without_publishing_a_terminal_state() {
+async fn queued_cancellation_is_immediate_atomic_and_idempotent() {
     let _database_test = database_test_lock().lock().await;
     let Some((executions, events)) = stores().await else {
         return;
@@ -25,13 +25,213 @@ async fn cancellation_request_is_durable_without_publishing_a_terminal_state() {
     executions.insert(&queued).await.unwrap();
 
     let requested = executions.request_cancellation(&queued.id).await.unwrap();
-    assert_eq!(requested.state, ExecutionState::Queued);
-    assert!(executions.cancellation_requested(&queued.id).await.unwrap());
-    assert!(events.since(&queued.id, 0).await.unwrap().is_empty());
+    assert_eq!(requested.state, ExecutionState::Cancelled);
+    assert!(!executions.cancellation_requested(&queued.id).await.unwrap());
+    let cancelled = events.since(&queued.id, 0).await.unwrap();
+    assert_eq!(cancelled.len(), 1);
+    assert!(matches!(
+        cancelled[0].kind,
+        ExecutionEventKind::ExecutionCancelled
+    ));
+    assert!(cancelled[0].attempt_id.is_none());
 
     let replay = executions.request_cancellation(&queued.id).await.unwrap();
     assert_eq!(replay.id, queued.id);
-    assert_eq!(replay.state, ExecutionState::Queued);
+    assert_eq!(replay.state, ExecutionState::Cancelled);
+    assert_eq!(events.since(&queued.id, 0).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn scheduler_excludes_a_queued_execution_with_pending_cancellation() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let mut worker = registered_worker(
+        &format!("worker-cancel-exclusion-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    let capability = format!("cancel-exclusion-{}", uuid::Uuid::new_v4().simple());
+    worker.capabilities.capabilities.push(capability.clone());
+    workers.register(&worker).await.unwrap();
+    let mut cancelled = execution(ExecutionState::Queued);
+    cancelled
+        .manifest
+        .runtime
+        .capabilities
+        .push(capability.clone());
+    cancelled.created_at = Utc::now() - Duration::days(30_001);
+    let mut available = execution(ExecutionState::Queued);
+    available.manifest.runtime.capabilities.push(capability);
+    available.created_at = Utc::now() - Duration::days(30_000);
+    executions.insert(&cancelled).await.unwrap();
+    executions.insert(&available).await.unwrap();
+    let pool = PgPoolOptions::new()
+        .connect(&std::env::var("AUTOSPEC_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO execution_cancellation_requests (execution_id) VALUES ($1)")
+        .bind(cancelled.id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let reserved = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reserved.execution.id, available.id);
+}
+
+#[tokio::test]
+async fn accepted_cancellation_fences_final_progress_and_retention() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let worker = registered_worker(
+        &format!("worker-cancel-fence-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    let mut queued = execution(ExecutionState::Queued);
+    queued.manifest.persistence = PersistenceMode::Resumable;
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    executions
+        .request_cancellation(&reservation.execution.id)
+        .await
+        .unwrap();
+    let mut review_ready = reservation.execution;
+    review_ready
+        .transition(ExecutionState::Provisioning)
+        .unwrap();
+    review_ready.transition(ExecutionState::Running).unwrap();
+    review_ready
+        .transition(ExecutionState::ReviewReady)
+        .unwrap();
+
+    assert!(matches!(
+        executions
+            .record_progress_and_request_retention(
+                &review_ready,
+                &progress_event(&review_ready, ExecutionEventKind::ReviewReady),
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        reservations
+            .commit_retained_and_release_capacity(
+                &review_ready.id,
+                review_ready.attempt_id.as_ref().unwrap(),
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(executions
+        .cancellation_requested(&review_ready.id)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn resolved_cleanup_cancellation_is_listable_and_restart_idempotent() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").unwrap();
+    let cleanup = PgCleanupAuthorityStore::connect(&database_url)
+        .await
+        .unwrap();
+    let events = PgEventLog::connect(&database_url).await.unwrap();
+    let worker = registered_worker(
+        &format!("worker-resolved-cancel-{}", uuid::Uuid::new_v4().simple()),
+        1,
+    );
+    workers.register(&worker).await.unwrap();
+    let queued = execution(ExecutionState::Queued);
+    executions.insert(&queued).await.unwrap();
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    cleanup
+        .begin(
+            &reservation.execution.id,
+            &reservation.attempt_id,
+            &worker.id,
+        )
+        .await
+        .unwrap();
+    executions
+        .request_cancellation(&reservation.execution.id)
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE execution_attempts SET finished_at = now(), updated_at = now() \
+         WHERE execution_id = $1 AND attempt_id = $2",
+    )
+    .bind(reservation.execution.id.as_str())
+    .bind(reservation.attempt_id.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM reservations WHERE execution_id = $1 AND attempt_id = $2")
+        .bind(reservation.execution.id.as_str())
+        .bind(reservation.attempt_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE cleanup_authorities SET phase = 'RESOLVED', updated_at = now() \
+         WHERE execution_id = $1 AND attempt_id = $2",
+    )
+    .bind(reservation.execution.id.as_str())
+    .bind(reservation.attempt_id.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+
+    assert!(executions
+        .list_pending_cancellations()
+        .await
+        .unwrap()
+        .iter()
+        .any(|execution| execution.id == reservation.execution.id));
+    executions
+        .complete_cancellation(&reservation.execution.id, &reservation.attempt_id)
+        .await
+        .unwrap();
+    let replay = executions
+        .request_cancellation(&reservation.execution.id)
+        .await
+        .unwrap();
+    assert_eq!(replay.state, ExecutionState::Cancelled);
+    assert!(!executions
+        .cancellation_requested(&reservation.execution.id)
+        .await
+        .unwrap());
+    assert_eq!(
+        events
+            .since(&reservation.execution.id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionCancelled))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -76,12 +276,12 @@ async fn current_migrator_fills_vacant_task6_versions_without_losing_pre_task6_r
 
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version IN (5, 10)"
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version IN (5, 10, 11)"
         )
         .fetch_one(&mut connection)
         .await
         .unwrap(),
-        2
+        3
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT id FROM executions WHERE id = 'preserved'")

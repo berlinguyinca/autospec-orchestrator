@@ -41,6 +41,9 @@ pub trait ExecutionStore: Send + Sync {
     async fn cancellation_requested(&self, _id: &ExecutionId) -> Result<bool, StoreError> {
         Ok(false)
     }
+    async fn list_pending_cancellations(&self) -> Result<Vec<Execution>, StoreError> {
+        Ok(Vec::new())
+    }
     async fn complete_cancellation(
         &self,
         id: &ExecutionId,
@@ -188,7 +191,17 @@ impl ExecutionStore for PgExecutionStore {
             .fetch_optional(&mut *transaction)
             .await?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
-        let execution = decode_execution(&row)?;
+        let mut execution = decode_execution(&row)?;
+        let existing_request = sqlx::query(
+            "SELECT completed_at FROM execution_cancellation_requests WHERE execution_id = $1",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if execution.state == ExecutionState::Cancelled && existing_request.is_some() {
+            transaction.commit().await?;
+            return Ok(execution);
+        }
         if execution.state.is_terminal() {
             return Err(StoreError::IllegalTransition {
                 from: execution.state,
@@ -202,6 +215,46 @@ impl ExecutionStore for PgExecutionStore {
         .bind(id.as_str())
         .execute(&mut *transaction)
         .await?;
+        if execution.state == ExecutionState::Queued
+            && execution.worker_id.is_none()
+            && execution.attempt_id.is_none()
+        {
+            execution
+                .transition(ExecutionState::Cancelled)
+                .map_err(|_| StoreError::IllegalTransition {
+                    from: ExecutionState::Queued,
+                    to: ExecutionState::Cancelled,
+                })?;
+            execution.result = Some(cancelled_result(id));
+            sqlx::query(
+                "UPDATE executions SET state = 'CANCELLED', result = $2, updated_at = $3, \
+                 version = version + 1 WHERE id = $1",
+            )
+            .bind(id.as_str())
+            .bind(to_json(
+                execution.result.as_ref().expect("cancelled result exists"),
+            )?)
+            .bind(execution.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+            let event = ExecutionEvent {
+                execution_id: id.clone(),
+                attempt_id: None,
+                sequence: 0,
+                at: execution.updated_at,
+                state: ExecutionState::Cancelled,
+                kind: ExecutionEventKind::ExecutionCancelled,
+            };
+            append_in_transaction(&mut transaction, &event).await?;
+            sqlx::query(
+                "UPDATE execution_cancellation_requests SET completed_at = $2 \
+                 WHERE execution_id = $1 AND completed_at IS NULL",
+            )
+            .bind(id.as_str())
+            .bind(execution.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(execution)
     }
@@ -215,6 +268,17 @@ impl ExecutionStore for PgExecutionStore {
         .fetch_one(&self.pool)
         .await
         .map_err(StoreError::from)
+    }
+
+    async fn list_pending_cancellations(&self) -> Result<Vec<Execution>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT e.* FROM executions e JOIN execution_cancellation_requests r \
+             ON r.execution_id = e.id WHERE r.completed_at IS NULL \
+             ORDER BY r.requested_at, e.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(decode_execution).collect()
     }
 
     async fn complete_cancellation(
@@ -332,6 +396,11 @@ impl ExecutionStore for PgExecutionStore {
             .await?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
         let mut execution = decode_execution(&row)?;
+        if cancellation_pending(&mut transaction, id).await? {
+            return Err(StoreError::Conflict(format!(
+                "execution {id} has a pending cancellation request"
+            )));
+        }
         let from = execution.state;
         if !from.can_transition_to(next) {
             return Err(StoreError::IllegalTransition { from, to: next });
@@ -371,6 +440,11 @@ impl ExecutionStore for PgExecutionStore {
             .await?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
         let mut execution = decode_execution(&row)?;
+        if cancellation_pending(&mut transaction, id).await? {
+            return Err(StoreError::Conflict(format!(
+                "execution {id} has a pending cancellation request"
+            )));
+        }
         if execution.attempt_id != event.attempt_id {
             return Err(StoreError::Conflict(
                 "execution transition and event attempt do not match".to_owned(),
@@ -548,6 +622,12 @@ async fn record_progress(
         .await?
         .ok_or_else(|| StoreError::NotFound(execution.id.to_string()))?;
     let persisted = decode_execution(&locked)?;
+    if cancellation_pending(&mut transaction, &execution.id).await? {
+        return Err(StoreError::Conflict(format!(
+            "execution {} has a pending cancellation request",
+            execution.id
+        )));
+    }
     let version = locked.try_get::<i64, _>("version")?;
     if persisted.worker_id != execution.worker_id || persisted.attempt_id != execution.attempt_id {
         return Err(StoreError::Conflict(
@@ -646,6 +726,20 @@ async fn record_progress(
     let sequence = append_in_transaction(&mut transaction, event).await?;
     transaction.commit().await?;
     Ok(sequence)
+}
+
+async fn cancellation_pending(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &ExecutionId,
+) -> Result<bool, StoreError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM execution_cancellation_requests \
+         WHERE execution_id = $1 AND completed_at IS NULL)",
+    )
+    .bind(id.as_str())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(StoreError::from)
 }
 
 pub(crate) async fn run_migrations(pool: &PgPool) -> Result<(), StoreError> {

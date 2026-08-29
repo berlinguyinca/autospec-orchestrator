@@ -59,8 +59,16 @@ pub(crate) async fn run_with_cancel(
         Ok(outcome) => outcome,
         Err(panic) => Err(WorkerError::Panic(panic_message(panic))),
     };
-    let cancellation = matches!(&outcome, Err(WorkerError::Cancelled));
+    let cancellation_lookup = worker
+        .executions
+        .cancellation_requested(&execution.id)
+        .await;
+    let cancellation =
+        matches!(&outcome, Err(WorkerError::Cancelled)) || matches!(cancellation_lookup, Ok(true));
     let mut cleanup_errors = Vec::new();
+    if let Err(error) = cancellation_lookup {
+        cleanup_errors.push(format!("read durable cancellation request: {error}"));
+    }
     if outcome.is_err() && !tracked.state.is_terminal() && !cancellation {
         let failure = if !guard.runtime_created {
             FailureClass::EnvironmentFailed
@@ -173,8 +181,16 @@ pub(crate) async fn run_adopted_with_cancel(
         Ok(outcome) => outcome,
         Err(panic) => Err(WorkerError::Panic(panic_message(panic))),
     };
-    let cancellation = matches!(&outcome, Err(WorkerError::Cancelled));
+    let cancellation_lookup = worker
+        .executions
+        .cancellation_requested(&execution.id)
+        .await;
+    let cancellation =
+        matches!(&outcome, Err(WorkerError::Cancelled)) || matches!(cancellation_lookup, Ok(true));
     let mut cleanup_errors = Vec::new();
+    if let Err(error) = cancellation_lookup {
+        cleanup_errors.push(format!("read durable cancellation request: {error}"));
+    }
     if outcome.is_err() && !tracked.state.is_terminal() && !cancellation {
         if let Err(error) = persist_failure(worker, &mut tracked, FailureClass::WorkerLost).await {
             cleanup_errors.push(error.to_string());

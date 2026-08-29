@@ -309,7 +309,7 @@ async fn cancel_and_retry_enforce_lifecycle_without_choosing_retry_policy() {
             .await
             .unwrap()
             .state,
-        ExecutionState::Queued
+        ExecutionState::Cancelled
     );
     let events = api.events.since(&create.id, 0).await.unwrap();
     assert_eq!(
@@ -317,9 +317,9 @@ async fn cancel_and_retry_enforce_lifecycle_without_choosing_retry_policy() {
             .iter()
             .map(|event| event.sequence)
             .collect::<Vec<_>>(),
-        vec![1]
+        vec![1, 2]
     );
-    assert!(api
+    assert!(!api
         .executions
         .cancellation_requested(&create.id)
         .await
@@ -343,7 +343,7 @@ async fn cancel_and_retry_enforce_lifecycle_without_choosing_retry_policy() {
             .await
             .unwrap()
             .status(),
-        reqwest::StatusCode::CONFLICT
+        reqwest::StatusCode::CREATED
     );
     let mut cancelled_source = create.clone();
     cancelled_source.id = ExecutionId::new(format!(

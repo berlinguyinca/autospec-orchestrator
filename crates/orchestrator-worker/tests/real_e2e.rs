@@ -461,21 +461,22 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
         "restart adoption must publish ReviewReady exactly once"
     );
 
-    let retained_execution = executions.get(&execution_id).await.unwrap();
-    cleanup
-        .transition(
-            &execution_id,
-            orchestrator_persistence::CleanupDisposition::Retained,
-            orchestrator_persistence::CleanupDisposition::CleanupPending,
-            &authorities[0].handles,
-        )
+    executions
+        .request_cancellation(&execution_id)
         .await
         .unwrap();
-    let requested = cleanup.get(&execution_id).await.unwrap();
     replacement
-        .recover_cleanup_authority(&requested, &retained_execution)
+        .observe_cancellations(&worker_id, &[])
         .await
         .unwrap();
+    assert_eq!(
+        executions.get(&execution_id).await.unwrap().state,
+        ExecutionState::Cancelled
+    );
+    assert!(!executions
+        .cancellation_requested(&execution_id)
+        .await
+        .unwrap());
     assert!(!released_layout.root.exists());
     assert!(execution_storage::JournalStore::new(&root)
         .unwrap()
@@ -511,6 +512,17 @@ async fn crashed_worker_is_adopted_across_postgres_git_docker_pi_evidence_and_cl
             .count(),
         1,
         "explicit retained cleanup must not republish ReviewReady"
+    );
+    assert_eq!(
+        event_log
+            .since(&execution_id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionCancelled))
+            .count(),
+        1,
+        "retained cancellation must publish one terminal event after cleanup"
     );
     let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
     sqlx::query("DELETE FROM cleanup_authorities WHERE execution_id = $1")
@@ -605,7 +617,7 @@ async fn controller_cancellation_stops_hung_pi_before_one_terminal_event_and_rel
         reservations.clone(),
         cleanup.clone(),
     ));
-    let task = worker.spawn(assigned);
+    let task = worker.clone().spawn(assigned);
     for _ in 0..300 {
         if cleanup.get(&execution_id).await.is_ok_and(|authority| {
             authority.disposition().ok() == Some(CleanupDisposition::Active(CleanupStage::Running))
@@ -671,10 +683,10 @@ async fn controller_cancellation_stops_hung_pi_before_one_terminal_event_and_rel
             .count(),
         0
     );
-    assert!(task
-        .observe_cancellation(executions.as_ref())
+    worker
+        .observe_cancellations(&worker_id, std::slice::from_ref(&task))
         .await
-        .unwrap());
+        .unwrap();
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), task.join())
         .await
         .expect("controller cancellation must bound hung Pi termination");
@@ -717,8 +729,51 @@ async fn controller_cancellation_stops_hung_pi_before_one_terminal_event_and_rel
             .count(),
         1
     );
+
+    let before_task_id = ExecutionId::new(format!("execution-before-task-{suffix}"));
+    let mut before_task = queued.clone();
+    before_task.id = before_task_id.clone();
+    before_task.labels.execution_id = before_task_id.clone();
+    before_task.state = ExecutionState::Queued;
+    before_task.worker_id = None;
+    before_task.attempt_id = None;
+    before_task.session_id = None;
+    before_task.worktree_path = None;
+    before_task.result = None;
+    before_task.created_at = Utc::now();
+    before_task.updated_at = before_task.created_at;
+    executions.insert(&before_task).await.unwrap();
+    reservations
+        .reserve_next(&worker_id)
+        .await
+        .unwrap()
+        .expect("pre-task cancellation execution must reserve");
+    executions
+        .request_cancellation(&before_task_id)
+        .await
+        .unwrap();
+    worker.observe_cancellations(&worker_id, &[]).await.unwrap();
+    assert_eq!(
+        executions.get(&before_task_id).await.unwrap().state,
+        ExecutionState::Cancelled
+    );
+    assert!(!executions
+        .cancellation_requested(&before_task_id)
+        .await
+        .unwrap());
+    assert_eq!(
+        events
+            .since(&before_task_id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, ExecutionEventKind::ExecutionCancelled))
+            .count(),
+        1
+    );
     server.abort();
     delete_matrix_records(&database_url, &execution_id, &worker_id).await;
+    delete_matrix_records(&database_url, &before_task_id, &worker_id).await;
     if root.exists() {
         fs::remove_dir_all(root).unwrap();
     }

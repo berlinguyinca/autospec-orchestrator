@@ -207,6 +207,37 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+        let cancellation_pending = match executions.cancellation_requested(&execution.id).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    attempt_id = %authority.attempt_id,
+                    %error,
+                    "cannot determine cancellation intent; refusing startup adoption"
+                );
+                continue;
+            }
+        };
+        if cancellation_pending {
+            match execution_worker
+                .recover_cleanup_authority(&authority, &execution)
+                .await
+            {
+                Ok(()) => tracing::info!(
+                    execution_id = %execution.id,
+                    attempt_id = %authority.attempt_id,
+                    "completed durable cancellation during startup recovery"
+                ),
+                Err(error) => tracing::error!(
+                    execution_id = %execution.id,
+                    attempt_id = %authority.attempt_id,
+                    %error,
+                    "startup cancellation recovery remains pending"
+                ),
+            }
+            continue;
+        }
         if same_attempt
             && execution.manifest.persistence == orchestrator_core::PersistenceMode::Resumable
             && matches!(
@@ -317,15 +348,15 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        for task in &tasks {
-            if let Err(error) = task.observe_cancellation(executions.as_ref()).await {
-                tracing::warn!(
-                    worker_id = %worker.id,
-                    execution_id = %task.execution_id(),
-                    %error,
-                    "cancellation request poll failed; execution remains supervised"
-                );
-            }
+        if let Err(error) = execution_worker
+            .observe_cancellations(&worker.id, &tasks)
+            .await
+        {
+            tracing::warn!(
+                worker_id = %worker.id,
+                %error,
+                "durable cancellation reconciliation remains pending"
+            );
         }
         for authority in cleanup
             .list_for_worker(&worker.id)

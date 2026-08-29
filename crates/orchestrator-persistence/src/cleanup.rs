@@ -303,7 +303,7 @@ impl CleanupAuthorityStore for PgCleanupAuthorityStore {
              AND (a.finished_at IS NOT NULL OR e.state IN ('REVIEW_READY', 'COMPLETED', 'FAILED', 'CANCELLED') \
                  OR EXISTS (SELECT 1 FROM execution_cancellation_requests r \
                      WHERE r.execution_id = c.execution_id AND r.completed_at IS NULL)) \
-             AND c.phase NOT IN ('RETAINED', 'RUNTIME_STOPPED', 'RUNTIME_DESTROYED', \
+             AND c.phase NOT IN ('RUNTIME_STOPPED', 'RUNTIME_DESTROYED', \
                  'GIT_RECOVERED_CLEANED', 'STORAGE_RELEASED', 'RESERVATION_RELEASED', 'RESOLVED')",
         )
         .bind(execution_id.as_str())

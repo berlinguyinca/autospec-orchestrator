@@ -18,7 +18,9 @@ use async_trait::async_trait;
 use execution_storage::AllocationReceipt;
 use git_worktree::{DiffCapture, Worktree};
 use harness_traits::SessionRef;
-use orchestrator_core::{Execution, ExecutionEvent, ExecutionId, ExecutionResult, TaskPacket};
+use orchestrator_core::{
+    Execution, ExecutionEvent, ExecutionId, ExecutionResult, TaskPacket, WorkerId,
+};
 use orchestrator_persistence::{
     CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, ExecutionStore, ReservationStore,
     StoreError,
@@ -261,6 +263,56 @@ impl Worker {
         }
     }
 
+    /// Observes durable cancellation intent for this worker's active and
+    /// restart-recoverable executions. The database remains authoritative;
+    /// task flags only interrupt an in-process workload.
+    pub async fn observe_cancellations(
+        &self,
+        worker_id: &WorkerId,
+        tasks: &[ExecutionTask],
+    ) -> Result<(), WorkerError> {
+        for execution in self
+            .executions
+            .list_pending_cancellations()
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?
+        {
+            if execution.worker_id.as_ref() != Some(worker_id) {
+                continue;
+            }
+            if let Some(task) = tasks
+                .iter()
+                .find(|task| task.execution_id() == &execution.id)
+            {
+                task.cancel();
+                continue;
+            }
+            let authority = match self.cleanup_authorities.get(&execution.id).await {
+                Ok(authority) => authority,
+                Err(StoreError::NotFound(_)) => {
+                    let attempt_id = execution.attempt_id.as_ref().ok_or_else(|| {
+                        WorkerError::Invalid(format!(
+                            "pending cancellation {} lacks attempt authority",
+                            execution.id
+                        ))
+                    })?;
+                    self.cleanup_authorities
+                        .begin(&execution.id, attempt_id, worker_id)
+                        .await
+                        .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+                    self.cleanup_authorities
+                        .get(&execution.id)
+                        .await
+                        .map_err(|error| WorkerError::Persistence(error.to_string()))?
+                }
+                Err(error) => return Err(WorkerError::Persistence(error.to_string())),
+            };
+            self.recover_cleanup_authority(&authority, &execution)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn recover_cleanup_authority(
         &self,
         authority: &CleanupAuthority,
@@ -269,7 +321,21 @@ impl Worker {
         let mut disposition = authority
             .disposition()
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
-        if disposition == CleanupDisposition::Retained {
+        let cancellation_pending = self
+            .executions
+            .cancellation_requested(&authority.execution_id)
+            .await
+            .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+        if disposition == CleanupDisposition::Retained && !cancellation_pending {
+            return Ok(());
+        }
+        if disposition == CleanupDisposition::Resolved {
+            if cancellation_pending {
+                self.executions
+                    .complete_cancellation(&authority.execution_id, &authority.attempt_id)
+                    .await
+                    .map_err(|error| WorkerError::Persistence(error.to_string()))?;
+            }
             return Ok(());
         }
         if !matches!(
@@ -330,12 +396,7 @@ impl Worker {
                 .await
                 .map_err(|error| WorkerError::Persistence(error.to_string()))?;
         }
-        if self
-            .executions
-            .cancellation_requested(&authority.execution_id)
-            .await
-            .map_err(|error| WorkerError::Persistence(error.to_string()))?
-        {
+        if cancellation_pending {
             self.executions
                 .complete_cancellation(&authority.execution_id, &authority.attempt_id)
                 .await
