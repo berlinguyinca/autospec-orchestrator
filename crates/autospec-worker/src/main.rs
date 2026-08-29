@@ -100,6 +100,9 @@ struct Cli {
     clone_base: String,
     #[arg(long, env = "AUTOSPEC_DOCKER_SOCKET")]
     docker_socket: Option<String>,
+    /// Allows the worker to use only the deployment's constrained Docker API proxy.
+    #[arg(long, env = "AUTOSPEC_WORKER_HOST_DOCKER", default_value_t = false)]
+    host_docker: bool,
     #[arg(long, default_value = "pi")]
     pi_executable: String,
     /// Explicitly permits the local development-only credential issuer.
@@ -119,16 +122,40 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    ensure_local_development_credentials_allowed(&cli)?;
-    let storage = build_storage(&cli)?;
-    let (proof, health_errors) = match probe_capabilities(&cli, storage.as_ref()) {
-        Ok(proof) => (Some(proof), Vec::new()),
+    let prepared = prepare_execution_plane(&cli).await;
+    let (worker, execution_plane) = advertisement_from_preparation(&cli, prepared)?;
+    let token = Secret(cli.worker_token.clone());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    run_control_loop(&cli, worker, execution_plane, token, client).await
+}
+
+struct ExecutionPlane {
+    worker: Arc<Worker>,
+    executions: Arc<PgExecutionStore>,
+    reservations: Arc<PgReservationStore>,
+}
+
+fn advertisement_from_preparation(
+    cli: &Cli,
+    prepared: Result<(WorkerCapabilityProof, ExecutionPlane)>,
+) -> Result<(WorkerAdvertisement, Option<ExecutionPlane>)> {
+    match prepared {
+        Ok((proof, plane)) => Ok((advertisement(cli, Some(proof), Vec::new())?, Some(plane))),
         Err(error) => {
-            tracing::error!(worker_id = %cli.worker_id, %error, "worker capability proof unavailable; advertising no runtime capacity");
-            (None, vec![capability_failure_code(&error).to_owned()])
+            let failure = capability_failure_code(&error);
+            tracing::error!(worker_id = %cli.worker_id, failure, "worker execution capability unavailable; advertising no runtime capacity");
+            Ok((advertisement(cli, None, vec![failure.to_owned()])?, None))
         }
-    };
-    let worker = advertisement(&cli, proof, health_errors)?;
+    }
+}
+
+async fn prepare_execution_plane(cli: &Cli) -> Result<(WorkerCapabilityProof, ExecutionPlane)> {
+    validate_host_docker_policy(cli)?;
+    ensure_local_development_credentials_allowed(cli)?;
+    let storage = build_storage(cli)?;
+    let proof = probe_capabilities(cli, storage.as_ref())?;
     let executions = Arc::new(PgExecutionStore::connect(&cli.database_url).await?);
     let reservations = Arc::new(PgReservationStore::connect(&cli.database_url).await?);
     let cleanup = Arc::new(PgCleanupAuthorityStore::connect(&cli.database_url).await?);
@@ -179,10 +206,23 @@ async fn main() -> Result<()> {
         reservations.clone(),
         cleanup.clone(),
     ));
-    let token = Secret(cli.worker_token);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    Ok((
+        proof,
+        ExecutionPlane {
+            worker: execution_worker,
+            executions,
+            reservations,
+        },
+    ))
+}
+
+async fn run_control_loop(
+    cli: &Cli,
+    worker: WorkerAdvertisement,
+    execution_plane: Option<ExecutionPlane>,
+    token: Secret,
+    client: reqwest::Client,
+) -> Result<()> {
     tracing::info!(
         worker_id = %worker.id,
         controller = %cli.controller,
@@ -197,7 +237,10 @@ async fn main() -> Result<()> {
     let mut registered = false;
     let mut backoff = Duration::from_secs(1);
     let mut heartbeat_due = tokio::time::Instant::now();
-    let mut tasks: Vec<ExecutionTask> = execution_worker.reconcile_startup(&worker.id).await?;
+    let mut tasks: Vec<ExecutionTask> = match execution_plane.as_ref() {
+        Some(plane) => plane.worker.reconcile_startup(&worker.id).await?,
+        None => Vec::new(),
+    };
     loop {
         let mut index = tasks.len();
         while index > 0 {
@@ -209,34 +252,35 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        while registered && tasks.len() < usize::try_from(cli.concurrency)? {
-            match reservations.reserve_next(&worker.id).await {
-                Ok(Some(reservation)) => {
-                    tasks.push(execution_worker.clone().spawn(reservation.execution));
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(
-                        worker_id = %worker.id,
-                        %error,
-                        retry_seconds = backoff.as_secs(),
-                        "reservation poll failed; active execution tasks remain supervised"
-                    );
-                    heartbeat_due = tokio::time::Instant::now() + backoff;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                    break;
+        if let Some(plane) = execution_plane.as_ref() {
+            while registered && tasks.len() < usize::try_from(cli.concurrency)? {
+                match plane.reservations.reserve_next(&worker.id).await {
+                    Ok(Some(reservation)) => {
+                        tasks.push(plane.worker.clone().spawn(reservation.execution));
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            worker_id = %worker.id,
+                            %error,
+                            retry_seconds = backoff.as_secs(),
+                            "reservation poll failed; active execution tasks remain supervised"
+                        );
+                        heartbeat_due = tokio::time::Instant::now() + backoff;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        break;
+                    }
                 }
             }
         }
-        if let Err(error) = execution_worker
-            .reconcile_daemon_tick(&worker.id, &tasks)
-            .await
-        {
-            tracing::warn!(
-                worker_id = %worker.id,
-                %error,
-                "durable cancellation reconciliation remains pending"
-            );
+        if let Some(plane) = execution_plane.as_ref() {
+            if let Err(error) = plane.worker.reconcile_daemon_tick(&worker.id, &tasks).await {
+                tracing::warn!(
+                    worker_id = %worker.id,
+                    %error,
+                    "durable cancellation reconciliation remains pending"
+                );
+            }
         }
         if tokio::time::Instant::now() >= heartbeat_due {
             let request = if registered {
@@ -287,7 +331,10 @@ async fn main() -> Result<()> {
             signal = tokio::signal::ctrl_c() => {
                 signal.context("failed to listen for shutdown")?;
                 for task in &tasks {
-                    if let Err(error) = executions.request_cancellation(task.execution_id()).await {
+                    let Some(plane) = execution_plane.as_ref() else {
+                        break;
+                    };
+                    if let Err(error) = plane.executions.request_cancellation(task.execution_id()).await {
                         tracing::error!(execution_id = %task.execution_id(), %error, "failed to persist shutdown cancellation request");
                     }
                     task.cancel();
@@ -301,6 +348,18 @@ async fn main() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn validate_host_docker_policy(cli: &Cli) -> Result<()> {
+    anyhow::ensure!(
+        cli.host_docker,
+        "Docker execution requires AUTOSPEC_WORKER_HOST_DOCKER=true"
+    );
+    anyhow::ensure!(
+        cli.docker_socket.as_deref() == Some("tcp://docker-api:2375"),
+        "Docker execution requires the constrained deployment proxy"
+    );
     Ok(())
 }
 
@@ -538,6 +597,7 @@ mod tests {
             state_root: "/tmp".into(),
             clone_base: "https://github.com".into(),
             docker_socket: None,
+            host_docker: false,
             pi_executable: "pi".into(),
             allow_local_development_credentials: false,
         }
@@ -598,6 +658,38 @@ mod tests {
         assert_eq!(
             control_disposition(true, reqwest::StatusCode::NO_CONTENT),
             ControlDisposition::Registered
+        );
+    }
+
+    #[test]
+    fn host_docker_requires_explicit_opt_in_and_the_constrained_proxy() {
+        let mut cli = cli();
+        cli.docker_socket = Some("tcp://docker-api:2375".into());
+        assert!(validate_host_docker_policy(&cli).is_err());
+        cli.host_docker = true;
+        validate_host_docker_policy(&cli).unwrap();
+        cli.docker_socket = Some("unix:///var/run/docker.sock".into());
+        assert!(validate_host_docker_policy(&cli).is_err());
+        cli.docker_socket = Some("tcp://127.0.0.1:2375".into());
+        assert!(validate_host_docker_policy(&cli).is_err());
+    }
+
+    #[tokio::test]
+    async fn docker_construction_failure_still_produces_sanitized_offline_registration() {
+        let mut cli = cli();
+        cli.allow_local_development_credentials = true;
+        cli.host_docker = true;
+        cli.docker_socket = Some("tcp://docker-api:2375".into());
+        cli.docker_binary = "/definitely/missing/autospec-docker".into();
+        let prepared = prepare_execution_plane(&cli).await;
+        assert!(prepared.is_err());
+        let (worker, plane) = advertisement_from_preparation(&cli, prepared).unwrap();
+        assert!(plane.is_none());
+        assert!(worker.capability_proof.is_none());
+        assert!(worker.capabilities.runtimes.is_empty());
+        assert_eq!(
+            worker.capabilities.health_errors,
+            vec!["docker-capability-unavailable"]
         );
     }
 }

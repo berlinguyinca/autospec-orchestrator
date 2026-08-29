@@ -16,8 +16,15 @@ async fn frozen_runtime_conformance_reports_every_adapter_and_explicit_unavailab
         assert_eq!(report.runtime, runtime.name());
         match report.availability {
             RuntimeAvailability::Available => {
+                assert_eq!(runtime.name(), "docker");
                 println!(
-                    "PASS {RUNTIME_CONFORMANCE_VERSION}: {} available",
+                    "ELIGIBLE {RUNTIME_CONFORMANCE_VERSION}: {} lifecycle gate is required",
+                    runtime.name()
+                );
+            }
+            RuntimeAvailability::DetectedUnsupported => {
+                println!(
+                    "UNSUPPORTED {RUNTIME_CONFORMANCE_VERSION}: {} detected without lifecycle conformance",
                     runtime.name()
                 );
             }
@@ -29,4 +36,9 @@ async fn frozen_runtime_conformance_reports_every_adapter_and_explicit_unavailab
             }
         }
     }
+
+    assert!(
+        docker.available().await,
+        "Docker is required for conformance"
+    );
 }

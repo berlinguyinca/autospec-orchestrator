@@ -108,6 +108,40 @@ async fn authenticated_worker_routes_own_liveness_and_reap_after_ninety_seconds(
     let listed: Vec<WorkerRegistration> = listed.json().await.unwrap();
     assert!(listed.iter().any(|worker| worker.id == advertised.id));
 
+    assert_eq!(
+        client
+            .get(format!("{base}?limit=0"))
+            .bearer_auth("api-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}?limit=101"))
+            .bearer_auth("api-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let bounded = client
+        .get(format!("{base}?limit=1&cursor={}", advertised.id))
+        .bearer_auth("api-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bounded.status(), reqwest::StatusCode::OK);
+    assert!(bounded
+        .json::<Vec<WorkerRegistration>>()
+        .await
+        .unwrap()
+        .iter()
+        .all(|worker| worker.id.as_str() > advertised.id.as_str()));
+
     let heartbeat = client
         .post(format!("{}/{}/heartbeat", base, advertised.id))
         .bearer_auth(&token)

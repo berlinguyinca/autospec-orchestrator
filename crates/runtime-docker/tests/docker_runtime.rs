@@ -1855,16 +1855,15 @@ async fn failed_normal_cleanup_keeps_scope_armed() {
 }
 
 #[tokio::test]
-async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
+async fn frozen_conformance_requires_docker_and_proves_lifecycle_limits_storage_and_targeted_cleanup(
+) {
     let execution_labels = labels_for(unique_execution_id());
-    let Some((state, runtime)) = execution_runtime_or_skip(
-        "provision_reconcile_and_destroy_preserve_execution_isolation",
+    let (state, runtime) = execution_runtime_or_skip(
+        "frozen_conformance_requires_docker_and_proves_lifecycle_limits_storage_and_targeted_cleanup",
         &execution_labels,
     )
     .await
-    else {
-        return;
-    };
+    .expect("Docker and its immutable verifier image are required for frozen conformance");
     let docker = raw_client().expect("the already-probed Docker daemon remains connectable");
     let mut scope = DockerTestScope::new(&runtime, &execution_labels);
     let service = ServiceRequirement {
@@ -2062,23 +2061,44 @@ async fn provision_reconcile_and_destroy_preserve_execution_isolation() {
     scope.cleanup().await.expect("cleanup lifecycle resources");
     result.expect("real Docker lifecycle succeeds");
 
-    let managed_filter = HashMap::from([(
-        "label".to_owned(),
-        vec![format!("{}=true", labels::MANAGED)],
-    )]);
-    let leaked = docker
-        .list_networks(Some(bollard::network::ListNetworksOptions {
-            filters: managed_filter,
-        }))
-        .await
-        .expect("list managed networks")
-        .into_iter()
-        .filter_map(|network| network.labels)
-        .any(|resource_labels| {
-            resource_labels.get(labels::EXECUTION_ID)
-                == Some(&execution_labels.execution_id.to_string())
-        });
-    assert!(!leaked, "test execution network must not leak");
+    for scoped_labels in [
+        execution_labels.clone(),
+        control_labels_for(&execution_labels),
+    ] {
+        let filters = HashMap::from([("label".to_owned(), scoped_labels.selector())]);
+        assert!(
+            docker
+                .list_containers(Some(bollard::container::ListContainersOptions {
+                    all: true,
+                    filters: filters.clone(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("list exact conformance containers")
+                .is_empty(),
+            "conformance containers must not leak"
+        );
+        assert!(
+            docker
+                .list_networks(Some(bollard::network::ListNetworksOptions {
+                    filters: filters.clone(),
+                }))
+                .await
+                .expect("list exact conformance networks")
+                .is_empty(),
+            "conformance networks must not leak"
+        );
+        assert!(
+            docker
+                .list_volumes(Some(bollard::volume::ListVolumesOptions { filters }))
+                .await
+                .expect("list exact conformance volumes")
+                .volumes
+                .unwrap_or_default()
+                .is_empty(),
+            "conformance volumes must not leak"
+        );
+    }
 }
 
 #[tokio::test]

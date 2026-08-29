@@ -13,6 +13,11 @@ pub trait WorkerStore: Send + Sync {
     ) -> Result<WorkerRegistration, StoreError>;
     async fn get(&self, id: &WorkerId) -> Result<WorkerRegistration, StoreError>;
     async fn list(&self) -> Result<Vec<WorkerRegistration>, StoreError>;
+    async fn list_page(
+        &self,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<Vec<WorkerRegistration>, StoreError>;
     async fn mark_stale_before(&self, deadline: DateTime<Utc>)
         -> Result<Vec<WorkerId>, StoreError>;
 }
@@ -133,6 +138,26 @@ impl WorkerStore for PgWorkerStore {
 
     async fn list(&self) -> Result<Vec<WorkerRegistration>, StoreError> {
         sqlx::query("SELECT * FROM workers ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(decode_worker)
+            .collect()
+    }
+
+    async fn list_page(
+        &self,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<Vec<WorkerRegistration>, StoreError> {
+        if !(1..=100).contains(&limit) {
+            return Err(StoreError::Conflict(
+                "worker page limit must be between 1 and 100".to_owned(),
+            ));
+        }
+        sqlx::query("SELECT * FROM workers WHERE id > $1 ORDER BY id LIMIT $2")
+            .bind(cursor.unwrap_or(""))
+            .bind(i64::from(limit))
             .fetch_all(&self.pool)
             .await?
             .iter()

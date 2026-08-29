@@ -79,7 +79,10 @@ mod tests {
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let report = inspect_runtime(&ApptainerRuntime::new(&binary)).await;
         assert_eq!(report.runtime, "apptainer");
-        assert_eq!(report.availability, RuntimeAvailability::Available);
+        assert_eq!(
+            report.availability,
+            RuntimeAvailability::DetectedUnsupported
+        );
         assert!(
             !ApptainerRuntime::new(directory.path().join("missing"))
                 .available()

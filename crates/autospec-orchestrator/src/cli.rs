@@ -36,7 +36,12 @@ struct OperatorCli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// List registered worker capacity and sanitized health failures.
-    Workers,
+    Workers {
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
     /// List bounded live execution metadata (never manifests or task packets).
     Executions {
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=100))]
@@ -96,7 +101,16 @@ fn endpoint(controller: &str, command: &Command) -> Result<String> {
     );
     let root = controller.trim_end_matches('/');
     let suffix = match command {
-        Command::Workers => "workers".to_owned(),
+        Command::Workers { limit, cursor } => {
+            anyhow::ensure!((1..=100).contains(limit), "limit must be between 1 and 100");
+            let mut suffix = format!("workers?limit={limit}");
+            if let Some(cursor) = cursor {
+                anyhow::ensure!(!cursor.is_empty(), "cursor must not be empty");
+                suffix.push_str("&cursor=");
+                suffix.push_str(&urlencoding_for_query(cursor));
+            }
+            suffix
+        }
         Command::Executions { limit } => {
             anyhow::ensure!((1..=100).contains(limit), "limit must be between 1 and 100");
             format!("operator/executions?limit={limit}")
@@ -105,6 +119,15 @@ fn endpoint(controller: &str, command: &Command) -> Result<String> {
         Command::CleanupHealth => "operator/cleanup-health".to_owned(),
     };
     Ok(format!("{root}/api/{API_VERSION}/{suffix}"))
+}
+
+fn urlencoding_for_query(value: &str) -> String {
+    let mut url = Url::parse("http://query.invalid/").expect("static URL is valid");
+    url.query_pairs_mut().append_pair("cursor", value);
+    url.query()
+        .and_then(|query| query.strip_prefix("cursor="))
+        .expect("cursor query exists")
+        .to_owned()
 }
 
 async fn read_bounded(mut response: Response) -> Result<Vec<u8>> {
@@ -132,8 +155,15 @@ mod tests {
     fn commands_map_only_to_bounded_authenticated_operator_endpoints() {
         let base = "http://127.0.0.1:8420";
         assert_eq!(
-            endpoint(base, &Command::Workers).unwrap(),
-            "http://127.0.0.1:8420/api/v1/workers"
+            endpoint(
+                base,
+                &Command::Workers {
+                    limit: 25,
+                    cursor: Some("worker/a".into())
+                }
+            )
+            .unwrap(),
+            "http://127.0.0.1:8420/api/v1/workers?limit=25&cursor=worker%2Fa"
         );
         assert_eq!(
             endpoint(base, &Command::Executions { limit: 25 }).unwrap(),
@@ -147,10 +177,14 @@ mod tests {
             endpoint(base, &Command::CleanupHealth).unwrap(),
             "http://127.0.0.1:8420/api/v1/operator/cleanup-health"
         );
-        assert!(endpoint("file:///tmp/controller", &Command::Workers).is_err());
-        assert!(endpoint("http://user:secret@localhost", &Command::Workers).is_err());
-        assert!(endpoint("http://localhost?token=secret", &Command::Workers).is_err());
-        assert!(endpoint("http://localhost#fragment", &Command::Workers).is_err());
+        let workers = Command::Workers {
+            limit: 50,
+            cursor: None,
+        };
+        assert!(endpoint("file:///tmp/controller", &workers).is_err());
+        assert!(endpoint("http://user:secret@localhost", &workers).is_err());
+        assert!(endpoint("http://localhost?token=secret", &workers).is_err());
+        assert!(endpoint("http://localhost#fragment", &workers).is_err());
     }
 
     #[test]

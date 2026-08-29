@@ -1,9 +1,14 @@
 name: autospec-orchestrator
 
+x-autospec-labels: &autospec-labels
+  autospec.managed: "true"
+  autospec.execution_id: ${AUTOSPEC_DEPLOYMENT_ID:?set stable AUTOSPEC_DEPLOYMENT_ID}
+
 services:
   postgres:
     image: postgres:17.6-bookworm
     restart: unless-stopped
+    labels: *autospec-labels
     environment:
       POSTGRES_DB: autospec_orchestrator
       POSTGRES_USER: autospec_orchestrator
@@ -22,6 +27,7 @@ services:
       context: ..
       target: controller
     restart: unless-stopped
+    labels: *autospec-labels
     command: ["--addr", "0.0.0.0:8420"]
     environment:
       AUTOSPEC_DATABASE_URL: postgres://autospec_orchestrator:${AUTOSPEC_POSTGRES_PASSWORD}@postgres/autospec_orchestrator
@@ -41,6 +47,7 @@ services:
     image: tecnativa/docker-socket-proxy:0.3.0
     profiles: [host-docker-worker]
     restart: unless-stopped
+    labels: *autospec-labels
     environment:
       LOG_LEVEL: warning
       POST: 1
@@ -68,6 +75,7 @@ services:
       target: worker
     profiles: [host-docker-worker]
     restart: unless-stopped
+    labels: *autospec-labels
     environment:
       AUTOSPEC_ORCHESTRATOR_URL: http://controller:8420
       AUTOSPEC_DATABASE_URL: postgres://autospec_orchestrator:${AUTOSPEC_POSTGRES_PASSWORD}@postgres/autospec_orchestrator
@@ -97,10 +105,15 @@ services:
 networks:
   control:
     internal: true
+    labels: *autospec-labels
   runtime-api:
     internal: true
+    labels: *autospec-labels
 
 volumes:
   postgres-data:
+    labels: *autospec-labels
   controller-state:
+    labels: *autospec-labels
   worker-state:
+    labels: *autospec-labels

@@ -2688,6 +2688,33 @@ async fn stale_worker_becomes_unreachable_and_fresh_proven_heartbeat_restores_re
 }
 
 #[tokio::test]
+async fn worker_page_is_strictly_bounded_and_resumes_after_cursor() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((_, workers, _)) = worker_stores().await else {
+        return;
+    };
+    let prefix = format!("worker-page-{}", uuid::Uuid::new_v4().simple());
+    for suffix in ["-a", "-b", "-c"] {
+        workers
+            .register(&registered_worker(&format!("{prefix}{suffix}"), 2))
+            .await
+            .unwrap();
+    }
+    let first = workers
+        .list_page(2, Some(&format!("{prefix}-0")))
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].id.as_str(), format!("{prefix}-a"));
+    assert_eq!(first[1].id.as_str(), format!("{prefix}-b"));
+    let second = workers
+        .list_page(2, Some(first[1].id.as_str()))
+        .await
+        .unwrap();
+    assert_eq!(second[0].id.as_str(), format!("{prefix}-c"));
+}
+
+#[tokio::test]
 async fn orphan_reservation_reconcile_is_idempotent() {
     let _database_test = database_test_lock().lock().await;
     let Some((executions, workers, reservations)) = worker_stores().await else {

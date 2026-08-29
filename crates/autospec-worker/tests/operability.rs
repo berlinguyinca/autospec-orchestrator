@@ -46,6 +46,8 @@ fn compose_renders_without_exposing_the_host_docker_socket_to_the_worker() {
         .env("AUTOSPEC_WORKER_TOKEN", "test-worker-token")
         .env("AUTOSPEC_POSTGRES_PASSWORD", "test-postgres-password")
         .env("AUTOSPEC_WORKER_ID", "test-worker")
+        .env("AUTOSPEC_DEPLOYMENT_ID", "deployment-test")
+        .env("AUTOSPEC_WORKER_HOST_DOCKER", "true")
         .env("AUTOSPEC_STORAGE_KIND", "lvm")
         .env("AUTOSPEC_STORAGE_POOL", "autospec-vg")
         .env(
@@ -54,13 +56,11 @@ fn compose_renders_without_exposing_the_host_docker_socket_to_the_worker() {
         )
         .output()
         .expect("execute docker compose config");
-    if !output.status.success() {
-        eprintln!(
-            "SKIP single-host Compose rendering: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+    assert!(
+        output.status.success(),
+        "docker compose config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let config: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let worker = &config["services"]["worker"];
     let mounts = worker["volumes"].as_array().cloned().unwrap_or_default();
@@ -72,4 +72,20 @@ fn compose_renders_without_exposing_the_host_docker_socket_to_the_worker() {
         worker["environment"]["DOCKER_HOST"],
         "tcp://docker-api:2375"
     );
+    for service in config["services"].as_object().unwrap().values() {
+        assert_eq!(service["labels"]["autospec.managed"], "true");
+        assert_eq!(
+            service["labels"]["autospec.execution_id"],
+            "deployment-test"
+        );
+    }
+    for resources in ["networks", "volumes"] {
+        for resource in config[resources].as_object().unwrap().values() {
+            assert_eq!(resource["labels"]["autospec.managed"], "true");
+            assert_eq!(
+                resource["labels"]["autospec.execution_id"],
+                "deployment-test"
+            );
+        }
+    }
 }

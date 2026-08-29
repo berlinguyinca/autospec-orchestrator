@@ -17,6 +17,7 @@ pub const RUNTIME_CONFORMANCE_VERSION: &str = "autospec.dev/runtime-conformance/
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeAvailability {
     Available,
+    DetectedUnsupported,
     Unavailable,
 }
 
@@ -34,10 +35,13 @@ pub async fn inspect_runtime(runtime: &dyn Runtime) -> RuntimeConformanceReport 
     RuntimeConformanceReport {
         contract: RUNTIME_CONFORMANCE_VERSION,
         runtime: runtime.name(),
-        availability: if runtime.available().await {
-            RuntimeAvailability::Available
-        } else {
-            RuntimeAvailability::Unavailable
+        availability: match (
+            runtime.available().await,
+            runtime.supports_frozen_conformance(),
+        ) {
+            (true, true) => RuntimeAvailability::Available,
+            (true, false) => RuntimeAvailability::DetectedUnsupported,
+            (false, _) => RuntimeAvailability::Unavailable,
         },
     }
 }
@@ -109,6 +113,12 @@ pub trait CredentialBroker: Send + Sync {
 pub trait Runtime: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// True only after this adapter has a frozen lifecycle/limits/storage/cleanup
+    /// conformance test. Detection alone must never advertise conformance.
+    fn supports_frozen_conformance(&self) -> bool {
+        false
+    }
+
     /// True when this runtime is usable on the current host.
     async fn available(&self) -> bool;
 
@@ -137,6 +147,9 @@ mod conformance_tests {
     impl Runtime for AvailableRuntime {
         fn name(&self) -> &'static str {
             "fixture"
+        }
+        fn supports_frozen_conformance(&self) -> bool {
+            true
         }
         async fn available(&self) -> bool {
             true

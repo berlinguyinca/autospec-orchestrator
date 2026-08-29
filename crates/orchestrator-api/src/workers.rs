@@ -1,5 +1,5 @@
 use axum::{
-    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -9,6 +9,7 @@ use orchestrator_core::{
     ExecutionId, WorkerAdvertisement, WorkerId, WorkerRegistration, WorkerState,
 };
 use orchestrator_persistence::{CleanupDisposition, StoreError};
+use serde::Deserialize;
 
 use crate::{
     auth::{authorize_api, authorize_worker},
@@ -18,6 +19,12 @@ use crate::{
 
 const WORKER_BODY_LIMIT: usize = 1_048_576;
 const HEARTBEAT_DEADLINE_SECONDS: i64 = 90;
+
+#[derive(Debug, Deserialize)]
+struct WorkerListQuery {
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
 
 impl AppState {
     pub async fn reap_stale(&self, now: DateTime<Utc>) -> Result<Vec<WorkerId>, StoreError> {
@@ -169,11 +176,21 @@ async fn heartbeat(
 async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<WorkerListQuery>,
 ) -> Result<Json<Vec<WorkerRegistration>>, ApiError> {
     authorize_api(&state, &headers)?;
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(ApiError::validation("limit must be between 1 and 100"));
+    }
+    if query.cursor.as_ref().is_some_and(|cursor| {
+        cursor.is_empty() || cursor.len() > 255 || cursor.chars().any(char::is_control)
+    }) {
+        return Err(ApiError::validation("cursor is invalid"));
+    }
     state
         .workers
-        .list()
+        .list_page(limit, query.cursor.as_deref())
         .await
         .map(Json)
         .map_err(ApiError::store)

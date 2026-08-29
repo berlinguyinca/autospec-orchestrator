@@ -353,6 +353,10 @@ impl Runtime for DockerRuntime {
         "docker"
     }
 
+    fn supports_frozen_conformance(&self) -> bool {
+        true
+    }
+
     async fn available(&self) -> bool {
         self.require_compatible_daemon().await.is_ok()
     }
