@@ -2834,6 +2834,15 @@ strict link/descriptor recheck, Docker proof, layout creation, or Ready
 publication. Ordinary directory capture remains fail-closed and never repairs
 group- or world-accessible modes.
 
+The first supported Docker execution-worker pairing is Linux with thick LVM.
+The APFS backend remains a physically exercised storage-lifecycle adapter, but
+macOS Docker Desktop is rejected during worker preparation: its user-scoped
+file-sharing process cannot traverse the root-owned `0700` filesystem required
+by the storage authority. macOS Docker support requires a typed privileged APFS
+helper that runs storage operations as root while the worker and Docker Desktop
+share a dedicated non-root uid. Arbitrary `diskutil` delegation, permission
+weakening, and ACL exceptions are not valid substitutes for that boundary.
+
 ---
 
 # 82. AutoSpec Cleanup Responsibilities After Migration

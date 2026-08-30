@@ -24,6 +24,7 @@ plan() {
   echo "State root: ${state_root}"
   echo "Create the owner-only state root on the already provisioned execution-storage pool."
   if [ "$kind" = apfs ]; then
+    echo "Support boundary: APFS is storage-lifecycle-only; Docker execution workers require Linux thick LVM."
     echo "AUTOSPEC_STORAGE_KIND=apfs"
     echo "AUTOSPEC_APFS_PROBE_PATH=${pool}"
     echo "AUTOSPEC_STORAGE_POOL=${pool}"

@@ -1,14 +1,23 @@
 # Single-host deployment
 
 The supported first deployment runs PostgreSQL and the controller with Docker
-Compose, and runs the execution worker on the host where APFS or thick LVM can
+Compose, and runs the execution worker on a Linux host where thick LVM can
 enforce disk reservations. The worker must not receive a raw host Docker socket.
+
+APFS allocation, quota, mount, exhaustion, and cleanup are physically tested as
+a storage lifecycle on macOS. APFS is not currently a supported Docker worker
+pairing: Docker Desktop's user-scoped file-sharing process cannot traverse the
+required root-owned `0700` execution filesystem. The worker rejects every
+pairing except Linux plus thick LVM during preparation. Supporting macOS Docker
+requires a typed privilege-separated APFS helper; weakening permissions or
+granting an unauthenticated ACL is not supported.
 
 1. Set `AUTOSPEC_POSTGRES_PASSWORD`, `AUTOSPEC_API_TOKEN`, and
    `AUTOSPEC_WORKER_TOKEN` to independent secrets. Set a stable
    `AUTOSPEC_DEPLOYMENT_ID`; every Compose-created resource is labelled with it.
-2. Run `deploy/provision-storage-pool.sh plan apfs <probe-path> <state-root>` on
-   macOS or `... plan lvm <volume-group> <state-root>` on Linux. `apply` is
+2. Run `deploy/provision-storage-pool.sh plan lvm <volume-group> <state-root>`
+   on Linux. The APFS form remains available only for storage-lifecycle testing.
+   `apply` is
    rejected unless `AUTOSPEC_STORAGE_CONFIRM` exactly matches the printed
    confirmation string. The script never creates or removes an APFS container,
    physical volume, or volume group; those destructive host operations remain

@@ -16,11 +16,22 @@ the repository's normal workspace gates on both the current compiler and Rust
 after label-scoped cleanup, while retaining content-addressed evidence and the
 gapless durable event stream.
 
-The audit is deliberately conditional for physical aggregate storage
-exhaustion. The configured APFS/LVM tests ran and reported an explicit skip
-because this host has no operator-provisioned execution-storage pool. The audit
-did not create, repartition, or delete host storage to manufacture that proof.
-Podman and Apptainer are also unavailable and remain ineligible future adapters.
+The APFS storage lifecycle was subsequently exercised as root against an exact,
+disposable 4 GiB sparse-bundle container on macOS 26.5.2. It created a bounded
+volume, mounted it, exhausted the aggregate quota across repository and session
+paths, observed ENOSPC, unmounted it, removed it, detached the image, and left
+no proof mount or image behind. That run exposed and now locks macOS 26's
+duplicate created-device output, its unmounted-volume field shape, and the need
+to enable ownership after mount.
+
+The Docker aggregate test then failed closed at a separate platform boundary:
+Docker Desktop cannot bind a root-owned `0700` host directory. An independent
+disposable `/private/tmp` control reproduced the same denial without APFS, so
+this is not a quota defect. The supported Docker pairing is therefore Linux
+with thick LVM; macOS APFS plus Docker Desktop is rejected during worker
+preparation pending privilege separation. The full physical peer/mirror Docker
+proof remains intentionally open for the Linux handoff described in
+`docs/handoffs/2026-08-30-linux-lvm-aggregate-proof.md`.
 
 ## Environment and reproducibility
 
@@ -189,16 +200,18 @@ one execution to real aggregate ENOSPC and requires all of the following before
 passing: the failing allocation is contained, the peer allocation stays
 writable, and the shared mirror sentinel is byte-for-byte unchanged.
 
-On this host that test reported:
+The original unconfigured run reported:
 
 ```text
 SKIP configured Docker aggregate quota: operator storage pool is absent
 SKIP real storage quota lifecycle: operator pool configuration is absent
 ```
 
-This is not counted as physical ENOSPC proof. Providing
-`AUTOSPEC_APFS_PROBE_PATH` (or the Linux LVM equivalent) for a deliberately
-provisioned operator pool remains a deployment-readiness prerequisite.
+The later disposable APFS run counts as physical single-execution lifecycle and
+ENOSPC evidence, but not as the independent-peer and shared-mirror Docker proof.
+That final claim requires `AUTOSPEC_LVM_VOLUME_GROUP` on a deliberately
+provisioned Linux thick-LVM worker and the exact handoff test. The Task 9
+checkbox remains open until its captured output is reconciled here.
 
 ## Task-context duplication audit
 
@@ -341,9 +354,9 @@ containers and the Linux target volume were removed after verification.
 
 ## Explicit gaps and unavailable adapters
 
-- No operator APFS/LVM execution pool was configured, so physical aggregate
-  quota exhaustion was explicitly skipped. No destructive host provisioning was
-  attempted.
+- A disposable APFS pool physically proved the single-execution quota lifecycle
+  and ENOSPC cleanup. The independent-peer and shared-mirror Docker proof still
+  requires the handed-off Linux thick-LVM pool; it was not exercised here.
 - Podman was unavailable/ineligible and its conformance entry explicitly
   skipped. Its adapter intentionally exposes detection only.
 - Apptainer was unavailable/ineligible and its conformance entry explicitly
@@ -425,6 +438,7 @@ containers and the Linux target volume were removed after verification.
   same-uid host adversary.
 
 These gaps are explicit rather than inferred as passes. The supported release
-claim is the Docker execution plane with the tested storage-proof fail-closed
-gate; it is not a claim that unavailable adapters or an unconfigured physical
-quota pool were exercised.
+claim is the Linux Docker execution plane with the tested storage-proof
+fail-closed gate and a physically exercised APFS storage lifecycle; it is not a
+claim that unavailable adapters or the still-pending Linux thick-LVM
+peer/mirror proof were exercised.

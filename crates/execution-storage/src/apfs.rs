@@ -236,6 +236,11 @@ impl StorageBackend for ApfsBackend {
             ),
             "mount exact APFS execution volume",
         )?;
+        run_checked(
+            self.runner.as_ref(),
+            CommandSpec::new(DISKUTIL, args(&["enableOwnership", volume])),
+            "enable ownership on exact APFS execution volume",
+        )?;
         if self.state(layout, identity, bytes)? != BackendState::Mounted {
             return Err(StorageError::IdentityMismatch(
                 "APFS mount proof failed".to_owned(),
@@ -375,18 +380,31 @@ struct ApfsInfo {
     read_only: String,
 }
 fn parse_info(output: &[u8]) -> Result<ApfsInfo, StorageError> {
+    let mount_point = match field(output, "Mount Point") {
+        Ok(mount_point) => mount_point,
+        Err(_) if field(output, "Mounted")?.eq_ignore_ascii_case("No") => "Not mounted".to_owned(),
+        Err(error) => return Err(error),
+    };
+    let volume_read_only = field(output, "Volume Read-Only")?;
+    let read_only = if is_not_mounted(&mount_point)
+        && volume_read_only.eq_ignore_ascii_case("Not applicable (not mounted)")
+    {
+        field(output, "Media Read-Only")?
+    } else {
+        volume_read_only
+    };
     Ok(ApfsInfo {
         device: field(output, "Device Identifier")?,
         container: field(output, "APFS Container")?,
         personality: field(output, "File System Personality")?,
         name: field(output, "Volume Name")?,
         uuid: field(output, "Volume UUID")?,
-        mount_point: field(output, "Mount Point")?,
-        read_only: field(output, "Volume Read-Only")?,
+        mount_point,
+        read_only,
     })
 }
 fn parse_created_device(output: &[u8]) -> Result<String, StorageError> {
-    let devices = text(output, "diskutil addVolume output")?
+    let mut devices = text(output, "diskutil addVolume output")?
         .split_whitespace()
         .filter(|field| {
             let Some(suffix) = field.strip_prefix("disk") else {
@@ -401,6 +419,8 @@ fn parse_created_device(output: &[u8]) -> Result<String, StorageError> {
                 && slice.bytes().all(|byte| byte.is_ascii_digit())
         })
         .collect::<Vec<_>>();
+    devices.sort_unstable();
+    devices.dedup();
     match devices.as_slice() {
         [device] => Ok((*device).to_owned()),
         _ => Err(StorageError::IdentityMismatch(
@@ -518,7 +538,17 @@ fn path_text(path: &Path) -> Result<&str, StorageError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_volume_device_by_name, parse_created_device, parse_volume_bounds};
+    use super::{
+        find_volume_device_by_name, parse_created_device, parse_info, parse_volume_bounds,
+    };
+
+    #[test]
+    fn unmounted_volume_uses_mounted_and_media_read_only_fields() {
+        let output = b"Device Identifier: disk6s2\nVolume Name: autospec-token\nMounted: No\nFile System Personality: APFS\nVolume UUID: VOL-UUID\nMedia Read-Only: No\nVolume Read-Only: Not applicable (not mounted)\nAPFS Container: disk6\n";
+        let info = parse_info(output).expect("macOS 26 unmounted volume info");
+        assert_eq!(info.mount_point, "Not mounted");
+        assert_eq!(info.read_only, "No");
+    }
 
     #[test]
     fn exact_volume_header_does_not_accept_device_or_name_prefixes() {
@@ -538,6 +568,15 @@ mod tests {
         assert!(parse_created_device(b"Created disk9s10 and disk9s1").is_err());
         assert_eq!(
             parse_created_device(b"Created disk9s1\n").expect("device"),
+            "disk9s1"
+        );
+    }
+
+    #[test]
+    fn repeated_identical_created_device_is_one_exact_identity() {
+        let output = b"Created new APFS Volume disk9s1\nDisk from APFS operation: disk9s1\n";
+        assert_eq!(
+            parse_created_device(output).expect("repeated exact device"),
             "disk9s1"
         );
     }

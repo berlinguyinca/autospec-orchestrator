@@ -176,6 +176,10 @@ fn apfs_create_identity_is_proved_before_mount_and_cleanup_rechecks_uuid_and_tok
             Ok(success(Vec::new())),
         ),
         (
+            command("/usr/sbin/diskutil", &["enableOwnership", "disk9s1"]),
+            Ok(success(Vec::new())),
+        ),
+        (
             command("/usr/sbin/diskutil", &["apfs", "list", "disk3"]),
             Ok(success(list.clone())),
         ),
@@ -673,9 +677,10 @@ fn configured_real_pool_runs_full_quota_lifecycle_or_explicitly_skips() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(16 * 1024 * 1024);
     let state = tempfile::tempdir().expect("state");
-    let mount = state.path().join("executions/real-storage-proof");
+    let canonical_state = state.path().canonicalize().expect("canonical state");
+    let mount = canonical_state.join("executions/real-storage-proof");
     fs::create_dir_all(&mount).expect("mount");
-    let layout = ExecutionLayout::new(state.path(), &ExecutionId::new("real-storage-proof"))
+    let layout = ExecutionLayout::new(&canonical_state, &ExecutionId::new("real-storage-proof"))
         .expect("layout");
     let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
     let backend: Box<dyn StorageBackend> = if kind == "apfs" {
@@ -695,6 +700,7 @@ fn configured_real_pool_runs_full_quota_lifecycle_or_explicitly_skips() {
         }
     };
     if let Err(error) = backend.mount(&layout, &prepared, bytes) {
+        eprintln!("configured storage mount failed before rollback: {error}");
         if matches!(
             backend.state(&layout, &prepared, bytes),
             Ok(BackendState::Mounted)

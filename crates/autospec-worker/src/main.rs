@@ -267,6 +267,8 @@ fn advertisement_from_preparation(
 async fn prepare_execution_plane(
     cli: &Cli,
 ) -> PreparationResult<(WorkerCapabilityProof, ExecutionPlane)> {
+    validate_storage_runtime_pairing(cli.storage_kind, std::env::consts::OS)
+        .map_err(PreparationFailure::configuration)?;
     validate_host_docker_policy(cli).map_err(PreparationFailure::configuration)?;
     ensure_local_development_credentials_allowed(cli).map_err(PreparationFailure::configuration)?;
     let storage = build_storage(cli)?;
@@ -346,6 +348,16 @@ async fn prepare_execution_plane(
             reservations,
         },
     ))
+}
+
+fn validate_storage_runtime_pairing(storage_kind: StorageKind, os: &str) -> Result<()> {
+    if os == "linux" && matches!(storage_kind, StorageKind::Lvm) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Docker execution workers require Linux with thick LVM; APFS is storage-lifecycle-only pending a privilege-separated macOS worker"
+        )
+    }
 }
 
 async fn run_control_loop(
@@ -890,6 +902,14 @@ mod tests {
     }
 
     #[test]
+    fn storage_runtime_pairing_supports_only_linux_lvm_for_docker_workers() {
+        assert!(validate_storage_runtime_pairing(StorageKind::Lvm, "linux").is_ok());
+        assert!(validate_storage_runtime_pairing(StorageKind::Apfs, "macos").is_err());
+        assert!(validate_storage_runtime_pairing(StorageKind::Apfs, "linux").is_err());
+        assert!(validate_storage_runtime_pairing(StorageKind::Lvm, "macos").is_err());
+    }
+
+    #[test]
     fn preparation_failures_are_typed_and_diagnostics_never_echo_sources() {
         let secret = "postgres://user:password@database/private";
         for (failure, kind, code) in [
@@ -942,17 +962,17 @@ mod tests {
         assert_eq!(retry.record_failure(), Duration::from_secs(1));
     }
 
-    #[tokio::test]
-    async fn docker_construction_failure_still_produces_sanitized_offline_registration() {
+    #[test]
+    fn docker_construction_failure_still_produces_sanitized_offline_registration() {
         let mut cli = cli();
         cli.allow_local_development_credentials = true;
         cli.host_docker = true;
         cli.docker_socket = Some("tcp://docker-api:2375".into());
         cli.docker_binary = "/definitely/missing/autospec-docker".into();
-        let prepared = prepare_execution_plane(&cli).await;
-        assert!(prepared.is_err());
-        let (worker, plane) = advertisement_from_preparation(&cli, prepared).unwrap();
-        assert!(plane.is_none());
+        let failure = build_storage(&cli).expect_err("missing Docker binary");
+        assert_eq!(failure.kind, PreparationFailureKind::Docker);
+        let worker =
+            advertisement(&cli, None, vec!["docker-capability-unavailable".to_owned()]).unwrap();
         assert!(worker.capability_proof.is_none());
         assert!(worker.capabilities.runtimes.is_empty());
         assert_eq!(
