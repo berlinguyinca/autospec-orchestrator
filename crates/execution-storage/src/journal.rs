@@ -343,9 +343,10 @@ impl SecureMetadataDirectory {
             )));
         }
         let operation = format!("metadata-subdirectory-{name}");
-        let (staged, handle, expected) = self
-            .directory
-            .create_temporary_directory(&operation, "metadata-subdirectory-after-staged-mkdir")?;
+        let (staged, handle, expected) = self.directory.create_temporary_directory(
+            &operation,
+            "metadata-subdirectory-after-mkdir-before-first-observation",
+        )?;
         let result = (|| {
             sync_parent(&self.directory)?;
             self.directory.commit_directory_noreplace_verified(
@@ -799,7 +800,8 @@ fn lease_name(layout: &ExecutionLayout) -> Result<String, StorageError> {
 }
 
 #[derive(Debug, Clone)]
-/// Internal boundary for descriptor-pinned, no-follow directory operations.
+/// Internal boundary for descriptor-pinned, no-follow directory operations
+/// (spec section 81).
 ///
 /// All child access is resolved by the kernel relative to the retained
 /// descriptor. The canonical path is used only for identity verification and
@@ -1104,6 +1106,9 @@ impl PinnedDirectory {
                 Err(rustix::io::Errno::EXIST) => continue,
                 Err(error) => return Err(rustix_error("create temporary directory", &path, error)),
             }
+            // `mkdirat` does not return a descriptor. This hook deliberately
+            // marks the unobservable creation-to-first-observation interval.
+            race_hook(after_mkdir_hook);
             let stat = rustix::fs::statat(&*self.handle, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|error| {
                     rustix_error("inspect created temporary directory", &path, error)
@@ -1123,7 +1128,6 @@ impl PinnedDirectory {
                         .to_owned(),
                 ));
             }
-            race_hook(after_mkdir_hook);
             let fd = rustix::fs::openat(
                 &*self.handle,
                 name.as_str(),
@@ -1400,41 +1404,78 @@ impl PinnedDirectory {
             .map_err(|error| rustix_error("fsync directory", &self.path, error))
     }
 
+    /// Publishes an owner-only child with `RENAME_NOREPLACE` and returns the
+    /// descriptor authenticated before publication (spec section 81).
+    ///
+    /// The collision-resistant operation name prevents accidental clashes; it
+    /// is not a secret. POSIX `mkdirat` returns no descriptor, so an
+    /// uncooperative same-uid process that replaces the child between
+    /// `mkdirat` and the first `statat` is outside this boundary. After that
+    /// first authenticated observation, every source and target transition is
+    /// identity-checked and fails closed.
     #[cfg(unix)]
-    pub(crate) fn create_directory(&self, name: &str) -> Result<(), StorageError> {
-        let _ = self.create_directory_unsynced(name)?;
-        self.sync()
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_published_directory(
+        &self,
+        name: &str,
+        operation: &str,
+        after_mkdir_hook: &str,
+        before_commit_hook: &str,
+        before_final_authentication_hook: &str,
+        purpose: &str,
+    ) -> Result<Self, StorageError> {
+        let _lock = self.lock()?;
+        validate_descriptor_name(name)?;
+        self.verify("directory publication parent")?;
+        if self.child_metadata(name)?.is_some() {
+            return Err(StorageError::IdentityMismatch(format!(
+                "{purpose} already exists: {}",
+                self.path.join(name).display()
+            )));
+        }
+        let (staged, handle, expected) =
+            self.create_temporary_directory(operation, after_mkdir_hook)?;
+        let result = (|| {
+            self.sync()?;
+            self.commit_directory_noreplace_verified(
+                &staged,
+                name,
+                &expected,
+                before_commit_hook,
+                before_final_authentication_hook,
+            )?;
+            self.sync()?;
+            let child = self.pin_authenticated_child(name, handle, &expected, purpose)?;
+            self.verify("directory publication parent")?;
+            Ok(child)
+        })();
+        match result {
+            Ok(child) => Ok(child),
+            Err(error) => {
+                let rollback = if self.child_metadata(&staged)?.is_some() {
+                    self.remove_directory_verified(&staged, &expected)
+                } else if self.child_metadata(name)?.is_some() {
+                    self.remove_directory_verified(name, &expected)
+                } else {
+                    Err(StorageError::IdentityMismatch(format!(
+                        "created {purpose} disappeared; preserve unverified state"
+                    )))
+                };
+                match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(StorageError::IdentityMismatch(format!(
+                        "{error}; rollback {purpose} failed: {rollback}"
+                    ))),
+                }
+            }
+        }
     }
 
-    #[cfg(unix)]
-    fn create_directory_unsynced(&self, name: &str) -> Result<fs::Metadata, StorageError> {
+    #[cfg(all(unix, test))]
+    fn create_directory_for_descriptor_test(&self, name: &str) -> Result<(), StorageError> {
         let path = self.child_path(name)?;
         rustix::fs::mkdirat(&*self.handle, name, Mode::from_bits_truncate(0o700))
-            .map_err(|error| rustix_error("create directory", &path, error))?;
-        let fd = rustix::fs::openat(
-            &*self.handle,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| rustix_error("open created directory", &path, error))?;
-        let created = File::from(fd);
-        race_hook("directory-create-before-stat");
-        let expected = created
-            .metadata()
-            .map_err(|error| journal_error("inspect created directory", &path, error))?;
-        let observed = self.child_metadata(name)?.ok_or_else(|| {
-            StorageError::IdentityMismatch(
-                "new metadata child disappeared; preserve unverified state".to_owned(),
-            )
-        })?;
-        verify_directory_identity(&expected, &observed, "new metadata child")?;
-        if expected.mode() & 0o077 != 0 {
-            return Err(StorageError::IdentityMismatch(
-                "new metadata child is not owner-only; preserve unverified state".to_owned(),
-            ));
-        }
-        Ok(expected)
+            .map_err(|error| rustix_error("create test directory", &path, error))
     }
 
     #[cfg(unix)]
@@ -2558,7 +2599,7 @@ mod tests {
     }
 
     #[test]
-    fn public_subdirectory_creation_refuses_a_staged_child_swapped_before_open() {
+    fn pre_observation_mkdir_interval_is_an_explicit_same_uid_threat_boundary() {
         let (root, metadata) = metadata_directory();
         let staged_name = ".metadata-subdirectory-session.1.1.1.tmp";
         let staged = root.path().join(staged_name);
@@ -2566,35 +2607,115 @@ mod tests {
         let staged_for_hook = staged.clone();
         let displaced_for_hook = displaced.clone();
         install_temporary_name_fixtures([staged_name]);
-        install_race_hook("metadata-subdirectory-after-staged-mkdir", move || {
-            let trusted = fs::symlink_metadata(&staged_for_hook)
-                .expect("inspect trusted staged directory before displacement");
-            fs::rename(&staged_for_hook, &displaced_for_hook)
-                .expect("displace trusted staged directory");
-            let preserved = fs::symlink_metadata(&displaced_for_hook)
-                .expect("inspect preserved trusted staged directory");
-            assert_eq!(
-                (preserved.dev(), preserved.ino()),
-                (trusted.dev(), trusted.ino())
-            );
-            fs::create_dir(&staged_for_hook).expect("install attacker staged directory");
-            fs::set_permissions(&staged_for_hook, fs::Permissions::from_mode(0o700))
-                .expect("secure attacker directory");
-            fs::write(staged_for_hook.join("sentinel"), b"attacker sentinel")
-                .expect("write attacker sentinel");
-        });
+        install_race_hook(
+            "metadata-subdirectory-after-mkdir-before-first-observation",
+            move || {
+                let trusted = fs::symlink_metadata(&staged_for_hook)
+                    .expect("inspect trusted staged directory before displacement");
+                fs::rename(&staged_for_hook, &displaced_for_hook)
+                    .expect("displace trusted staged directory");
+                let preserved = fs::symlink_metadata(&displaced_for_hook)
+                    .expect("inspect preserved trusted staged directory");
+                assert_eq!(
+                    (preserved.dev(), preserved.ino()),
+                    (trusted.dev(), trusted.ino())
+                );
+                fs::create_dir(&staged_for_hook).expect("install attacker staged directory");
+                fs::set_permissions(&staged_for_hook, fs::Permissions::from_mode(0o700))
+                    .expect("secure attacker directory");
+                fs::write(staged_for_hook.join("sentinel"), b"attacker sentinel")
+                    .expect("write attacker sentinel");
+            },
+        );
 
-        let error = metadata
+        let child = metadata
             .create_subdirectory("session")
-            .expect_err("reject staged directory swapped before it is opened");
+            .expect("the first observation authenticates the replacement in the excluded interval");
 
-        assert!(matches!(error, StorageError::IdentityMismatch(_)));
         assert_eq!(
-            fs::read(staged.join("sentinel")).expect("attacker remains"),
+            fs::read(child.path().join("sentinel")).expect("replacement is the published child"),
             b"attacker sentinel"
         );
         assert!(displaced.is_dir(), "trusted staged directory remains exact");
-        assert!(!root.path().join("session").exists());
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn descriptor_parent_publishes_and_returns_the_authenticated_final_child() {
+        let root = tempfile::tempdir().expect("temporary root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure publication parent");
+        let parent = PinnedDirectory::capture(root.path(), "publication parent")
+            .expect("capture publication parent");
+        let staged_name = ".execution-mountpoint-execution-7.1.1.1.tmp";
+        install_temporary_name_fixtures([staged_name]);
+
+        let child = parent
+            .create_published_directory(
+                "execution-7",
+                "execution-mountpoint-execution-7",
+                "execution-mountpoint-after-mkdir-before-first-observation",
+                "execution-mountpoint-before-commit",
+                "execution-mountpoint-before-final-authentication",
+                "execution mountpoint",
+            )
+            .expect("publish authenticated child");
+
+        child
+            .verify("execution mountpoint")
+            .expect("pin remains live");
+        assert_eq!(
+            child.path,
+            root.path()
+                .canonicalize()
+                .expect("canonical publication parent")
+                .join("execution-7")
+        );
+        assert!(!root.path().join(staged_name).exists());
+    }
+
+    #[test]
+    fn execution_mountpoint_publication_fails_closed_after_first_observation() {
+        let root = tempfile::tempdir().expect("temporary root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure publication parent");
+        let parent = PinnedDirectory::capture(root.path(), "publication parent")
+            .expect("capture publication parent");
+        let staged_name = ".execution-mountpoint-execution-7.1.1.1.tmp";
+        let staged = root.path().join(staged_name);
+        let displaced = root.path().join("authenticated-staged-away");
+        install_temporary_name_fixtures([staged_name]);
+        install_race_hook("execution-mountpoint-before-commit", {
+            let staged = staged.clone();
+            let displaced = displaced.clone();
+            move || {
+                fs::rename(&staged, &displaced).expect("displace authenticated staged directory");
+                fs::create_dir(&staged).expect("install replacement staged directory");
+                fs::set_permissions(&staged, fs::Permissions::from_mode(0o700))
+                    .expect("secure replacement staged directory");
+                fs::write(staged.join("sentinel"), b"replacement sentinel")
+                    .expect("write replacement sentinel");
+            }
+        });
+
+        let error = parent
+            .create_published_directory(
+                "execution-7",
+                "execution-mountpoint-execution-7",
+                "execution-mountpoint-after-mkdir-before-first-observation",
+                "execution-mountpoint-before-commit",
+                "execution-mountpoint-before-final-authentication",
+                "execution mountpoint",
+            )
+            .expect_err("reject replacement after first authenticated observation");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(staged.join("sentinel")).expect("replacement remains untouched"),
+            b"replacement sentinel"
+        );
+        assert!(displaced.is_dir(), "authenticated inode remains untouched");
+        assert!(!root.path().join("execution-7").exists());
     }
 
     #[test]
@@ -2898,7 +3019,7 @@ mod tests {
         );
 
         pinned
-            .create_directory("session")
+            .create_directory_for_descriptor_test("session")
             .expect("create captured directory");
         assert!(captured.join("session").is_dir());
         assert!(!attacker.join("session").exists());

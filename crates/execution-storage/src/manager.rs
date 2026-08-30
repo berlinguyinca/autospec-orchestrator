@@ -453,7 +453,7 @@ impl ExecutionStorage {
         Ok(state)
     }
 
-    fn create_mountpoint(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
+    fn create_mountpoint(&self, layout: &ExecutionLayout) -> Result<PinnedDirectory, StorageError> {
         self.executions_directory.verify("executions directory")?;
         if layout.root.parent() != Some(self.state_root.join("executions").as_path()) {
             return Err(StorageError::IdentityMismatch(
@@ -466,7 +466,14 @@ impl ExecutionStorage {
                 "execution mountpoint already exists: {}",
                 layout.root.display()
             ))),
-            None => self.executions_directory.create_directory(name),
+            None => self.executions_directory.create_published_directory(
+                name,
+                &format!("execution-mountpoint-{name}"),
+                "execution-mountpoint-after-mkdir-before-first-observation",
+                "execution-mountpoint-before-commit",
+                "execution-mountpoint-before-final-authentication",
+                "execution mountpoint",
+            ),
         }
     }
 
@@ -485,21 +492,49 @@ impl ExecutionStorage {
         }
     }
 
-    fn create_layout_directories(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
-        self.executions_directory.verify("executions directory")?;
-        for directory in [
-            &layout.repository,
-            &layout.session,
-            &layout.conversation,
-            &layout.credentials,
-            &layout.runtime,
-        ] {
-            create_secure_directory(directory).map_err(|error| {
-                StorageError::Journal(format!("create directory {}: {error}", directory.display()))
-            })?;
-            require_real_directory(directory, "execution directory")?;
+    fn create_layout_directories(
+        &self,
+        layout: &ExecutionLayout,
+        mounted_root: &PinnedDirectory,
+    ) -> Result<Vec<PinnedDirectory>, StorageError> {
+        mounted_root.verify("mounted execution filesystem")?;
+        if mounted_root.path != layout.root {
+            return Err(StorageError::IdentityMismatch(
+                "mounted execution descriptor does not match the deterministic layout".to_owned(),
+            ));
         }
-        Ok(())
+        let mut pinned = Vec::with_capacity(5);
+        for name in ["repository", "session", "credentials", "runtime"] {
+            pinned.push(mounted_root.create_published_directory(
+                name,
+                &format!("execution-layout-{name}"),
+                "execution-layout-after-mkdir-before-first-observation",
+                "execution-layout-before-commit",
+                "execution-layout-before-final-authentication",
+                "execution layout directory",
+            )?);
+        }
+        let session = pinned
+            .iter()
+            .find(|directory| directory.path == layout.session)
+            .ok_or_else(|| {
+                StorageError::IdentityMismatch(
+                    "authenticated session directory is missing from the layout".to_owned(),
+                )
+            })?;
+        pinned.push(session.create_published_directory(
+            "conversation",
+            "execution-layout-conversation",
+            "execution-layout-after-mkdir-before-first-observation",
+            "execution-layout-before-commit",
+            "execution-layout-before-final-authentication",
+            "execution conversation directory",
+        )?);
+        for directory in &pinned {
+            directory.verify("execution layout directory")?;
+        }
+        mounted_root.verify("mounted execution filesystem")?;
+        Ok(pinned)
     }
 
     fn cleanup_identity(
@@ -688,17 +723,6 @@ impl ReadyAllocationVerifier for ExecutionStorage {
     }
 }
 
-fn create_secure_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700).create(path)
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(path)
-}
-
 fn mountpoint_name(layout: &ExecutionLayout) -> Result<&str, StorageError> {
     layout
         .root
@@ -796,7 +820,7 @@ impl ExecutionStorageManager for ExecutionStorage {
                 capability.backend.reservable_bytes
             )));
         }
-        self.create_mountpoint(&layout)?;
+        let mountpoint = self.create_mountpoint(&layout)?;
         let ownership_token = ownership_token()?;
         let allocating = PhaseJournal::allocating(
             request.labels.clone(),
@@ -881,6 +905,14 @@ impl ExecutionStorageManager for ExecutionStorage {
                 error,
             ));
         }
+        if let Err(error) = mountpoint.verify("execution mountpoint before backend mount") {
+            return Err(self.rollback_allocation(
+                &layout,
+                &prepared_journal,
+                Some(&prepared_identity),
+                error,
+            ));
+        }
         if let Err(error) = self
             .backend
             .mount(&layout, &prepared_identity, reserved_bytes)
@@ -893,6 +925,15 @@ impl ExecutionStorageManager for ExecutionStorage {
             ));
         }
         let result = (|| {
+            // The pre-mount descriptor remains alive across the path-based
+            // backend consumer. Re-open the mounted object relative to the
+            // retained executions-directory descriptor and carry that new pin
+            // through the bind proof and layout publication.
+            let name = mountpoint_name(&layout)?;
+            let mounted_root = self
+                .executions_directory
+                .capture_child(name, "mounted execution filesystem")?;
+            mounted_root.verify("mounted execution filesystem")?;
             if self
                 .backend
                 .state(&layout, &prepared_identity, reserved_bytes)?
@@ -902,7 +943,9 @@ impl ExecutionStorageManager for ExecutionStorage {
                     "prepared backend is not mounted".to_owned(),
                 ));
             }
+            mounted_root.verify("mounted execution filesystem before Docker bind proof")?;
             let docker_bind = self.docker.verify(&layout.root)?;
+            mounted_root.verify("mounted execution filesystem after Docker bind proof")?;
             if docker_bind.daemon_id != capability.docker_bind.daemon_id
                 || docker_bind.verifier != capability.docker_bind.verifier
                 || docker_bind.method_version != capability.docker_bind.method_version
@@ -911,7 +954,7 @@ impl ExecutionStorageManager for ExecutionStorage {
                     "Docker bind verifier contract changed after capability probe".to_owned(),
                 ));
             }
-            self.create_layout_directories(&layout)?;
+            let layout_directories = self.create_layout_directories(&layout, &mounted_root)?;
             let receipt = AllocationReceipt {
                 api_version: ALLOCATION_API_VERSION.to_owned(),
                 labels: request.labels.clone(),
@@ -924,6 +967,10 @@ impl ExecutionStorageManager for ExecutionStorage {
                 docker_bind,
             };
             receipt.validate(&request.labels, &layout)?;
+            for directory in &layout_directories {
+                directory.verify("execution layout directory before Ready")?;
+            }
+            mounted_root.verify("mounted execution filesystem before Ready")?;
             self.journals.ensure_ready_lease(&layout)?;
             self.journals
                 .write(&layout, &PhaseJournal::ready(receipt.clone()))?;

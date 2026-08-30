@@ -1,7 +1,7 @@
 # Phase 5.5 completion audit
 
 Audit date: 2026-08-29
-Evidence refreshed: 2026-08-29T19:36:39-07:00
+Evidence refreshed: 2026-08-30
 Implementation baseline: `3ff8b5e` on `feat/pi-execution-plane`
 Database-isolation repair baseline: `8e44ca9`
 Scanner baseline: `06c0c5e`
@@ -86,7 +86,7 @@ workspace gates recorded below.
 
 The Rust 1.85 gate used the rustup binary explicitly because Homebrew's `cargo`
 preceded the rustup proxy on this host. The latest complete rerun covered the
-final staged-directory and killed-production-probe closure, using a distinct
+final staged-directory and killed-production-probe verification, using a distinct
 `target-rust185-dirfdfix3` target directory:
 
 ```text
@@ -107,7 +107,7 @@ load; that exact case passed in isolation in 9.94s, and the complete unmodified
 workspace gate then passed on rerun. This is recorded as a superseded failed
 attempt, not folded into the successful result.
 
-The Unix-specific closure also ran in labeled, disposable Linux/aarch64 Rust
+The Unix-specific verification also ran in labeled, disposable Linux/aarch64 Rust
 1.85 containers. `cargo test -p execution-storage --all-targets --locked`
 passed all 34 unit, 7 backend, and 35 storage tests. The base image omitted
 clippy, so the first clippy invocation was an environmental failure; after a
@@ -264,6 +264,48 @@ model policy remains data transported to the harness boundary; this repository
 does not select hardware, load models, serve inference, or decide model
 placement.
 
+## Final directory-publication scope verification
+
+The commit containing this audit corrects the directory-FD threat claim and
+routes production mountpoint publication through the authenticated staged path.
+Verification ran on 2026-08-30 against fresh disposable PostgreSQL databases.
+Because the default-parallel workspace suite repeatedly made its own five-second
+Pi drop assertion miss under concurrent real Docker load, the complete proving
+runs used one Rust test thread. The unchanged drop test passed in 3.51 seconds
+when isolated; an unrelated PostgreSQL advisory-lock timing case also passed in
+0.25 seconds when isolated. Those superseded timing attempts are not counted as
+green workspace runs.
+
+```text
+cargo fmt --all -- --check
+cargo build --workspace
+AUTOSPEC_DATABASE_URL="$DISPOSABLE_TEST_DATABASE" \
+  cargo test --workspace -- --nocapture --test-threads=1
+cargo clippy --workspace --all-targets -- -D warnings
+
+CARGO_TARGET_DIR=target-rust185-dirfdfix4 rustup run 1.85.0 cargo fmt --all -- --check
+CARGO_TARGET_DIR=target-rust185-dirfdfix4 rustup run 1.85.0 cargo build --workspace
+CARGO_TARGET_DIR=target-rust185-dirfdfix4 \
+  AUTOSPEC_DATABASE_URL="$DISPOSABLE_TEST_DATABASE" \
+  rustup run 1.85.0 cargo test --workspace -- --nocapture --test-threads=1
+CARGO_TARGET_DIR=target-rust185-dirfdfix4 \
+  rustup run 1.85.0 cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Both complete chains exited 0. The current compiler's real worker suite passed
+14/14 in 775.16 seconds; Rust 1.85 passed the same 14/14 suite in 430.51
+seconds. Each execution-storage suite passed 36 unit, 7 backend, and 35 storage
+tests, including the exact excluded-window characterization and the
+post-observation execution-mountpoint swap rejection. Warnings-denied clippy
+passed workspace-wide on both compilers.
+
+The Unix-specific gate then ran in a labeled, disposable Linux/aarch64
+`rust:1.85-bookworm` container. `cargo test -p execution-storage --all-targets
+--locked` passed 36 unit, 7 backend, and 35 storage tests, and `cargo clippy -p
+execution-storage --all-targets --locked -- -D warnings` exited 0 after the
+container installed its matching clippy component. The labeled container and
+target volume were removed; no Linux proof resource remains.
+
 ## Explicit gaps and unavailable adapters
 
 - No operator APFS/LVM execution pool was configured, so physical aggregate
@@ -277,22 +319,28 @@ placement.
   made; deterministic JSON-mode Pi boundary behavior is the tested contract.
 - Production InferWeave credential issuance is an external integration boundary;
   real E2E uses the execution-scoped, short-lived local credential broker.
-- The macOS directory-FD race is closed with the approved direct `rustix`
+- The macOS directory-FD work now enforces an explicit, accurate `rustix`
   filesystem boundary. The originally supplied directory is opened with
   `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and compared with its initial `lstat`
   before canonical-path diagnostics are computed; production child directories
-  are captured with `openat` from the retained parent descriptor. New metadata
-  subdirectories are first created under an unpredictable, exclusively claimed
-  operation name. The retained parent descriptor is used to record the staged
-  inode, immediately open and authenticate it, and commit it to the requested
-  final name with `RENAME_NOREPLACE`; both the now-absent staged source and the
-  final inode are authenticated after the rename. Any staged or final identity
-  mismatch preserves every object for inspection and never deletes an
-  unauthenticated entry. Journal and
+  are captured with `openat` from the retained parent descriptor. New
+  directories are first created under a collision-resistant, exclusively
+  claimed operation name; that name is not treated as a secret. POSIX
+  `mkdirat` returns no descriptor, so an uncooperative same-uid actor capable of
+  observing and replacing the entry between `mkdirat` and its first
+  `statat`/`openat` is explicitly outside the enforceable boundary. Such an
+  actor can also trace or control the worker process. From the first
+  authenticated observation onward, the retained parent descriptor is used to
+  carry the staged inode through a `RENAME_NOREPLACE` commit; both the
+  now-absent staged source and final inode are authenticated after the rename.
+  Any later staged or final identity mismatch preserves every object for
+  inspection and never deletes an unauthenticated entry. Journal and
   secure-metadata mutations hold a shared process-local mutex together with an
-  advisory lock on that descriptor. Independently captured stores coordinate
-  through the advisory lock, while calls through the same instance or a clone
-  cannot bypass it through process-local `flock` re-entrancy. No-replace commits
+  advisory lock on that descriptor. These locks serialize cooperative writers;
+  they are not a boundary against an uncooperative same-uid process.
+  Independently captured stores coordinate through the advisory lock, while
+  calls through the same instance or a clone cannot bypass it through
+  process-local `flock` re-entrancy. No-replace commits
   and atomic exchanges carry both source and target inode identities through
   the operation and authenticate the final canonical target plus the displaced
   exchange side before any cleanup. An unauthenticated post-operation side is
@@ -304,13 +352,26 @@ placement.
   rather than deleted, and reconciliation fails closed after 1,024 such entries
   instead of accepting unbounded accumulation. Ownership probes are unlinked
   while their descriptor remains open, with unwind cleanup covering the
-  create-to-unlink interval. Deterministic public-flow race tests cover root and
-  child capture, source and final-target swaps during create/replace, remove,
-  staged-subdirectory creation before open, before commit, and after commit,
-  subdirectory cleanup, journal create/write/removal, lock exclusion, collision
-  retry, both ownership-probe unwind cuts, and a genuinely killed subprocess
-  blocked inside the production `verify_current_owner` probe path while proving
-  attacker sentinels and displaced trusted inodes remain byte-for-byte intact.
+  create-to-unlink interval. A deterministic test characterizes the excluded
+  `mkdirat`-to-first-observation interval rather than claiming to close it.
+  Deterministic public-flow race tests then prove fail-closed behavior after the
+  first authenticated observation: root and child capture, source and
+  final-target swaps during create/replace, remove, staged-subdirectory creation
+  before commit and after commit, subdirectory cleanup, journal
+  create/write/removal, lock exclusion, collision retry, both ownership-probe
+  unwind cuts, and a genuinely killed subprocess blocked inside the production
+  `verify_current_owner` probe path while proving attacker sentinels and
+  displaced trusted inodes remain byte-for-byte intact.
+
+  Production execution mountpoints use the same staged authenticated directory
+  publication and `RENAME_NOREPLACE`, eliminating the former deterministic
+  final-name `mkdirat`/`openat` gap. The authenticated pre-mount descriptor is
+  retained across the backend's unavoidable path-based mount call. After mount,
+  the mounted filesystem is reopened with `openat` through the retained
+  executions-directory descriptor, reauthenticated, and retained through the
+  backend-state check, Docker bind proof, descriptor-relative layout creation,
+  and durable Ready transition. A same-uid replacement before either first
+  observation remains part of the explicit deployment boundary above.
 
   Unix does not provide an inode-conditional `unlinkat`: a continuously active
   process with the same uid can ignore the advisory lock and replace a verified

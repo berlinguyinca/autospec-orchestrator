@@ -2813,6 +2813,20 @@ container isolation
 
 A model instruction is not a security boundary.
 
+On POSIX platforms, descriptor-relative storage mutations authenticate each
+directory or file inode before using it and fail closed when an authenticated
+object changes. Operation names are collision-resistant, not secret. Because
+`mkdirat` returns no descriptor, an uncooperative process running as the worker
+uid can observe and replace a newly created directory between `mkdirat` and its
+first `statat`/`openat`; that actor is outside the enforceable filesystem
+boundary and can also control or trace the worker process. Process mutexes and
+descriptor advisory locks serialize cooperative writers only. Deployments must
+therefore keep untrusted agents on a different uid and deny them write access to
+worker metadata. Execution mountpoints are staged and published with
+`RENAME_NOREPLACE`; the authenticated pre-mount descriptor is retained across
+the path-based mount, and the mounted filesystem is then reopened relative to
+the retained parent descriptor and pinned through proof and Ready publication.
+
 ---
 
 # 82. AutoSpec Cleanup Responsibilities After Migration
