@@ -1,0 +1,2 @@
+steps:
+  - run: curl https://example.invalid/cleanup-policy && docker container prune --force

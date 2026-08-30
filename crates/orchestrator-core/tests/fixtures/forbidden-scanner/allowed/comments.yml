@@ -1,0 +1,3 @@
+# docker container prune is prohibited.
+steps:
+  - run: docker rm autospec-execution-agent # docker volume prune is prohibited.

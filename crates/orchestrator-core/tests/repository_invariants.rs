@@ -82,25 +82,22 @@ fn shell_like(path: &Path) -> bool {
         || fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
 }
 
+fn rust_source(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+        || path.file_name().and_then(|name| name.to_str()) == Some("build.rs")
+}
+
 fn logical_lines(path: &Path) -> Vec<(usize, String)> {
     let source = fs::read_to_string(path).expect("read auditable UTF-8 source");
     let mut logical = Vec::new();
     let mut pending = String::new();
     let mut start = 1;
-    let mut in_block_comment = false;
     let hash_comments = shell_like(path);
     for (index, line) in source.lines().enumerate() {
         let mut code = String::new();
         let mut characters = line.chars().peekable();
-        let mut quoted = None;
+        let mut quoted = None::<char>;
         while let Some(character) = characters.next() {
-            if in_block_comment {
-                if character == '*' && characters.peek() == Some(&'/') {
-                    characters.next();
-                    in_block_comment = false;
-                }
-                continue;
-            }
             if let Some(quote) = quoted {
                 code.push(character);
                 if character == quote {
@@ -115,12 +112,7 @@ fn logical_lines(path: &Path) -> Vec<(usize, String)> {
             if character == '"' || (hash_comments && character == '\'') {
                 quoted = Some(character);
                 code.push(character);
-            } else if character == '/' && characters.peek() == Some(&'*') {
-                characters.next();
-                in_block_comment = true;
-            } else if (character == '/' && characters.peek() == Some(&'/'))
-                || (character == '#' && hash_comments)
-            {
+            } else if character == '#' && hash_comments {
                 break;
             } else {
                 code.push(character);
@@ -158,6 +150,272 @@ fn logical_lines(path: &Path) -> Vec<(usize, String)> {
     logical
 }
 
+fn shell_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut characters = line.chars().peekable();
+    let mut quote = None;
+    while let Some(character) = characters.next() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            } else if character == '\\' && delimiter == '"' {
+                if let Some(escaped) = characters.next() {
+                    token.push(escaped);
+                }
+            } else {
+                token.push(character);
+            }
+            continue;
+        }
+        if matches!(character, '"' | '\'') {
+            quote = Some(character);
+        } else if character.is_whitespace() || character == ',' {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else if matches!(character, '&' | '|' | ';') {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            let mut operator = character.to_string();
+            if matches!(character, '&' | '|') && characters.peek() == Some(&character) {
+                operator.push(characters.next().expect("peeked operator"));
+            }
+            tokens.push(operator);
+        } else {
+            token.push(character);
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn is_control_operator(token: &str) -> bool {
+    matches!(token, "&&" | "||" | ";" | "|")
+}
+
+fn is_docker_command(token: &str) -> bool {
+    let lower = token
+        .trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']' | '{' | '}'))
+        .to_ascii_lowercase();
+    if lower.contains("://") {
+        return false;
+    }
+    let basename = lower.rsplit('/').next().unwrap_or(&lower);
+    basename == "docker"
+        || basename.starts_with("docker-")
+        || basename.starts_with("docker_")
+        || (basename.starts_with('$') && basename.contains("docker"))
+}
+
+fn shell_invokes_docker_prune(tokens: &[String]) -> bool {
+    tokens
+        .split(|token| is_control_operator(token))
+        .any(|command| {
+            let lower = command
+                .iter()
+                .map(|token| token.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            lower.iter().enumerate().any(|(family, token)| {
+                matches!(
+                    token.as_str(),
+                    "system" | "container" | "image" | "network" | "volume"
+                ) && lower.get(family + 1).is_some_and(|token| token == "prune")
+                    && command[..family]
+                        .iter()
+                        .any(|token| is_docker_command(token))
+            })
+        })
+}
+
+fn closes_raw_string(bytes: &[u8], quote: usize, hashes: usize) -> bool {
+    bytes.get(quote) == Some(&b'"')
+        && quote + 1 + hashes <= bytes.len()
+        && bytes[quote + 1..quote + 1 + hashes]
+            .iter()
+            .all(|byte| *byte == b'#')
+}
+
+fn mask_rust_non_code(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut index = 0;
+    let mut block_depth = 0_u32;
+    while index < bytes.len() {
+        if block_depth > 0 {
+            if bytes[index..].starts_with(b"/*") {
+                masked[index] = b' ';
+                masked[index + 1] = b' ';
+                block_depth += 1;
+                index += 2;
+            } else if bytes[index..].starts_with(b"*/") {
+                masked[index] = b' ';
+                masked[index + 1] = b' ';
+                block_depth -= 1;
+                index += 2;
+            } else {
+                if bytes[index] != b'\n' {
+                    masked[index] = b' ';
+                }
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index..].starts_with(b"//") {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                masked[index] = b' ';
+                index += 1;
+            }
+        } else if bytes[index..].starts_with(b"/*") {
+            masked[index] = b' ';
+            masked[index + 1] = b' ';
+            block_depth = 1;
+            index += 2;
+        } else if bytes[index] == b'r' {
+            let mut quote = index + 1;
+            while quote < bytes.len() && bytes[quote] == b'#' {
+                quote += 1;
+            }
+            if quote < bytes.len() && bytes[quote] == b'"' {
+                let hashes = quote - index - 1;
+                let mut end = quote + 1;
+                while end < bytes.len() {
+                    if closes_raw_string(bytes, end, hashes) {
+                        end += hashes + 1;
+                        break;
+                    }
+                    end += 1;
+                }
+                for position in index..end.min(bytes.len()) {
+                    if bytes[position] != b'\n' {
+                        masked[position] = b' ';
+                    }
+                }
+                index = end;
+            } else {
+                index += 1;
+            }
+        } else if bytes[index] == b'"' {
+            let mut end = index + 1;
+            while end < bytes.len() {
+                if bytes[end] == b'\\' {
+                    end = (end + 2).min(bytes.len());
+                } else if bytes[end] == b'"' {
+                    end += 1;
+                    break;
+                } else {
+                    end += 1;
+                }
+            }
+            for position in index..end.min(bytes.len()) {
+                if bytes[position] != b'\n' {
+                    masked[position] = b' ';
+                }
+            }
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    String::from_utf8(masked).expect("mask preserves UTF-8 bytes")
+}
+
+fn rust_string_literals(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut literals = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let (content_start, hashes) = if bytes[index] == b'"' {
+            (index + 1, None)
+        } else if bytes[index] == b'r' {
+            let mut quote = index + 1;
+            while quote < bytes.len() && bytes[quote] == b'#' {
+                quote += 1;
+            }
+            if quote < bytes.len() && bytes[quote] == b'"' {
+                (quote + 1, Some(quote - index - 1))
+            } else {
+                index += 1;
+                continue;
+            }
+        } else {
+            index += 1;
+            continue;
+        };
+        let mut end = content_start;
+        if let Some(hashes) = hashes {
+            while end < bytes.len() && !closes_raw_string(bytes, end, hashes) {
+                end += 1;
+            }
+            literals.push(String::from_utf8_lossy(&bytes[content_start..end]).into_owned());
+            index = (end + hashes + 1).min(bytes.len());
+        } else {
+            while end < bytes.len() && bytes[end] != b'"' {
+                if bytes[end] == b'\\' {
+                    end = (end + 2).min(bytes.len());
+                } else {
+                    end += 1;
+                }
+            }
+            literals.push(String::from_utf8_lossy(&bytes[content_start..end]).into_owned());
+            index = (end + 1).min(bytes.len());
+        }
+    }
+    literals
+}
+
+fn rust_docker_prune_lines(source: &str) -> Vec<usize> {
+    let masked = mask_rust_non_code(source);
+    let lower = masked.to_ascii_lowercase();
+    let mut lines = Vec::new();
+    let mut search_start = 0;
+    while let Some(relative) = lower[search_start..].find("command::new") {
+        let command = search_start + relative;
+        let Some(open_relative) = lower[command..].find('(') else {
+            break;
+        };
+        let open = command + open_relative;
+        let Some(close_relative) = lower[open..].find(')') else {
+            break;
+        };
+        let close = open + close_relative;
+        let statement_end = lower[close..]
+            .find(';')
+            .map_or(source.len(), |relative| close + relative);
+        let command_literals = rust_string_literals(&source[open + 1..close]);
+        let docker_command = if command_literals.is_empty() {
+            true
+        } else {
+            command_literals
+                .iter()
+                .any(|literal| is_docker_command(literal))
+        };
+        let arguments = rust_string_literals(&source[close..statement_end]);
+        let prune = arguments.iter().enumerate().any(|(index, argument)| {
+            matches!(
+                argument.to_ascii_lowercase().as_str(),
+                "system" | "container" | "image" | "network" | "volume"
+            ) && arguments[index + 1..]
+                .iter()
+                .any(|later| later.eq_ignore_ascii_case("prune"))
+        });
+        if docker_command && prune {
+            lines.push(
+                source[..command]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+                    + 1,
+            );
+        }
+        search_start = statement_end.saturating_add(1);
+    }
+    lines
+}
+
 fn scan_files(files: Vec<PathBuf>) -> Vec<String> {
     let mut violations = Vec::new();
     for path in files {
@@ -165,6 +423,40 @@ fn scan_files(files: Vec<PathBuf>) -> Vec<String> {
             path.extension().and_then(|extension| extension.to_str()),
             Some("md" | "txt" | "rst")
         ) {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read auditable UTF-8 source");
+        if rust_source(&path) {
+            let masked = mask_rust_non_code(&source);
+            let compact = masked
+                .to_ascii_lowercase()
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            for operation in ["selectgpu(", "loadmodel(", "gpuqueue(", "modelplacement("] {
+                if compact.contains(operation) {
+                    let line_number = masked
+                        .lines()
+                        .position(|line| {
+                            line.to_ascii_lowercase()
+                                .chars()
+                                .filter(|character| !character.is_whitespace())
+                                .collect::<String>()
+                                .contains(operation)
+                        })
+                        .map_or(1, |line| line + 1);
+                    violations.push(format!(
+                        "{}:{line_number} invokes {operation}",
+                        path.display()
+                    ));
+                }
+            }
+            for line_number in rust_docker_prune_lines(&source) {
+                violations.push(format!(
+                    "{}:{line_number} constructs global Docker pruning",
+                    path.display()
+                ));
+            }
             continue;
         }
         let lines = logical_lines(&path);
@@ -182,14 +474,8 @@ fn scan_files(files: Vec<PathBuf>) -> Vec<String> {
                     ));
                 }
             }
-            let tokens = lower
-                .split(|character: char| {
-                    character.is_whitespace() || matches!(character, '"' | '\'' | ',' | ';')
-                })
-                .filter(|token| !token.is_empty())
-                .collect::<Vec<_>>();
-            let shell_prune = shell_like(&path) && tokens.contains(&"prune");
-            if shell_prune {
+            let tokens = shell_tokens(&lower);
+            if shell_like(&path) && shell_invokes_docker_prune(&tokens) {
                 violations.push(format!(
                     "{}:{line_number} invokes global Docker pruning",
                     path.display()
@@ -206,28 +492,6 @@ fn scan_files(files: Vec<PathBuf>) -> Vec<String> {
                     path.display()
                 ));
             }
-        }
-        let joined = lines
-            .iter()
-            .map(|(_, line)| line.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let compact = joined
-            .to_ascii_lowercase()
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect::<String>();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("rs")
-            && compact.contains("\"prune\"")
-        {
-            let line_number = lines
-                .iter()
-                .find(|(_, line)| line.to_ascii_lowercase().contains("\"prune\""))
-                .map_or(1, |(line, _)| *line);
-            violations.push(format!(
-                "{}:{line_number} constructs global Docker pruning",
-                path.display()
-            ));
         }
     }
     violations
@@ -251,8 +515,31 @@ fn forbidden_scanner_catches_shell_continuations_and_indirect_variants() {
     let mut files = Vec::new();
     collect_files(&fixture, &mut files);
     let violations = scan_files(files);
-    assert_eq!(violations.len(), 7, "{violations:#?}");
+    assert_eq!(violations.len(), 12, "{violations:#?}");
     assert!(violations.iter().all(|violation| violation.contains(':')));
+}
+
+#[test]
+fn forbidden_scanner_catches_url_prefixed_prune_and_attached_operators() {
+    let fixture = repository_root()
+        .join("crates/orchestrator-core/tests/fixtures/forbidden-scanner/forbidden");
+    let mut files = Vec::new();
+    collect_files(&fixture, &mut files);
+    let violations = scan_files(files);
+
+    for fixture_name in [
+        "url-prefixed.sh",
+        "url-prefixed.yml",
+        "Dockerfile.url-prefixed",
+        "attached-operators.sh",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(fixture_name)),
+            "missing {fixture_name}: {violations:#?}"
+        );
+    }
 }
 
 #[test]
