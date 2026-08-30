@@ -724,11 +724,12 @@ impl ExecutionStore for PgExecutionStore {
         .map_err(map_conflict)?;
         sqlx::query(
             "INSERT INTO execution_requests \
-             (idempotency_key, request_scope, execution_id, created_at) \
-             VALUES ($1, $2, $3, $4)",
+             (idempotency_key, request_scope, manifest, execution_id, created_at) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(idempotency_key)
         .bind(request_scope)
+        .bind(&manifest)
         .bind(execution.id.as_str())
         .bind(execution.created_at)
         .execute(&mut *transaction)

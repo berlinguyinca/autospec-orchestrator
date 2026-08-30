@@ -69,22 +69,76 @@ fn executable_sources() -> Vec<PathBuf> {
     files
 }
 
+fn shell_like(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("sh" | "yml" | "yaml")
+    ) || name.starts_with("Dockerfile")
+        || matches!(name, "Makefile" | "Justfile")
+        || fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+}
+
 fn logical_lines(path: &Path) -> Vec<(usize, String)> {
     let source = fs::read_to_string(path).expect("read auditable UTF-8 source");
     let mut logical = Vec::new();
     let mut pending = String::new();
     let mut start = 1;
+    let mut in_block_comment = false;
+    let hash_comments = shell_like(path);
     for (index, line) in source.lines().enumerate() {
-        let trimmed = line.trim_start();
+        let mut code = String::new();
+        let mut characters = line.chars().peekable();
+        let mut quoted = None;
+        while let Some(character) = characters.next() {
+            if in_block_comment {
+                if character == '*' && characters.peek() == Some(&'/') {
+                    characters.next();
+                    in_block_comment = false;
+                }
+                continue;
+            }
+            if let Some(quote) = quoted {
+                code.push(character);
+                if character == quote {
+                    quoted = None;
+                } else if character == '\\' {
+                    if let Some(escaped) = characters.next() {
+                        code.push(escaped);
+                    }
+                }
+                continue;
+            }
+            if character == '"' || (hash_comments && character == '\'') {
+                quoted = Some(character);
+                code.push(character);
+            } else if character == '/' && characters.peek() == Some(&'*') {
+                characters.next();
+                in_block_comment = true;
+            } else if (character == '/' && characters.peek() == Some(&'/'))
+                || (character == '#' && hash_comments)
+            {
+                break;
+            } else {
+                code.push(character);
+            }
+        }
+        let trimmed = code.trim_start();
         if pending.is_empty() && (trimmed.starts_with("//") || trimmed.starts_with('#')) {
+            continue;
+        }
+        if trimmed.is_empty() {
             continue;
         }
         if pending.is_empty() {
             start = index + 1;
         }
-        let continued = line.trim_end().ends_with('\\');
+        let continued = code.trim_end().ends_with('\\');
         pending.push_str(
-            line.trim_end_matches(|character: char| character == '\\' || character.is_whitespace()),
+            code.trim_end_matches(|character: char| character == '\\' || character.is_whitespace()),
         );
         pending.push(' ');
         if !continued {
@@ -107,6 +161,12 @@ fn logical_lines(path: &Path) -> Vec<(usize, String)> {
 fn scan_files(files: Vec<PathBuf>) -> Vec<String> {
     let mut violations = Vec::new();
     for path in files {
+        if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("md" | "txt" | "rst")
+        ) {
+            continue;
+        }
         let lines = logical_lines(&path);
         for (line_number, line) in &lines {
             let lower = line.to_ascii_lowercase();
@@ -128,16 +188,8 @@ fn scan_files(files: Vec<PathBuf>) -> Vec<String> {
                 })
                 .filter(|token| !token.is_empty())
                 .collect::<Vec<_>>();
-            if tokens
-                .iter()
-                .position(|token| *token == "docker")
-                .is_some_and(|docker| {
-                    tokens[docker + 1..]
-                        .iter()
-                        .take(4)
-                        .any(|token| *token == "prune")
-                })
-            {
+            let shell_prune = shell_like(&path) && tokens.contains(&"prune");
+            if shell_prune {
                 violations.push(format!(
                     "{}:{line_number} invokes global Docker pruning",
                     path.display()
@@ -165,18 +217,17 @@ fn scan_files(files: Vec<PathBuf>) -> Vec<String> {
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
-        if let Some(command) = compact.find("command::new(\"docker\")") {
-            let tail = &compact[command..compact.len().min(command + 512)];
-            if tail.contains("\"prune\"") {
-                let line_number = lines
-                    .iter()
-                    .find(|(_, line)| line.to_ascii_lowercase().contains("command::new"))
-                    .map_or(1, |(line, _)| *line);
-                violations.push(format!(
-                    "{}:{line_number} constructs global Docker pruning",
-                    path.display()
-                ));
-            }
+        if path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+            && compact.contains("\"prune\"")
+        {
+            let line_number = lines
+                .iter()
+                .find(|(_, line)| line.to_ascii_lowercase().contains("\"prune\""))
+                .map_or(1, |(line, _)| *line);
+            violations.push(format!(
+                "{}:{line_number} constructs global Docker pruning",
+                path.display()
+            ));
         }
     }
     violations
@@ -200,7 +251,7 @@ fn forbidden_scanner_catches_shell_continuations_and_indirect_variants() {
     let mut files = Vec::new();
     collect_files(&fixture, &mut files);
     let violations = scan_files(files);
-    assert_eq!(violations.len(), 5, "{violations:#?}");
+    assert_eq!(violations.len(), 7, "{violations:#?}");
     assert!(violations.iter().all(|violation| violation.contains(':')));
 }
 

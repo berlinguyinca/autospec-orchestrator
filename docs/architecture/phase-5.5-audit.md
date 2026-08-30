@@ -144,27 +144,32 @@ provisioned operator pool remains a deployment-readiness prerequisite.
 
 ## Task-context duplication audit
 
-The E2E stores a distinctive task goal and searches every durable table. The
-goal exists only in the canonical `executions.manifest`; it is absent from
-request, worker, reservation, attempt, event, cleanup, control, cancellation,
-artifact-metadata, and artifact-blob records. The Pi fixture records exactly one
-task-packet invocation.
+The E2E stores a distinctive task goal and searches every durable table. During
+the mixed-controller rollout window, the goal exists in the canonical
+`executions.manifest` and in the temporary compatibility copy at
+`execution_requests.manifest`; it is absent from worker, reservation, attempt,
+event, cleanup, control, cancellation, artifact-metadata, and artifact-blob
+records. The Pi fixture records exactly one task-packet invocation.
 
 The audit originally caught a duplicate full manifest in
 `execution_requests`. Migration
 `0013_prepare_request_manifest_contract.sql` is the safe expand phase: it
 makes the legacy column nullable, preserves populated pre-upgrade rows, and
 allows prior-version controllers to keep inserting during a mixed rollout. New
-controllers leave the legacy column `NULL`. Idempotency replay compares against
-the canonical `executions.manifest` in the same transaction, preserving same
-request and conflicting-request concurrency semantics without a second payload
-copy.
+controllers temporarily dual-write the legacy column so a prior controller can
+replay a new row using its non-optional manifest decoder. New-controller replay
+still compares against the canonical `executions.manifest` in the same
+transaction, preserving same-request and conflicting-request concurrency
+semantics. This compatibility duplication is the sole deliberate exception to
+the steady-state task-context efficiency claim.
 Artifact bytes remain stored once by content hash, with metadata referring to
 the blob rather than duplicating it.
 
-Rollback has a deliberate stop boundary. Before starting an older controller,
-stop every new controller and backfill only the legacy compatibility column from
-the canonical execution row:
+After the minimum supported controller contract excludes the prior reader, a
+separate contract release must first stop the legacy dual-write and verify no
+old controller can serve traffic; only a later migration may drop the column.
+For rollback from that future release, stop every newer controller and backfill
+only the legacy compatibility column from the canonical execution row:
 
 ```sql
 UPDATE execution_requests AS request

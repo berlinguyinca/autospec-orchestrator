@@ -1285,6 +1285,70 @@ async fn migration_0012_to_0013_is_expand_only_for_mixed_controller_versions() {
 }
 
 #[tokio::test]
+async fn new_controller_rows_remain_replayable_by_prior_controllers_during_rollout() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, _events)) = stores().await else {
+        return;
+    };
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").unwrap();
+    let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+    let queued = execution(ExecutionState::Queued);
+    let created = ExecutionEvent {
+        execution_id: queued.id.clone(),
+        attempt_id: None,
+        sequence: 0,
+        at: Utc::now(),
+        state: ExecutionState::Queued,
+        kind: ExecutionEventKind::ExecutionCreated,
+    };
+    let key = format!("mixed-version-{}", uuid::Uuid::new_v4().simple());
+    let scope = "prior-controller-create";
+
+    let first = executions
+        .create_idempotent(&queued, &created, &key, scope)
+        .await
+        .unwrap();
+    assert!(first.created);
+
+    // This is the prior controller's exact replay lookup and non-optional
+    // manifest decode. It must remain valid throughout a mixed rollout.
+    let prior_row = sqlx::query(
+        "SELECT request_scope, manifest, execution_id FROM execution_requests \
+         WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let prior_scope: String = prior_row.try_get("request_scope").unwrap();
+    let prior_manifest: ExecutionManifest =
+        serde_json::from_value(prior_row.try_get("manifest").unwrap()).unwrap();
+    let prior_execution_id: String = prior_row.try_get("execution_id").unwrap();
+    assert_eq!(prior_scope, scope);
+    assert_eq!(
+        serde_json::to_value(prior_manifest).unwrap(),
+        serde_json::to_value(&queued.manifest).unwrap()
+    );
+    assert_eq!(prior_execution_id, queued.id.as_str());
+
+    let replay = executions
+        .create_idempotent(&queued, &created, &key, scope)
+        .await
+        .unwrap();
+    assert!(!replay.created);
+    assert_eq!(replay.execution.id, queued.id);
+
+    let mut conflicting = queued.clone();
+    conflicting.manifest.repository.base_ref = "release".into();
+    assert!(matches!(
+        executions
+            .create_idempotent(&conflicting, &created, &key, scope)
+            .await,
+        Err(StoreError::IdempotencyConflict(_))
+    ));
+}
+
+#[tokio::test]
 async fn event_batches_are_bounded_and_strictly_ordered() {
     let _database_test = database_test_lock().lock().await;
     let Some((executions, events)) = stores().await else {

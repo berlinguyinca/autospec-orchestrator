@@ -414,7 +414,6 @@ async fn task9_manifest_runs_through_real_worker_and_exact_cleanup_with_durable_
     let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
     for table in [
         "artifact_blobs",
-        "execution_requests",
         "execution_control_requests",
         "execution_cancellation_requests",
         "reservations",
@@ -434,6 +433,19 @@ async fn task9_manifest_runs_through_real_worker_and_exact_cleanup_with_durable_
             .unwrap();
         assert!(!duplicated, "task packet duplicated into {table}");
     }
+    let compatibility_copy: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM execution_requests \
+         WHERE execution_id = $1 AND manifest::text LIKE '%' || $2 || '%')",
+    )
+    .bind(created.id.as_str())
+    .bind(&goal)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        compatibility_copy,
+        "mixed-version rollout requires the temporary prior-controller replay copy"
+    );
 
     executions.request_cancellation(&created.id).await.unwrap();
     worker.reconcile_daemon_tick(&worker_id, &[]).await.unwrap();
