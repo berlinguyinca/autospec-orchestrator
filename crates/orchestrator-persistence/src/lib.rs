@@ -7,6 +7,9 @@ mod event_log;
 mod reservations;
 mod workers;
 
+#[doc(hidden)]
+pub mod test_support;
+
 pub use artifacts::{Artifact, ArtifactStore, PgArtifactStore};
 pub use cleanup::{
     CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, CleanupHealthSnapshot,

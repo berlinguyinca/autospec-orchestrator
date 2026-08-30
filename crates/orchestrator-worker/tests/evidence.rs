@@ -5,6 +5,7 @@ use orchestrator_core::{
     HarnessKind, ModelPolicy, OwnershipLabels, PersistenceMode, RepositoryReference, Role,
     RuntimeRequirement, WorkerId,
 };
+use orchestrator_persistence::test_support::DisposableTestDatabaseLock;
 use orchestrator_persistence::{ArtifactStore, ExecutionStore, PgArtifactStore, PgExecutionStore};
 use orchestrator_worker::{ContentAddressedEvidenceStore, EvidenceStore};
 use std::sync::Arc;
@@ -15,6 +16,9 @@ async fn production_evidence_adapter_persists_metadata_without_touching_the_pi_m
         eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real artifact evidence test");
         return;
     };
+    let _database_lock = DisposableTestDatabaseLock::acquire(&database_url)
+        .await
+        .unwrap();
     let suffix = format!(
         "{}-{}",
         std::process::id(),

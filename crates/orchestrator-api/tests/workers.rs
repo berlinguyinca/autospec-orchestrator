@@ -4,6 +4,7 @@ use orchestrator_core::{
     ExecutionId, RuntimeKind, WorkerCapabilities, WorkerCapabilityProof, WorkerId,
     WorkerRegistration, WorkerState,
 };
+use orchestrator_persistence::test_support::DisposableTestDatabaseLock;
 use orchestrator_persistence::{
     CleanupAuthorityStore, CleanupDisposition, CleanupStage, PgArtifactStore,
     PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore, PgWorkerStore,
@@ -18,6 +19,9 @@ async fn authenticated_worker_routes_own_liveness_and_reap_after_ninety_seconds(
         eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
         return;
     };
+    let _database_lock = DisposableTestDatabaseLock::acquire(&database_url)
+        .await
+        .unwrap();
     let store = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
     let token = format!("worker-token-{}", uuid::Uuid::new_v4());
     let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
@@ -171,6 +175,9 @@ async fn authenticated_execution_cleanup_requests_durable_reconciliation() {
         eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
         return;
     };
+    let _database_lock = DisposableTestDatabaseLock::acquire(&database_url)
+        .await
+        .unwrap();
     let workers = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
     let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
     let cleanup = Arc::new(
@@ -321,6 +328,9 @@ async fn worker_routes_reject_invalid_and_oversized_bodies() {
         eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
         return;
     };
+    let _database_lock = DisposableTestDatabaseLock::acquire(&database_url)
+        .await
+        .unwrap();
     let store = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
     let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
     let state = app_state(&database_url, store, reservations, "secret".into()).await;
@@ -357,6 +367,9 @@ async fn worker_api_registers_every_preparation_failure_as_safe_offline_health()
         eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
         return;
     };
+    let _database_lock = DisposableTestDatabaseLock::acquire(&database_url)
+        .await
+        .unwrap();
     let store = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
     let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
     let token = format!("worker-token-{}", uuid::Uuid::new_v4());

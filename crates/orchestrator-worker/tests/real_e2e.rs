@@ -14,6 +14,7 @@ use orchestrator_core::{
     RuntimeRequirement, ServiceRequirement, TaskPacket, WorkerAdvertisement, WorkerCapabilities,
     WorkerCapabilityProof, WorkerId, WorkerRegistration, WorkerState,
 };
+use orchestrator_persistence::test_support::DisposableTestDatabaseLock;
 use orchestrator_persistence::{
     ArtifactStore, CleanupAuthority, CleanupAuthorityStore, CleanupDisposition, CleanupStage,
     EventLog, ExecutionStore, PgArtifactStore, PgCleanupAuthorityStore, PgEventLog,
@@ -27,7 +28,6 @@ use orchestrator_worker::{
 };
 use runtime_docker::{DockerRuntime, LocalCredentialBroker, TrustedVerifierImage};
 use runtime_traits::{CredentialBroker, EnvironmentHandle, Runtime, RuntimeError};
-use sqlx::{Connection, PgConnection};
 use std::{
     collections::BTreeMap,
     fs,
@@ -3976,13 +3976,10 @@ fn initialize_state_root(root: &Path) {
     }
 }
 
-async fn acquire_real_test_lock(database_url: &str) -> PgConnection {
-    let mut connection = PgConnection::connect(database_url).await.unwrap();
-    sqlx::query("SELECT pg_advisory_lock(870_051_003)")
-        .execute(&mut connection)
+async fn acquire_real_test_lock(database_url: &str) -> DisposableTestDatabaseLock {
+    DisposableTestDatabaseLock::acquire(database_url)
         .await
-        .unwrap();
-    connection
+        .unwrap()
 }
 
 fn create_stub_repository(remote_root: &Path) {

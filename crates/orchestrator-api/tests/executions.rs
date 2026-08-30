@@ -3,6 +3,7 @@ use orchestrator_api::{router, AppState};
 use orchestrator_core::{
     event::ExecutionEventKind, ExecutionEvent, ExecutionId, ExecutionManifest, ExecutionState,
 };
+use orchestrator_persistence::test_support::DisposableTestDatabaseLock;
 use orchestrator_persistence::{
     ArtifactStore, EventLog, ExecutionStore, PgArtifactStore, PgEventLog, PgExecutionStore,
     PgReservationStore, PgWorkerStore,
@@ -17,6 +18,7 @@ struct TestApi {
     executions: Arc<PgExecutionStore>,
     artifacts: Arc<PgArtifactStore>,
     event_tx: tokio::sync::broadcast::Sender<ExecutionEvent>,
+    _database_lock: DisposableTestDatabaseLock,
     _root: tempfile::TempDir,
 }
 
@@ -25,6 +27,9 @@ async fn test_api() -> Option<TestApi> {
         eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real execution API test");
         return None;
     };
+    let database_lock = DisposableTestDatabaseLock::acquire(&database_url)
+        .await
+        .unwrap();
     let root = tempfile::tempdir().unwrap();
     let executions = Arc::new(PgExecutionStore::connect(&database_url).await.unwrap());
     let events = Arc::new(PgEventLog::connect(&database_url).await.unwrap());
@@ -56,6 +61,7 @@ async fn test_api() -> Option<TestApi> {
         executions,
         artifacts,
         event_tx,
+        _database_lock: database_lock,
         _root: root,
     })
 }
