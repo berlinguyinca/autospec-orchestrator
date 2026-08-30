@@ -1,8 +1,9 @@
 # Phase 5.5 completion audit
 
 Audit date: 2026-08-29
-Evidence refreshed: 2026-08-29T19:22:31-07:00
+Evidence refreshed: 2026-08-29T19:36:39-07:00
 Implementation baseline: `3ff8b5e` on `feat/pi-execution-plane`
+Database-isolation repair baseline: `8e44ca9`
 Scanner baseline: `06c0c5e`
 Scope: the execution plane only; no AutoSpec planning policy or InferWeave
 model-serving behavior was added.
@@ -51,10 +52,37 @@ cargo clippy --workspace --all-targets -- -D warnings
 Result: exit 0 on 2026-08-29. The real worker suite passed 14/14 in
 296.54s, including the Task 9 chain, crash adoption, independent peer
 isolation, credential containment, failure-stage recovery, cancellation, and
-exact cleanup. This rerun also exposed and then verified the repair for
-PostgreSQL test contamination: the guarded test lock now resets only the
-already-proven disposable database, and the full 40-test persistence suite
-passes under normal parallel scheduling.
+exact cleanup. This rerun also exposed the original process-local PostgreSQL
+test-contamination guard. That guard was subsequently superseded at `8e44ca9`
+by the cross-process evidence below.
+
+The database-isolation repair was tested against a freshly recreated
+`autospec_test_task9fix4_20260829` database. Every database-mutating integration
+binary now proves the disposable database identity and holds the same
+PostgreSQL session advisory lock for its complete mutation scope. Persistence
+migrates before its guarded whole-database reset. The direct two-session lock
+regression passed, followed by the adversarial cross-binary reproduction:
+
+```text
+# launched first and kept live while the second binary attempted its reset
+cargo test -p orchestrator-worker --test real_e2e \
+  task9_manifest_runs_through_real_worker_and_exact_cleanup_with_durable_evidence \
+  -- --exact --nocapture
+
+# launched concurrently
+cargo test -p orchestrator-persistence --test postgres \
+  new_controller_rows_remain_replayable_by_prior_controllers_during_rollout \
+  -- --exact --nocapture
+```
+
+Result: both commands exited 0. Task 9 passed in 10.86s; the prior-controller
+test passed in 5.32s after waiting for the shared lock instead of truncating
+Task 9's live rows. The full persistence suite then passed 41/41, API database
+integration passed 10/10, and the worker evidence integration test passed.
+Current-toolchain clippy with warnings denied passed for the three affected
+crates, and Rust 1.85 `cargo check --all-targets` passed for those crates. This
+focused repair evidence supplements rather than replaces the complete
+workspace gates recorded below.
 
 The Rust 1.85 gate used the rustup binary explicitly because Homebrew's `cargo`
 preceded the rustup proxy on this host. The latest complete rerun was at
