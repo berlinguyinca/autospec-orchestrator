@@ -1,7 +1,9 @@
 # Phase 5.5 completion audit
 
 Audit date: 2026-08-29
-Baseline: `003ead7` on `feat/pi-execution-plane`
+Evidence refreshed: 2026-08-29T19:22:31-07:00
+Implementation baseline: `3ff8b5e` on `feat/pi-execution-plane`
+Scanner baseline: `06c0c5e`
 Scope: the execution plane only; no AutoSpec planning policy or InferWeave
 model-serving behavior was added.
 
@@ -27,17 +29,17 @@ Podman and Apptainer are also unavailable and remain ineligible future adapters.
 | MSRV | `rustc 1.85.0 (4d91de4e4 2025-02-17)` | `rustup run 1.85.0 rustc --version` |
 | Docker | client/server `29.2.1` | `docker version --format ...` |
 | PostgreSQL | `postgres:17.6-bookworm` | disposable container inspection |
-| Database | `autospec_test_task9audit20260829` | destructive-test guard accepted it |
+| Database | `autospec_test_task9fix3_20260829` | destructive-test guard accepted it |
 | Pi CLI | `0.84.3` at `/opt/homebrew/bin/pi` | `pi --version` |
 
 PostgreSQL ran in the disposable container
-`autospec-task9-pg-20260829`, bound only to `127.0.0.1:61901`, with the labels
+`autospec-task9fix3-pg-20260829`, bound only to `127.0.0.1:49850`, with the labels
 `autospec.managed=true` and
-`autospec.execution_id=task9-audit-20260829`. Commands below used
+`autospec.execution_id=task9-fix3-20260829`. Commands below used
 `AUTOSPEC_DATABASE_URL` pointing at that database; credentials are intentionally
 omitted from this durable record.
 
-The current-toolchain gate was:
+The current-toolchain gate was rerun at `3ff8b5e`:
 
 ```text
 cargo fmt --all -- --check
@@ -46,28 +48,43 @@ AUTOSPEC_DATABASE_URL="$DISPOSABLE_TEST_DATABASE" cargo test --workspace -- --no
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Result: exit 0. The real worker suite passed 14/14, including the Task 9 chain,
-crash adoption, independent peer isolation, credential containment, failure
-stage recovery, cancellation, and exact cleanup.
+Result: exit 0 on 2026-08-29. The real worker suite passed 14/14 in
+296.54s, including the Task 9 chain, crash adoption, independent peer
+isolation, credential containment, failure-stage recovery, cancellation, and
+exact cleanup. This rerun also exposed and then verified the repair for
+PostgreSQL test contamination: the guarded test lock now resets only the
+already-proven disposable database, and the full 40-test persistence suite
+passes under normal parallel scheduling.
 
 The Rust 1.85 gate used the rustup binary explicitly because Homebrew's `cargo`
-preceded the rustup proxy on this host:
+preceded the rustup proxy on this host. The latest complete rerun was at
+`3ff8b5e`, using a distinct `target-rust185-fix3` target directory:
 
 ```text
-CARGO_TARGET_DIR=target-rust185 rustup run 1.85.0 cargo fmt --all -- --check
-CARGO_TARGET_DIR=target-rust185 rustup run 1.85.0 cargo build --workspace
-CARGO_TARGET_DIR=target-rust185 AUTOSPEC_DATABASE_URL="$DISPOSABLE_TEST_DATABASE" \
+CARGO_TARGET_DIR=target-rust185-fix3 rustup run 1.85.0 cargo fmt --all -- --check
+CARGO_TARGET_DIR=target-rust185-fix3 rustup run 1.85.0 cargo build --workspace
+CARGO_TARGET_DIR=target-rust185-fix3 AUTOSPEC_DATABASE_URL="$DISPOSABLE_TEST_DATABASE" \
   rustup run 1.85.0 cargo test --workspace -- --nocapture
-CARGO_TARGET_DIR=target-rust185 rustup run 1.85.0 cargo clippy \
+CARGO_TARGET_DIR=target-rust185-fix3 rustup run 1.85.0 cargo clippy \
   --workspace --all-targets -- -D warnings
 ```
 
-Result: exit 0. The default-parallel real worker suite passed 14/14 in 882.78s,
-and clippy completed with warnings denied. The real-environment polling windows
-are 60s so concurrent Docker tests measure behavior rather than a 15s host-load
-assumption. The failing 15s cases were first reproduced in the parallel gate,
-then passed in isolation, and the full parallel gate passed after this test-only
-correction.
+Result: exit 0 on 2026-08-29. The default-parallel real worker suite passed
+14/14 in 375.98s, and clippy completed with warnings denied. This was a full
+fmt/build/workspace-test/clippy chain at the stated implementation commit, not
+an extrapolation from focused cases.
+
+The immediately preceding Rust 1.85 attempt at `a3aeb33` did **not** establish
+a green full workspace gate: one real parallel case timed out under host load,
+although that exact case passed when rerun in isolation, and fmt, build, and
+clippy exited 0. That qualified evidence is retained here rather than being
+reported as a full pass; the complete `3ff8b5e` rerun above supersedes it.
+
+This Mac was not a dedicated unloaded runner: unrelated Docker services and the
+Docker virtualization process remained active. No competing Cargo, rustc, or
+autospec test process was present before the latest gate. The recorded exit 0
+therefore proves the full gate on this shared host, but it is not represented as
+dedicated-host performance evidence.
 
 ## Manifest-to-cleanup proof
 
@@ -194,13 +211,17 @@ configuration, and CI workflows. It rejects:
 - global Docker `system`, `container`, `image`, `network`, or `volume` prune;
 - the forbidden `git branch` plus `grep` plus `xargs` cleanup pipeline.
 
-Committed positive fixtures cover shell continuations, constructed Docker
-commands, Git pipelines, and whitespace-separated model-placement calls;
-negative fixtures cover comments and label-scoped cleanup without making the
-scanner trigger on its own test implementation. Every violation retains file
-and line evidence. Neutral manifest model policy remains data transported to
-the harness boundary; this repository does not select hardware, load models,
-serve inference, or decide model placement.
+Committed positive fixtures cover shell continuations, URL-prefixed shell/YAML/
+Dockerfile commands, attached `&&` and pipe operators, configurable or wrapped
+Docker binaries, constructed Rust commands, Git pipelines, and whitespace-
+separated model-placement calls. Negative fixtures cover syntax-specific
+comments, Rust validation literals, URL arguments, `git worktree prune`, and
+other non-Docker prune commands. Docker cleanup is rejected only when a Docker
+command invokes the `system`, `container`, `image`, `network`, or `volume`
+prune family. Every violation retains file and line evidence. Neutral manifest
+model policy remains data transported to the harness boundary; this repository
+does not select hardware, load models, serve inference, or decide model
+placement.
 
 ## Explicit gaps and unavailable adapters
 
