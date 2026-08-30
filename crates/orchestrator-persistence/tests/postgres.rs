@@ -1542,6 +1542,15 @@ impl DatabaseTestIsolation {
             .await
             .expect("read PostgreSQL test database identity");
         require_disposable_test_database(&database_name).unwrap_or_else(|error| panic!("{error}"));
+        sqlx::raw_sql(
+            "TRUNCATE execution_control_requests, execution_cancellation_requests, \
+             execution_requests, cleanup_authorities, execution_attempts, reservations, \
+             artifacts, artifact_blobs, execution_events, workers, executions \
+             RESTART IDENTITY CASCADE",
+        )
+        .execute(&pool)
+        .await
+        .expect("reset proven-disposable PostgreSQL test database");
         pool.close().await;
         PgExecutionStore::connect(&database_url)
             .await
