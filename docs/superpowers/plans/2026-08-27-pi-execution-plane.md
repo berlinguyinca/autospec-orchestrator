@@ -163,9 +163,9 @@
 **Files:**
 - Create: `docs/architecture/phase-5.5-audit.md`, repository-wide invariant tests, end-to-end fixtures
 
-- [ ] Demonstrate manifest → persisted execution → worker → worktree → Docker/services → Pi → events/artifacts → cleanup.
-- [ ] Demonstrate crash resume and independent review isolation.
+- [x] Demonstrate manifest → persisted execution → worker → worktree → Docker/services → Pi → events/artifacts → cleanup.
+- [x] Demonstrate crash resume and independent review isolation.
 - [ ] Demonstrate aggregate disk exhaustion is contained by the execution filesystem and cannot mutate shared mirrors or another execution.
-- [ ] Assert forbidden prune/xargs/model-placement patterns are absent.
-- [ ] Run `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Record evidence for every invariant and all unavailable external-runtime tests.
+- [x] Assert forbidden prune/xargs/model-placement patterns are absent.
+- [x] Run `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings`.
+- [x] Record evidence for every invariant and all unavailable external-runtime tests.
