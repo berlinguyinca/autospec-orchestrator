@@ -85,22 +85,35 @@ focused repair evidence supplements rather than replaces the complete
 workspace gates recorded below.
 
 The Rust 1.85 gate used the rustup binary explicitly because Homebrew's `cargo`
-preceded the rustup proxy on this host. The latest complete rerun was at
-`3ff8b5e`, using a distinct `target-rust185-fix3` target directory:
+preceded the rustup proxy on this host. The latest complete rerun covered the
+final staged-directory and killed-production-probe closure, using a distinct
+`target-rust185-dirfdfix3` target directory:
 
 ```text
-CARGO_TARGET_DIR=target-rust185-fix3 rustup run 1.85.0 cargo fmt --all -- --check
-CARGO_TARGET_DIR=target-rust185-fix3 rustup run 1.85.0 cargo build --workspace
-CARGO_TARGET_DIR=target-rust185-fix3 AUTOSPEC_DATABASE_URL="$DISPOSABLE_TEST_DATABASE" \
+CARGO_TARGET_DIR=target-rust185-dirfdfix3 rustup run 1.85.0 cargo fmt --all -- --check
+CARGO_TARGET_DIR=target-rust185-dirfdfix3 rustup run 1.85.0 cargo build --workspace
+CARGO_TARGET_DIR=target-rust185-dirfdfix3 AUTOSPEC_DATABASE_URL="$DISPOSABLE_TEST_DATABASE" \
   rustup run 1.85.0 cargo test --workspace -- --nocapture
-CARGO_TARGET_DIR=target-rust185-fix3 rustup run 1.85.0 cargo clippy \
+CARGO_TARGET_DIR=target-rust185-dirfdfix3 rustup run 1.85.0 cargo clippy \
   --workspace --all-targets -- -D warnings
 ```
 
 Result: exit 0 on 2026-08-29. The default-parallel real worker suite passed
-14/14 in 375.98s, and clippy completed with warnings denied. This was a full
-fmt/build/workspace-test/clippy chain at the stated implementation commit, not
-an extrapolation from focused cases.
+14/14 in 383.59s, and clippy completed with warnings denied. The matching
+current-toolchain fmt/build/workspace-test/clippy chain also exited 0; its real
+worker suite passed 14/14 in 950.64s. The first current-toolchain test attempt
+had one unrelated five-second Pi drop-bound miss under shared-host parallel
+load; that exact case passed in isolation in 9.94s, and the complete unmodified
+workspace gate then passed on rerun. This is recorded as a superseded failed
+attempt, not folded into the successful result.
+
+The Unix-specific closure also ran in labeled, disposable Linux/aarch64 Rust
+1.85 containers. `cargo test -p execution-storage --all-targets --locked`
+passed all 34 unit, 7 backend, and 35 storage tests. The base image omitted
+clippy, so the first clippy invocation was an environmental failure; after a
+fresh labeled container installed the Rust 1.85 clippy component,
+`cargo clippy -p execution-storage --all-targets --locked -- -D warnings`
+exited 0. No test container or disposable database was retained.
 
 The immediately preceding Rust 1.85 attempt at `a3aeb33` did **not** establish
 a green full workspace gate: one real parallel case timed out under host load,
@@ -268,7 +281,14 @@ placement.
   filesystem boundary. The originally supplied directory is opened with
   `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and compared with its initial `lstat`
   before canonical-path diagnostics are computed; production child directories
-  are captured with `openat` from the retained parent descriptor. Journal and
+  are captured with `openat` from the retained parent descriptor. New metadata
+  subdirectories are first created under an unpredictable, exclusively claimed
+  operation name. The retained parent descriptor is used to record the staged
+  inode, immediately open and authenticate it, and commit it to the requested
+  final name with `RENAME_NOREPLACE`; both the now-absent staged source and the
+  final inode are authenticated after the rename. Any staged or final identity
+  mismatch preserves every object for inspection and never deletes an
+  unauthenticated entry. Journal and
   secure-metadata mutations hold a shared process-local mutex together with an
   advisory lock on that descriptor. Independently captured stores coordinate
   through the advisory lock, while calls through the same instance or a clone
@@ -286,10 +306,11 @@ placement.
   while their descriptor remains open, with unwind cleanup covering the
   create-to-unlink interval. Deterministic public-flow race tests cover root and
   child capture, source and final-target swaps during create/replace, remove,
-  subdirectory creation and cleanup, journal create/write/removal, lock
-  exclusion, collision retry, both ownership-probe unwind cuts, and a genuinely
-  killed probe subprocess while proving attacker sentinels and displaced trusted
-  inodes remain byte-for-byte intact.
+  staged-subdirectory creation before open, before commit, and after commit,
+  subdirectory cleanup, journal create/write/removal, lock exclusion, collision
+  retry, both ownership-probe unwind cuts, and a genuinely killed subprocess
+  blocked inside the production `verify_current_owner` probe path while proving
+  attacker sentinels and displaced trusted inodes remain byte-for-byte intact.
 
   Unix does not provide an inode-conditional `unlinkat`: a continuously active
   process with the same uid can ignore the advisory lock and replace a verified

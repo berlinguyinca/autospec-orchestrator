@@ -83,6 +83,15 @@ pub struct SecureMetadataDirectory {
     directory: PinnedDirectory,
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct DescriptorIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+}
+
 impl SecureMetadataDirectory {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Ok(Self {
@@ -223,7 +232,11 @@ impl SecureMetadataDirectory {
         let mut ignored_residue = 0usize;
         for name in names {
             if is_operation_temporary_name(&name) || is_owner_probe_name(&name) {
-                self.directory.open_file(&name)?;
+                self.directory.child_metadata(&name)?.ok_or_else(|| {
+                    StorageError::IdentityMismatch(
+                        "temporary residue disappeared during inspection".to_owned(),
+                    )
+                })?;
                 ignored_residue += 1;
                 if ignored_residue > MAX_IGNORED_RESIDUE_ENTRIES {
                     return Err(residue_limit_error(&self.directory.path));
@@ -297,32 +310,30 @@ impl SecureMetadataDirectory {
         let _lock = self.directory.lock()?;
         self.create_subdirectory_with(
             name,
-            |directory, child| {
-                directory.child_metadata(child)?.ok_or_else(|| {
-                    StorageError::IdentityMismatch("metadata subdirectory disappeared".to_owned())
-                })
-            },
             PinnedDirectory::sync,
-            |directory, child| {
+            |directory, child, handle, expected| {
                 Ok(Self {
-                    directory: directory.capture_child(child, "metadata subdirectory")?,
+                    directory: directory.pin_authenticated_child(
+                        child,
+                        handle,
+                        expected,
+                        "metadata subdirectory",
+                    )?,
                 })
             },
         )
     }
 
     #[cfg(unix)]
-    fn create_subdirectory_with<Metadata, Sync, Pin>(
+    fn create_subdirectory_with<Sync, Pin>(
         &self,
         name: &str,
-        inspect_child: Metadata,
         sync_parent: Sync,
         pin_child: Pin,
     ) -> Result<Self, StorageError>
     where
-        Metadata: FnOnce(&PinnedDirectory, &str) -> Result<fs::Metadata, StorageError>,
         Sync: FnOnce(&PinnedDirectory) -> Result<(), StorageError>,
-        Pin: FnOnce(&PinnedDirectory, &str) -> Result<Self, StorageError>,
+        Pin: FnOnce(&PinnedDirectory, &str, File, &fs::Metadata) -> Result<Self, StorageError>,
     {
         validate_metadata_name(name)?;
         self.directory.verify("metadata directory")?;
@@ -331,35 +342,39 @@ impl SecureMetadataDirectory {
                 "metadata subdirectory already exists: {name}"
             )));
         }
-        let expected = self.directory.create_directory_unsynced(name)?;
+        let operation = format!("metadata-subdirectory-{name}");
+        let (staged, handle, expected) = self
+            .directory
+            .create_temporary_directory(&operation, "metadata-subdirectory-after-staged-mkdir")?;
         let result = (|| {
-            let observed = inspect_child(&self.directory, name)?;
-            verify_directory_identity(&expected, &observed, "metadata subdirectory")?;
             sync_parent(&self.directory)?;
-            let child = pin_child(&self.directory, name)?;
-            let opened = child
-                .directory
-                .handle
-                .metadata()
-                .map_err(|error| journal_error("inspect", &child.directory.path, error))?;
-            if expected.dev() != opened.dev()
-                || expected.ino() != opened.ino()
-                || expected.uid() != opened.uid()
-            {
-                return Err(StorageError::IdentityMismatch(
-                    "metadata subdirectory changed while pinning".to_owned(),
-                ));
-            }
+            self.directory.commit_directory_noreplace_verified(
+                &staged,
+                name,
+                &expected,
+                "metadata-subdirectory-before-commit",
+                "metadata-subdirectory-before-final-authentication",
+            )?;
+            self.directory.sync()?;
+            let child = pin_child(&self.directory, name, handle, &expected)?;
             self.directory.verify("metadata directory")?;
             Ok(child)
         })();
         match result {
             Ok(child) => Ok(child),
-            Err(error) => match self.rollback_created_subdirectory(name, &expected) {
+            Err(error) => match self.rollback_created_subdirectory(&staged, name, &expected) {
                 Ok(()) => Err(error),
-                Err(rollback) => Err(StorageError::Journal(format!(
-                    "{error}; rollback metadata subdirectory failed: {rollback}"
-                ))),
+                Err(rollback) => {
+                    let message =
+                        format!("{error}; rollback metadata subdirectory failed: {rollback}");
+                    if matches!(error, StorageError::IdentityMismatch(_))
+                        || matches!(rollback, StorageError::IdentityMismatch(_))
+                    {
+                        Err(StorageError::IdentityMismatch(message))
+                    } else {
+                        Err(StorageError::Journal(message))
+                    }
+                }
             },
         }
     }
@@ -367,23 +382,21 @@ impl SecureMetadataDirectory {
     #[cfg(unix)]
     fn rollback_created_subdirectory(
         &self,
-        name: &str,
+        staged: &str,
+        final_name: &str,
         expected: &fs::Metadata,
     ) -> Result<(), StorageError> {
-        let current = self.directory.child_metadata(name)?.ok_or_else(|| {
-            StorageError::IdentityMismatch("metadata subdirectory disappeared".to_owned())
-        })?;
-        if current.file_type().is_symlink()
-            || !current.is_dir()
-            || current.dev() != expected.dev()
-            || current.ino() != expected.ino()
-            || current.uid() != expected.uid()
-        {
-            return Err(StorageError::IdentityMismatch(
-                "created metadata subdirectory identity changed".to_owned(),
-            ));
+        if self.directory.child_metadata(staged)?.is_some() {
+            return self.directory.remove_directory_verified(staged, expected);
         }
-        self.directory.remove_directory(name)
+        if self.directory.child_metadata(final_name)?.is_some() {
+            return self
+                .directory
+                .remove_directory_verified(final_name, expected);
+        }
+        Err(StorageError::IdentityMismatch(
+            "created metadata subdirectory disappeared; preserve unverified state".to_owned(),
+        ))
     }
 
     /// Removes an empty direct child only when its retained pinned identity matches.
@@ -1001,6 +1014,38 @@ impl PinnedDirectory {
     }
 
     #[cfg(unix)]
+    fn pin_authenticated_child(
+        &self,
+        name: &str,
+        handle: File,
+        expected: &fs::Metadata,
+        purpose: &str,
+    ) -> Result<Self, StorageError> {
+        validate_descriptor_name(name)?;
+        let path = self.path.join(name);
+        let opened = handle
+            .metadata()
+            .map_err(|error| journal_error("inspect authenticated directory", &path, error))?;
+        verify_directory_identity(expected, &opened, purpose)?;
+        if opened.mode() & 0o077 != 0 {
+            return Err(StorageError::Unavailable(format!(
+                "{purpose} mode {:o} permits group or world access",
+                opened.mode() & 0o777
+            )));
+        }
+        self.verify_child_identity(name, expected)?;
+        verify_current_owner(&handle, &path, opened.uid(), purpose)?;
+        Ok(Self {
+            path,
+            device: opened.dev(),
+            inode: opened.ino(),
+            uid: opened.uid(),
+            handle: Arc::new(handle),
+            process_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    #[cfg(unix)]
     pub(crate) fn child_path(&self, name: &str) -> Result<PathBuf, StorageError> {
         validate_descriptor_name(name)?;
         Ok(self.path.join(name))
@@ -1037,6 +1082,75 @@ impl PinnedDirectory {
         }
         Err(StorageError::Journal(format!(
             "temporary namespace collision limit reached in {}",
+            self.path.display()
+        )))
+    }
+
+    #[cfg(unix)]
+    fn create_temporary_directory(
+        &self,
+        operation: &str,
+        after_mkdir_hook: &str,
+    ) -> Result<(String, File, fs::Metadata), StorageError> {
+        for _ in 0..MAX_TEMPORARY_NAME_ATTEMPTS {
+            let name = temporary_name(operation)?;
+            let path = self.child_path(&name)?;
+            match rustix::fs::mkdirat(
+                &*self.handle,
+                name.as_str(),
+                Mode::from_bits_truncate(0o700),
+            ) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => return Err(rustix_error("create temporary directory", &path, error)),
+            }
+            let stat = rustix::fs::statat(&*self.handle, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| {
+                    rustix_error("inspect created temporary directory", &path, error)
+                })?;
+            let expected = DescriptorIdentity {
+                device: stat.st_dev as u64,
+                inode: stat.st_ino as u64,
+                uid: stat.st_uid,
+                mode: stat.st_mode as u32,
+            };
+            if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+                || expected.mode & 0o077 != 0
+                || expected.uid != self.uid
+            {
+                return Err(StorageError::IdentityMismatch(
+                    "new staged metadata directory has an invalid type, owner, or mode; preserve unverified state"
+                        .to_owned(),
+                ));
+            }
+            race_hook(after_mkdir_hook);
+            let fd = rustix::fs::openat(
+                &*self.handle,
+                name.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| rustix_error("open created temporary directory", &path, error))?;
+            let handle = File::from(fd);
+            let opened = handle.metadata().map_err(|error| {
+                journal_error("inspect created temporary directory", &path, error)
+            })?;
+            if expected.device != opened.dev()
+                || expected.inode != opened.ino()
+                || expected.uid != opened.uid()
+                || expected.mode != opened.mode()
+                || !opened.is_dir()
+            {
+                return Err(StorageError::IdentityMismatch(
+                    "staged metadata directory changed before authentication; preserve all staged objects"
+                        .to_owned(),
+                ));
+            }
+            self.verify_child_identity(&name, &opened)?;
+            return Ok((name, handle, opened));
+        }
+        Err(StorageError::Journal(format!(
+            "temporary directory namespace collision limit reached in {}",
             self.path.display()
         )))
     }
@@ -1154,6 +1268,44 @@ impl PinnedDirectory {
             race_hook(hook);
         }
         self.verify_child_identity(target, expected_source)
+    }
+
+    #[cfg(unix)]
+    fn commit_directory_noreplace_verified(
+        &self,
+        source: &str,
+        target: &str,
+        expected_source: &fs::Metadata,
+        before_commit_hook: &str,
+        before_final_authentication_hook: &str,
+    ) -> Result<(), StorageError> {
+        self.child_path(source)?;
+        self.child_path(target)?;
+        race_hook(before_commit_hook);
+        self.verify_child_identity(source, expected_source)?;
+        if self.child_metadata(target)?.is_some() {
+            return Err(StorageError::IdentityMismatch(format!(
+                "directory commit target appeared before no-replace rename: {}",
+                self.path.join(target).display()
+            )));
+        }
+        self.rename_noreplace(source, target)?;
+        race_hook(before_final_authentication_hook);
+        let source_result = match self.child_metadata(source)? {
+            None => Ok(()),
+            Some(_) => Err(StorageError::IdentityMismatch(format!(
+                "staged directory source reappeared after commit: {}",
+                self.path.join(source).display()
+            ))),
+        };
+        let final_result = self.verify_child_identity(target, expected_source);
+        match (source_result, final_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(source_error), Err(final_error)) => Err(StorageError::Journal(format!(
+                "{source_error}; final directory also failed authentication: {final_error}"
+            ))),
+        }
     }
 
     #[cfg(unix)]
@@ -1876,23 +2028,29 @@ mod tests {
         const CHILD_ENV: &str = "AUTOSPEC_STALE_PROBE_CHILD";
         if let Ok(root) = std::env::var(CHILD_ENV) {
             let root = PathBuf::from(root);
-            let probe = root.join(format!(
-                ".autospec-owner-{}-{:x}-0",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("clock")
-                    .as_nanos()
-            ));
-            fs::write(&probe, b"stale probe sentinel").expect("create stale probe");
-            fs::set_permissions(&probe, fs::Permissions::from_mode(0o600))
-                .expect("secure stale probe");
-            let readiness_temporary = root.join("child-ready.tmp");
-            fs::write(&readiness_temporary, probe.as_os_str().as_encoded_bytes())
-                .expect("write stale probe readiness");
-            fs::rename(readiness_temporary, root.join("child-ready"))
-                .expect("publish stale probe readiness atomically");
-            std::thread::sleep(Duration::from_secs(60));
+            let hook_root = root.clone();
+            install_race_hook("ownership-probe-after-create", move || {
+                let probe = fs::read_dir(&hook_root)
+                    .expect("list production ownership probes")
+                    .map(|entry| entry.expect("read ownership probe entry").path())
+                    .find(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(is_owner_probe_name)
+                    })
+                    .expect("production ownership probe is linked");
+                fs::write(&probe, b"stale production probe sentinel")
+                    .expect("write through production probe path");
+                let readiness_temporary = hook_root.join("child-ready.tmp");
+                fs::write(&readiness_temporary, probe.as_os_str().as_encoded_bytes())
+                    .expect("write stale probe readiness");
+                fs::rename(readiness_temporary, hook_root.join("child-ready"))
+                    .expect("publish stale probe readiness atomically");
+                loop {
+                    std::thread::park();
+                }
+            });
+            let _ = SecureMetadataDirectory::new(&root);
             return;
         }
 
@@ -1932,7 +2090,7 @@ mod tests {
             .is_empty());
         assert_eq!(
             fs::read(&stale_probe).expect("stale probe is preserved"),
-            b"stale probe sentinel"
+            b"stale production probe sentinel"
         );
         metadata
             .create("record", b"trusted")
@@ -2400,32 +2558,43 @@ mod tests {
     }
 
     #[test]
-    fn public_subdirectory_creation_refuses_a_new_child_swapped_during_capture() {
+    fn public_subdirectory_creation_refuses_a_staged_child_swapped_before_open() {
         let (root, metadata) = metadata_directory();
-        let selected = root.path().join("session");
-        let displaced = root.path().join("created-away");
-        let selected_for_hook = selected.clone();
+        let staged_name = ".metadata-subdirectory-session.1.1.1.tmp";
+        let staged = root.path().join(staged_name);
+        let displaced = root.path().join("trusted-staged-away");
+        let staged_for_hook = staged.clone();
         let displaced_for_hook = displaced.clone();
-        install_race_hook("child-metadata-after-lstat", move || {
-            fs::rename(&selected_for_hook, &displaced_for_hook)
-                .expect("displace newly created directory");
-            fs::create_dir(&selected_for_hook).expect("install attacker directory");
-            fs::set_permissions(&selected_for_hook, fs::Permissions::from_mode(0o700))
+        install_temporary_name_fixtures([staged_name]);
+        install_race_hook("metadata-subdirectory-after-staged-mkdir", move || {
+            let trusted = fs::symlink_metadata(&staged_for_hook)
+                .expect("inspect trusted staged directory before displacement");
+            fs::rename(&staged_for_hook, &displaced_for_hook)
+                .expect("displace trusted staged directory");
+            let preserved = fs::symlink_metadata(&displaced_for_hook)
+                .expect("inspect preserved trusted staged directory");
+            assert_eq!(
+                (preserved.dev(), preserved.ino()),
+                (trusted.dev(), trusted.ino())
+            );
+            fs::create_dir(&staged_for_hook).expect("install attacker staged directory");
+            fs::set_permissions(&staged_for_hook, fs::Permissions::from_mode(0o700))
                 .expect("secure attacker directory");
-            fs::write(selected_for_hook.join("sentinel"), b"attacker sentinel")
+            fs::write(staged_for_hook.join("sentinel"), b"attacker sentinel")
                 .expect("write attacker sentinel");
         });
 
         let error = metadata
             .create_subdirectory("session")
-            .expect_err("reject new directory swapped while capturing its identity");
+            .expect_err("reject staged directory swapped before it is opened");
 
         assert!(matches!(error, StorageError::IdentityMismatch(_)));
         assert_eq!(
-            fs::read(selected.join("sentinel")).expect("attacker remains"),
+            fs::read(staged.join("sentinel")).expect("attacker remains"),
             b"attacker sentinel"
         );
-        assert!(displaced.is_dir());
+        assert!(displaced.is_dir(), "trusted staged directory remains exact");
+        assert!(!root.path().join("session").exists());
     }
 
     #[test]
@@ -2505,35 +2674,122 @@ mod tests {
     }
 
     #[test]
-    fn public_subdirectory_creation_rejects_a_swap_before_first_stat() {
+    fn public_subdirectory_creation_rejects_a_staged_swap_before_commit() {
         let (root, metadata) = metadata_directory();
-        let selected = root.path().join("session");
-        let displaced = root.path().join("trusted-session-away");
-        let selected_for_hook = selected.clone();
+        let staged_name = ".metadata-subdirectory-session.1.1.1.tmp";
+        let staged = root.path().join(staged_name);
+        let displaced = root.path().join("trusted-staged-away");
+        let staged_for_hook = staged.clone();
         let displaced_for_hook = displaced.clone();
-        install_race_hook("directory-create-before-stat", move || {
-            fs::rename(&selected_for_hook, &displaced_for_hook)
-                .expect("displace newly created directory");
-            fs::create_dir(&selected_for_hook).expect("install attacker directory");
-            fs::set_permissions(&selected_for_hook, fs::Permissions::from_mode(0o700))
+        install_temporary_name_fixtures([staged_name]);
+        install_race_hook("metadata-subdirectory-before-commit", move || {
+            let trusted = fs::symlink_metadata(&staged_for_hook)
+                .expect("inspect authenticated staged directory before displacement");
+            fs::rename(&staged_for_hook, &displaced_for_hook)
+                .expect("displace authenticated staged directory");
+            let preserved = fs::symlink_metadata(&displaced_for_hook)
+                .expect("inspect preserved authenticated staged directory");
+            assert_eq!(
+                (preserved.dev(), preserved.ino()),
+                (trusted.dev(), trusted.ino())
+            );
+            fs::create_dir(&staged_for_hook).expect("install attacker staged directory");
+            fs::set_permissions(&staged_for_hook, fs::Permissions::from_mode(0o700))
                 .expect("secure attacker directory");
-            fs::write(selected_for_hook.join("sentinel"), b"attacker sentinel")
+            fs::write(staged_for_hook.join("sentinel"), b"attacker sentinel")
                 .expect("write attacker sentinel");
         });
 
         let error = metadata
             .create_subdirectory("session")
-            .expect_err("reject new directory swapped before first stat");
+            .expect_err("reject authenticated staged directory swapped before commit");
 
         assert!(matches!(error, StorageError::IdentityMismatch(_)));
         assert_eq!(
-            fs::read(selected.join("sentinel")).expect("attacker remains"),
+            fs::read(staged.join("sentinel")).expect("attacker remains"),
             b"attacker sentinel"
         );
-        assert!(
-            displaced.is_dir(),
-            "trusted created directory remains preserved"
+        assert!(displaced.is_dir(), "trusted staged directory remains exact");
+        assert!(!root.path().join("session").exists());
+    }
+
+    #[test]
+    fn public_subdirectory_creation_authenticates_source_and_final_after_commit() {
+        let (root, metadata) = metadata_directory();
+        let staged_name = ".metadata-subdirectory-session.1.1.1.tmp";
+        let final_path = root.path().join("session");
+        let trusted_final = root.path().join("trusted-final-away");
+        let final_for_hook = final_path.clone();
+        let trusted_for_hook = trusted_final.clone();
+        install_temporary_name_fixtures([staged_name]);
+        install_race_hook(
+            "metadata-subdirectory-before-final-authentication",
+            move || {
+                let trusted = fs::symlink_metadata(&final_for_hook)
+                    .expect("inspect committed trusted directory before displacement");
+                fs::rename(&final_for_hook, &trusted_for_hook)
+                    .expect("displace committed trusted directory");
+                let preserved = fs::symlink_metadata(&trusted_for_hook)
+                    .expect("inspect preserved committed trusted directory");
+                assert_eq!(
+                    (preserved.dev(), preserved.ino()),
+                    (trusted.dev(), trusted.ino())
+                );
+                fs::create_dir(&final_for_hook).expect("install attacker final directory");
+                fs::set_permissions(&final_for_hook, fs::Permissions::from_mode(0o700))
+                    .expect("secure attacker final directory");
+                fs::write(final_for_hook.join("sentinel"), b"attacker final sentinel")
+                    .expect("write attacker final sentinel");
+            },
         );
+
+        let error = metadata
+            .create_subdirectory("session")
+            .expect_err("reject final directory swapped after no-replace commit");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(final_path.join("sentinel")).expect("attacker final remains"),
+            b"attacker final sentinel"
+        );
+        assert!(
+            trusted_final.is_dir(),
+            "trusted committed directory remains exact"
+        );
+        assert!(!root.path().join(staged_name).exists());
+    }
+
+    #[test]
+    fn public_subdirectory_creation_rejects_a_reappearing_source_after_commit() {
+        let (root, metadata) = metadata_directory();
+        let staged_name = ".metadata-subdirectory-session.1.1.1.tmp";
+        let staged = root.path().join(staged_name);
+        let staged_for_hook = staged.clone();
+        install_temporary_name_fixtures([staged_name]);
+        install_race_hook(
+            "metadata-subdirectory-before-final-authentication",
+            move || {
+                fs::create_dir(&staged_for_hook).expect("install attacker staged source");
+                fs::set_permissions(&staged_for_hook, fs::Permissions::from_mode(0o700))
+                    .expect("secure attacker staged source");
+                fs::write(
+                    staged_for_hook.join("sentinel"),
+                    b"attacker source sentinel",
+                )
+                .expect("write attacker source sentinel");
+            },
+        );
+
+        let error = metadata
+            .create_subdirectory("session")
+            .expect_err("reject a source name that reappears after commit");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(staged.join("sentinel")).expect("attacker source remains"),
+            b"attacker source sentinel"
+        );
+        assert!(root.path().join("session").is_dir());
     }
 
     #[test]
@@ -2676,21 +2932,19 @@ mod tests {
         let error = metadata
             .create_subdirectory_with(
                 "capture-fsync-failure",
-                |directory, name| {
-                    directory.child_metadata(name)?.ok_or_else(|| {
-                        StorageError::IdentityMismatch(
-                            "metadata subdirectory disappeared".to_owned(),
-                        )
-                    })
-                },
                 |_| {
                     Err(StorageError::Journal(
                         "injected parent fsync failure".to_owned(),
                     ))
                 },
-                |directory, name| {
+                |directory, name, handle, expected| {
                     Ok(SecureMetadataDirectory {
-                        directory: directory.capture_child(name, "metadata subdirectory")?,
+                        directory: directory.pin_authenticated_child(
+                            name,
+                            handle,
+                            expected,
+                            "metadata subdirectory",
+                        )?,
                     })
                 },
             )
@@ -2707,15 +2961,8 @@ mod tests {
         let error = metadata
             .create_subdirectory_with(
                 "capture-pin-failure",
-                |directory, name| {
-                    directory.child_metadata(name)?.ok_or_else(|| {
-                        StorageError::IdentityMismatch(
-                            "metadata subdirectory disappeared".to_owned(),
-                        )
-                    })
-                },
                 PinnedDirectory::sync,
-                |_, _| {
+                |_, _, _, _| {
                     Err::<SecureMetadataDirectory, _>(StorageError::IdentityMismatch(
                         "injected child pin failure".to_owned(),
                     ))
@@ -2730,34 +2977,26 @@ mod tests {
     }
 
     #[test]
-    fn subdirectory_creation_metadata_failure_removes_only_the_created_child() {
+    fn subdirectory_creation_retries_an_exclusive_staged_name_collision() {
         let (root, metadata) = metadata_directory();
-        let foreign = root.path().join("foreign");
-        fs::create_dir(&foreign).expect("create foreign directory");
-        fs::write(foreign.join("sentinel"), b"still safe").expect("write foreign sentinel");
+        let collision_name = ".metadata-subdirectory-session.1.1.1.tmp";
+        let collision = root.path().join(collision_name);
+        fs::create_dir(&collision).expect("create attacker collision directory");
+        fs::write(collision.join("sentinel"), b"attacker collision sentinel")
+            .expect("write attacker collision sentinel");
+        install_temporary_name_fixtures([
+            collision_name,
+            ".metadata-subdirectory-session.1.1.2.tmp",
+        ]);
 
-        let error = metadata
-            .create_subdirectory_with(
-                "capture-metadata-failure",
-                |_, _| {
-                    Err(StorageError::Journal(
-                        "injected child metadata failure".to_owned(),
-                    ))
-                },
-                PinnedDirectory::sync,
-                |directory, name| {
-                    Ok(SecureMetadataDirectory {
-                        directory: directory.capture_child(name, "metadata subdirectory")?,
-                    })
-                },
-            )
-            .expect_err("surface injected metadata failure");
+        metadata
+            .create_subdirectory("session")
+            .expect("retry exclusive staged name collision");
 
-        assert!(matches!(error, StorageError::Journal(message) if message.contains("injected")));
-        assert!(!root.path().join("capture-metadata-failure").exists());
+        assert!(root.path().join("session").is_dir());
         assert_eq!(
-            fs::read(foreign.join("sentinel")).expect("read foreign sentinel"),
-            b"still safe"
+            fs::read(collision.join("sentinel")).expect("attacker collision remains"),
+            b"attacker collision sentinel"
         );
     }
 }
