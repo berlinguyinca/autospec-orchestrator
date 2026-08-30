@@ -1228,7 +1228,10 @@ fn create_intent_recovers_partial_clone_after_restart() {
         .expect("recover exact intent and recreate repository");
 
     assert!(!intent.exists());
-    assert!(!temporary_intent.exists());
+    assert_eq!(
+        std::fs::read(&temporary_intent).expect("unverified temporary intent is preserved"),
+        b"{\"partial\":"
+    );
     assert_eq!(worktree.base_sha, journaled_base);
     assert!(Path::new(&worktree.path)
         .join(".autospec-owner.json")

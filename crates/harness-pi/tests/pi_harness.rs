@@ -208,6 +208,7 @@ impl DockerPi {
         let execution = ExecutionId::new(&execution_id);
         let layout = ExecutionLayout::new(&state_root, &execution).unwrap();
         fs::create_dir_all(state_root.join("execution-storage")).unwrap();
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(
             state_root.join("execution-storage"),
             fs::Permissions::from_mode(0o700),

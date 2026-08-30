@@ -12,10 +12,41 @@ use std::{
     },
 };
 
+#[cfg(test)]
+type RaceHook = Option<(String, Box<dyn FnOnce()>)>;
+
+#[cfg(test)]
+thread_local! {
+    static RACE_HOOK: std::cell::RefCell<RaceHook> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_race_hook(point: &str, hook: impl FnOnce() + 'static) {
+    RACE_HOOK.with(|slot| *slot.borrow_mut() = Some((point.to_owned(), Box::new(hook))));
+}
+
+#[cfg(test)]
+fn race_hook(point: &str) {
+    RACE_HOOK.with(|slot| {
+        let matches = slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|(expected, _)| expected == point);
+        if matches {
+            let (_, hook) = slot.borrow_mut().take().expect("race hook disappeared");
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn race_hook(_: &str) {}
+
 static OWNER_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -39,36 +70,86 @@ impl SecureMetadataDirectory {
         })
     }
 
+    #[cfg(unix)]
+    fn capture_subdirectory(&self, name: &str) -> Result<Self, StorageError> {
+        Ok(Self {
+            directory: self
+                .directory
+                .capture_child(name, "metadata subdirectory")?,
+        })
+    }
+
     pub fn create(&self, name: &str, bytes: &[u8]) -> Result<(), StorageError> {
-        self.reconcile(name)?;
+        let _lock = self.directory.lock()?;
+        validate_metadata_name(name)?;
+        self.directory.verify("metadata directory")?;
         if self.directory.child_metadata(name)?.is_some() {
             return Err(StorageError::Journal(format!(
                 "metadata record already exists: {name}"
             )));
         }
-        let temporary = metadata_temporary_name(name)?;
+        let temporary = temporary_name(&format!("metadata-{name}"))?;
         let file = self.directory.create_file(&temporary)?;
-        write_bytes_and_sync(file, bytes, &self.directory.child_path(&temporary)?)?;
-        self.directory.rename(&temporary, name)?;
+        let temporary_identity = file
+            .metadata()
+            .map_err(|error| journal_error("inspect", &self.directory.path, error))?;
+        if let Err(error) =
+            write_bytes_and_sync(file, bytes, &self.directory.child_path(&temporary)?)
+        {
+            let _ = self
+                .directory
+                .remove_file_verified(&temporary, &temporary_identity);
+            return Err(error);
+        }
+        race_hook("metadata-create-before-commit");
+        if let Err(error) = self.directory.rename_noreplace(&temporary, name) {
+            let _ = self
+                .directory
+                .remove_file_verified(&temporary, &temporary_identity);
+            return Err(error);
+        }
         self.directory.sync()
     }
 
     pub fn replace(&self, name: &str, bytes: &[u8]) -> Result<(), StorageError> {
-        self.reconcile(name)?;
+        let _lock = self.directory.lock()?;
+        validate_metadata_name(name)?;
+        self.directory.verify("metadata directory")?;
         let current = self.directory.open_file(name)?;
         let expected = current
             .metadata()
             .map_err(|error| journal_error("inspect", &self.directory.path, error))?;
-        let temporary = metadata_temporary_name(name)?;
+        let temporary = temporary_name(&format!("metadata-{name}"))?;
         let file = self.directory.create_file(&temporary)?;
-        write_bytes_and_sync(file, bytes, &self.directory.child_path(&temporary)?)?;
-        self.directory.verify_child(name, &expected)?;
-        self.directory.rename(&temporary, name)?;
+        let temporary_identity = file
+            .metadata()
+            .map_err(|error| journal_error("inspect", &self.directory.path, error))?;
+        if let Err(error) =
+            write_bytes_and_sync(file, bytes, &self.directory.child_path(&temporary)?)
+        {
+            let _ = self
+                .directory
+                .remove_file_verified(&temporary, &temporary_identity);
+            return Err(error);
+        }
+        if let Err(error) = self.directory.exchange_verified(
+            &temporary,
+            name,
+            &expected,
+            "metadata-replace-before-rename",
+        ) {
+            let _ = self
+                .directory
+                .remove_file_verified(&temporary, &temporary_identity);
+            return Err(error);
+        }
+        self.directory.remove_file_verified(&temporary, &expected)?;
         self.directory.sync()
     }
 
     pub fn read(&self, name: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        self.reconcile(name)?;
+        validate_metadata_name(name)?;
+        self.directory.verify("metadata directory")?;
         if self.directory.child_metadata(name)?.is_none() {
             return Ok(None);
         }
@@ -81,7 +162,9 @@ impl SecureMetadataDirectory {
     }
 
     pub fn remove(&self, name: &str) -> Result<(), StorageError> {
-        self.reconcile(name)?;
+        let _lock = self.directory.lock()?;
+        validate_metadata_name(name)?;
+        self.directory.verify("metadata directory")?;
         let Some(_) = self.directory.child_metadata(name)? else {
             return Ok(());
         };
@@ -89,10 +172,14 @@ impl SecureMetadataDirectory {
         let expected = file
             .metadata()
             .map_err(|error| journal_error("inspect", &self.directory.path, error))?;
-        let tombstone = metadata_removal_name(name)?;
-        self.directory.rename(name, &tombstone)?;
-        self.directory.verify_child(&tombstone, &expected)?;
-        self.directory.remove_file(&tombstone)?;
+        let tombstone = temporary_name(&format!("remove-metadata-{name}"))?;
+        self.directory.rename_verified(
+            name,
+            &tombstone,
+            &expected,
+            "metadata-remove-before-rename",
+        )?;
+        self.directory.remove_file_verified(&tombstone, &expected)?;
         self.directory.sync()
     }
 
@@ -104,16 +191,28 @@ impl SecureMetadataDirectory {
     pub fn names(&self) -> Result<Vec<String>, StorageError> {
         self.directory.verify("metadata directory")?;
         let names = self.directory.child_names()?;
-        for name in &names {
-            validate_metadata_name(name)?;
+        let mut records = Vec::new();
+        for name in names {
+            if is_operation_temporary_name(&name) || is_owner_probe_name(&name) {
+                self.directory.open_file(&name)?;
+                continue;
+            }
+            validate_metadata_name(&name)?;
+            records.push(name);
         }
         self.directory.verify("metadata directory")?;
-        Ok(names)
+        Ok(records)
     }
 
     /// Restricts an existing real direct-child file to owner-only access and fsyncs it.
     #[cfg(unix)]
     pub fn restrict_file_to_owner(&self, name: &str) -> Result<(), StorageError> {
+        let _lock = self.directory.lock()?;
+        self.restrict_file_to_owner_locked(name).map(|_| ())
+    }
+
+    #[cfg(unix)]
+    fn restrict_file_to_owner_locked(&self, name: &str) -> Result<fs::Metadata, StorageError> {
         use std::os::unix::fs::PermissionsExt;
 
         validate_metadata_name(name)?;
@@ -135,24 +234,35 @@ impl SecureMetadataDirectory {
         file.sync_all()
             .map_err(|error| journal_error("fsync", &path, error))?;
         self.directory.verify_child(name, &expected)?;
-        self.directory.sync()
+        self.directory.sync()?;
+        Ok(expected)
     }
 
     /// Restricts and removes an optional real direct-child file created by a trusted host tool.
     #[cfg(unix)]
     pub fn remove_tool_file(&self, name: &str) -> Result<(), StorageError> {
+        let _lock = self.directory.lock()?;
         validate_metadata_name(name)?;
         self.directory.verify("metadata directory")?;
         if self.directory.child_metadata(name)?.is_none() {
             return Ok(());
         }
-        self.restrict_file_to_owner(name)?;
-        self.remove(name)
+        let expected = self.restrict_file_to_owner_locked(name)?;
+        let tombstone = temporary_name(&format!("remove-tool-{name}"))?;
+        self.directory.rename_verified(
+            name,
+            &tombstone,
+            &expected,
+            "metadata-tool-remove-before-rename",
+        )?;
+        self.directory.remove_file_verified(&tombstone, &expected)?;
+        self.directory.sync()
     }
 
     /// Creates and pins one owner-only direct child beneath this directory.
     #[cfg(unix)]
     pub fn create_subdirectory(&self, name: &str) -> Result<Self, StorageError> {
+        let _lock = self.directory.lock()?;
         self.create_subdirectory_with(
             name,
             |directory, child| {
@@ -161,7 +271,11 @@ impl SecureMetadataDirectory {
                 })
             },
             PinnedDirectory::sync,
-            |path| Self::new(path),
+            |directory, child| {
+                Ok(Self {
+                    directory: directory.capture_child(child, "metadata subdirectory")?,
+                })
+            },
         )
     }
 
@@ -176,7 +290,7 @@ impl SecureMetadataDirectory {
     where
         Metadata: FnOnce(&PinnedDirectory, &str) -> Result<fs::Metadata, StorageError>,
         Sync: FnOnce(&PinnedDirectory) -> Result<(), StorageError>,
-        Pin: FnOnce(&Path) -> Result<Self, StorageError>,
+        Pin: FnOnce(&PinnedDirectory, &str) -> Result<Self, StorageError>,
     {
         validate_metadata_name(name)?;
         self.directory.verify("metadata directory")?;
@@ -190,7 +304,7 @@ impl SecureMetadataDirectory {
             let observed = inspect_child(&self.directory, name)?;
             verify_directory_identity(&expected, &observed, "metadata subdirectory")?;
             sync_parent(&self.directory)?;
-            let child = pin_child(&self.directory.path.join(name))?;
+            let child = pin_child(&self.directory, name)?;
             let opened = child
                 .directory
                 .handle
@@ -243,6 +357,7 @@ impl SecureMetadataDirectory {
     /// Removes an empty direct child only when its retained pinned identity matches.
     #[cfg(unix)]
     pub fn remove_subdirectory(&self, name: &str, child: &Self) -> Result<(), StorageError> {
+        let _lock = self.directory.lock()?;
         validate_metadata_name(name)?;
         self.directory.verify("metadata directory")?;
         child.directory.verify("metadata subdirectory")?;
@@ -267,24 +382,15 @@ impl SecureMetadataDirectory {
                 "metadata subdirectory identity changed".to_owned(),
             ));
         }
-        self.directory.remove_directory(name)
-    }
-
-    fn reconcile(&self, name: &str) -> Result<(), StorageError> {
-        self.directory.verify("metadata directory")?;
-        let temporary = metadata_temporary_name(name)?;
-        let tombstone = metadata_removal_name(name)?;
-        if self.directory.child_metadata(&tombstone)?.is_some() {
-            self.directory.open_file(&tombstone)?;
-            self.directory.remove_file(&tombstone)?;
-            self.directory.sync()?;
-        }
-        if self.directory.child_metadata(&temporary)?.is_some() {
-            self.directory.open_file(&temporary)?;
-            self.directory.remove_file(&temporary)?;
-            self.directory.sync()?;
-        }
-        self.directory.verify("metadata directory")
+        let tombstone = temporary_name(&format!("remove-directory-{name}"))?;
+        self.directory.rename_verified(
+            name,
+            &tombstone,
+            &expected,
+            "metadata-subdirectory-before-remove",
+        )?;
+        self.directory
+            .remove_directory_verified(&tombstone, &expected)
     }
 }
 
@@ -305,10 +411,12 @@ pub struct ExecutionLifecycleHoldStore {
 
 impl ExecutionLifecycleHoldStore {
     pub fn new(state_root: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let parent = SecureMetadataDirectory::new(state_root.as_ref().join("execution-storage"))?;
-        let path = parent.path().join("holds");
-        let directory = if path.exists() {
-            SecureMetadataDirectory::new(&path)?
+        let state_root = PinnedDirectory::capture(state_root.as_ref(), "state root")?;
+        let parent = SecureMetadataDirectory {
+            directory: state_root.capture_child("execution-storage", "journal directory")?,
+        };
+        let directory = if parent.directory.child_metadata("holds")?.is_some() {
+            parent.capture_subdirectory("holds")?
         } else {
             parent.create_subdirectory("holds")?
         };
@@ -388,7 +496,8 @@ impl JournalStore {
     pub fn new(state_root: impl AsRef<Path>) -> Result<Self, StorageError> {
         let state_root = PinnedDirectory::capture(state_root.as_ref(), "state root")?;
         let directory = state_root.path.join("execution-storage");
-        let journal_directory = PinnedDirectory::capture(&directory, "journal directory")?;
+        let journal_directory =
+            state_root.capture_child("execution-storage", "journal directory")?;
         Ok(Self {
             directory,
             state_root,
@@ -401,6 +510,7 @@ impl JournalStore {
         layout: &ExecutionLayout,
         journal: &PhaseJournal,
     ) -> Result<(), StorageError> {
+        let _lock = self.journal_directory.lock()?;
         self.verify_directories()?;
         self.validate_path(layout)?;
         journal.validate(layout)?;
@@ -425,6 +535,7 @@ impl JournalStore {
         layout: &ExecutionLayout,
         journal: &PhaseJournal,
     ) -> Result<(), StorageError> {
+        let _lock = self.journal_directory.lock()?;
         self.verify_directories()?;
         self.validate_path(layout)?;
         journal.validate(layout)?;
@@ -435,13 +546,32 @@ impl JournalStore {
             .map_err(|error| journal_error("inspect", &layout.journal, error))?;
         let temporary = temporary_name(&name)?;
         let file = self.journal_directory.create_file(&temporary)?;
-        write_and_sync(
+        let temporary_identity = file
+            .metadata()
+            .map_err(|error| journal_error("inspect", &layout.journal, error))?;
+        if let Err(error) = write_and_sync(
             file,
             journal,
             &self.journal_directory.child_path(&temporary)?,
-        )?;
-        self.journal_directory.verify_child(&name, &expected)?;
-        self.journal_directory.rename(&temporary, &name)?;
+        ) {
+            let _ = self
+                .journal_directory
+                .remove_file_verified(&temporary, &temporary_identity);
+            return Err(error);
+        }
+        if let Err(error) = self.journal_directory.exchange_verified(
+            &temporary,
+            &name,
+            &expected,
+            "journal-write-before-rename",
+        ) {
+            let _ = self
+                .journal_directory
+                .remove_file_verified(&temporary, &temporary_identity);
+            return Err(error);
+        }
+        self.journal_directory
+            .remove_file_verified(&temporary, &expected)?;
         self.journal_directory.sync()?;
         self.verify_directories()
     }
@@ -459,6 +589,7 @@ impl JournalStore {
     }
 
     pub(crate) fn ensure_ready_lease(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
+        let _lock = self.journal_directory.lock()?;
         self.verify_directories()?;
         self.validate_path(layout)?;
         let name = lease_name(layout)?;
@@ -490,6 +621,7 @@ impl JournalStore {
     }
 
     pub fn remove(&self, layout: &ExecutionLayout) -> Result<(), StorageError> {
+        let _lock = self.journal_directory.lock()?;
         self.verify_directories()?;
         self.validate_path(layout)?;
         let name = journal_name(layout)?;
@@ -498,9 +630,14 @@ impl JournalStore {
             .metadata()
             .map_err(|error| journal_error("inspect", &layout.journal, error))?;
         let tombstone = temporary_name(&format!("remove-{name}"))?;
-        self.journal_directory.rename(&name, &tombstone)?;
-        self.journal_directory.verify_child(&tombstone, &expected)?;
-        self.journal_directory.remove_file(&tombstone)?;
+        self.journal_directory.rename_verified(
+            &name,
+            &tombstone,
+            &expected,
+            "journal-remove-before-rename",
+        )?;
+        self.journal_directory
+            .remove_file_verified(&tombstone, &expected)?;
         self.journal_directory.sync()?;
         self.verify_directories()
     }
@@ -522,7 +659,8 @@ impl JournalStore {
                     StorageError::Journal(format!("journal entry disappeared: {name}"))
                 })?;
             if matches!(name.as_str(), "holds" | "releases") && metadata.is_dir() {
-                SecureMetadataDirectory::new(&entry_path)?;
+                self.journal_directory
+                    .capture_child(&name, "journal metadata subdirectory")?;
                 continue;
             }
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -535,10 +673,12 @@ impl JournalStore {
                 self.journal_directory.open_file(&name)?;
                 continue;
             }
+            if is_owner_probe_name(&name) {
+                self.journal_directory.open_file(&name)?;
+                continue;
+            }
             if is_journal_temporary_name(&name) {
                 self.journal_directory.open_file(&name)?;
-                self.journal_directory.remove_file(&name)?;
-                self.journal_directory.sync()?;
                 continue;
             }
             let execution_id = name.strip_suffix(".json").ok_or_else(|| {
@@ -593,20 +733,59 @@ pub(crate) struct PinnedDirectory {
     handle: Arc<File>,
 }
 
+#[cfg(unix)]
+struct DirectoryLock<'a> {
+    handle: &'a File,
+}
+
+#[cfg(unix)]
+impl Drop for DirectoryLock<'_> {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(self.handle);
+    }
+}
+
 impl PinnedDirectory {
+    #[cfg(unix)]
+    fn lock(&self) -> Result<DirectoryLock<'_>, StorageError> {
+        fs2::FileExt::lock_exclusive(&*self.handle)
+            .map_err(|error| journal_error("lock directory", &self.path, error))?;
+        Ok(DirectoryLock {
+            handle: &self.handle,
+        })
+    }
+
     pub(crate) fn capture(path: &Path, purpose: &str) -> Result<Self, StorageError> {
-        let supplied =
-            fs::symlink_metadata(path).map_err(|error| journal_error("inspect", path, error))?;
+        let supplied_path = path.to_path_buf();
+        let supplied = fs::symlink_metadata(&supplied_path)
+            .map_err(|error| journal_error("inspect", path, error))?;
+        race_hook("capture-after-lstat");
         if supplied.file_type().is_symlink() || !supplied.is_dir() {
             return Err(StorageError::Journal(format!(
                 "{purpose} is not a real directory: {}",
                 path.display()
             )));
         }
-        let path = path.canonicalize().map_err(|error| {
+        #[cfg(unix)]
+        let handle = open_directory(&supplied_path)?;
+        #[cfg(unix)]
+        let opened = handle
+            .metadata()
+            .map_err(|error| journal_error("inspect", &supplied_path, error))?;
+        #[cfg(unix)]
+        if opened.dev() != supplied.dev()
+            || opened.ino() != supplied.ino()
+            || opened.uid() != supplied.uid()
+            || opened.mode() != supplied.mode()
+        {
+            return Err(StorageError::IdentityMismatch(format!(
+                "{purpose} changed while opening"
+            )));
+        }
+        let path = supplied_path.canonicalize().map_err(|error| {
             StorageError::Journal(format!(
                 "canonicalize {purpose} {}: {error}",
-                path.display()
+                supplied_path.display()
             ))
         })?;
         let metadata =
@@ -625,13 +804,13 @@ impl PinnedDirectory {
                     metadata.mode() & 0o777
                 )));
             }
-            let handle = open_directory(&path)?;
-            let opened = handle
-                .metadata()
-                .map_err(|error| journal_error("inspect", &path, error))?;
-            if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            if opened.dev() != metadata.dev()
+                || opened.ino() != metadata.ino()
+                || opened.uid() != metadata.uid()
+                || opened.mode() != metadata.mode()
+            {
                 return Err(StorageError::IdentityMismatch(format!(
-                    "{purpose} changed while opening"
+                    "{purpose} changed while canonicalizing diagnostics"
                 )));
             }
             verify_current_owner(&handle, &path, metadata.uid(), purpose)?;
@@ -671,6 +850,72 @@ impl PinnedDirectory {
             )));
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn capture_child(&self, name: &str, purpose: &str) -> Result<Self, StorageError> {
+        validate_descriptor_name(name)?;
+        let diagnostic = self.path.join(name);
+        let stat = rustix::fs::statat(&*self.handle, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| rustix_error("inspect", &diagnostic, error))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(StorageError::Journal(format!(
+                "{purpose} is not a real directory: {}",
+                diagnostic.display()
+            )));
+        }
+        if stat.st_mode as u32 & 0o077 != 0 {
+            return Err(StorageError::Unavailable(format!(
+                "{purpose} mode {:o} permits group or world access",
+                stat.st_mode as u32 & 0o777
+            )));
+        }
+        race_hook("capture-child-after-lstat");
+        let fd = rustix::fs::openat(
+            &*self.handle,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| rustix_error("open directory", &diagnostic, error))?;
+        let handle = File::from(fd);
+        let opened = handle
+            .metadata()
+            .map_err(|error| journal_error("inspect", &diagnostic, error))?;
+        if opened.dev() != stat.st_dev as u64
+            || opened.ino() != stat.st_ino as u64
+            || opened.uid() != stat.st_uid
+            || opened.mode() != stat.st_mode as u32
+        {
+            return Err(StorageError::IdentityMismatch(format!(
+                "{purpose} changed while opening"
+            )));
+        }
+        let path = diagnostic.canonicalize().map_err(|error| {
+            StorageError::Journal(format!(
+                "canonicalize {purpose} {}: {error}",
+                diagnostic.display()
+            ))
+        })?;
+        let current =
+            fs::symlink_metadata(&path).map_err(|error| journal_error("inspect", &path, error))?;
+        if current.dev() != opened.dev()
+            || current.ino() != opened.ino()
+            || current.uid() != opened.uid()
+            || current.mode() != opened.mode()
+        {
+            return Err(StorageError::IdentityMismatch(format!(
+                "{purpose} changed while canonicalizing diagnostics"
+            )));
+        }
+        verify_current_owner(&handle, &path, opened.uid(), purpose)?;
+        Ok(Self {
+            path,
+            device: opened.dev(),
+            inode: opened.ino(),
+            uid: opened.uid(),
+            handle: Arc::new(handle),
+        })
     }
 
     #[cfg(unix)]
@@ -744,6 +989,22 @@ impl PinnedDirectory {
     }
 
     #[cfg(unix)]
+    fn verify_child_identity(
+        &self,
+        name: &str,
+        expected: &fs::Metadata,
+    ) -> Result<(), StorageError> {
+        let actual = self.child_metadata(name)?.ok_or_else(|| {
+            StorageError::IdentityMismatch(format!(
+                "descriptor-relative child disappeared: {}",
+                self.path.join(name).display()
+            ))
+        })?;
+        verify_same_identity(expected, &actual, "descriptor-relative child")
+    }
+
+    #[cfg(unix)]
+    #[cfg(test)]
     fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
         self.child_path(from)?;
         let to_path = self.child_path(to)?;
@@ -752,10 +1013,95 @@ impl PinnedDirectory {
     }
 
     #[cfg(unix)]
+    fn rename_noreplace(&self, from: &str, to: &str) -> Result<(), StorageError> {
+        self.child_path(from)?;
+        let to_path = self.child_path(to)?;
+        rustix::fs::renameat_with(
+            &*self.handle,
+            from,
+            &*self.handle,
+            to,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| rustix_error("rename without replacement", &to_path, error))
+    }
+
+    #[cfg(unix)]
+    fn exchange_verified(
+        &self,
+        replacement: &str,
+        target: &str,
+        expected_target: &fs::Metadata,
+        hook: &str,
+    ) -> Result<(), StorageError> {
+        self.child_path(replacement)?;
+        self.child_path(target)?;
+        self.verify_child_identity(target, expected_target)?;
+        race_hook(hook);
+        rustix::fs::renameat_with(
+            &*self.handle,
+            replacement,
+            &*self.handle,
+            target,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(|error| rustix_error("atomically exchange", &self.path.join(target), error))?;
+        if let Err(identity) = self.verify_child_identity(replacement, expected_target) {
+            let rollback = rustix::fs::renameat_with(
+                &*self.handle,
+                replacement,
+                &*self.handle,
+                target,
+                RenameFlags::EXCHANGE,
+            );
+            return Err(match rollback {
+                Ok(()) => identity,
+                Err(error) => StorageError::Journal(format!(
+                    "{identity}; rollback atomic exchange failed: {error}"
+                )),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn rename_verified(
+        &self,
+        source: &str,
+        tombstone: &str,
+        expected: &fs::Metadata,
+        hook: &str,
+    ) -> Result<(), StorageError> {
+        self.verify_child_identity(source, expected)?;
+        race_hook(hook);
+        self.rename_noreplace(source, tombstone)?;
+        if let Err(identity) = self.verify_child_identity(tombstone, expected) {
+            let rollback = self.rename_noreplace(tombstone, source);
+            return Err(match rollback {
+                Ok(()) => identity,
+                Err(error) => StorageError::Journal(format!(
+                    "{identity}; rollback verified rename failed: {error}"
+                )),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     fn remove_file(&self, name: &str) -> Result<(), StorageError> {
         let path = self.child_path(name)?;
         rustix::fs::unlinkat(&*self.handle, name, AtFlags::empty())
             .map_err(|error| rustix_error("remove", &path, error))
+    }
+
+    #[cfg(unix)]
+    fn remove_file_verified(
+        &self,
+        name: &str,
+        expected: &fs::Metadata,
+    ) -> Result<(), StorageError> {
+        self.verify_child_identity(name, expected)?;
+        self.remove_file(name)
     }
 
     #[cfg(unix)]
@@ -779,26 +1125,11 @@ impl PinnedDirectory {
             Ok(Some(metadata)) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
                 Ok(metadata)
             }
-            Ok(_) => {
-                let cleanup = rustix::fs::unlinkat(&*self.handle, name, AtFlags::REMOVEDIR);
-                Err(match cleanup {
-                    Ok(()) => StorageError::IdentityMismatch(
-                        "new metadata child is not a real directory".to_owned(),
-                    ),
-                    Err(error) => rustix_error("remove invalid new directory", &path, error),
-                })
-            }
-            Err(error) => {
-                let inspection = error;
-                Err(
-                    match rustix::fs::unlinkat(&*self.handle, name, AtFlags::REMOVEDIR) {
-                        Ok(()) => inspection,
-                        Err(cleanup) => StorageError::Journal(format!(
-                            "{inspection}; remove uninspected new directory failed: {cleanup}"
-                        )),
-                    },
-                )
-            }
+            Ok(_) => Err(StorageError::IdentityMismatch(
+                "new metadata child is not a real directory; preserve unverified replacement"
+                    .to_owned(),
+            )),
+            Err(error) => Err(error),
         }
     }
 
@@ -814,9 +1145,40 @@ impl PinnedDirectory {
                 path.display()
             )));
         }
-        rustix::fs::unlinkat(&*self.handle, name, AtFlags::REMOVEDIR)
-            .map_err(|error| rustix_error("remove directory", &path, error))?;
+        let tombstone = temporary_name(&format!("remove-directory-{name}"))?;
+        self.rename_verified(
+            name,
+            &tombstone,
+            &metadata,
+            "directory-remove-before-rename",
+        )?;
+        self.unlink_directory_verified(&tombstone, &metadata)?;
         self.sync()
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_verified(
+        &self,
+        name: &str,
+        expected: &fs::Metadata,
+    ) -> Result<(), StorageError> {
+        self.verify_child_identity(name, expected)?;
+        let tombstone = temporary_name(&format!("remove-directory-{name}"))?;
+        self.rename_verified(name, &tombstone, expected, "directory-remove-before-rename")?;
+        self.unlink_directory_verified(&tombstone, expected)?;
+        self.sync()
+    }
+
+    #[cfg(unix)]
+    fn unlink_directory_verified(
+        &self,
+        name: &str,
+        expected: &fs::Metadata,
+    ) -> Result<(), StorageError> {
+        let path = self.child_path(name)?;
+        self.verify_child_identity(name, expected)?;
+        rustix::fs::unlinkat(&*self.handle, name, AtFlags::REMOVEDIR)
+            .map_err(|error| rustix_error("remove directory", &path, error))
     }
 
     #[cfg(unix)]
@@ -843,6 +1205,7 @@ impl PinnedDirectory {
                 )))
             }
         };
+        race_hook("child-metadata-after-lstat");
         let fd = rustix::fs::openat(
             &*self.handle,
             name,
@@ -911,19 +1274,42 @@ fn verify_current_owner(
     )
     .map_err(|error| rustix_error("create ownership probe", &probe, error))?;
     let file = File::from(fd);
+    let mut probe_guard = OwnershipProbeGuard {
+        directory: handle,
+        name: name.as_str(),
+        linked: true,
+    };
+    race_hook("ownership-probe-after-create");
+    rustix::fs::unlinkat(handle, name.as_str(), AtFlags::empty())
+        .map_err(|error| rustix_error("remove ownership probe", &probe, error))?;
+    probe_guard.linked = false;
+    race_hook("ownership-probe-after-unlink");
     let actual_uid = file
         .metadata()
         .map_err(|error| journal_error("inspect ownership probe", &probe, error))?
         .uid();
-    drop(file);
-    rustix::fs::unlinkat(handle, name.as_str(), AtFlags::empty())
-        .map_err(|error| rustix_error("remove ownership probe", &probe, error))?;
     if actual_uid == expected_uid {
         Ok(())
     } else {
         Err(StorageError::Unavailable(format!(
             "{purpose} is owned by uid {expected_uid}, current uid is {actual_uid}"
         )))
+    }
+}
+
+#[cfg(unix)]
+struct OwnershipProbeGuard<'a> {
+    directory: &'a File,
+    name: &'a str,
+    linked: bool,
+}
+
+#[cfg(unix)]
+impl Drop for OwnershipProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.linked {
+            let _ = rustix::fs::unlinkat(self.directory, self.name, AtFlags::empty());
+        }
     }
 }
 
@@ -977,16 +1363,6 @@ fn write_bytes_and_sync(mut file: File, bytes: &[u8], path: &Path) -> Result<(),
         .map_err(|error| journal_error("fsync", path, error))
 }
 
-fn metadata_temporary_name(name: &str) -> Result<String, StorageError> {
-    validate_metadata_name(name)?;
-    Ok(format!("{name}.tmp"))
-}
-
-fn metadata_removal_name(name: &str) -> Result<String, StorageError> {
-    validate_metadata_name(name)?;
-    Ok(format!("remove-{name}.tmp"))
-}
-
 fn validate_metadata_name(name: &str) -> Result<(), StorageError> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
         Err(StorageError::InvalidRequest(
@@ -995,6 +1371,24 @@ fn validate_metadata_name(name: &str) -> Result<(), StorageError> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn verify_same_identity(
+    expected: &fs::Metadata,
+    actual: &fs::Metadata,
+    purpose: &str,
+) -> Result<(), StorageError> {
+    if expected.dev() != actual.dev()
+        || expected.ino() != actual.ino()
+        || expected.uid() != actual.uid()
+        || expected.file_type() != actual.file_type()
+    {
+        return Err(StorageError::IdentityMismatch(format!(
+            "{purpose} identity changed"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn require_real_directory(path: &Path, purpose: &str) -> Result<(), StorageError> {
@@ -1114,6 +1508,34 @@ fn is_journal_temporary_name(name: &str) -> bool {
         })
 }
 
+fn is_operation_temporary_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let mut components = rest.rsplitn(3, '.');
+    components.next() == Some("tmp")
+        && components
+            .next()
+            .is_some_and(|counter| counter.bytes().all(|byte| byte.is_ascii_digit()))
+        && components.next().is_some_and(|prefix| {
+            prefix.rsplit_once('.').is_some_and(|(operation, process)| {
+                !operation.is_empty() && process.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+}
+
+fn is_owner_probe_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".autospec-owner-") else {
+        return false;
+    };
+    rest.split_once('-').is_some_and(|(process, counter)| {
+        !process.is_empty()
+            && !counter.is_empty()
+            && process.bytes().all(|byte| byte.is_ascii_digit())
+            && counter.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 fn journal_error(action: &str, path: &Path, error: std::io::Error) -> StorageError {
     StorageError::Journal(format!("{action} {}: {error}", path.display()))
 }
@@ -1121,6 +1543,7 @@ fn journal_error(action: &str, path: &Path, error: std::io::Error) -> StorageErr
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use orchestrator_core::WorkerId;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn metadata_directory() -> (tempfile::TempDir, SecureMetadataDirectory) {
@@ -1129,6 +1552,40 @@ mod tests {
             .expect("secure metadata root");
         let metadata = SecureMetadataDirectory::new(root.path()).expect("pin metadata root");
         (root, metadata)
+    }
+
+    fn journal_fixture() -> (
+        tempfile::TempDir,
+        JournalStore,
+        ExecutionLayout,
+        PhaseJournal,
+    ) {
+        let root = tempfile::tempdir().expect("temporary state root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure state root");
+        let journal_directory = root.path().join("execution-storage");
+        fs::create_dir(&journal_directory).expect("create journal directory");
+        fs::set_permissions(&journal_directory, fs::Permissions::from_mode(0o700))
+            .expect("secure journal directory");
+        let canonical = root.path().canonicalize().expect("canonical state root");
+        let labels = OwnershipLabels {
+            execution_id: ExecutionId::new("dirfd-race"),
+            worker_id: WorkerId::new("worker-a"),
+            repository: "owner/repository".to_owned(),
+            issue: Some("29".to_owned()),
+        };
+        let layout = ExecutionLayout::new(&canonical, &labels.execution_id).expect("layout");
+        let journal = PhaseJournal::allocating(
+            labels,
+            1,
+            layout.root.clone(),
+            "test".to_owned(),
+            "test:key".to_owned(),
+            "pool".to_owned(),
+            "token".to_owned(),
+        );
+        let store = JournalStore::new(&canonical).expect("journal store");
+        (root, store, layout, journal)
     }
 
     fn swapped_directory() -> (tempfile::TempDir, PinnedDirectory, PathBuf, PathBuf) {
@@ -1147,6 +1604,317 @@ mod tests {
         fs::set_permissions(&selected, fs::Permissions::from_mode(0o700))
             .expect("secure attacker directory");
         (root, pinned, captured, selected)
+    }
+
+    #[test]
+    fn public_capture_rejects_a_supplied_directory_swapped_after_initial_inspection() {
+        let root = tempfile::tempdir().expect("temporary parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure temporary parent");
+        let selected = root.path().join("selected");
+        let captured = root.path().join("captured");
+        let attacker = root.path().join("attacker");
+        fs::create_dir(&selected).expect("create selected directory");
+        fs::create_dir(&attacker).expect("create attacker directory");
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o700))
+            .expect("secure selected directory");
+        fs::set_permissions(&attacker, fs::Permissions::from_mode(0o700))
+            .expect("secure attacker directory");
+        fs::write(attacker.join("sentinel"), b"attacker sentinel")
+            .expect("write attacker sentinel");
+        let selected_for_hook = selected.clone();
+        let captured_for_hook = captured.clone();
+        let attacker_for_hook = attacker.clone();
+        install_race_hook("capture-after-lstat", move || {
+            fs::rename(&selected_for_hook, &captured_for_hook)
+                .expect("displace inspected directory");
+            fs::rename(&attacker_for_hook, &selected_for_hook).expect("install attacker directory");
+        });
+
+        let error = SecureMetadataDirectory::new(&selected)
+            .expect_err("reject directory replaced during capture");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(selected.join("sentinel")).expect("attacker sentinel remains"),
+            b"attacker sentinel"
+        );
+    }
+
+    #[test]
+    fn journal_store_captures_nested_directory_from_the_retained_parent() {
+        let root = tempfile::tempdir().expect("temporary state root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure state root");
+        let selected = root.path().join("execution-storage");
+        let captured = root.path().join("captured-storage");
+        let attacker = root.path().join("attacker-storage");
+        fs::create_dir(&selected).expect("create selected journal directory");
+        fs::create_dir(&attacker).expect("create attacker journal directory");
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o700))
+            .expect("secure selected journal directory");
+        fs::set_permissions(&attacker, fs::Permissions::from_mode(0o700))
+            .expect("secure attacker journal directory");
+        fs::write(attacker.join("sentinel"), b"attacker sentinel")
+            .expect("write attacker sentinel");
+        let selected_for_hook = selected.clone();
+        let captured_for_hook = captured.clone();
+        let attacker_for_hook = attacker.clone();
+        install_race_hook("capture-child-after-lstat", move || {
+            fs::rename(&selected_for_hook, &captured_for_hook)
+                .expect("displace selected journal directory");
+            fs::rename(&attacker_for_hook, &selected_for_hook)
+                .expect("install attacker journal directory");
+        });
+
+        let error = JournalStore::new(root.path())
+            .expect_err("nested capture must reject a child swapped after parent capture");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(selected.join("sentinel")).expect("attacker sentinel remains"),
+            b"attacker sentinel"
+        );
+    }
+
+    #[test]
+    fn ownership_probe_cleanup_survives_a_failure_after_creation() {
+        let root = tempfile::tempdir().expect("temporary metadata root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure metadata root");
+        install_race_hook("ownership-probe-after-create", || {
+            panic!("injected crash cut after probe creation")
+        });
+
+        let failure = std::panic::catch_unwind(|| SecureMetadataDirectory::new(root.path()));
+
+        assert!(failure.is_err());
+        assert!(
+            fs::read_dir(root.path())
+                .expect("list metadata root")
+                .next()
+                .is_none(),
+            "ownership probe must not remain linked"
+        );
+        SecureMetadataDirectory::new(root.path()).expect("recovery capture is not blocked");
+    }
+
+    #[test]
+    fn ownership_probe_is_unlinked_before_later_capture_work() {
+        let root = tempfile::tempdir().expect("temporary metadata root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure metadata root");
+        install_race_hook("ownership-probe-after-unlink", || {
+            panic!("injected crash cut after probe unlink")
+        });
+
+        let failure = std::panic::catch_unwind(|| SecureMetadataDirectory::new(root.path()));
+
+        assert!(failure.is_err());
+        assert!(
+            fs::read_dir(root.path())
+                .expect("list metadata root")
+                .next()
+                .is_none(),
+            "unlinked ownership probe must not reappear"
+        );
+        SecureMetadataDirectory::new(root.path()).expect("recovery capture is not blocked");
+    }
+
+    fn replace_child_with_attacker(
+        selected: PathBuf,
+        displaced: PathBuf,
+        bytes: &'static [u8],
+    ) -> impl FnOnce() {
+        move || {
+            fs::rename(&selected, &displaced).expect("displace verified child");
+            fs::write(&selected, bytes).expect("install attacker child");
+            fs::set_permissions(&selected, fs::Permissions::from_mode(0o600))
+                .expect("secure attacker child");
+        }
+    }
+
+    #[test]
+    fn public_metadata_replace_refuses_a_child_swapped_after_verification() {
+        let (root, metadata) = metadata_directory();
+        metadata
+            .create("record", b"trusted")
+            .expect("create record");
+        let selected = root.path().join("record");
+        let displaced = root.path().join("trusted-away");
+        install_race_hook(
+            "metadata-replace-before-rename",
+            replace_child_with_attacker(selected.clone(), displaced.clone(), b"attacker sentinel"),
+        );
+
+        let error = metadata
+            .replace("record", b"new trusted")
+            .expect_err("refuse replacement after verified inode is swapped");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(selected).expect("attacker remains"),
+            b"attacker sentinel"
+        );
+        assert_eq!(fs::read(displaced).expect("trusted remains"), b"trusted");
+    }
+
+    #[test]
+    fn public_metadata_create_never_overwrites_a_late_attacker_child() {
+        let (root, metadata) = metadata_directory();
+        let selected = root.path().join("record");
+        let selected_for_hook = selected.clone();
+        install_race_hook("metadata-create-before-commit", move || {
+            fs::write(&selected_for_hook, b"attacker sentinel").expect("install attacker child");
+            fs::set_permissions(&selected_for_hook, fs::Permissions::from_mode(0o600))
+                .expect("secure attacker child");
+        });
+
+        let error = metadata
+            .create("record", b"trusted")
+            .expect_err("exclusive commit rejects late child");
+
+        assert!(matches!(error, StorageError::Journal(_)));
+        assert_eq!(
+            fs::read(selected).expect("attacker remains"),
+            b"attacker sentinel"
+        );
+    }
+
+    #[test]
+    fn public_metadata_remove_refuses_a_child_swapped_after_verification() {
+        let (root, metadata) = metadata_directory();
+        metadata
+            .create("record", b"trusted")
+            .expect("create record");
+        let selected = root.path().join("record");
+        let displaced = root.path().join("trusted-away");
+        install_race_hook(
+            "metadata-remove-before-rename",
+            replace_child_with_attacker(selected.clone(), displaced.clone(), b"attacker sentinel"),
+        );
+
+        let error = metadata
+            .remove("record")
+            .expect_err("refuse removal after verified inode is swapped");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(selected).expect("attacker remains"),
+            b"attacker sentinel"
+        );
+        assert_eq!(fs::read(displaced).expect("trusted remains"), b"trusted");
+    }
+
+    #[test]
+    fn public_metadata_subdirectory_remove_refuses_a_swapped_child() {
+        let (root, metadata) = metadata_directory();
+        let child = metadata
+            .create_subdirectory("session")
+            .expect("create pinned child");
+        let selected = root.path().join("session");
+        let displaced = root.path().join("trusted-session-away");
+        let selected_for_hook = selected.clone();
+        let displaced_for_hook = displaced.clone();
+        install_race_hook("metadata-subdirectory-before-remove", move || {
+            fs::rename(&selected_for_hook, &displaced_for_hook)
+                .expect("displace verified directory");
+            fs::create_dir(&selected_for_hook).expect("install attacker directory");
+            fs::set_permissions(&selected_for_hook, fs::Permissions::from_mode(0o700))
+                .expect("secure attacker directory");
+            fs::write(selected_for_hook.join("sentinel"), b"attacker sentinel")
+                .expect("write attacker sentinel");
+        });
+
+        let error = metadata
+            .remove_subdirectory("session", &child)
+            .expect_err("refuse removal after pinned directory is swapped");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(selected.join("sentinel")).expect("attacker remains"),
+            b"attacker sentinel"
+        );
+        assert!(displaced.is_dir());
+    }
+
+    #[test]
+    fn public_subdirectory_creation_refuses_a_new_child_swapped_during_capture() {
+        let (root, metadata) = metadata_directory();
+        let selected = root.path().join("session");
+        let displaced = root.path().join("created-away");
+        let selected_for_hook = selected.clone();
+        let displaced_for_hook = displaced.clone();
+        install_race_hook("child-metadata-after-lstat", move || {
+            fs::rename(&selected_for_hook, &displaced_for_hook)
+                .expect("displace newly created directory");
+            fs::create_dir(&selected_for_hook).expect("install attacker directory");
+            fs::set_permissions(&selected_for_hook, fs::Permissions::from_mode(0o700))
+                .expect("secure attacker directory");
+            fs::write(selected_for_hook.join("sentinel"), b"attacker sentinel")
+                .expect("write attacker sentinel");
+        });
+
+        let error = metadata
+            .create_subdirectory("session")
+            .expect_err("reject new directory swapped while capturing its identity");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(selected.join("sentinel")).expect("attacker remains"),
+            b"attacker sentinel"
+        );
+        assert!(displaced.is_dir());
+    }
+
+    #[test]
+    fn public_journal_write_refuses_a_child_swapped_after_verification() {
+        let (_root, store, layout, journal) = journal_fixture();
+        store.create(&layout, &journal).expect("create journal");
+        let selected = layout.journal.clone();
+        let displaced = layout.journal.with_extension("trusted-away");
+        install_race_hook(
+            "journal-write-before-rename",
+            replace_child_with_attacker(selected.clone(), displaced.clone(), b"attacker sentinel"),
+        );
+
+        let error = store
+            .write(&layout, &journal)
+            .expect_err("refuse journal write after verified inode is swapped");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(selected).expect("attacker remains"),
+            b"attacker sentinel"
+        );
+        assert!(fs::read(displaced)
+            .expect("trusted remains")
+            .starts_with(b"{"));
+    }
+
+    #[test]
+    fn public_journal_remove_refuses_a_child_swapped_after_verification() {
+        let (_root, store, layout, journal) = journal_fixture();
+        store.create(&layout, &journal).expect("create journal");
+        let selected = layout.journal.clone();
+        let displaced = layout.journal.with_extension("trusted-away");
+        install_race_hook(
+            "journal-remove-before-rename",
+            replace_child_with_attacker(selected.clone(), displaced.clone(), b"attacker sentinel"),
+        );
+
+        let error = store
+            .remove(&layout)
+            .expect_err("refuse journal removal after verified inode is swapped");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::read(selected).expect("attacker remains"),
+            b"attacker sentinel"
+        );
+        assert!(fs::read(displaced)
+            .expect("trusted remains")
+            .starts_with(b"{"));
     }
 
     #[test]
@@ -1276,7 +2044,11 @@ mod tests {
                         "injected parent fsync failure".to_owned(),
                     ))
                 },
-                |path| SecureMetadataDirectory::new(path),
+                |directory, name| {
+                    Ok(SecureMetadataDirectory {
+                        directory: directory.capture_child(name, "metadata subdirectory")?,
+                    })
+                },
             )
             .expect_err("surface injected parent fsync failure");
 
@@ -1299,7 +2071,7 @@ mod tests {
                     })
                 },
                 PinnedDirectory::sync,
-                |_| {
+                |_, _| {
                     Err::<SecureMetadataDirectory, _>(StorageError::IdentityMismatch(
                         "injected child pin failure".to_owned(),
                     ))
@@ -1329,7 +2101,11 @@ mod tests {
                     ))
                 },
                 PinnedDirectory::sync,
-                |path| SecureMetadataDirectory::new(path),
+                |directory, name| {
+                    Ok(SecureMetadataDirectory {
+                        directory: directory.capture_child(name, "metadata subdirectory")?,
+                    })
+                },
             )
             .expect_err("surface injected metadata failure");
 

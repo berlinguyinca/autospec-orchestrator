@@ -31,7 +31,7 @@ fn storage_directories(root: &Path) {
 }
 
 #[test]
-fn secure_metadata_directory_discards_uncommitted_temporary_files() {
+fn secure_metadata_directory_never_deletes_an_unauthenticated_temporary_file() {
     let root = tempfile::tempdir().expect("temporary metadata root");
     #[cfg(unix)]
     mode(root.path(), 0o700);
@@ -46,11 +46,14 @@ fn secure_metadata_directory_discards_uncommitted_temporary_files() {
         metadata.read("intent.json").expect("reconcile intent"),
         None
     );
-    assert!(!root.path().join("intent.json.tmp").exists());
+    assert_eq!(
+        fs::read(root.path().join("intent.json.tmp")).expect("attacker temporary is preserved"),
+        b"{\"partial\":"
+    );
 }
 
 #[test]
-fn journal_store_discards_partial_orphan_temporary_file() {
+fn journal_store_ignores_but_preserves_an_unauthenticated_orphan_temporary_file() {
     let root = tempfile::tempdir().expect("temporary state root");
     storage_directories(root.path());
     let state_root = root.path().canonicalize().expect("canonical state root");
@@ -64,7 +67,10 @@ fn journal_store_discards_partial_orphan_temporary_file() {
         .list(&state_root)
         .expect("reconcile journals")
         .is_empty());
-    assert!(!temporary.exists());
+    assert_eq!(
+        fs::read(&temporary).expect("unverified temporary is preserved"),
+        b"{\"phase\":"
+    );
 }
 
 #[test]

@@ -265,12 +265,29 @@ placement.
 - Production InferWeave credential issuance is an external integration boundary;
   real E2E uses the execution-scoped, short-lived local credential broker.
 - The macOS directory-FD race is closed with the approved direct `rustix`
-  filesystem boundary. Journal and secure-metadata child opens, creates,
-  metadata inspection, listing, renames, unlinks, directory creation/removal,
-  ownership probes, and directory fsyncs now resolve relative to a retained
-  no-follow directory descriptor on macOS and Linux. Adversarial pathname-swap
-  tests prove reads and mutations remain inside the captured directory while
-  the replacement attacker path and its sentinels remain untouched.
+  filesystem boundary. The originally supplied directory is opened with
+  `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and compared with its initial `lstat`
+  before canonical-path diagnostics are computed; production child directories
+  are captured with `openat` from the retained parent descriptor. Journal and
+  secure-metadata mutations take an advisory lock on that descriptor, use
+  no-replace commits or atomic exchanges, carry the verified inode through the
+  operation, and roll back when the displaced inode differs. Unauthenticated
+  crash temporaries are ignored and preserved rather than deleted. Ownership
+  probes are unlinked while their descriptor remains open, with unwind cleanup
+  covering the create-to-unlink interval. Deterministic public-flow race tests
+  cover root and child capture, create, replace, remove, subdirectory cleanup,
+  journal write/removal, and both ownership-probe crash cuts while proving an
+  attacker sentinel remains byte-for-byte intact.
+
+  Unix does not provide an inode-conditional `unlinkat`: a continuously active
+  process with the same uid can ignore the advisory lock and replace a verified
+  tombstone in the final instruction window before unlink. The implementation
+  therefore revalidates immediately before unlink and never treats the lock as
+  a security boundary. Runtime deployment must preserve the existing invariant
+  that untrusted agents do not share the worker host uid or writable metadata
+  directory; the tests prove fail-closed behavior for a replacement at every
+  exposed verify-to-mutate barrier, not containment of a fully privileged
+  same-uid host adversary.
 
 These gaps are explicit rather than inferred as passes. The supported release
 claim is the Docker execution plane with the tested storage-proof fail-closed
