@@ -269,15 +269,27 @@ placement.
   `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and compared with its initial `lstat`
   before canonical-path diagnostics are computed; production child directories
   are captured with `openat` from the retained parent descriptor. Journal and
-  secure-metadata mutations take an advisory lock on that descriptor, use
-  no-replace commits or atomic exchanges, carry the verified inode through the
-  operation, and roll back when the displaced inode differs. Unauthenticated
-  crash temporaries are ignored and preserved rather than deleted. Ownership
-  probes are unlinked while their descriptor remains open, with unwind cleanup
-  covering the create-to-unlink interval. Deterministic public-flow race tests
-  cover root and child capture, create, replace, remove, subdirectory cleanup,
-  journal write/removal, and both ownership-probe crash cuts while proving an
-  attacker sentinel remains byte-for-byte intact.
+  secure-metadata mutations hold a shared process-local mutex together with an
+  advisory lock on that descriptor. Independently captured stores coordinate
+  through the advisory lock, while calls through the same instance or a clone
+  cannot bypass it through process-local `flock` re-entrancy. No-replace commits
+  and atomic exchanges carry both source and target inode identities through
+  the operation and authenticate the final canonical target plus the displaced
+  exchange side before any cleanup. An unauthenticated post-operation side is
+  preserved; it is never mutated by an attempted rollback or deletion.
+
+  Operation temporaries and ownership probes use process, nanosecond-epoch, and
+  atomic-counter components with bounded exclusive-create collision retries.
+  Unauthenticated crash temporaries and stale probes are ignored and preserved
+  rather than deleted, and reconciliation fails closed after 1,024 such entries
+  instead of accepting unbounded accumulation. Ownership probes are unlinked
+  while their descriptor remains open, with unwind cleanup covering the
+  create-to-unlink interval. Deterministic public-flow race tests cover root and
+  child capture, source and final-target swaps during create/replace, remove,
+  subdirectory creation and cleanup, journal create/write/removal, lock
+  exclusion, collision retry, both ownership-probe unwind cuts, and a genuinely
+  killed probe subprocess while proving attacker sentinels and displaced trusted
+  inodes remain byte-for-byte intact.
 
   Unix does not provide an inode-conditional `unlinkat`: a continuously active
   process with the same uid can ignore the advisory lock and replace a verified
