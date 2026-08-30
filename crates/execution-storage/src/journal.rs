@@ -922,6 +922,11 @@ impl PinnedDirectory {
         Ok(Self { path })
     }
 
+    #[cfg(unix)]
+    pub(crate) fn owner_uid(&self) -> u32 {
+        self.uid
+    }
+
     pub(crate) fn verify(&self, purpose: &str) -> Result<(), StorageError> {
         let metadata = fs::symlink_metadata(&self.path)
             .map_err(|error| journal_error("inspect", &self.path, error))?;
@@ -1013,6 +1018,123 @@ impl PinnedDirectory {
             handle: Arc::new(handle),
             process_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Captures a freshly mounted direct child whose filesystem root may still
+    /// have ext4's default `0755` mode, then restricts that exact opened inode
+    /// to `0700` before it can be published as Ready (spec section 81).
+    ///
+    /// This is deliberately separate from `capture`/`capture_child`: ordinary
+    /// directory capture remains owner-only and never repairs permissions.
+    #[cfg(unix)]
+    pub(crate) fn capture_mounted_child(
+        &self,
+        name: &str,
+        expected_device: u64,
+        expected_uid: u32,
+        purpose: &str,
+    ) -> Result<Self, StorageError> {
+        validate_descriptor_name(name)?;
+        self.verify("mounted-root parent")?;
+        let diagnostic = self.path.join(name);
+        let stat = rustix::fs::statat(&*self.handle, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| rustix_error("inspect", &diagnostic, error))?;
+        let observed_mode = stat.st_mode as u32 & 0o7777;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(StorageError::IdentityMismatch(format!(
+                "{purpose} is not a real directory: {}",
+                diagnostic.display()
+            )));
+        }
+        if stat.st_dev as u64 != expected_device || stat.st_uid != expected_uid {
+            return Err(StorageError::IdentityMismatch(format!(
+                "{purpose} has a foreign device or owner"
+            )));
+        }
+        if !matches!(observed_mode, 0o700 | 0o755) {
+            return Err(StorageError::Unavailable(format!(
+                "{purpose} mode {observed_mode:o} is neither owner-only nor the expected ext4 default"
+            )));
+        }
+        race_hook("capture-mounted-child-after-lstat");
+        let fd = rustix::fs::openat(
+            &*self.handle,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| rustix_error("open mounted directory", &diagnostic, error))?;
+        let handle = File::from(fd);
+        let opened = handle
+            .metadata()
+            .map_err(|error| journal_error("inspect mounted directory", &diagnostic, error))?;
+        if opened.dev() != stat.st_dev as u64
+            || opened.ino() != stat.st_ino as u64
+            || opened.uid() != stat.st_uid
+            || opened.mode() != stat.st_mode as u32
+            || !opened.is_dir()
+        {
+            return Err(StorageError::IdentityMismatch(format!(
+                "{purpose} changed while opening"
+            )));
+        }
+        let path = diagnostic.canonicalize().map_err(|error| {
+            StorageError::Journal(format!(
+                "canonicalize {purpose} {}: {error}",
+                diagnostic.display()
+            ))
+        })?;
+        let current =
+            fs::symlink_metadata(&path).map_err(|error| journal_error("inspect", &path, error))?;
+        if current.dev() != opened.dev()
+            || current.ino() != opened.ino()
+            || current.uid() != opened.uid()
+            || current.mode() != opened.mode()
+        {
+            return Err(StorageError::IdentityMismatch(format!(
+                "{purpose} changed while canonicalizing diagnostics"
+            )));
+        }
+        verify_current_owner(&handle, &path, expected_uid, purpose)?;
+        if observed_mode == 0o755 {
+            rustix::fs::fchmod(&handle, Mode::from_bits_truncate(0o700))
+                .map_err(|error| rustix_error("restrict mounted directory", &path, error))?;
+        }
+        rustix::fs::fsync(&handle)
+            .map_err(|error| rustix_error("fsync mounted directory", &path, error))?;
+        let normalized = handle
+            .metadata()
+            .map_err(|error| journal_error("reinspect mounted directory", &path, error))?;
+        if normalized.dev() != expected_device
+            || normalized.ino() != opened.ino()
+            || normalized.uid() != expected_uid
+            || normalized.mode() & 0o7777 != 0o700
+            || !normalized.is_dir()
+        {
+            return Err(StorageError::IdentityMismatch(format!(
+                "{purpose} identity, owner, or mode changed during normalization"
+            )));
+        }
+        let linked = self.child_metadata(name)?.ok_or_else(|| {
+            StorageError::IdentityMismatch(format!("{purpose} disappeared after normalization"))
+        })?;
+        verify_same_identity(&normalized, &linked, purpose)?;
+        if linked.mode() & 0o7777 != 0o700 {
+            return Err(StorageError::IdentityMismatch(format!(
+                "{purpose} is not owner-only after normalization"
+            )));
+        }
+        self.verify("mounted-root parent")?;
+        let pinned = Self {
+            path,
+            device: normalized.dev(),
+            inode: normalized.ino(),
+            uid: normalized.uid(),
+            handle: Arc::new(handle),
+            process_lock: Arc::new(Mutex::new(())),
+        };
+        pinned.verify(purpose)?;
+        Ok(pinned)
     }
 
     #[cfg(unix)]
@@ -1970,6 +2092,170 @@ mod tests {
             .expect("secure metadata root");
         let metadata = SecureMetadataDirectory::new(root.path()).expect("pin metadata root");
         (root, metadata)
+    }
+
+    #[test]
+    fn mounted_root_capture_normalizes_only_ext4_default_mode_through_the_open_descriptor() {
+        let root = tempfile::tempdir().expect("temporary parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("secure parent");
+        let mounted = root.path().join("mounted");
+        fs::create_dir(&mounted).expect("mounted filesystem root");
+        fs::set_permissions(&mounted, fs::Permissions::from_mode(0o755))
+            .expect("ext4 default mode");
+        let metadata = fs::symlink_metadata(&mounted).expect("mounted metadata");
+        let parent = PinnedDirectory::capture(root.path(), "mount parent").expect("parent pin");
+
+        let pinned = parent
+            .capture_mounted_child(
+                "mounted",
+                metadata.dev(),
+                metadata.uid(),
+                "mounted execution filesystem",
+            )
+            .expect("normalize mounted root");
+
+        pinned
+            .verify("normalized mounted root")
+            .expect("strict pin");
+        assert_eq!(
+            fs::symlink_metadata(&mounted)
+                .expect("normalized metadata")
+                .mode()
+                & 0o7777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn mounted_root_capture_rejects_a_foreign_owner_before_chmod() {
+        let root = tempfile::tempdir().expect("temporary parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("secure parent");
+        let mounted = root.path().join("mounted");
+        fs::create_dir(&mounted).expect("mounted filesystem root");
+        fs::set_permissions(&mounted, fs::Permissions::from_mode(0o755))
+            .expect("ext4 default mode");
+        let metadata = fs::symlink_metadata(&mounted).expect("mounted metadata");
+        let parent = PinnedDirectory::capture(root.path(), "mount parent").expect("parent pin");
+
+        let error = parent
+            .capture_mounted_child(
+                "mounted",
+                metadata.dev(),
+                metadata.uid().wrapping_add(1),
+                "mounted execution filesystem",
+            )
+            .expect_err("foreign owner must not be normalized");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::symlink_metadata(&mounted)
+                .expect("unchanged metadata")
+                .mode()
+                & 0o7777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn mounted_root_capture_rejects_a_symlink_without_following_it() {
+        let root = tempfile::tempdir().expect("temporary parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("secure parent");
+        let foreign = root.path().join("foreign");
+        fs::create_dir(&foreign).expect("foreign directory");
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o755)).expect("foreign mode");
+        std::os::unix::fs::symlink(&foreign, root.path().join("mounted")).expect("mounted symlink");
+        let metadata = fs::symlink_metadata(&foreign).expect("foreign metadata");
+        let parent = PinnedDirectory::capture(root.path(), "mount parent").expect("parent pin");
+
+        let error = parent
+            .capture_mounted_child(
+                "mounted",
+                metadata.dev(),
+                metadata.uid(),
+                "mounted execution filesystem",
+            )
+            .expect_err("symlink must not be followed");
+
+        assert!(error.to_string().contains("real directory"));
+        assert_eq!(
+            fs::symlink_metadata(&foreign)
+                .expect("foreign remains")
+                .mode()
+                & 0o7777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn mounted_root_capture_rejects_a_foreign_device_identity_before_chmod() {
+        let root = tempfile::tempdir().expect("temporary parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("secure parent");
+        let mounted = root.path().join("mounted");
+        fs::create_dir(&mounted).expect("mounted filesystem root");
+        fs::set_permissions(&mounted, fs::Permissions::from_mode(0o755))
+            .expect("ext4 default mode");
+        let metadata = fs::symlink_metadata(&mounted).expect("mounted metadata");
+        let parent = PinnedDirectory::capture(root.path(), "mount parent").expect("parent pin");
+
+        let error = parent
+            .capture_mounted_child(
+                "mounted",
+                metadata.dev().wrapping_add(1),
+                metadata.uid(),
+                "mounted execution filesystem",
+            )
+            .expect_err("foreign device must not be normalized");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        assert_eq!(
+            fs::symlink_metadata(&mounted)
+                .expect("unchanged metadata")
+                .mode()
+                & 0o7777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn mounted_root_capture_rejects_a_child_swapped_after_device_observation() {
+        let root = tempfile::tempdir().expect("temporary parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("secure parent");
+        let mounted = root.path().join("mounted");
+        let displaced = root.path().join("mounted-displaced");
+        fs::create_dir(&mounted).expect("mounted filesystem root");
+        fs::set_permissions(&mounted, fs::Permissions::from_mode(0o755))
+            .expect("ext4 default mode");
+        let metadata = fs::symlink_metadata(&mounted).expect("mounted metadata");
+        let mounted_for_hook = mounted.clone();
+        let displaced_for_hook = displaced.clone();
+        install_race_hook("capture-mounted-child-after-lstat", move || {
+            fs::rename(&mounted_for_hook, &displaced_for_hook)
+                .expect("displace observed mounted root");
+            fs::create_dir(&mounted_for_hook).expect("install foreign mounted root");
+            fs::set_permissions(&mounted_for_hook, fs::Permissions::from_mode(0o755))
+                .expect("foreign default mode");
+        });
+        let parent = PinnedDirectory::capture(root.path(), "mount parent").expect("parent pin");
+
+        let error = parent
+            .capture_mounted_child(
+                "mounted",
+                metadata.dev(),
+                metadata.uid(),
+                "mounted execution filesystem",
+            )
+            .expect_err("device/inode replacement must not be normalized");
+
+        assert!(matches!(error, StorageError::IdentityMismatch(_)));
+        for path in [&mounted, &displaced] {
+            assert_eq!(
+                fs::symlink_metadata(path)
+                    .expect("untrusted root remains")
+                    .mode()
+                    & 0o7777,
+                0o755
+            );
+        }
     }
 
     fn journal_fixture() -> (

@@ -929,10 +929,29 @@ impl ExecutionStorageManager for ExecutionStorage {
             // backend consumer. Re-open the mounted object relative to the
             // retained executions-directory descriptor and carry that new pin
             // through the bind proof and layout publication.
+            if self
+                .backend
+                .state(&layout, &prepared_identity, reserved_bytes)?
+                != BackendState::Mounted
+            {
+                return Err(StorageError::IdentityMismatch(
+                    "prepared backend is not mounted".to_owned(),
+                ));
+            }
             let name = mountpoint_name(&layout)?;
-            let mounted_root = self
-                .executions_directory
-                .capture_child(name, "mounted execution filesystem")?;
+            let mounted_metadata = fs::symlink_metadata(&layout.root)
+                .map_err(|error| StorageError::IdentityMismatch(error.to_string()))?;
+            if mounted_metadata.file_type().is_symlink() || !mounted_metadata.is_dir() {
+                return Err(StorageError::IdentityMismatch(
+                    "mounted execution filesystem is not a real directory".to_owned(),
+                ));
+            }
+            let mounted_root = self.executions_directory.capture_mounted_child(
+                name,
+                mounted_metadata.dev(),
+                mountpoint.owner_uid(),
+                "mounted execution filesystem",
+            )?;
             mounted_root.verify("mounted execution filesystem")?;
             if self
                 .backend

@@ -306,6 +306,39 @@ execution-storage --all-targets --locked -- -D warnings` exited 0 after the
 container installed its matching clippy component. The labeled container and
 target volume were removed; no Linux proof resource remains.
 
+The 2026-08-30 mounted-root normalization repair reran both complete workspace
+chains against the fresh disposable database
+`autospec_test_dirfdfixfive20260830`:
+
+```text
+cargo fmt --all -- --check
+cargo build --workspace
+AUTOSPEC_DATABASE_URL="$DISPOSABLE_TEST_DATABASE" \
+  cargo test --workspace -- --nocapture --test-threads=1
+cargo clippy --workspace --all-targets -- -D warnings
+
+CARGO_TARGET_DIR=target-rust185-dirfdfix5 rustup run 1.85.0 cargo fmt --all -- --check
+CARGO_TARGET_DIR=target-rust185-dirfdfix5 rustup run 1.85.0 cargo build --workspace
+CARGO_TARGET_DIR=target-rust185-dirfdfix5 \
+  AUTOSPEC_DATABASE_URL="$DISPOSABLE_TEST_DATABASE" \
+  rustup run 1.85.0 cargo test --workspace -- --nocapture --test-threads=1
+CARGO_TARGET_DIR=target-rust185-dirfdfix5 \
+  rustup run 1.85.0 cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Both chains exited 0. Current Rust and Rust 1.85 each passed the 14/14 real
+worker suite plus 41 execution-storage unit tests, 7 backend tests, and 38
+storage integration tests. The matching labeled, disposable Linux/aarch64
+`rust:1.85-bookworm` gate passed `cargo test -p execution-storage --all-targets
+--locked` with the same 41/7/38 counts and passed warnings-denied clippy. The
+first current-workspace attempt used a disposable database whose name did not
+meet the test harness's destructive-test naming contract; the harness rejected
+all mutation before test setup, and the complete unmodified gate above
+superseded it. The first Linux shell used login-shell semantics that removed
+`/usr/local/cargo/bin` from `PATH`; the corrected non-login invocation above
+superseded that pre-compilation environmental failure. Exact labeled test
+containers and the Linux target volume were removed after verification.
+
 ## Explicit gaps and unavailable adapters
 
 - No operator APFS/LVM execution pool was configured, so physical aggregate
@@ -367,11 +400,19 @@ target volume were removed; no Linux proof resource remains.
   publication and `RENAME_NOREPLACE`, eliminating the former deterministic
   final-name `mkdirat`/`openat` gap. The authenticated pre-mount descriptor is
   retained across the backend's unavoidable path-based mount call. After mount,
-  the mounted filesystem is reopened with `openat` through the retained
-  executions-directory descriptor, reauthenticated, and retained through the
-  backend-state check, Docker bind proof, descriptor-relative layout creation,
-  and durable Ready transition. A same-uid replacement before either first
-  observation remains part of the explicit deployment boundary above.
+  exact backend filesystem identity is proved, then the mounted filesystem is
+  reopened with `openat` through the retained executions-directory descriptor.
+  A mount-only boundary accepts either `0700` or ext4's exact `0755` root,
+  checks the observed mounted device and pre-mount owner, applies `fchmod(0700)`
+  and `fsync` to that retained descriptor, and strictly reauthenticates the
+  descriptor/link plus exact backend filesystem identity before Docker bind
+  proof, descriptor-relative layout creation, and durable Ready transition.
+  Ordinary root/child captures still reject every group- or world-accessible
+  mode rather than normalizing it. Deterministic tests cover the `0755`-to-Ready
+  path and reject unexpected mode, owner, symlink, device/inode replacement,
+  and post-normalization backend filesystem drift. A same-uid replacement
+  before either first observation remains part of the explicit deployment
+  boundary above.
 
   Unix does not provide an inode-conditional `unlinkat`: a continuously active
   process with the same uid can ignore the advisory lock and replace a verified

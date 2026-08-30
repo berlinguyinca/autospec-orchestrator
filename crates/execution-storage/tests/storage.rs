@@ -10,7 +10,10 @@ use std::{
     fs,
     path::Path,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 #[cfg(unix)]
@@ -521,6 +524,122 @@ struct FakeBackend {
     mutate_prepared: bool,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct MountedRootModeBackend {
+    inner: FakeBackend,
+    mounted_mode: u32,
+    reject_second_mounted_identity: bool,
+    mounted_state_checks: AtomicUsize,
+}
+
+#[cfg(unix)]
+impl StorageBackend for MountedRootModeBackend {
+    fn key(&self, labels: &OwnershipLabels) -> String {
+        self.inner.key(labels)
+    }
+
+    fn probe(&self, required_bytes: u64) -> Result<BackendCapability, StorageError> {
+        self.inner.probe(required_bytes)
+    }
+
+    fn discover(
+        &self,
+        layout: &ExecutionLayout,
+        ownership_token: &str,
+        reserved_bytes: u64,
+    ) -> Result<Option<BackendIdentity>, StorageError> {
+        self.inner.discover(layout, ownership_token, reserved_bytes)
+    }
+
+    fn create(
+        &self,
+        layout: &ExecutionLayout,
+        labels: &OwnershipLabels,
+        ownership_token: &str,
+        reserved_bytes: u64,
+    ) -> Result<BackendIdentity, StorageError> {
+        self.inner
+            .create(layout, labels, ownership_token, reserved_bytes)
+    }
+
+    fn prepare(
+        &self,
+        layout: &ExecutionLayout,
+        identity: &BackendIdentity,
+        reserved_bytes: u64,
+    ) -> Result<BackendIdentity, StorageError> {
+        self.inner.prepare(layout, identity, reserved_bytes)
+    }
+
+    fn mount(
+        &self,
+        layout: &ExecutionLayout,
+        identity: &BackendIdentity,
+        reserved_bytes: u64,
+    ) -> Result<(), StorageError> {
+        self.inner.mount(layout, identity, reserved_bytes)?;
+        mode(&layout.root, self.mounted_mode);
+        Ok(())
+    }
+
+    fn state(
+        &self,
+        layout: &ExecutionLayout,
+        identity: &BackendIdentity,
+        reserved_bytes: u64,
+    ) -> Result<BackendState, StorageError> {
+        let state = self.inner.state(layout, identity, reserved_bytes)?;
+        if state == BackendState::Mounted
+            && self.reject_second_mounted_identity
+            && self.mounted_state_checks.fetch_add(1, Ordering::SeqCst) == 1
+        {
+            return Err(StorageError::IdentityMismatch(
+                "mounted filesystem identity changed".to_owned(),
+            ));
+        }
+        Ok(state)
+    }
+
+    fn unmount(
+        &self,
+        layout: &ExecutionLayout,
+        identity: &BackendIdentity,
+    ) -> Result<(), StorageError> {
+        self.inner.unmount(layout, identity)
+    }
+
+    fn remove(&self, identity: &BackendIdentity) -> Result<(), StorageError> {
+        self.inner.remove(identity)
+    }
+}
+
+#[cfg(unix)]
+fn mounted_root_mode_manager(
+    root: &Path,
+    mounted_mode: u32,
+) -> (ExecutionStorage, Arc<Mutex<Vec<String>>>) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let manager = ExecutionStorage::new(
+        root,
+        Box::new(MountedRootModeBackend {
+            inner: FakeBackend {
+                calls: Arc::clone(&calls),
+                removes_mountpoint: false,
+                state: Arc::new(Mutex::new(BackendState::Absent)),
+                pool_identity: "pool-7",
+                mutate_prepared: false,
+            },
+            mounted_mode,
+            reject_second_mounted_identity: false,
+            mounted_state_checks: AtomicUsize::new(0),
+        }),
+        Box::new(FakeDockerVerifier),
+    )
+    .expect("storage manager");
+    (manager, calls)
+}
+
 impl StorageBackend for FakeBackend {
     fn key(&self, labels: &OwnershipLabels) -> String {
         format!("fake:{}", labels.execution_id)
@@ -796,6 +915,105 @@ fn manager_fixture() -> (tempfile::TempDir, ExecutionStorage, Arc<Mutex<Vec<Stri
     )
     .expect("storage manager");
     (root, manager, calls)
+}
+
+#[cfg(unix)]
+#[test]
+fn mounted_ext4_shaped_root_is_normalized_through_its_descriptor_before_ready() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("temporary state root");
+    storage_directories(root.path());
+    let (manager, calls) = mounted_root_mode_manager(root.path(), 0o755);
+
+    let receipt = manager
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 1,
+        })
+        .expect("ext4-shaped mounted root reaches Ready after normalization");
+
+    assert_eq!(
+        fs::symlink_metadata(&receipt.mount_path)
+            .expect("mounted root metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        JournalStore::new(manager.state_root())
+            .expect("journal store")
+            .read(
+                &ExecutionLayout::new(manager.state_root(), &receipt.labels.execution_id)
+                    .expect("layout"),
+            )
+            .expect("Ready journal")
+            .phase,
+        AllocationPhase::Ready
+    );
+    assert!(calls
+        .lock()
+        .expect("backend calls")
+        .iter()
+        .any(|call| call.starts_with("mount:")));
+}
+
+#[cfg(unix)]
+#[test]
+fn mounted_root_normalization_rejects_unexpected_public_mode_before_ready() {
+    let root = tempfile::tempdir().expect("temporary state root");
+    storage_directories(root.path());
+    let (manager, _calls) = mounted_root_mode_manager(root.path(), 0o777);
+
+    let error = manager
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 1,
+        })
+        .expect_err("unexpected mounted-root mode must not reach Ready");
+
+    assert!(error.to_string().contains("mode"));
+    let layout =
+        ExecutionLayout::new(manager.state_root(), &labels().execution_id).expect("layout");
+    assert!(!layout.journal.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn mounted_root_normalization_rejects_foreign_filesystem_identity_before_ready() {
+    let root = tempfile::tempdir().expect("temporary state root");
+    storage_directories(root.path());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let manager = ExecutionStorage::new(
+        root.path(),
+        Box::new(MountedRootModeBackend {
+            inner: FakeBackend {
+                calls,
+                removes_mountpoint: false,
+                state: Arc::new(Mutex::new(BackendState::Absent)),
+                pool_identity: "pool-7",
+                mutate_prepared: false,
+            },
+            mounted_mode: 0o755,
+            reject_second_mounted_identity: true,
+            mounted_state_checks: AtomicUsize::new(0),
+        }),
+        Box::new(FakeDockerVerifier),
+    )
+    .expect("storage manager");
+
+    let error = manager
+        .allocate(&AllocationRequest {
+            labels: labels(),
+            disk_gib: 1,
+        })
+        .expect_err("changed mounted filesystem identity must not reach Ready");
+
+    assert!(error.to_string().contains("filesystem identity changed"));
+    let layout =
+        ExecutionLayout::new(manager.state_root(), &labels().execution_id).expect("layout");
+    assert!(!layout.journal.exists());
 }
 
 #[test]

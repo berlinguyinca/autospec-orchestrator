@@ -2825,7 +2825,14 @@ therefore keep untrusted agents on a different uid and deny them write access to
 worker metadata. Execution mountpoints are staged and published with
 `RENAME_NOREPLACE`; the authenticated pre-mount descriptor is retained across
 the path-based mount, and the mounted filesystem is then reopened relative to
-the retained parent descriptor and pinned through proof and Ready publication.
+the retained parent descriptor. Exact backend mount/filesystem identity is
+checked before and after that capture. The one mount-specific capture path
+accepts only an already-private `0700` root or ext4's exact `0755` default,
+requires the pre-mount owner and the observed mounted device, and normalizes
+`0755` to `0700` with `fchmod` and `fsync` on the retained descriptor before a
+strict link/descriptor recheck, Docker proof, layout creation, or Ready
+publication. Ordinary directory capture remains fail-closed and never repairs
+group- or world-accessible modes.
 
 ---
 
