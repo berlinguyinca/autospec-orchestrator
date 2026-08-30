@@ -553,8 +553,8 @@ name = "execution-storage"
 version = "0.1.0"
 dependencies = [
  "fs2",
- "libc",
  "orchestrator-core",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

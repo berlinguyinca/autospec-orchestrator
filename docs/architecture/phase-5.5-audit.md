@@ -264,9 +264,13 @@ placement.
   made; deterministic JSON-mode Pi boundary behavior is the tested contract.
 - Production InferWeave credential issuance is an external integration boundary;
   real E2E uses the execution-scoped, short-lived local credential broker.
-- The previously identified macOS directory-FD race hardening requires a direct
-  low-level filesystem dependency decision. That dependency/scope decision was
-  not expanded during this no-new-dependencies completion audit.
+- The macOS directory-FD race is closed with the approved direct `rustix`
+  filesystem boundary. Journal and secure-metadata child opens, creates,
+  metadata inspection, listing, renames, unlinks, directory creation/removal,
+  ownership probes, and directory fsyncs now resolve relative to a retained
+  no-follow directory descriptor on macOS and Linux. Adversarial pathname-swap
+  tests prove reads and mutations remain inside the captured directory while
+  the replacement attacker path and its sentinels remain untouched.
 
 These gaps are explicit rather than inferred as passes. The supported release
 claim is the Docker execution plane with the tested storage-proof fail-closed

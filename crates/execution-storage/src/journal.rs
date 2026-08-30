@@ -3,7 +3,7 @@ use orchestrator_core::ExecutionId;
 use orchestrator_core::OwnershipLabels;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -15,9 +15,9 @@ use std::{
 static OWNER_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 #[derive(Debug, Clone)]
 pub struct JournalStore {
@@ -103,19 +103,10 @@ impl SecureMetadataDirectory {
 
     pub fn names(&self) -> Result<Vec<String>, StorageError> {
         self.directory.verify("metadata directory")?;
-        let mut names = Vec::new();
-        for entry in fs::read_dir(&self.directory.path)
-            .map_err(|error| journal_error("list", &self.directory.path, error))?
-        {
-            let entry =
-                entry.map_err(|error| journal_error("list", &self.directory.path, error))?;
-            let name = entry.file_name().into_string().map_err(|_| {
-                StorageError::IdentityMismatch("metadata child name is not UTF-8".to_owned())
-            })?;
-            validate_metadata_name(&name)?;
-            names.push(name);
+        let names = self.directory.child_names()?;
+        for name in &names {
+            validate_metadata_name(name)?;
         }
-        names.sort();
         self.directory.verify("metadata directory")?;
         Ok(names)
     }
@@ -137,12 +128,7 @@ impl SecureMetadataDirectory {
                 path.display()
             )));
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|error| journal_error("open", &path, error))?;
+        let file = self.directory.open_file_read_write(name)?;
         verify_opened_identity(&expected, &file, &path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|error| journal_error("restrict", &path, error))?;
@@ -527,32 +513,24 @@ impl JournalStore {
             ));
         }
         let mut journals = Vec::new();
-        let entries = fs::read_dir(&self.directory)
-            .map_err(|error| journal_error("read directory", &self.directory, error))?;
-        for entry in entries {
-            let entry =
-                entry.map_err(|error| journal_error("read entry", &self.directory, error))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|error| journal_error("inspect entry", &entry.path(), error))?;
-            if matches!(entry.file_name().to_str(), Some("holds" | "releases"))
-                && file_type.is_dir()
-            {
-                SecureMetadataDirectory::new(entry.path())?;
+        for name in self.journal_directory.child_names()? {
+            let entry_path = self.directory.join(&name);
+            let metadata = self
+                .journal_directory
+                .child_metadata(&name)?
+                .ok_or_else(|| {
+                    StorageError::Journal(format!("journal entry disappeared: {name}"))
+                })?;
+            if matches!(name.as_str(), "holds" | "releases") && metadata.is_dir() {
+                SecureMetadataDirectory::new(&entry_path)?;
                 continue;
             }
-            if file_type.is_symlink() || !file_type.is_file() {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(StorageError::Journal(format!(
                     "unexpected journal entry type: {}",
-                    entry.path().display()
+                    entry_path.display()
                 )));
             }
-            let name = entry.file_name().into_string().map_err(|name| {
-                StorageError::Journal(format!(
-                    "journal filename is not UTF-8: {}",
-                    Path::new(&name).display()
-                ))
-            })?;
             if name.ends_with(".lease") {
                 self.journal_directory.open_file(&name)?;
                 continue;
@@ -600,9 +578,9 @@ fn lease_name(layout: &ExecutionLayout) -> Result<String, StorageError> {
 #[derive(Debug, Clone)]
 /// Internal boundary for descriptor-pinned, no-follow directory operations.
 ///
-/// Linux resolves children through `/proc/self/fd`; macOS currently retains the
-/// same inode/mode checks but needs a safe `openat`/`renameat`/`unlinkat` wrapper
-/// before it can avoid path re-resolution entirely.
+/// All child access is resolved by the kernel relative to the retained
+/// descriptor. The canonical path is used only for identity verification and
+/// diagnostics, never as mutation authority.
 pub(crate) struct PinnedDirectory {
     pub(crate) path: PathBuf,
     #[cfg(unix)]
@@ -647,8 +625,7 @@ impl PinnedDirectory {
                     metadata.mode() & 0o777
                 )));
             }
-            verify_current_owner(&path, metadata.uid(), purpose)?;
-            let handle = File::open(&path).map_err(|error| journal_error("open", &path, error))?;
+            let handle = open_directory(&path)?;
             let opened = handle
                 .metadata()
                 .map_err(|error| journal_error("inspect", &path, error))?;
@@ -657,6 +634,7 @@ impl PinnedDirectory {
                     "{purpose} changed while opening"
                 )));
             }
+            verify_current_owner(&handle, &path, metadata.uid(), purpose)?;
             Ok(Self {
                 path,
                 device: metadata.dev(),
@@ -677,9 +655,9 @@ impl PinnedDirectory {
                 "{purpose} is no longer a real directory"
             )));
         }
-        let opened = File::open(&self.path)
-            .and_then(|file| file.metadata())
-            .map_err(|error| journal_error("open", &self.path, error))?;
+        let opened = open_directory(&self.path)?
+            .metadata()
+            .map_err(|error| journal_error("inspect", &self.path, error))?;
         #[cfg(unix)]
         if metadata.dev() != self.device
             || metadata.ino() != self.inode
@@ -697,38 +675,27 @@ impl PinnedDirectory {
 
     #[cfg(unix)]
     pub(crate) fn child_path(&self, name: &str) -> Result<PathBuf, StorageError> {
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-            return Err(StorageError::InvalidRequest(
-                "descriptor-relative name is unsafe".to_owned(),
-            ));
-        }
-        #[cfg(target_os = "linux")]
-        let parent = Path::new("/proc/self/fd").join(self.handle.as_raw_fd().to_string());
-        #[cfg(not(target_os = "linux"))]
-        let parent = self.path.clone();
-        Ok(parent.join(name))
+        validate_descriptor_name(name)?;
+        Ok(self.path.join(name))
     }
 
     #[cfg(unix)]
     fn create_file(&self, name: &str) -> Result<File, StorageError> {
         let path = self.child_path(name)?;
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|error| journal_error("create", &path, error))
+        let fd = rustix::fs::openat(
+            &*self.handle,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|error| rustix_error("create", &path, error))?;
+        Ok(File::from(fd))
     }
 
     #[cfg(unix)]
     fn open_file(&self, name: &str) -> Result<File, StorageError> {
         let path = self.child_path(name)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|error| journal_error("open", &path, error))?;
+        let file = self.open_file_with(name, OFlags::RDONLY)?;
         let metadata = file
             .metadata()
             .map_err(|error| journal_error("inspect", &path, error))?;
@@ -742,6 +709,35 @@ impl PinnedDirectory {
     }
 
     #[cfg(unix)]
+    fn open_file_read_write(&self, name: &str) -> Result<File, StorageError> {
+        let path = self.child_path(name)?;
+        let file = self.open_file_with(name, OFlags::RDWR)?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| journal_error("inspect", &path, error))?;
+        if !metadata.is_file() {
+            return Err(StorageError::Journal(format!(
+                "metadata child is not a real file: {}",
+                path.display()
+            )));
+        }
+        Ok(file)
+    }
+
+    #[cfg(unix)]
+    fn open_file_with(&self, name: &str, access: OFlags) -> Result<File, StorageError> {
+        let path = self.child_path(name)?;
+        let fd = rustix::fs::openat(
+            &*self.handle,
+            name,
+            access | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| rustix_error("open", &path, error))?;
+        Ok(File::from(fd))
+    }
+
+    #[cfg(unix)]
     fn verify_child(&self, name: &str, expected: &fs::Metadata) -> Result<(), StorageError> {
         let file = self.open_file(name)?;
         verify_opened_file(expected, &file, &self.child_path(name)?)
@@ -749,22 +745,23 @@ impl PinnedDirectory {
 
     #[cfg(unix)]
     fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
-        let from_path = self.child_path(from)?;
+        self.child_path(from)?;
         let to_path = self.child_path(to)?;
-        fs::rename(&from_path, &to_path).map_err(|error| journal_error("rename", &to_path, error))
+        rustix::fs::renameat(&*self.handle, from, &*self.handle, to)
+            .map_err(|error| rustix_error("rename", &to_path, error))
     }
 
     #[cfg(unix)]
     fn remove_file(&self, name: &str) -> Result<(), StorageError> {
         let path = self.child_path(name)?;
-        fs::remove_file(&path).map_err(|error| journal_error("remove", &path, error))
+        rustix::fs::unlinkat(&*self.handle, name, AtFlags::empty())
+            .map_err(|error| rustix_error("remove", &path, error))
     }
 
     #[cfg(unix)]
     fn sync(&self) -> Result<(), StorageError> {
-        self.handle
-            .sync_all()
-            .map_err(|error| journal_error("fsync directory", &self.path, error))
+        rustix::fs::fsync(&*self.handle)
+            .map_err(|error| rustix_error("fsync directory", &self.path, error))
     }
 
     #[cfg(unix)]
@@ -775,32 +772,32 @@ impl PinnedDirectory {
 
     #[cfg(unix)]
     fn create_directory_unsynced(&self, name: &str) -> Result<fs::Metadata, StorageError> {
-        use std::os::unix::fs::DirBuilderExt;
         let path = self.child_path(name)?;
-        let mut builder = fs::DirBuilder::new();
-        builder
-            .mode(0o700)
-            .create(&path)
-            .map_err(|error| journal_error("create directory", &path, error))?;
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(metadata),
+        rustix::fs::mkdirat(&*self.handle, name, Mode::from_bits_truncate(0o700))
+            .map_err(|error| rustix_error("create directory", &path, error))?;
+        match self.child_metadata(name) {
+            Ok(Some(metadata)) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                Ok(metadata)
+            }
             Ok(_) => {
-                let cleanup = fs::remove_dir(&path);
+                let cleanup = rustix::fs::unlinkat(&*self.handle, name, AtFlags::REMOVEDIR);
                 Err(match cleanup {
                     Ok(()) => StorageError::IdentityMismatch(
                         "new metadata child is not a real directory".to_owned(),
                     ),
-                    Err(error) => journal_error("remove invalid new directory", &path, error),
+                    Err(error) => rustix_error("remove invalid new directory", &path, error),
                 })
             }
             Err(error) => {
-                let inspection = journal_error("inspect new directory", &path, error);
-                Err(match fs::remove_dir(&path) {
-                    Ok(()) => inspection,
-                    Err(cleanup) => StorageError::Journal(format!(
-                        "{inspection}; remove uninspected new directory failed: {cleanup}"
-                    )),
-                })
+                let inspection = error;
+                Err(
+                    match rustix::fs::unlinkat(&*self.handle, name, AtFlags::REMOVEDIR) {
+                        Ok(()) => inspection,
+                        Err(cleanup) => StorageError::Journal(format!(
+                            "{inspection}; remove uninspected new directory failed: {cleanup}"
+                        )),
+                    },
+                )
             }
         }
     }
@@ -808,53 +805,119 @@ impl PinnedDirectory {
     #[cfg(unix)]
     pub(crate) fn remove_directory(&self, name: &str) -> Result<(), StorageError> {
         let path = self.child_path(name)?;
-        let metadata =
-            fs::symlink_metadata(&path).map_err(|error| journal_error("inspect", &path, error))?;
+        let metadata = self.child_metadata(name)?.ok_or_else(|| {
+            StorageError::Journal(format!("inspect {}: no such directory", path.display()))
+        })?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(StorageError::IdentityMismatch(format!(
                 "descriptor-relative mountpoint is not a real directory: {}",
                 path.display()
             )));
         }
-        fs::remove_dir(&path).map_err(|error| journal_error("remove directory", &path, error))?;
+        rustix::fs::unlinkat(&*self.handle, name, AtFlags::REMOVEDIR)
+            .map_err(|error| rustix_error("remove directory", &path, error))?;
         self.sync()
     }
 
     #[cfg(unix)]
     pub(crate) fn child_metadata(&self, name: &str) -> Result<Option<fs::Metadata>, StorageError> {
         let path = self.child_path(name)?;
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => Ok(Some(metadata)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(journal_error("inspect", &path, error)),
+        let stat = match rustix::fs::statat(&*self.handle, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(rustix_error("inspect", &path, error)),
+        };
+        let flags = match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => OFlags::RDONLY,
+            FileType::Directory => OFlags::RDONLY | OFlags::DIRECTORY,
+            FileType::Symlink => {
+                return Err(StorageError::IdentityMismatch(format!(
+                    "descriptor-relative child is not a real directory or file (symlink): {}",
+                    path.display()
+                )))
+            }
+            _ => {
+                return Err(StorageError::IdentityMismatch(format!(
+                    "descriptor-relative child has an unsupported type: {}",
+                    path.display()
+                )))
+            }
+        };
+        let fd = rustix::fs::openat(
+            &*self.handle,
+            name,
+            flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| rustix_error("open for inspection", &path, error))?;
+        let file = File::from(fd);
+        let metadata = file
+            .metadata()
+            .map_err(|error| journal_error("inspect opened child", &path, error))?;
+        if metadata.dev() != stat.st_dev as u64
+            || metadata.ino() != stat.st_ino as u64
+            || metadata.uid() != stat.st_uid
+        {
+            return Err(StorageError::IdentityMismatch(format!(
+                "descriptor-relative child changed while opening: {}",
+                path.display()
+            )));
         }
+        Ok(Some(metadata))
+    }
+
+    #[cfg(unix)]
+    fn child_names(&self) -> Result<Vec<String>, StorageError> {
+        let directory = rustix::fs::Dir::read_from(&*self.handle)
+            .map_err(|error| rustix_error("list", &self.path, error))?;
+        let mut names = Vec::new();
+        for entry in directory {
+            let entry = entry.map_err(|error| rustix_error("list", &self.path, error))?;
+            let bytes = entry.file_name().to_bytes();
+            if matches!(bytes, b"." | b"..") {
+                continue;
+            }
+            let name = std::str::from_utf8(bytes).map_err(|_| {
+                StorageError::IdentityMismatch(
+                    "descriptor-relative child name is not UTF-8".to_owned(),
+                )
+            })?;
+            validate_descriptor_name(name)?;
+            names.push(name.to_owned());
+        }
+        names.sort();
+        Ok(names)
     }
 }
 
 #[cfg(unix)]
 fn verify_current_owner(
+    handle: &File,
     directory: &Path,
     expected_uid: u32,
     purpose: &str,
 ) -> Result<(), StorageError> {
-    let probe = directory.join(format!(
+    let name = format!(
         ".autospec-owner-{}-{}",
         std::process::id(),
         OWNER_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&probe)
-        .map_err(|error| journal_error("create ownership probe", &probe, error))?;
+    );
+    let probe = directory.join(&name);
+    let fd = rustix::fs::openat(
+        handle,
+        name.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| rustix_error("create ownership probe", &probe, error))?;
+    let file = File::from(fd);
     let actual_uid = file
         .metadata()
         .map_err(|error| journal_error("inspect ownership probe", &probe, error))?
         .uid();
     drop(file);
-    fs::remove_file(&probe)
-        .map_err(|error| journal_error("remove ownership probe", &probe, error))?;
+    rustix::fs::unlinkat(handle, name.as_str(), AtFlags::empty())
+        .map_err(|error| rustix_error("remove ownership probe", &probe, error))?;
     if actual_uid == expected_uid {
         Ok(())
     } else {
@@ -862,6 +925,33 @@ fn verify_current_owner(
             "{purpose} is owned by uid {expected_uid}, current uid is {actual_uid}"
         )))
     }
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> Result<File, StorageError> {
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| rustix_error("open directory", path, error))?;
+    Ok(File::from(fd))
+}
+
+#[cfg(unix)]
+fn validate_descriptor_name(name: &str) -> Result<(), StorageError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        Err(StorageError::InvalidRequest(
+            "descriptor-relative name is unsafe".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn rustix_error(action: &str, path: &Path, error: rustix::io::Errno) -> StorageError {
+    journal_error(action, path, error.into())
 }
 
 fn write_and_sync(file: File, journal: &PhaseJournal, path: &Path) -> Result<(), StorageError> {
@@ -1031,7 +1121,7 @@ fn journal_error(action: &str, path: &Path, error: std::io::Error) -> StorageErr
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn metadata_directory() -> (tempfile::TempDir, SecureMetadataDirectory) {
         let root = tempfile::tempdir().expect("temporary metadata root");
@@ -1039,6 +1129,132 @@ mod tests {
             .expect("secure metadata root");
         let metadata = SecureMetadataDirectory::new(root.path()).expect("pin metadata root");
         (root, metadata)
+    }
+
+    fn swapped_directory() -> (tempfile::TempDir, PinnedDirectory, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().expect("temporary parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure temporary parent");
+        let selected = root.path().join("selected");
+        fs::create_dir(&selected).expect("create selected directory");
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o700))
+            .expect("secure selected directory");
+        let pinned = PinnedDirectory::capture(&selected, "race-test directory")
+            .expect("pin selected directory");
+        let captured = root.path().join("captured");
+        fs::rename(&selected, &captured).expect("displace captured directory");
+        fs::create_dir(&selected).expect("install attacker directory at selected path");
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o700))
+            .expect("secure attacker directory");
+        (root, pinned, captured, selected)
+    }
+
+    #[test]
+    fn descriptor_relative_file_access_stays_in_captured_directory_after_path_swap() {
+        let (_root, pinned, captured, attacker) = swapped_directory();
+        fs::write(captured.join("existing"), b"trusted").expect("write trusted child");
+        fs::set_permissions(captured.join("existing"), fs::Permissions::from_mode(0o600))
+            .expect("secure trusted child");
+        fs::write(attacker.join("existing"), b"attacker sentinel")
+            .expect("write attacker sentinel");
+        fs::set_permissions(attacker.join("existing"), fs::Permissions::from_mode(0o600))
+            .expect("secure attacker sentinel");
+
+        let mut opened = pinned.open_file("existing").expect("open captured child");
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).expect("read captured child");
+        assert_eq!(bytes, b"trusted");
+        let expected = fs::symlink_metadata(captured.join("existing")).expect("trusted metadata");
+        let observed = pinned
+            .child_metadata("existing")
+            .expect("descriptor-relative metadata")
+            .expect("captured child exists");
+        assert_eq!(
+            (observed.dev(), observed.ino()),
+            (expected.dev(), expected.ino())
+        );
+
+        let mut created = pinned
+            .create_file("created")
+            .expect("create captured child");
+        created
+            .write_all(b"created safely")
+            .expect("write captured child");
+        created.sync_all().expect("sync captured child");
+        assert_eq!(
+            fs::read(captured.join("created")).expect("read created captured child"),
+            b"created safely"
+        );
+        assert!(!attacker.join("created").exists());
+        assert_eq!(
+            fs::read(attacker.join("existing")).expect("read attacker sentinel"),
+            b"attacker sentinel"
+        );
+    }
+
+    #[test]
+    fn descriptor_relative_mutations_leave_replacement_path_untouched() {
+        let (_root, pinned, captured, attacker) = swapped_directory();
+        fs::write(captured.join("record.tmp"), b"trusted").expect("write trusted temporary");
+        fs::set_permissions(
+            captured.join("record.tmp"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("secure trusted temporary");
+        fs::write(attacker.join("record.tmp"), b"attacker sentinel")
+            .expect("write attacker temporary");
+        fs::set_permissions(
+            attacker.join("record.tmp"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("secure attacker temporary");
+
+        pinned
+            .rename("record.tmp", "record")
+            .expect("rename captured child");
+        assert_eq!(
+            fs::read(captured.join("record")).expect("read renamed captured child"),
+            b"trusted"
+        );
+        assert_eq!(
+            fs::read(attacker.join("record.tmp")).expect("read attacker sentinel"),
+            b"attacker sentinel"
+        );
+        assert!(!attacker.join("record").exists());
+
+        pinned.remove_file("record").expect("remove captured child");
+        assert!(!captured.join("record").exists());
+        assert_eq!(
+            fs::read(attacker.join("record.tmp")).expect("read attacker sentinel after removal"),
+            b"attacker sentinel"
+        );
+
+        pinned
+            .create_directory("session")
+            .expect("create captured directory");
+        assert!(captured.join("session").is_dir());
+        assert!(!attacker.join("session").exists());
+        pinned
+            .remove_directory("session")
+            .expect("remove captured directory");
+        assert!(!captured.join("session").exists());
+        assert!(!attacker.join("session").exists());
+    }
+
+    #[test]
+    fn descriptor_relative_listing_reads_only_the_captured_directory() {
+        let (_root, pinned, captured, attacker) = swapped_directory();
+        fs::write(captured.join("trusted"), b"trusted").expect("write trusted child");
+        fs::write(attacker.join("attacker"), b"attacker").expect("write attacker child");
+
+        assert_eq!(
+            pinned.child_names().expect("list captured directory"),
+            vec!["trusted".to_owned()]
+        );
+        assert_eq!(
+            fs::read(attacker.join("attacker")).expect("read attacker child"),
+            b"attacker"
+        );
     }
 
     #[test]
