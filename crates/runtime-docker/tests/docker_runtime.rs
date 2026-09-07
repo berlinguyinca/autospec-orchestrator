@@ -1871,6 +1871,10 @@ async fn failed_normal_cleanup_keeps_scope_armed() {
         return;
     };
     let docker = raw_client().expect("connect to probed daemon");
+    // These tests create containers directly against the daemon rather than
+    // through the helper that pulls, so the image is not guaranteed present.
+    // A fresh CI runner has a daemon but no images: 'No such image: alpine:3.20'.
+    ensure_alpine_image(&docker).await;
     let execution_labels = labels_for(unique_execution_id());
     let control_labels = control_labels_for(&execution_labels);
     let blocker_labels = [
@@ -2241,6 +2245,10 @@ async fn image_volumes_are_bind_backed_and_container_roots_are_read_only() {
         return;
     };
     let docker = raw_client().expect("connect to probed daemon");
+    // These tests create containers directly against the daemon rather than
+    // through the helper that pulls, so the image is not guaranteed present.
+    // A fresh CI runner has a daemon but no images: 'No such image: alpine:3.20'.
+    ensure_alpine_image(&docker).await;
     let mut scope = DockerTestScope::new(&runtime, &execution_labels);
     let requirement = RuntimeRequirement {
         image: Some("alpine:3.20".to_owned()),
@@ -2603,6 +2611,10 @@ async fn cleanup_aggregates_volume_failures_and_still_removes_the_network() {
         return;
     };
     let docker = raw_client().expect("connect to probed daemon");
+    // These tests create containers directly against the daemon rather than
+    // through the helper that pulls, so the image is not guaranteed present.
+    // A fresh CI runner has a daemon but no images: 'No such image: alpine:3.20'.
+    ensure_alpine_image(&docker).await;
     let execution_labels = labels_for(unique_execution_id());
     let mut scope = DockerTestScope::new(&runtime, &execution_labels);
     let network = DockerRuntime::network_name(&execution_labels.execution_id);
