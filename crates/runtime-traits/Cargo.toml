@@ -11,5 +11,9 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 orchestrator-core.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

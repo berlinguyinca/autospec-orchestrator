@@ -22,4 +22,4 @@ services:
     image: redis:8
 
   localstack:
-    image: localstack/localstack
+    image: localstack/localstack:latest

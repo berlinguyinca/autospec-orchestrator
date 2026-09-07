@@ -2813,6 +2813,36 @@ container isolation
 
 A model instruction is not a security boundary.
 
+On POSIX platforms, descriptor-relative storage mutations authenticate each
+directory or file inode before using it and fail closed when an authenticated
+object changes. Operation names are collision-resistant, not secret. Because
+`mkdirat` returns no descriptor, an uncooperative process running as the worker
+uid can observe and replace a newly created directory between `mkdirat` and its
+first `statat`/`openat`; that actor is outside the enforceable filesystem
+boundary and can also control or trace the worker process. Process mutexes and
+descriptor advisory locks serialize cooperative writers only. Deployments must
+therefore keep untrusted agents on a different uid and deny them write access to
+worker metadata. Execution mountpoints are staged and published with
+`RENAME_NOREPLACE`; the authenticated pre-mount descriptor is retained across
+the path-based mount, and the mounted filesystem is then reopened relative to
+the retained parent descriptor. Exact backend mount/filesystem identity is
+checked before and after that capture. The one mount-specific capture path
+accepts only an already-private `0700` root or ext4's exact `0755` default,
+requires the pre-mount owner and the observed mounted device, and normalizes
+`0755` to `0700` with `fchmod` and `fsync` on the retained descriptor before a
+strict link/descriptor recheck, Docker proof, layout creation, or Ready
+publication. Ordinary directory capture remains fail-closed and never repairs
+group- or world-accessible modes.
+
+The first supported Docker execution-worker pairing is Linux with thick LVM.
+The APFS backend remains a physically exercised storage-lifecycle adapter, but
+macOS Docker Desktop is rejected during worker preparation: its user-scoped
+file-sharing process cannot traverse the root-owned `0700` filesystem required
+by the storage authority. macOS Docker support requires a typed privileged APFS
+helper that runs storage operations as root while the worker and Docker Desktop
+share a dedicated non-root uid. Arbitrary `diskutil` delegation, permission
+weakening, and ACL exceptions are not valid substitutes for that boundary.
+
 ---
 
 # 82. AutoSpec Cleanup Responsibilities After Migration

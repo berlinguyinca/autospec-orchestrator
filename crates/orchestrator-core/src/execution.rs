@@ -88,6 +88,48 @@ pub struct TestSummary {
     pub skipped: u32,
 }
 
+/// Durable interactive action requested through the controller and executed by
+/// the owning worker. This is execution control, not scheduling policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionControlAction {
+    Pause,
+    Resume,
+    ForkConversation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionControlRequest {
+    pub request_id: i64,
+    pub execution_id: ExecutionId,
+    pub action: ExecutionControlAction,
+    pub requested_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Cursor-only attachment metadata. Conversation history and artifacts remain
+/// available through their incremental/event and artifact APIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionAttachment {
+    pub execution_id: ExecutionId,
+    pub state: ExecutionState,
+    pub session_id: SessionId,
+    pub workspace_ref: String,
+    pub event_cursor: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttachmentMode {
+    ForkConversation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentRequest {
+    pub mode: AttachmentMode,
+}
+
 /// The authoritative execution record (spec section 49).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Execution {

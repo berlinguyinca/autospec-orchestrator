@@ -1,0 +1,6 @@
+{"type":"session","version":3,"id":"retry-success","timestamp":"2026-08-28T00:00:00Z","cwd":"/workspace"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"temporary backend failure"}}
+{"type":"agent_end","messages":[],"willRetry":true}
+{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":10,"errorMessage":"temporary backend failure"}

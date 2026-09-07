@@ -1,0 +1,5 @@
+{"type":"turn_start"}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"recovered"}],"stopReason":"stop"}}
+{"type":"auto_retry_end","success":true,"attempt":1}
+{"type":"agent_end","messages":[],"willRetry":false}
+{"type":"agent_settled"}

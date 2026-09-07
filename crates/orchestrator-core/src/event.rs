@@ -18,6 +18,9 @@ pub enum ExecutionEventKind {
     TestsStarted,
     TestsFailed,
     ReviewReady,
+    ExecutionRequeued {
+        failure: FailureClass,
+    },
     ExecutionFailed {
         failure: FailureClass,
     },
@@ -26,6 +29,11 @@ pub enum ExecutionEventKind {
     /// Emitted when the orchestrator detects a hung agent (spec section 95).
     AgentInactive {
         seconds: u64,
+    },
+    ExecutionPaused,
+    ExecutionResumed,
+    ConversationForked {
+        session_id: SessionId,
     },
 }
 

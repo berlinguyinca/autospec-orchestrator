@@ -1,0 +1,5 @@
+{"type":"turn_start"}
+{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"backend unavailable"}}
+{"type":"agent_end","messages":[],"willRetry":false}
+{"type":"auto_retry_end","success":false,"attempt":1,"finalError":"backend unavailable"}
+{"type":"agent_settled"}

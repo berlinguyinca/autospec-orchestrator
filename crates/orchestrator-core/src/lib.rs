@@ -7,6 +7,7 @@
 //!
 //! See `docs/specs/three-plane-execution-architecture.md` sections 77 and 101.
 
+pub mod environment;
 pub mod error;
 pub mod event;
 pub mod execution;
@@ -14,11 +15,16 @@ pub mod ids;
 pub mod labels;
 pub mod manifest;
 pub mod task_packet;
+pub mod telemetry;
 pub mod worker;
 
+pub use environment::EnvironmentFile;
 pub use error::{CoreError, FailureClass};
 pub use event::ExecutionEvent;
-pub use execution::{Execution, ExecutionResult, ExecutionState, Role};
+pub use execution::{
+    AttachmentMode, AttachmentRequest, Execution, ExecutionAttachment, ExecutionControlAction,
+    ExecutionControlRequest, ExecutionResult, ExecutionState, Role,
+};
 pub use ids::{AttemptId, ExecutionId, SessionId, WorkerId};
 pub use labels::OwnershipLabels;
 pub use manifest::{
@@ -26,7 +32,10 @@ pub use manifest::{
     RepositoryReference, RuntimeKind, RuntimeRequirement, ServiceRequirement, TaskReference,
 };
 pub use task_packet::TaskPacket;
-pub use worker::{WorkerCapabilities, WorkerRegistration, WorkerState};
+pub use telemetry::{execution_span, init_tracing};
+pub use worker::{
+    WorkerAdvertisement, WorkerCapabilities, WorkerCapabilityProof, WorkerRegistration, WorkerState,
+};
 
 /// API version prefix for the orchestrator HTTP surface (spec section 75).
 pub const API_VERSION: &str = "v1";

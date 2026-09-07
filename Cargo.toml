@@ -12,6 +12,10 @@ members = [
     "crates/git-worktree",
     "crates/autospec-orchestrator",
     "crates/autospec-worker",
+    "crates/orchestrator-persistence",
+    "crates/execution-storage",
+    "crates/runtime-apptainer",
+    "crates/runtime-podman",
 ]
 
 [workspace.package]
@@ -23,12 +27,17 @@ repository = "https://github.com/InferWeave/autospec-orchestrator"
 authors = ["InferWeave"]
 
 [workspace.dependencies]
+bollard = "0.18"
+execution-storage = { path = "crates/execution-storage" }
 orchestrator-core = { path = "crates/orchestrator-core" }
 orchestrator-api = { path = "crates/orchestrator-api" }
+orchestrator-persistence = { path = "crates/orchestrator-persistence" }
 orchestrator-scheduler = { path = "crates/orchestrator-scheduler" }
 orchestrator-worker = { path = "crates/orchestrator-worker" }
 runtime-traits = { path = "crates/runtime-traits" }
 runtime-docker = { path = "crates/runtime-docker" }
+runtime-apptainer = { path = "crates/runtime-apptainer" }
+runtime-podman = { path = "crates/runtime-podman" }
 harness-traits = { path = "crates/harness-traits" }
 harness-pi = { path = "crates/harness-pi" }
 git-worktree = { path = "crates/git-worktree" }
@@ -38,9 +47,17 @@ async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+futures-util = "0.3"
+libc = "0.2"
+regex = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "json", "uuid", "migrate"] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace"] }

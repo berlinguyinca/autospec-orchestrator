@@ -16,10 +16,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
+execution-storage.workspace = true
+git-worktree.workspace = true
 orchestrator-core.workspace = true
+orchestrator-persistence.workspace = true
 orchestrator-worker.workspace = true
+reqwest.workspace = true
 runtime-docker.workspace = true
+runtime-traits.workspace = true
+serde_json.workspace = true
 harness-pi.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -1,0 +1,1852 @@
+use crate::{AdoptedExecution, ExecutionLifecycle, LifecycleError};
+use async_trait::async_trait;
+use execution_storage::{
+    AllocationPhase, AllocationReceipt, AllocationRequest, ExecutionLayout,
+    ExecutionLifecycleHoldStore, ExecutionStorageManager, JournalStore, ReadyAllocationVerifier,
+};
+use git_worktree::{DiffCapture, Worktree, WorktreeManager};
+use harness_pi::{PiHarness, PiHarnessConfig};
+use harness_traits::{AgentHarness, SessionRef};
+use orchestrator_core::{
+    Execution, ExecutionEvent, ExecutionId, OwnershipLabels, SessionId, TaskPacket,
+};
+use orchestrator_persistence::{ArtifactStore, CleanupAuthority, CleanupDisposition};
+use runtime_docker::{DockerRuntime, TrustedVerifierImage};
+use runtime_traits::{
+    CredentialBroker, EnvironmentHandle, Runtime, VerifiedAgentContainer, VerifiedBindMount,
+};
+use serde::Deserialize;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex},
+};
+
+#[async_trait]
+pub trait RuntimeFactory: Send + Sync {
+    async fn build(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError>;
+    async fn build_for_adoption(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+        environment: &EnvironmentHandle,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        let _ = environment;
+        self.build(execution, receipt).await
+    }
+    /// Constructs exact runtime cleanup authority without minting workload
+    /// credentials, which may be expired when durable cleanup resumes (spec
+    /// sections 36 and 48).
+    async fn build_for_cleanup(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError>;
+    async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError>;
+    async fn revoke_credentials(&self, execution_id: &ExecutionId) -> Result<(), LifecycleError>;
+}
+
+#[async_trait]
+pub trait HarnessFactory: Send + Sync {
+    async fn build(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+        environment: &EnvironmentHandle,
+        worktree: &Worktree,
+    ) -> Result<Arc<dyn AgentHarness>, LifecycleError>;
+}
+
+#[async_trait]
+pub trait EvidenceStore: Send + Sync {
+    async fn persist(
+        &self,
+        execution: &Execution,
+        capture: &DiffCapture,
+    ) -> Result<String, LifecycleError>;
+}
+
+#[derive(Clone)]
+pub struct VerifiedDockerRuntimeFactory {
+    socket: Option<String>,
+    docker_binary: PathBuf,
+    verifier: Arc<dyn ReadyAllocationVerifier>,
+    trusted_verifier: TrustedVerifierImage,
+    credentials: Arc<dyn CredentialBroker>,
+}
+
+impl VerifiedDockerRuntimeFactory {
+    pub fn new(
+        socket: Option<String>,
+        docker_binary: PathBuf,
+        verifier: Arc<dyn ReadyAllocationVerifier>,
+        trusted_verifier: TrustedVerifierImage,
+        credentials: Arc<dyn CredentialBroker>,
+    ) -> Self {
+        Self {
+            socket,
+            docker_binary,
+            verifier,
+            trusted_verifier,
+            credentials,
+        }
+    }
+}
+
+#[async_trait]
+impl RuntimeFactory for VerifiedDockerRuntimeFactory {
+    async fn build(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        let credentials = self
+            .credentials
+            .mint(execution)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        if credentials.expires_at <= chrono::Utc::now()
+            || !credentials
+                .path
+                .starts_with(receipt.mount_path.join("credentials"))
+        {
+            let revocation = self.credentials.revoke(&execution.id).await;
+            return Err(LifecycleError::Step(match revocation {
+                Ok(()) => "credential broker returned invalid execution authority".into(),
+                Err(error) => format!(
+                    "credential broker returned invalid execution authority; credential revocation failed: {error}"
+                ),
+            }));
+        }
+        match DockerRuntime::connect_with_verified_execution_storage(
+            self.socket.as_deref(),
+            Arc::clone(&self.verifier),
+            receipt.clone(),
+            self.trusted_verifier.clone(),
+        )
+        .map(|runtime| Arc::new(runtime.with_credentials(credentials)) as Arc<dyn Runtime>)
+        {
+            Ok(runtime) => Ok(runtime),
+            Err(error) => {
+                let revocation = self.credentials.revoke(&execution.id).await;
+                Err(LifecycleError::Step(match revocation {
+                    Ok(()) => error.to_string(),
+                    Err(revoke) => format!("{error}; credential revocation failed: {revoke}"),
+                }))
+            }
+        }
+    }
+
+    async fn build_for_adoption(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+        environment: &EnvironmentHandle,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        let runtime = self.build(execution, receipt).await?;
+        let credentials = self
+            .credentials
+            .mint(execution)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        if credentials.expires_at <= chrono::Utc::now()
+            || environment.credentials_path.as_ref() != Some(&credentials.path)
+        {
+            return Err(LifecycleError::Step(
+                "adopted runtime credential differs from broker authority; runtime recreation is required"
+                    .into(),
+            ));
+        }
+        Ok(runtime)
+    }
+
+    async fn build_for_cleanup(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+    ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        DockerRuntime::connect_for_cleanup(
+            self.socket.as_deref(),
+            receipt.clone(),
+            &execution.labels,
+        )
+        .map(|runtime| Arc::new(runtime) as Arc<dyn Runtime>)
+        .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError> {
+        let docker = self.docker_binary.clone();
+        let socket = self.socket.clone();
+        let container = DockerRuntime::agent_container_name(&execution.id);
+        tokio::task::spawn_blocking(move || {
+            let mut command = docker_command(&docker, socket.as_deref());
+            let output = command
+                .args([
+                    "stats",
+                    "--no-stream",
+                    "--format",
+                    "{{.CPUPerc}}",
+                    &container,
+                ])
+                .output()
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+            if !output.status.success() {
+                return Err(LifecycleError::Step(format!(
+                    "Docker CPU probe failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            String::from_utf8(output.stdout)
+                .map_err(|error| LifecycleError::Step(error.to_string()))?
+                .trim()
+                .trim_end_matches('%')
+                .parse::<f64>()
+                .map_err(|error| LifecycleError::Step(error.to_string()))
+        })
+        .await
+        .map_err(|error| LifecycleError::Step(error.to_string()))?
+    }
+
+    async fn revoke_credentials(&self, execution_id: &ExecutionId) -> Result<(), LifecycleError> {
+        self.credentials
+            .revoke(execution_id)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedPiHarnessFactory {
+    verifier: Arc<dyn ReadyAllocationVerifier>,
+    docker_socket: Option<String>,
+    docker_binary: PathBuf,
+    pi_executable: String,
+    tools: Vec<String>,
+    skills: Vec<PathBuf>,
+}
+
+impl VerifiedPiHarnessFactory {
+    pub fn new(
+        verifier: Arc<dyn ReadyAllocationVerifier>,
+        docker_socket: Option<String>,
+        docker_binary: PathBuf,
+        pi_executable: String,
+        tools: Vec<String>,
+        skills: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            verifier,
+            docker_socket,
+            docker_binary,
+            pi_executable,
+            tools,
+            skills,
+        }
+    }
+}
+
+#[async_trait]
+impl HarnessFactory for VerifiedPiHarnessFactory {
+    async fn build(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+        environment: &EnvironmentHandle,
+        _: &Worktree,
+    ) -> Result<Arc<dyn AgentHarness>, LifecycleError> {
+        let mut config = PiHarnessConfig::for_ready_allocation(
+            Arc::clone(&self.verifier),
+            receipt.clone(),
+            environment.verified_agent_container.clone(),
+        )
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        config.docker_binary = self.docker_binary.clone();
+        config.docker_host = self.docker_socket.clone();
+        config.pi_executable = self.pi_executable.clone();
+        config.tools = self.tools.clone();
+        config.skills = self.skills.clone();
+        let credential_path = environment
+            .credentials_path
+            .as_ref()
+            .ok_or_else(|| LifecycleError::Step("Pi harness lacks credential authority".into()))?;
+        let credential = std::fs::read(credential_path)
+            .map_err(|error| LifecycleError::Step(format!("read Pi credential: {error}")))?;
+        let token = credential
+            .split(|byte| *byte == b'\n')
+            .next()
+            .filter(|token| token.len() >= 32)
+            .ok_or_else(|| LifecycleError::Step("Pi credential is malformed".into()))?;
+        config.credential_redactions = vec![token.to_vec()];
+        config.model_policy = Some(execution.manifest.agent.model_policy.clone());
+        Ok(Arc::new(PiHarness::new(config)))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FilesystemEvidenceStore {
+    root: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct ContentAddressedEvidenceStore {
+    artifacts: Arc<dyn ArtifactStore>,
+}
+
+impl ContentAddressedEvidenceStore {
+    pub fn new(artifacts: Arc<dyn ArtifactStore>) -> Self {
+        Self { artifacts }
+    }
+}
+
+#[async_trait]
+impl EvidenceStore for ContentAddressedEvidenceStore {
+    async fn persist(
+        &self,
+        execution: &Execution,
+        capture: &DiffCapture,
+    ) -> Result<String, LifecycleError> {
+        let attempt_id = execution
+            .attempt_id
+            .as_ref()
+            .ok_or_else(|| LifecycleError::Step("evidence lacks attempt id".into()))?;
+        let name = format!("diff-{attempt_id}.patch");
+        self.artifacts
+            .store(
+                &execution.id,
+                &name,
+                "text/x-diff; charset=utf-8",
+                capture.patch.as_bytes(),
+            )
+            .await
+            .map(|artifact| artifact.sha256)
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+}
+
+impl FilesystemEvidenceStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+#[async_trait]
+impl EvidenceStore for FilesystemEvidenceStore {
+    async fn persist(
+        &self,
+        execution: &Execution,
+        capture: &DiffCapture,
+    ) -> Result<String, LifecycleError> {
+        let root = self.root.clone();
+        let execution_id = execution.id.to_string();
+        let attempt_id = execution
+            .attempt_id
+            .as_ref()
+            .map(ToString::to_string)
+            .ok_or_else(|| LifecycleError::Step("evidence lacks attempt id".into()))?;
+        let bytes = capture.patch.as_bytes().to_vec();
+        tokio::task::spawn_blocking(move || {
+            persist_evidence_file(&root, &execution_id, &attempt_id, &bytes)
+        })
+        .await
+        .map_err(|error| LifecycleError::Step(error.to_string()))?
+    }
+}
+
+fn persist_evidence_file(
+    root: &Path,
+    execution_id: &str,
+    attempt_id: &str,
+    bytes: &[u8],
+) -> Result<String, LifecycleError> {
+    validate_evidence_component(execution_id, "execution id")?;
+    validate_evidence_component(attempt_id, "attempt id")?;
+    let root = root
+        .canonicalize()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    let directory = root.join("evidence").join(execution_id);
+    std::fs::create_dir_all(&directory).map_err(|error| LifecycleError::Step(error.to_string()))?;
+    let canonical_directory = directory
+        .canonicalize()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !canonical_directory.starts_with(&root) || canonical_directory != directory {
+        return Err(LifecycleError::Step(
+            "evidence directory escaped its trusted root".into(),
+        ));
+    }
+    let path = directory.join(format!("{attempt_id}.json"));
+    if std::fs::symlink_metadata(&path).is_ok() {
+        return Err(LifecycleError::Step(
+            "evidence artifact already exists".into(),
+        ));
+    }
+    let temporary = directory.join(format!(".{attempt_id}.tmp"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    std::fs::rename(&temporary, &path).map_err(|error| LifecycleError::Step(error.to_string()))?;
+    File::open(&directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn validate_evidence_component(value: &str, purpose: &str) -> Result<(), LifecycleError> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.as_bytes().contains(&0)
+    {
+        return Err(LifecycleError::Step(format!(
+            "{purpose} is not a safe path component"
+        )));
+    }
+    Ok(())
+}
+
+/// Production composition of the worker lifecycle's independently testable
+/// storage, Git, runtime, harness, and evidence boundaries.
+struct KnownSecret {
+    token: Vec<u8>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub struct SystemExecutionLifecycle {
+    state_root: PathBuf,
+    verifier: Arc<dyn ReadyAllocationVerifier>,
+    docker_binary: PathBuf,
+    docker_socket: Option<String>,
+    storage: Arc<dyn ExecutionStorageManager>,
+    worktrees: Arc<dyn WorktreeManager>,
+    runtimes: Arc<dyn RuntimeFactory>,
+    harnesses: Arc<dyn HarnessFactory>,
+    evidence: Arc<dyn EvidenceStore>,
+    active_runtimes: Mutex<BTreeMap<ExecutionId, Arc<dyn Runtime>>>,
+    active_harnesses: Mutex<BTreeMap<ExecutionId, Arc<dyn AgentHarness>>>,
+    known_secrets: Mutex<BTreeMap<ExecutionId, KnownSecret>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemRecoveryConfig {
+    pub state_root: PathBuf,
+    pub verifier: Arc<dyn ReadyAllocationVerifier>,
+    pub docker_binary: PathBuf,
+    pub docker_socket: Option<String>,
+}
+
+impl SystemExecutionLifecycle {
+    pub fn new(
+        recovery: SystemRecoveryConfig,
+        storage: Arc<dyn ExecutionStorageManager>,
+        worktrees: Arc<dyn WorktreeManager>,
+        runtimes: Arc<dyn RuntimeFactory>,
+        harnesses: Arc<dyn HarnessFactory>,
+        evidence: Arc<dyn EvidenceStore>,
+    ) -> Self {
+        Self {
+            state_root: recovery.state_root,
+            verifier: recovery.verifier,
+            docker_binary: recovery.docker_binary,
+            docker_socket: recovery.docker_socket,
+            storage,
+            worktrees,
+            runtimes,
+            harnesses,
+            evidence,
+            active_runtimes: Mutex::new(BTreeMap::new()),
+            active_harnesses: Mutex::new(BTreeMap::new()),
+            known_secrets: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn runtime(&self, id: &ExecutionId) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        self.active_runtimes
+            .lock()
+            .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| LifecycleError::Step(format!("runtime is not active for {id}")))
+    }
+
+    fn harness(&self, id: &ExecutionId) -> Result<Arc<dyn AgentHarness>, LifecycleError> {
+        self.active_harnesses
+            .lock()
+            .map_err(|_| LifecycleError::Step("harness registry lock poisoned".into()))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| LifecycleError::Step(format!("harness is not active for {id}")))
+    }
+
+    fn remember_and_validate_credentials(
+        &self,
+        execution: &Execution,
+        environment: &EnvironmentHandle,
+    ) -> Result<(), LifecycleError> {
+        let path = environment.credentials_path.as_ref().ok_or_else(|| {
+            LifecycleError::Step("execution runtime lacks credential authority".into())
+        })?;
+        let bytes = std::fs::read(path)
+            .map_err(|error| LifecycleError::Step(format!("read credential authority: {error}")))?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| LifecycleError::Step("credential authority is malformed".into()))?;
+        let mut lines = text.lines();
+        let token = lines
+            .next()
+            .filter(|token| token.len() >= 32)
+            .ok_or_else(|| LifecycleError::Step("credential authority is malformed".into()))?;
+        let expires_at = lines
+            .next()
+            .and_then(|expiry| expiry.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .ok_or_else(|| LifecycleError::Step("credential authority is malformed".into()))?;
+        if expires_at <= chrono::Utc::now() {
+            return Err(LifecycleError::Step(
+                "execution credential expired before use".into(),
+            ));
+        }
+        self.known_secrets
+            .lock()
+            .map_err(|_| LifecycleError::Step("secret registry lock poisoned".into()))?
+            .insert(
+                execution.id.clone(),
+                KnownSecret {
+                    token: token.as_bytes().to_vec(),
+                    expires_at,
+                },
+            );
+        Ok(())
+    }
+
+    fn ensure_credentials_live(&self, id: &ExecutionId) -> Result<(), LifecycleError> {
+        let secrets = self
+            .known_secrets
+            .lock()
+            .map_err(|_| LifecycleError::Step("secret registry lock poisoned".into()))?;
+        let secret = secrets
+            .get(id)
+            .ok_or_else(|| LifecycleError::Step("credential authority is unavailable".into()))?;
+        if secret.expires_at <= chrono::Utc::now() {
+            return Err(LifecycleError::Step(
+                "execution credential expired before use".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_secret(&self, id: &ExecutionId, bytes: &[u8]) -> Result<(), LifecycleError> {
+        let secrets = self
+            .known_secrets
+            .lock()
+            .map_err(|_| LifecycleError::Step("secret registry lock poisoned".into()))?;
+        if secrets
+            .get(id)
+            .is_some_and(|secret| contains_bytes(bytes, &secret.token))
+        {
+            return Err(LifecycleError::Step(
+                "credential exfiltration was rejected".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+#[derive(Deserialize)]
+struct DurableWorktreeOwner {
+    labels: BTreeMap<String, String>,
+    base_sha: String,
+    branch: String,
+}
+
+#[derive(Deserialize)]
+struct DurableCleanupHandles {
+    receipt: Option<AllocationReceipt>,
+    worktree: Option<DurableWorktreeHandle>,
+    runtime: Option<DurableRuntimeHandle>,
+    #[serde(default)]
+    runtime_selector: Option<OwnershipLabels>,
+    session: Option<DurableSessionHandle>,
+}
+
+#[derive(Deserialize)]
+struct DurableWorktreeHandle {
+    execution_id: ExecutionId,
+    path: String,
+    branch: String,
+    base_sha: String,
+    repository: String,
+}
+
+#[derive(Deserialize)]
+struct DurableRuntimeHandle {
+    execution_id: ExecutionId,
+    network: String,
+    agent_container: String,
+    container_id: String,
+    daemon_id: String,
+    labels: OwnershipLabels,
+    mounts: Vec<DurableMountHandle>,
+    service_containers: Vec<String>,
+    volumes: Vec<String>,
+    credentials_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct DurableMountHandle {
+    source: PathBuf,
+    target: String,
+    writable: bool,
+}
+
+#[derive(Deserialize)]
+struct DurableSessionHandle {
+    id: SessionId,
+    path: String,
+    execution_id: ExecutionId,
+    worktree_path: String,
+}
+
+fn durable_worktree(handle: DurableWorktreeHandle) -> Worktree {
+    Worktree {
+        execution_id: handle.execution_id,
+        path: handle.path,
+        branch: handle.branch,
+        base_sha: handle.base_sha,
+        repository: handle.repository,
+    }
+}
+
+fn durable_environment(handle: DurableRuntimeHandle) -> EnvironmentHandle {
+    EnvironmentHandle {
+        execution_id: handle.execution_id,
+        network: handle.network,
+        agent_container: handle.agent_container,
+        verified_agent_container: VerifiedAgentContainer {
+            container_id: handle.container_id,
+            daemon_id: handle.daemon_id,
+            labels: handle.labels,
+            mounts: handle
+                .mounts
+                .into_iter()
+                .map(|mount| VerifiedBindMount {
+                    source: mount.source,
+                    target: mount.target,
+                    writable: mount.writable,
+                })
+                .collect(),
+        },
+        service_containers: handle.service_containers,
+        volumes: handle.volumes,
+        credentials_path: handle.credentials_path,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerContainerInspect {
+    id: String,
+    state: DockerContainerState,
+    config: DockerContainerConfig,
+    mounts: Vec<DockerContainerMount>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerContainerState {
+    running: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerContainerConfig {
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerContainerMount {
+    #[serde(rename = "Type")]
+    mount_type: String,
+    source: PathBuf,
+    destination: String,
+    #[serde(rename = "RW")]
+    writable: bool,
+}
+
+fn docker_container_capability(
+    docker: &Path,
+    socket: Option<&str>,
+    receipt: &AllocationReceipt,
+    layout: &ExecutionLayout,
+    container_id: &str,
+    execution: &Execution,
+) -> Result<runtime_traits::VerifiedAgentContainer, LifecycleError> {
+    let daemon = docker_command(docker, socket)
+        .args(["info", "--format={{.ID}}"])
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !daemon.status.success()
+        || String::from_utf8_lossy(&daemon.stdout).trim() != receipt.docker_bind.daemon_id
+    {
+        return Err(LifecycleError::Step(
+            "Docker daemon identity changed during restart adoption".into(),
+        ));
+    }
+    let output = docker_command(docker, socket)
+        .args(["inspect", "--type", "container", container_id])
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !output.status.success() {
+        return Err(LifecycleError::Step(
+            "durable Pi container is unavailable during restart adoption".into(),
+        ));
+    }
+    let mut inspections: Vec<DockerContainerInspect> = serde_json::from_slice(&output.stdout)
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if inspections.len() != 1 {
+        return Err(LifecycleError::Step(
+            "Docker returned an ambiguous container inspection".into(),
+        ));
+    }
+    let inspection = inspections.pop().expect("length checked");
+    if inspection.id != container_id
+        || !inspection.state.running
+        || inspection.config.labels != receipt.labels.to_map()
+    {
+        return Err(LifecycleError::Step(
+            "durable Pi container authority changed during restart adoption".into(),
+        ));
+    }
+    let mut mounts = Vec::with_capacity(inspection.mounts.len());
+    for mount in inspection.mounts {
+        if mount.mount_type != "bind" {
+            return Err(LifecycleError::Step(
+                "adopted agent container has a non-bind mount".into(),
+            ));
+        }
+        mounts.push(runtime_traits::VerifiedBindMount {
+            source: mount
+                .source
+                .canonicalize()
+                .map_err(|error| LifecycleError::Step(error.to_string()))?,
+            target: mount.destination,
+            writable: mount.writable,
+        });
+    }
+    mounts.sort();
+    let expected_repository = layout
+        .repository
+        .canonicalize()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    let expected_conversation = layout
+        .conversation
+        .canonicalize()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !mounts.iter().any(|mount| {
+        mount.source == expected_repository && mount.target == "/workspace" && mount.writable
+    }) || !mounts.iter().any(|mount| {
+        mount.source == expected_conversation && mount.target == "/session" && mount.writable
+    }) || mounts.iter().any(|mount| mount.source == layout.session)
+    {
+        return Err(LifecycleError::Step(
+            "adopted agent container mounts do not match durable execution layout".into(),
+        ));
+    }
+    let mut expected_containers =
+        BTreeSet::from([DockerRuntime::agent_container_name(&execution.id)]);
+    expected_containers.extend(
+        execution
+            .manifest
+            .services
+            .iter()
+            .map(|service| DockerRuntime::service_container_name(&execution.id, &service.name)),
+    );
+    let all_containers = docker_resource_names(
+        docker,
+        socket,
+        &["ps", "-a"],
+        &receipt.labels.execution_id,
+        "{{.Names}}",
+    )?;
+    let running_containers = docker_resource_names(
+        docker,
+        socket,
+        &["ps"],
+        &receipt.labels.execution_id,
+        "{{.Names}}",
+    )?;
+    if all_containers != expected_containers || running_containers != expected_containers {
+        return Err(LifecycleError::Step(
+            "durable runtime container set is incomplete, stopped, or contains extras".into(),
+        ));
+    }
+    for container in &expected_containers {
+        let labels = docker_resource_labels(
+            docker,
+            socket,
+            &[
+                "inspect",
+                "--type",
+                "container",
+                "--format={{json .Config.Labels}}",
+            ],
+            container,
+        )?;
+        if labels != receipt.labels.to_map() {
+            return Err(LifecycleError::Step(format!(
+                "durable runtime container {container} has foreign or incomplete labels"
+            )));
+        }
+    }
+    let expected_network = DockerRuntime::network_name(&receipt.labels.execution_id);
+    let networks = docker_resource_names(
+        docker,
+        socket,
+        &["network", "ls"],
+        &receipt.labels.execution_id,
+        "{{.Name}}",
+    )?;
+    if networks != BTreeSet::from([expected_network.clone()]) {
+        return Err(LifecycleError::Step(
+            "durable runtime network set differs from the manifest".into(),
+        ));
+    }
+    if docker_resource_labels(
+        docker,
+        socket,
+        &["network", "inspect", "--format={{json .Labels}}"],
+        &expected_network,
+    )? != receipt.labels.to_map()
+    {
+        return Err(LifecycleError::Step(
+            "durable runtime network has foreign or incomplete labels".into(),
+        ));
+    }
+    let volumes = docker_resource_names(
+        docker,
+        socket,
+        &["volume", "ls"],
+        &receipt.labels.execution_id,
+        "{{.Name}}",
+    )?;
+    if !volumes.is_empty() {
+        return Err(LifecycleError::Step(
+            "durable runtime contains unexpected Docker volumes".into(),
+        ));
+    }
+    Ok(runtime_traits::VerifiedAgentContainer {
+        container_id: container_id.into(),
+        daemon_id: receipt.docker_bind.daemon_id.clone(),
+        labels: receipt.labels.clone(),
+        mounts,
+    })
+}
+
+fn docker_resource_labels(
+    docker: &Path,
+    socket: Option<&str>,
+    prefix: &[&str],
+    resource: &str,
+) -> Result<BTreeMap<String, String>, LifecycleError> {
+    let output = docker_command(docker, socket)
+        .args(prefix)
+        .arg(resource)
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !output.status.success() {
+        return Err(LifecycleError::Step(format!(
+            "Docker resource label inspection failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    serde_json::from_slice(String::from_utf8_lossy(&output.stdout).trim().as_bytes())
+        .map_err(|error| LifecycleError::Step(format!("malformed Docker resource labels: {error}")))
+}
+
+fn docker_resource_names(
+    docker: &Path,
+    socket: Option<&str>,
+    prefix: &[&str],
+    execution_id: &ExecutionId,
+    format: &str,
+) -> Result<BTreeSet<String>, LifecycleError> {
+    let mut command = docker_command(docker, socket);
+    command.args(prefix).args([
+        "--filter",
+        "label=autospec.managed=true",
+        "--filter",
+        &format!("label=autospec.execution_id={execution_id}"),
+        "--format",
+        format,
+    ]);
+    let output = command
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !output.status.success() {
+        return Err(LifecycleError::Step(format!(
+            "Docker resource inventory failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn docker_container_id(
+    docker: &Path,
+    socket: Option<&str>,
+    container: &str,
+) -> Result<String, LifecycleError> {
+    let output = docker_command(docker, socket)
+        .args([
+            "inspect",
+            "--type",
+            "container",
+            "--format={{.Id}}",
+            container,
+        ])
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !output.status.success() || id.is_empty() {
+        return Err(LifecycleError::Step(
+            "durable agent container identity is unavailable".into(),
+        ));
+    }
+    Ok(id)
+}
+
+fn docker_command(binary: &Path, socket: Option<&str>) -> Command {
+    let mut command = Command::new(binary);
+    if let Some(socket) = socket {
+        command.env("DOCKER_HOST", socket);
+    }
+    command
+}
+
+#[async_trait]
+impl ExecutionLifecycle for SystemExecutionLifecycle {
+    async fn allocate(&self, execution: &Execution) -> Result<AllocationReceipt, LifecycleError> {
+        let storage = Arc::clone(&self.storage);
+        let request = AllocationRequest {
+            labels: execution.labels.clone(),
+            disk_gib: execution.manifest.runtime.disk_gib,
+        };
+        tokio::task::spawn_blocking(move || storage.allocate(&request))
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn create_worktree(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+    ) -> Result<Worktree, LifecycleError> {
+        let worktrees = Arc::clone(&self.worktrees);
+        let labels = execution.labels.clone();
+        let repository = execution.manifest.repository.clone();
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || {
+            let base = repository
+                .base_sha
+                .as_deref()
+                .unwrap_or(&repository.base_ref);
+            let branch = repository.branch.as_deref().ok_or_else(|| {
+                LifecycleError::Step("execution lacks an AutoSpec-provided branch".into())
+            })?;
+            worktrees
+                .create_in(&labels, &repository.repo, base, branch, &receipt)
+                .map_err(|error| LifecycleError::Step(error.to_string()))
+        })
+        .await
+        .map_err(|error| LifecycleError::Step(error.to_string()))?
+    }
+
+    async fn provision(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+        _: &Worktree,
+    ) -> Result<EnvironmentHandle, LifecycleError> {
+        let runtime = self.runtimes.build(execution, receipt).await?;
+        self.active_runtimes
+            .lock()
+            .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
+            .insert(execution.id.clone(), Arc::clone(&runtime));
+        let environment = match runtime
+            .provision(
+                &execution.labels,
+                &execution.manifest.runtime,
+                &execution.manifest.services,
+            )
+            .await
+        {
+            Ok(environment) => environment,
+            Err(error) => {
+                let revocation = self.runtimes.revoke_credentials(&execution.id).await;
+                return Err(LifecycleError::Step(match revocation {
+                    Ok(()) => error.to_string(),
+                    Err(revoke) => format!("{error}; credential revocation failed: {revoke}"),
+                }));
+            }
+        };
+        Ok(environment)
+    }
+
+    async fn start(
+        &self,
+        execution: &Execution,
+        receipt: &AllocationReceipt,
+        environment: &EnvironmentHandle,
+        worktree: &Worktree,
+        packet: &TaskPacket,
+    ) -> Result<SessionRef, LifecycleError> {
+        self.remember_and_validate_credentials(execution, environment)?;
+        self.reject_secret(
+            &execution.id,
+            &serde_json::to_vec(packet).map_err(|error| LifecycleError::Step(error.to_string()))?,
+        )?;
+        let packet_directory = Path::new(&worktree.path).join(".autospec");
+        match std::fs::create_dir(&packet_directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(&packet_directory)
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(LifecycleError::Step(
+                        "TaskPacket staging path is not a real directory".into(),
+                    ));
+                }
+            }
+            Err(error) => return Err(LifecycleError::Step(error.to_string())),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&packet_directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        }
+        self.verifier
+            .verify_ready(receipt)
+            .and_then(|verified| verified.verify_directory(&packet_directory))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let harness = self
+            .harnesses
+            .build(execution, receipt, environment, worktree)
+            .await?;
+        let session = harness
+            .start(packet)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        self.active_harnesses
+            .lock()
+            .map_err(|_| LifecycleError::Step("harness registry lock poisoned".into()))?
+            .insert(execution.id.clone(), harness);
+        Ok(session)
+    }
+
+    async fn resume(
+        &self,
+        execution: &Execution,
+        _: &AllocationReceipt,
+        environment: &EnvironmentHandle,
+        session: &SessionRef,
+    ) -> Result<(), LifecycleError> {
+        self.remember_and_validate_credentials(execution, environment)?;
+        self.harness(&execution.id)?
+            .resume_interactive(session)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn pause(
+        &self,
+        execution: &Execution,
+        session: &SessionRef,
+    ) -> Result<(), LifecycleError> {
+        self.harness(&execution.id)?
+            .stop(session)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn fork_conversation(
+        &self,
+        execution: &Execution,
+        session: &SessionRef,
+        target: &SessionId,
+    ) -> Result<SessionRef, LifecycleError> {
+        self.ensure_credentials_live(&execution.id)?;
+        self.harness(&execution.id)?
+            .fork_conversation_as(session, target)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn poll(
+        &self,
+        execution: &Execution,
+        session: &SessionRef,
+    ) -> Result<Vec<ExecutionEvent>, LifecycleError> {
+        self.ensure_credentials_live(&execution.id)?;
+        let events = self
+            .harness(&execution.id)?
+            .poll_events(session)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        self.reject_secret(
+            &execution.id,
+            &serde_json::to_vec(&events)
+                .map_err(|error| LifecycleError::Step(error.to_string()))?,
+        )?;
+        Ok(events)
+    }
+
+    async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError> {
+        self.runtimes.cpu_percent(execution).await
+    }
+
+    async fn stop(
+        &self,
+        execution: &Execution,
+        session: &SessionRef,
+    ) -> Result<(), LifecycleError> {
+        let harness = self.harness(&execution.id)?;
+        harness
+            .stop(session)
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        self.active_harnesses
+            .lock()
+            .map_err(|_| LifecycleError::Step("harness registry lock poisoned".into()))?
+            .remove(&execution.id);
+        Ok(())
+    }
+
+    async fn capture(&self, worktree: &Worktree) -> Result<DiffCapture, LifecycleError> {
+        let manager = Arc::clone(&self.worktrees);
+        let worktree = worktree.clone();
+        let execution_id = worktree.execution_id.clone();
+        let worktree_path = worktree.path.clone();
+        let capture = tokio::task::spawn_blocking(move || manager.capture_diff(&worktree))
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        self.reject_secret(&execution_id, capture.patch.as_bytes())?;
+        let root = Path::new(&worktree_path)
+            .canonicalize()
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        for changed in &capture.changed_files {
+            let candidate = root.join(changed);
+            let metadata = match std::fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(LifecycleError::Step(error.to_string())),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(LifecycleError::Step(
+                    "changed evidence path is not a regular file".into(),
+                ));
+            }
+            let canonical = candidate
+                .canonicalize()
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+            if !canonical.starts_with(&root) {
+                return Err(LifecycleError::Step(
+                    "changed evidence path escaped its worktree".into(),
+                ));
+            }
+            self.reject_secret(
+                &execution_id,
+                &std::fs::read(canonical)
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?,
+            )?;
+        }
+        Ok(capture)
+    }
+
+    async fn persist_evidence(
+        &self,
+        execution: &Execution,
+        capture: &DiffCapture,
+    ) -> Result<String, LifecycleError> {
+        self.reject_secret(&execution.id, capture.patch.as_bytes())?;
+        self.evidence.persist(execution, capture).await
+    }
+
+    async fn destroy_runtime(&self, execution: &Execution) -> Result<(), LifecycleError> {
+        let runtime = self.runtime(&execution.id)?;
+        let destroy = runtime.destroy(&execution.labels).await;
+        let revoke = self.runtimes.revoke_credentials(&execution.id).await;
+        if destroy.is_ok() && revoke.is_ok() {
+            self.active_runtimes
+                .lock()
+                .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
+                .remove(&execution.id);
+            self.known_secrets
+                .lock()
+                .map_err(|_| LifecycleError::Step("secret registry lock poisoned".into()))?
+                .remove(&execution.id);
+            return Ok(());
+        }
+        Err(LifecycleError::Step(format!(
+            "runtime destroy: {}; credential revoke: {}",
+            destroy
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_owned()),
+            revoke
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_owned())
+        )))
+    }
+
+    async fn destroy_worktree(&self, worktree: &Worktree) -> Result<(), LifecycleError> {
+        let manager = Arc::clone(&self.worktrees);
+        let worktree = worktree.clone();
+        tokio::task::spawn_blocking(move || manager.destroy(&worktree))
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn ack_destroy_worktree(&self, worktree: &Worktree) -> Result<(), LifecycleError> {
+        let manager = Arc::clone(&self.worktrees);
+        let worktree = worktree.clone();
+        tokio::task::spawn_blocking(move || manager.ack_destroy(&worktree))
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn recover_interrupted_worktree(
+        &self,
+        execution: &Execution,
+        _receipt: Option<&AllocationReceipt>,
+    ) -> Result<(), LifecycleError> {
+        let layout = ExecutionLayout::new(&self.state_root, &execution.id)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let manager = Arc::clone(&self.worktrees);
+        let labels = execution.labels.clone();
+        tokio::task::spawn_blocking(move || {
+            manager.recover_interrupted_create(&labels, &layout.repository)
+        })
+        .await
+        .map_err(|error| LifecycleError::Step(error.to_string()))?
+        .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn release_storage(&self, receipt: &AllocationReceipt) -> Result<(), LifecycleError> {
+        let storage = Arc::clone(&self.storage);
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || storage.release(&receipt))
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn ack_release_storage(&self, receipt: &AllocationReceipt) -> Result<(), LifecycleError> {
+        let storage = Arc::clone(&self.storage);
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || storage.ack_release(&receipt))
+            .await
+            .map_err(|error| LifecycleError::Step(error.to_string()))?
+            .map_err(|error| LifecycleError::Step(error.to_string()))
+    }
+
+    async fn cleanup_authority(
+        &self,
+        authority: &CleanupAuthority,
+        execution: &Execution,
+    ) -> Result<(), LifecycleError> {
+        let handles: DurableCleanupHandles = serde_json::from_value(authority.handles.clone())
+            .map_err(|error| LifecycleError::Step(format!("decode cleanup authority: {error}")))?;
+        let layout = ExecutionLayout::new(&self.state_root, &authority.execution_id)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let mut receipt = handles.receipt;
+        if receipt.is_none() && layout.root.exists() {
+            let storage = Arc::clone(&self.storage);
+            let request = AllocationRequest {
+                labels: execution.labels.clone(),
+                disk_gib: execution.manifest.runtime.disk_gib,
+            };
+            receipt = Some(
+                tokio::task::spawn_blocking(move || storage.allocate(&request))
+                    .await
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?,
+            );
+        }
+        if let Some(receipt) = &receipt {
+            if receipt.labels.execution_id != authority.execution_id {
+                return Err(LifecycleError::Step(
+                    "cleanup receipt belongs to another execution".into(),
+                ));
+            }
+            self.verifier
+                .verify_ready(receipt)
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        }
+        let mut worktree = handles.worktree.map(|handle| Worktree {
+            execution_id: handle.execution_id,
+            path: handle.path,
+            branch: handle.branch,
+            base_sha: handle.base_sha,
+            repository: handle.repository,
+        });
+        if worktree
+            .as_ref()
+            .is_some_and(|worktree| worktree.execution_id != authority.execution_id)
+        {
+            return Err(LifecycleError::Step(
+                "cleanup worktree belongs to another execution".into(),
+            ));
+        }
+        if worktree.is_none() && layout.repository.join(".autospec-owner.json").is_file() {
+            let owner: DurableWorktreeOwner = serde_json::from_slice(
+                &std::fs::read(layout.repository.join(".autospec-owner.json"))
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?,
+            )
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+            if owner.labels != execution.labels.to_map() {
+                return Err(LifecycleError::Step(
+                    "recovered worktree owner differs from cleanup authority".into(),
+                ));
+            }
+            worktree = Some(Worktree {
+                execution_id: authority.execution_id.clone(),
+                path: layout.repository.to_string_lossy().into_owned(),
+                branch: owner.branch,
+                base_sha: owner.base_sha,
+                repository: execution.manifest.repository.repo.clone(),
+            });
+        }
+        let environment = handles.runtime.map(|handle| EnvironmentHandle {
+            execution_id: handle.execution_id,
+            network: handle.network,
+            agent_container: handle.agent_container,
+            verified_agent_container: VerifiedAgentContainer {
+                container_id: handle.container_id,
+                daemon_id: handle.daemon_id,
+                labels: handle.labels,
+                mounts: handle
+                    .mounts
+                    .into_iter()
+                    .map(|mount| VerifiedBindMount {
+                        source: mount.source,
+                        target: mount.target,
+                        writable: mount.writable,
+                    })
+                    .collect(),
+            },
+            service_containers: handle.service_containers,
+            volumes: handle.volumes,
+            credentials_path: handle.credentials_path,
+        });
+        if environment.as_ref().is_some_and(|environment| {
+            environment.execution_id != authority.execution_id
+                || environment.verified_agent_container.labels.execution_id
+                    != authority.execution_id
+        }) {
+            return Err(LifecycleError::Step(
+                "cleanup runtime belongs to another execution".into(),
+            ));
+        }
+        let mut session = handles.session.map(|handle| SessionRef {
+            id: handle.id,
+            path: handle.path,
+            execution_id: handle.execution_id,
+            worktree_path: handle.worktree_path,
+        });
+        if session
+            .as_ref()
+            .is_some_and(|session| session.execution_id != authority.execution_id)
+        {
+            return Err(LifecycleError::Step(
+                "cleanup session belongs to another execution".into(),
+            ));
+        }
+
+        if session.is_none() && environment.is_some() {
+            let holds = ExecutionLifecycleHoldStore::new(&self.state_root)
+                .and_then(|store| store.list(&authority.execution_id))
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+            let matching = holds
+                .into_iter()
+                .filter(|hold| hold.labels == execution.labels)
+                .collect::<Vec<_>>();
+            if matching.len() > 1 {
+                return Err(LifecycleError::Step(
+                    "cleanup authority has multiple durable Pi holds".into(),
+                ));
+            }
+            if let Some(hold) = matching.first() {
+                session = Some(SessionRef {
+                    id: SessionId::new(&hold.session_id),
+                    path: layout.session.to_string_lossy().into_owned(),
+                    execution_id: authority.execution_id.clone(),
+                    worktree_path: layout.repository.to_string_lossy().into_owned(),
+                });
+            }
+        }
+
+        let runtime_present = if let Some(receipt) = &receipt {
+            !docker_resource_names(
+                &self.docker_binary,
+                self.docker_socket.as_deref(),
+                &["ps", "-a"],
+                &receipt.labels.execution_id,
+                "{{.Names}}",
+            )?
+            .is_empty()
+                || !docker_resource_names(
+                    &self.docker_binary,
+                    self.docker_socket.as_deref(),
+                    &["network", "ls"],
+                    &receipt.labels.execution_id,
+                    "{{.Name}}",
+                )?
+                .is_empty()
+                || !docker_resource_names(
+                    &self.docker_binary,
+                    self.docker_socket.as_deref(),
+                    &["volume", "ls"],
+                    &receipt.labels.execution_id,
+                    "{{.Name}}",
+                )?
+                .is_empty()
+        } else {
+            false
+        };
+        if let Some(environment) = &environment {
+            let receipt = receipt.as_ref().ok_or_else(|| {
+                LifecycleError::Step("runtime cleanup lacks storage receipt".into())
+            })?;
+            if let (Some(worktree), Some(_session)) = (&worktree, &session) {
+                let harness = self
+                    .harnesses
+                    .build(execution, receipt, environment, worktree)
+                    .await?;
+                harness
+                    .recover_abandoned()
+                    .await
+                    .map_err(|error| LifecycleError::Step(error.to_string()))?;
+            }
+        }
+        if runtime_present {
+            let receipt = receipt.as_ref().ok_or_else(|| {
+                LifecycleError::Step("runtime cleanup lacks storage receipt".into())
+            })?;
+            self.runtimes
+                .build_for_cleanup(execution, receipt)
+                .await?
+                .destroy(&receipt.labels)
+                .await
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        }
+        if let Some(worktree) = worktree {
+            self.destroy_worktree(&worktree).await?;
+        }
+        self.recover_interrupted_worktree(execution, receipt.as_ref())
+            .await?;
+        if let Some(receipt) = receipt {
+            self.release_storage(&receipt).await?;
+        }
+        Ok(())
+    }
+
+    async fn cleanup_authority_step(
+        &self,
+        authority: &CleanupAuthority,
+        execution: &Execution,
+        disposition: CleanupDisposition,
+    ) -> Result<CleanupDisposition, LifecycleError> {
+        let handles: DurableCleanupHandles = serde_json::from_value(authority.handles.clone())
+            .map_err(|error| LifecycleError::Step(format!("decode cleanup authority: {error}")))?;
+        let layout = ExecutionLayout::new(&self.state_root, &authority.execution_id)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        match disposition {
+            CleanupDisposition::CleanupPending => {
+                if handles
+                    .runtime_selector
+                    .as_ref()
+                    .is_some_and(|labels| labels != &execution.labels)
+                {
+                    return Err(LifecycleError::Step(
+                        "runtime cleanup selector differs from execution authority".into(),
+                    ));
+                }
+                if let (Some(receipt), Some(runtime), Some(worktree)) =
+                    (handles.receipt, handles.runtime, handles.worktree)
+                {
+                    if receipt.labels.execution_id != authority.execution_id
+                        || runtime.execution_id != authority.execution_id
+                        || worktree.execution_id != authority.execution_id
+                    {
+                        return Err(LifecycleError::Step(
+                            "Pi cleanup handles belong to another execution".into(),
+                        ));
+                    }
+                    let environment = durable_environment(runtime);
+                    let worktree = durable_worktree(worktree);
+                    let harness = self
+                        .harnesses
+                        .build(execution, &receipt, &environment, &worktree)
+                        .await?;
+                    harness
+                        .recover_abandoned()
+                        .await
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                }
+                Ok(CleanupDisposition::RuntimeStopped)
+            }
+            CleanupDisposition::RuntimeStopped => {
+                if let Some(receipt) = handles.receipt {
+                    if receipt.labels.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "runtime cleanup receipt belongs to another execution".into(),
+                        ));
+                    }
+                    let runtime_present = !docker_resource_names(
+                        &self.docker_binary,
+                        self.docker_socket.as_deref(),
+                        &["ps", "-a"],
+                        &authority.execution_id,
+                        "{{.Names}}",
+                    )?
+                    .is_empty()
+                        || !docker_resource_names(
+                            &self.docker_binary,
+                            self.docker_socket.as_deref(),
+                            &["network", "ls"],
+                            &authority.execution_id,
+                            "{{.Name}}",
+                        )?
+                        .is_empty()
+                        || !docker_resource_names(
+                            &self.docker_binary,
+                            self.docker_socket.as_deref(),
+                            &["volume", "ls"],
+                            &authority.execution_id,
+                            "{{.Name}}",
+                        )?
+                        .is_empty();
+                    if runtime_present {
+                        self.runtimes
+                            .build_for_cleanup(execution, &receipt)
+                            .await?
+                            .destroy(&receipt.labels)
+                            .await
+                            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                    }
+                }
+                self.runtimes
+                    .revoke_credentials(&authority.execution_id)
+                    .await?;
+                Ok(CleanupDisposition::RuntimeDestroyed)
+            }
+            CleanupDisposition::RuntimeDestroyed => {
+                if let Some(worktree) = handles.worktree {
+                    let worktree = durable_worktree(worktree);
+                    if worktree.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "worktree cleanup handle belongs to another execution".into(),
+                        ));
+                    }
+                    self.destroy_worktree(&worktree).await?;
+                }
+                let manager = Arc::clone(&self.worktrees);
+                let labels = execution.labels.clone();
+                tokio::task::spawn_blocking(move || {
+                    manager.recover_interrupted_create(&labels, &layout.repository)
+                })
+                .await
+                .map_err(|error| LifecycleError::Step(error.to_string()))?
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                Ok(CleanupDisposition::GitRecoveredCleaned)
+            }
+            CleanupDisposition::GitRecoveredCleaned => {
+                if let Some(receipt) = handles.receipt {
+                    if receipt.labels.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "storage cleanup receipt belongs to another execution".into(),
+                        ));
+                    }
+                    self.release_storage(&receipt).await?;
+                }
+                Ok(CleanupDisposition::StorageReleased)
+            }
+            other => Err(LifecycleError::Step(format!(
+                "cleanup step cannot advance {other}"
+            ))),
+        }
+    }
+
+    async fn ack_cleanup_authority_step(
+        &self,
+        authority: &CleanupAuthority,
+        disposition: CleanupDisposition,
+    ) -> Result<(), LifecycleError> {
+        let handles: DurableCleanupHandles = serde_json::from_value(authority.handles.clone())
+            .map_err(|error| LifecycleError::Step(format!("decode cleanup authority: {error}")))?;
+        match disposition {
+            CleanupDisposition::GitRecoveredCleaned => {
+                if let Some(worktree) = handles.worktree {
+                    let worktree = durable_worktree(worktree);
+                    if worktree.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "worktree cleanup acknowledgment belongs to another execution".into(),
+                        ));
+                    }
+                    let manager = Arc::clone(&self.worktrees);
+                    tokio::task::spawn_blocking(move || manager.ack_destroy(&worktree))
+                        .await
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                }
+            }
+            CleanupDisposition::StorageReleased => {
+                if let Some(receipt) = handles.receipt {
+                    if receipt.labels.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "storage release acknowledgment belongs to another execution".into(),
+                        ));
+                    }
+                    let storage = Arc::clone(&self.storage);
+                    tokio::task::spawn_blocking(move || storage.ack_release(&receipt))
+                        .await
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                }
+            }
+            CleanupDisposition::ReservationReleased => {
+                if let Some(worktree) = handles.worktree {
+                    let worktree = durable_worktree(worktree);
+                    if worktree.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "worktree cleanup acknowledgment belongs to another execution".into(),
+                        ));
+                    }
+                    let manager = Arc::clone(&self.worktrees);
+                    tokio::task::spawn_blocking(move || manager.ack_destroy(&worktree))
+                        .await
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                }
+                if let Some(receipt) = handles.receipt {
+                    if receipt.labels.execution_id != authority.execution_id {
+                        return Err(LifecycleError::Step(
+                            "storage release acknowledgment belongs to another execution".into(),
+                        ));
+                    }
+                    let storage = Arc::clone(&self.storage);
+                    tokio::task::spawn_blocking(move || storage.ack_release(&receipt))
+                        .await
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?
+                        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn adopt(&self, execution: &Execution) -> Result<AdoptedExecution, LifecycleError> {
+        let session_id = execution
+            .session_id
+            .clone()
+            .ok_or_else(|| LifecycleError::Step("running execution lacks session id".into()))?;
+        let layout = ExecutionLayout::new(&self.state_root, &execution.id)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        if execution.worktree_path.as_deref() != Some(layout.repository.to_string_lossy().as_ref())
+        {
+            return Err(LifecycleError::Step(
+                "persisted worktree path differs from allocation layout".into(),
+            ));
+        }
+        let journal = JournalStore::new(&self.state_root)
+            .and_then(|journals| journals.read(&layout))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let receipt = journal.receipt.ok_or_else(|| {
+            LifecycleError::Step("storage journal lacks a durable allocation receipt".into())
+        })?;
+        if journal.phase != AllocationPhase::Ready
+            || receipt.labels != execution.labels
+            || receipt.mount_path != layout.root
+        {
+            return Err(LifecycleError::Step(
+                "storage allocation is not the exact durable Ready authority".into(),
+            ));
+        }
+        let ready = self
+            .verifier
+            .verify_ready(&receipt)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        ready
+            .verify()
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+
+        let owner: DurableWorktreeOwner = serde_json::from_slice(
+            &std::fs::read(layout.repository.join(".autospec-owner.json"))
+                .map_err(|error| LifecycleError::Step(error.to_string()))?,
+        )
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let branch = execution
+            .manifest
+            .repository
+            .branch
+            .as_deref()
+            .ok_or_else(|| LifecycleError::Step("execution lacks durable branch".into()))?;
+        if owner.labels != execution.labels.to_map() || owner.branch != branch {
+            return Err(LifecycleError::Step(
+                "Git owner record differs from persisted execution authority".into(),
+            ));
+        }
+        let worktree = Worktree {
+            execution_id: execution.id.clone(),
+            path: layout.repository.to_string_lossy().into_owned(),
+            branch: owner.branch,
+            base_sha: owner.base_sha,
+            repository: execution.manifest.repository.repo.clone(),
+        };
+
+        let holds = ExecutionLifecycleHoldStore::new(&self.state_root)
+            .and_then(|holds| holds.list(&execution.id))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        let agent_container = DockerRuntime::agent_container_name(&execution.id);
+        let container_id = docker_container_id(
+            &self.docker_binary,
+            self.docker_socket.as_deref(),
+            &agent_container,
+        )?;
+        if holds
+            .iter()
+            .any(|hold| hold.labels != execution.labels || hold.container_id != container_id)
+        {
+            return Err(LifecycleError::Step(
+                "restart adoption found a foreign Pi lifecycle hold".into(),
+            ));
+        }
+        let container = docker_container_capability(
+            &self.docker_binary,
+            self.docker_socket.as_deref(),
+            &receipt,
+            &layout,
+            &container_id,
+            execution,
+        )?;
+        let credentials_path = container
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/autospec-credential")
+            .map(|mount| mount.source.clone());
+        let environment = EnvironmentHandle {
+            execution_id: execution.id.clone(),
+            network: DockerRuntime::network_name(&execution.id),
+            agent_container,
+            verified_agent_container: container,
+            service_containers: execution
+                .manifest
+                .services
+                .iter()
+                .map(|service| DockerRuntime::service_container_name(&execution.id, &service.name))
+                .collect(),
+            volumes: Vec::new(),
+            credentials_path,
+        };
+        let runtime = self
+            .runtimes
+            .build_for_adoption(execution, &receipt, &environment)
+            .await?;
+        let harness = self
+            .harnesses
+            .build(execution, &receipt, &environment, &worktree)
+            .await?;
+        self.remember_and_validate_credentials(execution, &environment)?;
+        let session = SessionRef {
+            id: session_id,
+            path: layout.session.to_string_lossy().into_owned(),
+            execution_id: execution.id.clone(),
+            worktree_path: layout.repository.to_string_lossy().into_owned(),
+        };
+        if !holds.is_empty() {
+            harness
+                .recover_abandoned()
+                .await
+                .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        }
+        let remaining_holds = ExecutionLifecycleHoldStore::new(&self.state_root)
+            .and_then(|holds| holds.list(&execution.id))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        if !remaining_holds.is_empty() {
+            return Err(LifecycleError::Step(
+                "restart adoption did not quiesce abandoned Pi authority".into(),
+            ));
+        }
+        self.active_runtimes
+            .lock()
+            .map_err(|_| LifecycleError::Step("runtime registry lock poisoned".into()))?
+            .insert(execution.id.clone(), runtime);
+        self.active_harnesses
+            .lock()
+            .map_err(|_| LifecycleError::Step("harness registry lock poisoned".into()))?
+            .insert(execution.id.clone(), harness);
+        Ok(AdoptedExecution {
+            receipt,
+            worktree,
+            environment,
+            session,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::persist_evidence_file;
+
+    #[test]
+    fn evidence_rejects_path_escape_and_existing_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "autospec-worker-evidence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(persist_evidence_file(&root, "../escape", "attempt", b"bad").is_err());
+        let artifact = persist_evidence_file(&root, "execution", "attempt", b"first").unwrap();
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"first");
+        assert!(persist_evidence_file(&root, "execution", "attempt", b"replace").is_err());
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"first");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

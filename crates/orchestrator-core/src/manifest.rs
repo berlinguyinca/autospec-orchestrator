@@ -1,9 +1,10 @@
 //! The execution manifest: what AutoSpec (or Workbench) asks the execution plane
 //! to do (spec sections 5, 20, 45, 63, 75).
 
-use crate::{task_packet::TaskPacket, Role};
+use crate::{task_packet::TaskPacket, CoreError, Role, MANIFEST_API_VERSION};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::OnceLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionManifest {
@@ -23,6 +24,88 @@ pub struct ExecutionManifest {
     pub persistence: PersistenceMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_packet: Option<TaskPacket>,
+}
+
+impl ExecutionManifest {
+    /// Validates only execution-plane constraints before provisioning resources.
+    /// Task intent and model policy remain opaque (spec sections 5, 45, 75, 77).
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if self.api_version != MANIFEST_API_VERSION {
+            return invalid(format!(
+                "apiVersion must be {MANIFEST_API_VERSION}, got {}",
+                self.api_version
+            ));
+        }
+        validate_repository(&self.repository.repo)?;
+        validate_runtime(&self.runtime)?;
+        for service in &self.services {
+            validate_service_name(&service.name)?;
+            validate_image(&service.image, "service image")?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_runtime(runtime: &RuntimeRequirement) -> Result<(), CoreError> {
+    if runtime.cpu == 0 {
+        return invalid("runtime cpu must be greater than zero");
+    }
+    if runtime.memory_mib < 256 {
+        return invalid("runtime memoryMib must be at least 256");
+    }
+    if runtime.disk_gib == 0 {
+        return invalid("runtime diskGib must be greater than zero");
+    }
+    if let Some(image) = &runtime.image {
+        validate_image(image, "runtime image")?;
+    }
+    for capability in &runtime.capabilities {
+        if !capability_pattern().is_match(capability) {
+            return invalid(format!("invalid runtime capability: {capability}"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_service_name(name: &str) -> Result<(), CoreError> {
+    if capability_pattern().is_match(name) {
+        Ok(())
+    } else {
+        invalid(format!("invalid service name: {name}"))
+    }
+}
+
+fn invalid<T>(message: impl Into<String>) -> Result<T, CoreError> {
+    Err(CoreError::InvalidManifest(message.into()))
+}
+
+fn validate_repository(repository: &str) -> Result<(), CoreError> {
+    let mut parts = repository.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty() => Ok(()),
+        _ => invalid("repository.repo must be exactly owner/name"),
+    }
+}
+
+pub(crate) fn validate_image(image: &str, field: &str) -> Result<(), CoreError> {
+    let tagged = image
+        .rsplit_once('/')
+        .map_or(image, |(_, final_component)| final_component)
+        .split_once(':')
+        .is_some_and(|(name, tag)| !name.is_empty() && !tag.is_empty());
+    let digested = image
+        .split_once('@')
+        .is_some_and(|(name, digest)| !name.is_empty() && !digest.is_empty());
+    if tagged || digested {
+        Ok(())
+    } else {
+        invalid(format!("{field} must include a tag or digest: {image}"))
+    }
+}
+
+fn capability_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"^[a-z0-9][a-z0-9-]*$").expect("static regex is valid"))
 }
 
 /// A reference back into AutoSpec's workflow domain. The orchestrator treats
@@ -156,4 +239,64 @@ pub enum PersistenceMode {
     /// Session and worktree survive so a human can attach later
     /// (spec sections 38, 86).
     Resumable,
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    fn example_manifest() -> ExecutionManifest {
+        serde_yaml::from_str(include_str!("../../../examples/execution-manifest.yaml"))
+            .expect("example manifest parses")
+    }
+
+    #[test]
+    fn canonical_example_is_valid() {
+        example_manifest().validate().expect("manifest is valid");
+    }
+
+    #[test]
+    fn wrong_api_version_is_rejected() {
+        let mut manifest = example_manifest();
+        manifest.api_version = "autospec.dev/v2".to_owned();
+
+        assert!(matches!(
+            manifest.validate(),
+            Err(crate::CoreError::InvalidManifest(message)) if message.contains("apiVersion")
+        ));
+    }
+
+    #[test]
+    fn invalid_resources_repository_services_and_capabilities_are_rejected() {
+        let mut manifest = example_manifest();
+        manifest.runtime.cpu = 0;
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = example_manifest();
+        manifest.runtime.memory_mib = 255;
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = example_manifest();
+        manifest.runtime.disk_gib = 0;
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = example_manifest();
+        manifest.repository.repo = "owner/repo/extra".to_owned();
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = example_manifest();
+        manifest.services[0].image = "postgres".to_owned();
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = example_manifest();
+        manifest
+            .runtime
+            .capabilities
+            .push("worker.example".to_owned());
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = example_manifest();
+        manifest.runtime.capabilities.push("Docker".to_owned());
+        assert!(manifest.validate().is_err());
+    }
 }

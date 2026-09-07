@@ -1,0 +1,123 @@
+name: autospec-orchestrator
+
+x-autospec-labels: &autospec-labels
+  autospec.managed: "true"
+  autospec.execution_id: ${AUTOSPEC_DEPLOYMENT_ID:?set stable AUTOSPEC_DEPLOYMENT_ID}
+
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    restart: unless-stopped
+    labels: *autospec-labels
+    environment:
+      POSTGRES_DB: autospec_orchestrator
+      POSTGRES_USER: autospec_orchestrator
+      POSTGRES_PASSWORD: ${AUTOSPEC_POSTGRES_PASSWORD:?set AUTOSPEC_POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autospec_orchestrator -d autospec_orchestrator"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [control]
+
+  controller:
+    build:
+      context: ..
+      target: controller
+    restart: unless-stopped
+    labels: *autospec-labels
+    command: ["--addr", "0.0.0.0:8420"]
+    environment:
+      AUTOSPEC_DATABASE_URL: postgres://autospec_orchestrator:${AUTOSPEC_POSTGRES_PASSWORD}@postgres/autospec_orchestrator
+      AUTOSPEC_API_TOKEN: ${AUTOSPEC_API_TOKEN:?set AUTOSPEC_API_TOKEN}
+      AUTOSPEC_WORKER_TOKEN: ${AUTOSPEC_WORKER_TOKEN:?set AUTOSPEC_WORKER_TOKEN}
+      AUTOSPEC_STATE_ROOT: /var/lib/autospec
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${AUTOSPEC_ORCHESTRATOR_PORT:-8420}:8420"
+    volumes:
+      - controller-state:/var/lib/autospec
+    networks: [control]
+
+  docker-api:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    profiles: [host-docker-worker]
+    restart: unless-stopped
+    labels: *autospec-labels
+    environment:
+      LOG_LEVEL: warning
+      POST: 1
+      DELETE: 1
+      INFO: 1
+      VERSION: 1
+      AUTH: 0
+      SECRETS: 0
+      SERVICES: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+      CONTAINERS: 1
+      EXEC: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "127.0.0.1:${AUTOSPEC_DOCKER_PROXY_PORT:-2375}:2375"
+    networks: [runtime-api, host-publish]
+
+  worker:
+    build:
+      context: ..
+      target: worker
+    profiles: [host-docker-worker]
+    restart: unless-stopped
+    labels: *autospec-labels
+    environment:
+      AUTOSPEC_ORCHESTRATOR_URL: http://controller:8420
+      AUTOSPEC_DATABASE_URL: postgres://autospec_orchestrator:${AUTOSPEC_POSTGRES_PASSWORD}@postgres/autospec_orchestrator
+      AUTOSPEC_WORKER_ID: ${AUTOSPEC_WORKER_ID:?set AUTOSPEC_WORKER_ID}
+      AUTOSPEC_WORKER_TOKEN: ${AUTOSPEC_WORKER_TOKEN:?set AUTOSPEC_WORKER_TOKEN}
+      AUTOSPEC_STATE_ROOT: /var/lib/autospec
+      AUTOSPEC_DOCKER_SOCKET: tcp://docker-api:2375
+      DOCKER_HOST: tcp://docker-api:2375
+      AUTOSPEC_WORKER_HOST_DOCKER: ${AUTOSPEC_WORKER_HOST_DOCKER:-false}
+      AUTOSPEC_ALLOW_LOCAL_DEVELOPMENT_CREDENTIALS: ${AUTOSPEC_ALLOW_LOCAL_DEVELOPMENT_CREDENTIALS:-false}
+    command:
+      - --storage-kind
+      - ${AUTOSPEC_STORAGE_KIND:?set AUTOSPEC_STORAGE_KIND}
+      - --storage-pool
+      - ${AUTOSPEC_STORAGE_POOL:?set AUTOSPEC_STORAGE_POOL}
+      - --docker-verifier-image
+      - ${AUTOSPEC_DOCKER_VERIFIER_IMAGE:?set immutable AUTOSPEC_DOCKER_VERIFIER_IMAGE}
+    depends_on:
+      controller:
+        condition: service_started
+      docker-api:
+        condition: service_started
+    volumes:
+      - worker-state:/var/lib/autospec
+    networks: [control, runtime-api]
+
+networks:
+  control:
+    internal: true
+    labels: *autospec-labels
+  runtime-api:
+    internal: true
+    labels: *autospec-labels
+  host-publish:
+    labels: *autospec-labels
+
+volumes:
+  postgres-data:
+    labels: *autospec-labels
+  controller-state:
+    labels: *autospec-labels
+  worker-state:
+    labels: *autospec-labels

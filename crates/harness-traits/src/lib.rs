@@ -4,7 +4,7 @@
 //! on Pi-specific process semantics.
 
 use async_trait::async_trait;
-use orchestrator_core::{ExecutionEvent, SessionId, TaskPacket};
+use orchestrator_core::{ExecutionEvent, ExecutionId, SessionId, TaskPacket};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -19,6 +19,10 @@ pub enum HarnessError {
     ModelFailed(String),
     #[error("session not resumable: {0}")]
     NotResumable(String),
+    #[error("invalid harness session: {0}")]
+    InvalidSession(String),
+    #[error("harness I/O failed: {0}")]
+    Io(String),
 }
 
 /// Where a harness session's durable state lives. Sessions persist independently
@@ -27,6 +31,8 @@ pub enum HarnessError {
 pub struct SessionRef {
     pub id: SessionId,
     pub path: String,
+    pub execution_id: ExecutionId,
+    pub worktree_path: String,
 }
 
 #[async_trait]
@@ -40,8 +46,38 @@ pub trait AgentHarness: Send + Sync {
     /// (spec section 41).
     async fn resume(&self, session: &SessionRef) -> Result<(), HarnessError>;
 
+    /// Resumes for an explicit human control without consuming the automatic
+    /// crash-recovery budget.
+    async fn resume_interactive(&self, session: &SessionRef) -> Result<(), HarnessError> {
+        self.resume(session).await
+    }
+
+    /// Reaps durable process authority from an interrupted prior host process
+    /// without launching or replaying the agent conversation.
+    async fn recover_abandoned(&self) -> Result<(), HarnessError> {
+        Err(HarnessError::NotResumable(
+            "harness does not expose abandoned-process recovery".into(),
+        ))
+    }
+
     /// Fork the conversation without forking the workspace (spec section 39).
     async fn fork_conversation(&self, session: &SessionRef) -> Result<SessionRef, HarnessError>;
+
+    /// Forks into the controller-fenced target session used for crash-safe
+    /// interactive control reconciliation.
+    async fn fork_conversation_as(
+        &self,
+        session: &SessionRef,
+        target: &SessionId,
+    ) -> Result<SessionRef, HarnessError> {
+        let fork = self.fork_conversation(session).await?;
+        if &fork.id != target {
+            return Err(HarnessError::InvalidSession(
+                "harness did not honor the fenced fork target".to_owned(),
+            ));
+        }
+        Ok(fork)
+    }
 
     /// Drain harness events for republishing as execution events.
     async fn poll_events(&self, session: &SessionRef) -> Result<Vec<ExecutionEvent>, HarnessError>;

@@ -1,0 +1,3 @@
+FROM alpine:3.20
+# RUN docker image prune
+RUN echo 'docker network prune is prohibited'
