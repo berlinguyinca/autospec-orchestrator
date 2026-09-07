@@ -816,7 +816,21 @@ fn execution_commit_does_not_mutate_mirror_objects_or_refs() {
     std::fs::write(root.join("large.bin"), vec![0x5a; 2 * 1024 * 1024])
         .expect("write large execution object");
     git(&root, &["add", "large.bin"]);
-    git(&root, &["commit", "-m", "execution-only commit"]);
+    // The execution repository is created by the code under test and has no
+    // local identity, so supply one instead of inheriting the host's global
+    // git config (absent on fresh CI runners and sandboxes).
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Autospec Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "commit",
+            "-m",
+            "execution-only commit",
+        ],
+    );
 
     assert_eq!(
         git_output(&mirror, &["count-objects", "-v"]),
