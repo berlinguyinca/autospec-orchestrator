@@ -1085,11 +1085,32 @@ pub(crate) fn writable_container_mounts(
     Ok(mounts)
 }
 
+/// Mode for the host directories bound into a container's writable paths.
+///
+/// The container root is read only, so these binds are the only place a
+/// workload can write. The image decides which UID actually runs: an image that
+/// drops privileges (`redis` chowns its declared volume and re-execs as
+/// `redis`) never matches the orchestrator's host UID, so an owner-only mode
+/// leaves such a container with nowhere to write, and leaves the host unable to
+/// read back what it wrote. World-writable plus the sticky bit is the `/tmp`
+/// contract: any UID may create, only the owner may remove.
+///
+/// Privacy comes from the execution layout above these leaves, not from their
+/// own mode: `<state root>/executions/<id>/runtime` is created and re-verified
+/// as an orchestrator-owned `0700` directory, so nothing outside the execution
+/// can traverse into them.
+#[cfg(unix)]
+const CONTAINER_WRITABLE_BIND_MODE: u32 = 0o1777;
+
 #[cfg(unix)]
 fn make_container_writable(path: &Path) -> Result<(), RuntimeError> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(CONTAINER_WRITABLE_BIND_MODE),
+    )
+    .map_err(|error| {
         RuntimeError::Provisioning(format!(
             "make container bind directory writable {}: {error}",
             path.display()
@@ -1230,6 +1251,42 @@ mod tests {
         assert!(targets.contains("/run"));
         assert!(targets.contains("/cache"));
         assert!(targets.contains("/data"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_binds_stay_writable_for_a_container_that_drops_privileges() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let image = ImageInspect {
+            config: Some(ImageConfig {
+                volumes: Some(HashMap::from([("/data".to_owned(), HashMap::new())])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state = tempfile::tempdir().expect("state");
+        let runtime_root = state.path().join("runtime");
+        std::fs::create_dir(&runtime_root).expect("runtime root");
+        let runtime_root = std::fs::canonicalize(runtime_root).expect("canonical runtime root");
+        let mounts = writable_container_mounts(&runtime_root, "service-cache", &image)
+            .expect("build writable binds");
+
+        for mount in &mounts {
+            let source = Path::new(mount.source.as_deref().expect("bind source"));
+            let mode = std::fs::metadata(source)
+                .expect("inspect bind source")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode,
+                0o1777,
+                "bind source {} must stay writable for a container that runs as a \
+                 non-orchestrator UID, and readable back from the host afterwards",
+                source.display()
+            );
+        }
     }
 
     #[test]
