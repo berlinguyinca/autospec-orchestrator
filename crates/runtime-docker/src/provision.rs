@@ -1,6 +1,6 @@
 use crate::{
     limits::{drop_all_capabilities, harden_agent, host_limits},
-    services, DockerRuntime,
+    services, DockerRuntime, INFERENCE_RELAY_ALIAS,
 };
 use bollard::{
     container::{
@@ -336,6 +336,17 @@ async fn provision_inner(
     for service in service_requirements {
         service_images.push(ensure_image(runtime, storage, &service.image).await?);
     }
+    if let Some(relay) = &runtime.inference_relay {
+        // The relay mounts nothing, so an image that declares volumes would
+        // get unlabelled anonymous volumes the ownership cleanup cannot find.
+        let relay_image = ensure_image(runtime, storage, &relay.image).await?;
+        if !image_volume_targets(&relay_image).is_empty() {
+            return Err(RuntimeError::ResourceLimit(format!(
+                "inference relay image {} declares volumes; the relay must be stateless",
+                relay.image
+            )));
+        }
+    }
     let image_inspects = std::iter::once(&image_inspect)
         .chain(service_images.iter())
         .collect::<Vec<_>>();
@@ -374,6 +385,16 @@ async fn provision_inner(
         .collect::<Vec<_>>();
 
     let network = DockerRuntime::network_name(&labels.execution_id);
+    // With a relay the execution network has no route out: the agent reaches
+    // only the relay (and the services beside it), and the relay alone reaches
+    // the one configured upstream (spec section 5 R-ORCH).
+    let internal = runtime.inference_relay.is_some();
+    if !internal {
+        tracing::warn!(
+            execution_id = %labels.execution_id,
+            "no inference relay is configured: the execution network is not internal and the agent has unrestricted network egress"
+        );
+    }
     storage.verify(&all_mounts).await?;
     runtime
         .client
@@ -381,7 +402,7 @@ async fn provision_inner(
             name: network.clone(),
             check_duplicate: true,
             driver: "bridge".to_owned(),
-            internal: false,
+            internal,
             labels: labels.to_map().into_iter().collect(),
             ..Default::default()
         })
@@ -400,6 +421,13 @@ async fn provision_inner(
         (&layout.root, storage, &all_mounts),
     )
     .await?;
+
+    let relay_container = match &runtime.inference_relay {
+        Some(relay) => {
+            Some(services::create_relay(runtime, labels, requirement, &network, relay).await?)
+        }
+        None => None,
+    };
 
     let agent_container = DockerRuntime::agent_container_name(&labels.execution_id);
     let mut limits = host_limits(requirement);
@@ -424,7 +452,10 @@ async fn provision_inner(
                 image: Some(image.to_owned()),
                 cmd: Some(vec!["sleep".to_owned(), "infinity".to_owned()]),
                 user: Some(runtime.agent_user.clone()),
-                env: Some(agent_env(build_cache.as_ref().map(|plan| plan.max_gib))),
+                env: Some(agent_env(
+                    build_cache.as_ref().map(|plan| plan.max_gib),
+                    runtime.inference_relay.as_ref().map(|relay| relay.listen_port),
+                )),
                 labels: Some(labels.to_map().into_iter().collect()),
                 host_config: Some(limits),
                 networking_config: Some(services::networking_config(&network, "agent")),
@@ -460,6 +491,9 @@ async fn provision_inner(
     )
     .await?;
     services::start_services(runtime, &service_containers, storage, &all_mounts).await?;
+    if let Some(relay_container) = &relay_container {
+        services::start_relay(runtime, relay_container).await?;
+    }
     storage.verify(&all_mounts).await?;
     runtime
         .client
@@ -1176,13 +1210,18 @@ pub(crate) async fn verify_container_mount_sources(
 
 /// The agent's environment. The sccache variables appear only with the shared
 /// cache; without it nothing here mentions sccache.
-fn agent_env(cache_max_gib: Option<u64>) -> Vec<String> {
+fn agent_env(cache_max_gib: Option<u64>, relay_port: Option<u16>) -> Vec<String> {
     let mut env = vec![
         "HOME=/home/autospec".to_owned(),
         "TMPDIR=/tmp".to_owned(),
         format!("CARGO_TARGET_DIR={CONTAINER_CARGO_TARGET}"),
         format!("INFERWEAVE_CREDENTIAL_FILE={CONTAINER_CREDENTIAL}"),
     ];
+    if let Some(port) = relay_port {
+        env.push(format!(
+            "INFERWEAVE_RELAY_URL=http://{INFERENCE_RELAY_ALIAS}:{port}"
+        ));
+    }
     if let Some(max_gib) = cache_max_gib {
         env.push(format!("SCCACHE_DIR={CONTAINER_BUILD_CACHE}"));
         env.push(format!("SCCACHE_CACHE_SIZE={max_gib}G"));
@@ -1872,6 +1911,17 @@ mod tests {
     }
 
     #[test]
+    fn the_relay_url_is_in_the_agent_env_only_when_a_relay_is_configured() {
+        assert!(!agent_env(None, None)
+            .iter()
+            .any(|entry| entry.starts_with("INFERWEAVE_RELAY_URL")));
+        assert!(agent_env(None, Some(8080))
+            .contains(&"INFERWEAVE_RELAY_URL=http://inferweave:8080".to_owned()));
+        assert!(agent_env(Some(4), Some(9000))
+            .contains(&"INFERWEAVE_RELAY_URL=http://inferweave:9000".to_owned()));
+    }
+
+    #[test]
     fn build_cache_key_differs_only_by_image_or_lockfile_bytes() {
         let base = build_cache_key("rust:1.86", Some(b"lock-a"));
         assert_eq!(base, build_cache_key("rust:1.86", Some(b"lock-a")));
@@ -1895,7 +1945,7 @@ mod tests {
             !cache_root.exists(),
             "no capability must not touch the cache root"
         );
-        assert!(agent_env(None)
+        assert!(agent_env(None, None)
             .iter()
             .all(|e| !e.contains("SCCACHE") && !e.starts_with("RUSTC_WRAPPER")));
     }
@@ -1929,7 +1979,7 @@ mod tests {
         assert_eq!(owner["managed"], true);
         assert_eq!(owner["key"], key);
         assert!(is_managed_build_cache_dir(&plan.source));
-        let env = agent_env(Some(plan.max_gib));
+        let env = agent_env(Some(plan.max_gib), None);
         for expected in [
             "SCCACHE_DIR=/sccache",
             "SCCACHE_CACHE_SIZE=40G",

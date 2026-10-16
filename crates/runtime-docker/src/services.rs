@@ -76,7 +76,6 @@ const DEFAULT_BRIDGE: &str = "bridge";
 /// execution's ownership labels (AGENTS.md invariant 6), so `destroy` and
 /// `reconcile` remove it with the rest of the execution, has every capability
 /// dropped and the same CPU, memory and PID limits as the other containers.
-#[allow(dead_code)] // wired into provisioning by the next issue (#75)
 pub(crate) fn relay_config(
     runtime: &DockerRuntime,
     labels: &OwnershipLabels,
@@ -104,7 +103,6 @@ pub(crate) fn relay_config(
 /// reach the upstream when the execution network is internal.
 ///
 /// The relay image must already be present locally.
-#[allow(dead_code)] // wired into provisioning by the next issue (#75)
 pub(crate) async fn create_relay(
     runtime: &DockerRuntime,
     labels: &OwnershipLabels,
@@ -145,7 +143,6 @@ pub(crate) async fn create_relay(
     Ok(name)
 }
 
-#[allow(dead_code)] // wired into provisioning by the next issue (#75)
 pub(crate) async fn start_relay(runtime: &DockerRuntime, name: &str) -> Result<(), RuntimeError> {
     runtime
         .client
