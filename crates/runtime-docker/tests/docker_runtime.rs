@@ -1908,6 +1908,112 @@ async fn cargo_target_is_agent_only_and_under_the_execution_runtime() {
 }
 
 #[tokio::test]
+async fn shared_sccache_is_opt_in_per_requirement_and_keyed_outside_the_execution() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((state, runtime)) = execution_runtime_with_disk_or_skip(
+        "shared_sccache_is_opt_in_per_requirement_and_keyed_outside_the_execution",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let cache_root = tempfile::tempdir().expect("cache root");
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let wants_cache = RuntimeRequirement {
+        image: Some("alpine:3.20".to_owned()),
+        cpu: 1,
+        memory_mib: 2048,
+        disk_gib: 1,
+        capabilities: vec!["rust-build-cache".to_owned()],
+        ..RuntimeRequirement::default()
+    };
+
+    // The capability on a runtime with no configured cache is refused.
+    let unconfigured = runtime
+        .provision(&execution_labels, &wants_cache, &[])
+        .await;
+    assert!(
+        matches!(
+            unconfigured,
+            Err(runtime_traits::RuntimeError::Provisioning(_))
+        ),
+        "{unconfigured:?}"
+    );
+    scope.cleanup().await.expect("cleanup refused provision");
+
+    let runtime = runtime.with_build_cache(cache_root.path().to_path_buf(), 40);
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let handle = runtime
+        .provision(&execution_labels, &wants_cache, &[])
+        .await
+        .expect("provision agent with shared cache");
+    let agent = docker
+        .inspect_container(&handle.agent_container, None)
+        .await
+        .expect("inspect agent");
+    let env = agent.config.expect("config").env.expect("env");
+    for expected in [
+        "SCCACHE_DIR=/sccache",
+        "SCCACHE_CACHE_SIZE=40G",
+        "RUSTC_WRAPPER=sccache",
+    ] {
+        assert!(env.iter().any(|e| e == expected), "missing {expected}");
+    }
+    let mounts = agent.host_config.unwrap().mounts.unwrap();
+    let cache_mounts = mounts
+        .iter()
+        .filter(|mount| mount.target.as_deref() == Some("/sccache"))
+        .collect::<Vec<_>>();
+    assert_eq!(cache_mounts.len(), 1);
+    assert_ne!(cache_mounts[0].read_only, Some(true));
+    let source = fs::canonicalize(cache_mounts[0].source.as_deref().unwrap()).unwrap();
+    assert!(source.starts_with(fs::canonicalize(cache_root.path()).unwrap().join("sccache")));
+    assert!(!source.starts_with(fs::canonicalize(&state.path).unwrap()));
+    let owner: serde_json::Value =
+        serde_json::from_slice(&fs::read(source.join(".autospec-cache.json")).unwrap()).unwrap();
+    assert_eq!(owner["managed"], true);
+    let with_cache_mount_count = mounts.len();
+    scope.cleanup().await.expect("cleanup cache execution");
+    assert!(
+        source.join(".autospec-cache.json").is_file(),
+        "execution cleanup must leave the shared cache in place"
+    );
+
+    // Without the capability the same runtime mounts no cache and keeps the rest.
+    let plain = RuntimeRequirement {
+        capabilities: Vec::new(),
+        ..wants_cache.clone()
+    };
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let handle = runtime
+        .provision(&execution_labels, &plain, &[])
+        .await
+        .expect("provision agent without cache");
+    let agent = docker
+        .inspect_container(&handle.agent_container, None)
+        .await
+        .expect("inspect plain agent");
+    let env = agent.config.expect("config").env.expect("env");
+    assert!(!env
+        .iter()
+        .any(|e| e.contains("SCCACHE") || e.starts_with("RUSTC_WRAPPER")));
+    let mounts = agent.host_config.unwrap().mounts.unwrap();
+    assert_eq!(
+        mounts
+            .iter()
+            .filter(|mount| mount.target.as_deref() == Some("/sccache"))
+            .count(),
+        0
+    );
+    assert_eq!(mounts.len() + 1, with_cache_mount_count);
+    scope.cleanup().await.expect("cleanup plain execution");
+}
+
+#[tokio::test]
 async fn panicking_test_scope_removes_only_its_execution_resources() {
     let Some(runtime) =
         runtime_or_skip("panicking_test_scope_removes_only_its_execution_resources").await

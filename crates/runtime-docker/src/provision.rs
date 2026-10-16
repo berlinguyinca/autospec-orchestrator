@@ -11,6 +11,9 @@ use bollard::{
 use execution_storage::{disk_gib_to_bytes, ExecutionLayout, ReadyLease, VerifiedExecutionStorage};
 use futures_util::StreamExt;
 use orchestrator_core::{OwnershipLabels, RuntimeRequirement, ServiceRequirement};
+use runtime_traits::build_cache::{
+    is_managed_build_cache_dir, BUILD_CACHE_CAPABILITY, CONTAINER_BUILD_CACHE, OWNER_FILE,
+};
 use runtime_traits::{EnvironmentHandle, RuntimeError, VerifiedAgentContainer, VerifiedBindMount};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -342,6 +345,15 @@ async fn provision_inner(
     )?;
     let mut agent_mounts = writable_container_mounts(&layout.runtime, "agent", &image_inspect)?;
     agent_mounts.push(cargo_target_mount(&layout.runtime)?);
+    // The shared cache lives outside the execution root, so it is deliberately
+    // kept out of `all_mounts` (the storage proof and the trusted verifier only
+    // speak for the execution's own storage) and is verified on its own below.
+    let build_cache = plan_build_cache(
+        runtime.build_cache.as_ref(),
+        requirement,
+        image_inspect.id.as_deref().unwrap_or(image),
+        read_lockfile(&layout.repository).as_deref(),
+    )?;
     let service_mounts = service_requirements
         .iter()
         .zip(&service_images)
@@ -389,6 +401,10 @@ async fn provision_inner(
     limits.network_mode = Some(network.clone());
     let mut mounts = agent_mounts;
     mounts.extend(execution_mounts);
+    let cache_source = build_cache.as_ref().map(|plan| plan.source.clone());
+    if let Some(plan) = &build_cache {
+        mounts.push(plan.mount.clone());
+    }
     limits.mounts = Some(mounts.clone());
     storage.verify(&all_mounts).await?;
     let created_agent = runtime
@@ -402,12 +418,7 @@ async fn provision_inner(
                 image: Some(image.to_owned()),
                 cmd: Some(vec!["sleep".to_owned(), "infinity".to_owned()]),
                 user: Some("0:0".to_owned()),
-                env: Some(vec![
-                    "HOME=/home/autospec".to_owned(),
-                    "TMPDIR=/tmp".to_owned(),
-                    format!("CARGO_TARGET_DIR={CONTAINER_CARGO_TARGET}"),
-                    format!("INFERWEAVE_CREDENTIAL_FILE={CONTAINER_CREDENTIAL}"),
-                ]),
+                env: Some(agent_env(build_cache.as_ref().map(|plan| plan.max_gib))),
                 labels: Some(labels.to_map().into_iter().collect()),
                 host_config: Some(limits),
                 networking_config: Some(services::networking_config(&network, "agent")),
@@ -424,7 +435,14 @@ async fn provision_inner(
         })?;
     let agent_container_id = created_agent.id;
     storage.verify(&all_mounts).await?;
-    verify_container_mount_sources(runtime, &agent_container_id, &layout.root, &mounts).await?;
+    verify_container_mount_sources(
+        runtime,
+        &agent_container_id,
+        &layout.root,
+        &mounts,
+        cache_source.as_deref(),
+    )
+    .await?;
 
     verify_with_trusted_container(
         runtime,
@@ -813,7 +831,7 @@ async fn verify_with_trusted_container(
     let verifier_id = created.id;
 
     let verification = async {
-        verify_container_mount_sources(runtime, &verifier_id, execution_root, &proof_mounts)
+        verify_container_mount_sources(runtime, &verifier_id, execution_root, &proof_mounts, None)
             .await?;
         let mut attached = runtime
             .client
@@ -952,11 +970,15 @@ fn verifier_sources(
     Ok(workload_sources.into_iter().collect())
 }
 
+/// `external` is the one canonical host directory, outside the execution root,
+/// that the shared build cache may bind; every other bind must stay inside the
+/// execution root on its filesystem.
 pub(crate) async fn verify_container_mount_sources(
     runtime: &DockerRuntime,
     container: &str,
     execution_root: &Path,
     requested: &[Mount],
+    external: Option<&Path>,
 ) -> Result<(), RuntimeError> {
     let root = fs::canonicalize(execution_root).map_err(|error| {
         RuntimeError::ResourceLimit(format!("canonicalize execution root: {error}"))
@@ -1022,6 +1044,14 @@ pub(crate) async fn verify_container_mount_sources(
                 "canonicalize daemon bind source {source}: {error}"
             ))
         })?;
+        if target == CONTAINER_BUILD_CACHE && external == Some(canonical.as_path()) {
+            if !is_managed_build_cache_dir(&canonical) {
+                return Err(RuntimeError::ResourceLimit(
+                    "shared build cache lacks a managed owner file".to_owned(),
+                ));
+            }
+            continue;
+        }
         if !canonical.starts_with(&root) {
             return Err(RuntimeError::ResourceLimit(format!(
                 "daemon bind source {} escapes execution root {}",
@@ -1047,6 +1077,159 @@ pub(crate) async fn verify_container_mount_sources(
         }
     }
     Ok(())
+}
+
+/// The agent's environment. The sccache variables appear only with the shared
+/// cache; without it nothing here mentions sccache.
+fn agent_env(cache_max_gib: Option<u64>) -> Vec<String> {
+    let mut env = vec![
+        "HOME=/home/autospec".to_owned(),
+        "TMPDIR=/tmp".to_owned(),
+        format!("CARGO_TARGET_DIR={CONTAINER_CARGO_TARGET}"),
+        format!("INFERWEAVE_CREDENTIAL_FILE={CONTAINER_CREDENTIAL}"),
+    ];
+    if let Some(max_gib) = cache_max_gib {
+        env.push(format!("SCCACHE_DIR={CONTAINER_BUILD_CACHE}"));
+        env.push(format!("SCCACHE_CACHE_SIZE={max_gib}G"));
+        env.push("RUSTC_WRAPPER=sccache".to_owned());
+    }
+    env
+}
+
+/// Largest `Cargo.lock` hashed into a cache key; a larger file is treated as
+/// absent rather than read into memory.
+const MAX_LOCKFILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads the worktree's `Cargo.lock` if it is a regular, bounded, non-symlink
+/// file. The lockfile only selects a cache key, so absence is not an error.
+fn read_lockfile(repository: &Path) -> Option<Vec<u8>> {
+    let path = repository.join("Cargo.lock");
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_LOCKFILE_BYTES {
+        return None;
+    }
+    fs::read(path).ok()
+}
+
+/// Cache key: sha256 of the image identity and, when present, the lockfile
+/// bytes (separated by NUL so the two cannot blur). Different toolchain images
+/// or different dependency sets therefore never share a directory.
+fn build_cache_key(image: &str, lockfile: Option<&[u8]>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(image.as_bytes());
+    if let Some(lockfile) = lockfile {
+        hasher.update([0]);
+        hasher.update(lockfile);
+    }
+    hex_component(&hasher.finalize())
+}
+
+/// The shared-cache bind for one execution: the mount, its canonical host
+/// source, and the size bound.
+struct BuildCachePlan {
+    mount: Mount,
+    source: std::path::PathBuf,
+    max_gib: u64,
+}
+
+/// Decides whether this execution gets the shared cache. No capability means
+/// no mount, no directory and no environment; the capability on a runtime
+/// without a configured cache is an error, never a silent downgrade.
+fn plan_build_cache(
+    config: Option<&crate::BuildCacheConfig>,
+    requirement: &RuntimeRequirement,
+    image: &str,
+    lockfile: Option<&[u8]>,
+) -> Result<Option<BuildCachePlan>, RuntimeError> {
+    if !requirement
+        .capabilities
+        .iter()
+        .any(|capability| capability == BUILD_CACHE_CAPABILITY)
+    {
+        return Ok(None);
+    }
+    let config = config.ok_or_else(|| {
+        RuntimeError::Provisioning(format!(
+            "capability {BUILD_CACHE_CAPABILITY} requires a configured build cache"
+        ))
+    })?;
+    let key = build_cache_key(image, lockfile);
+    let mount = build_cache_mount(&config.root, &key)?;
+    let source =
+        fs::canonicalize(mount.source.as_deref().unwrap_or_default()).map_err(|error| {
+            RuntimeError::Provisioning(format!("canonicalize build cache: {error}"))
+        })?;
+    Ok(Some(BuildCachePlan {
+        mount,
+        source,
+        max_gib: config.max_gib,
+    }))
+}
+
+/// Creates (once) `<root>/sccache/<key>` with its owner file and returns the
+/// writable bind. Every path component must be a real directory; an existing
+/// key directory is reused only when its owner file is ours for this key.
+fn build_cache_mount(root: &Path, key: &str) -> Result<Mount, RuntimeError> {
+    validate_safe_component(key, "build cache key")?;
+    if let Err(error) = fs::create_dir_all(root) {
+        return Err(RuntimeError::Provisioning(format!(
+            "create build cache root {}: {error}",
+            root.display()
+        )));
+    }
+    ensure_real_directory(root, false, "build cache root")?;
+    let sccache_root = root.join("sccache");
+    ensure_real_directory(&sccache_root, true, "sccache root")?;
+    let dir = sccache_root.join(key);
+    ensure_real_directory(&dir, true, "sccache key directory")?;
+    write_owner_file_once(&dir, key)?;
+    make_container_writable(&dir)?;
+    bind_mount(&dir, CONTAINER_BUILD_CACHE)
+}
+
+fn write_owner_file_once(dir: &Path, key: &str) -> Result<(), RuntimeError> {
+    let owner = dir.join(OWNER_FILE);
+    let body = format!(
+        "{{\"managed\":true,\"key\":\"{key}\",\"created_at\":\"{}\"}}\n",
+        chrono::Utc::now().to_rfc3339()
+    );
+    // Publish atomically: a concurrent execution that finds the owner file
+    // always finds all of it (hard_link fails if the name exists).
+    let staging = dir.join(format!(
+        "{OWNER_FILE}.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    ));
+    fs::write(&staging, body.as_bytes()).map_err(|error| {
+        RuntimeError::Provisioning(format!("write build cache owner file: {error}"))
+    })?;
+    let linked = fs::hard_link(&staging, &owner);
+    let _ = fs::remove_file(&staging);
+    match linked {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let valid = is_managed_build_cache_dir(dir)
+                && fs::read(&owner)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .is_some_and(|value| value.get("key").and_then(|k| k.as_str()) == Some(key));
+            if valid {
+                Ok(())
+            } else {
+                Err(RuntimeError::Provisioning(format!(
+                    "build cache directory {} has a foreign or invalid owner file",
+                    dir.display()
+                )))
+            }
+        }
+        Err(error) => Err(RuntimeError::Provisioning(format!(
+            "create build cache owner file: {error}"
+        ))),
+    }
 }
 
 /// Container path of the agent's per-execution Rust build output directory.
@@ -1509,5 +1692,134 @@ mod tests {
         assert!(verifier
             .iter()
             .all(|source| !layout.credentials.starts_with(source)));
+    }
+
+    fn cache_config(root: &Path, max_gib: u64) -> crate::BuildCacheConfig {
+        crate::BuildCacheConfig {
+            root: root.to_path_buf(),
+            max_gib,
+        }
+    }
+
+    fn wants_cache() -> RuntimeRequirement {
+        RuntimeRequirement {
+            capabilities: vec![BUILD_CACHE_CAPABILITY.to_owned()],
+            ..RuntimeRequirement::default()
+        }
+    }
+
+    #[test]
+    fn build_cache_key_differs_only_by_image_or_lockfile_bytes() {
+        let base = build_cache_key("rust:1.86", Some(b"lock-a"));
+        assert_eq!(base, build_cache_key("rust:1.86", Some(b"lock-a")));
+        assert_ne!(base, build_cache_key("rust:1.86", Some(b"lock-b")));
+        assert_ne!(base, build_cache_key("rust:1.87", Some(b"lock-a")));
+        assert_ne!(base, build_cache_key("rust:1.86", None));
+        assert_eq!(base.len(), 64);
+        assert!(base.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn without_the_capability_there_is_no_mount_directory_or_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let cache_root = root.path().join("cache");
+        let config = cache_config(&cache_root, 40);
+        let plain = RuntimeRequirement::default();
+        assert!(plan_build_cache(Some(&config), &plain, "img", None)
+            .unwrap()
+            .is_none());
+        assert!(
+            !cache_root.exists(),
+            "no capability must not touch the cache root"
+        );
+        assert!(agent_env(None)
+            .iter()
+            .all(|e| !e.contains("SCCACHE") && !e.starts_with("RUSTC_WRAPPER")));
+    }
+
+    #[test]
+    fn the_capability_without_a_configured_cache_fails_provisioning() {
+        let error = plan_build_cache(None, &wants_cache(), "img", None)
+            .err()
+            .expect("must fail");
+        assert!(matches!(error, RuntimeError::Provisioning(_)), "{error:?}");
+    }
+
+    #[test]
+    fn the_capability_mounts_a_keyed_owned_directory_and_sets_the_sccache_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let config = cache_config(&root.path().join("cache"), 40);
+        let plan = plan_build_cache(Some(&config), &wants_cache(), "img", Some(b"lock"))
+            .unwrap()
+            .expect("plan");
+        assert_eq!(plan.mount.target.as_deref(), Some("/sccache"));
+        assert_ne!(plan.mount.read_only, Some(true));
+        let key = build_cache_key("img", Some(b"lock"));
+        assert_eq!(
+            plan.source,
+            std::fs::canonicalize(root.path().join("cache/sccache").join(&key)).unwrap()
+        );
+        let owner: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(plan.source.join(".autospec-cache.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(owner["managed"], true);
+        assert_eq!(owner["key"], key);
+        assert!(is_managed_build_cache_dir(&plan.source));
+        let env = agent_env(Some(plan.max_gib));
+        for expected in [
+            "SCCACHE_DIR=/sccache",
+            "SCCACHE_CACHE_SIZE=40G",
+            "RUSTC_WRAPPER=sccache",
+        ] {
+            assert!(env.iter().any(|e| e == expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn the_owner_file_is_written_once_and_a_foreign_one_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let config = cache_config(&root.path().join("cache"), 40);
+        let first = plan_build_cache(Some(&config), &wants_cache(), "img", None)
+            .unwrap()
+            .unwrap();
+        let owner_path = first.source.join(".autospec-cache.json");
+        let original = std::fs::read(&owner_path).unwrap();
+        let again = plan_build_cache(Some(&config), &wants_cache(), "img", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.source, first.source);
+        assert_eq!(std::fs::read(&owner_path).unwrap(), original);
+        std::fs::write(&owner_path, br#"{"managed":true,"key":"someone-else"}"#).unwrap();
+        assert!(plan_build_cache(Some(&config), &wants_cache(), "img", None).is_err());
+        std::fs::write(&owner_path, b"junk").unwrap();
+        assert!(plan_build_cache(Some(&config), &wants_cache(), "img", None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_cache_component_is_refused_and_its_target_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cache_root = root.path().join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        std::os::unix::fs::symlink(outside.path(), cache_root.join("sccache")).unwrap();
+        let config = cache_config(&cache_root, 40);
+        assert!(plan_build_cache(Some(&config), &wants_cache(), "img", None).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        let linked_root = root.path().join("linked-root");
+        std::os::unix::fs::symlink(outside.path(), &linked_root).unwrap();
+        let config = cache_config(&linked_root, 40);
+        assert!(plan_build_cache(Some(&config), &wants_cache(), "img", None).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_lockfile_is_read_only_when_it_is_a_regular_file() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(read_lockfile(repo.path()).is_none());
+        std::fs::write(repo.path().join("Cargo.lock"), b"abc").unwrap();
+        assert_eq!(read_lockfile(repo.path()).as_deref(), Some(&b"abc"[..]));
     }
 }

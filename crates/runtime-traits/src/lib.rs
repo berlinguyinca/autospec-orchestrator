@@ -213,3 +213,87 @@ mod conformance_tests {
         );
     }
 }
+
+/// Opt-in shared Rust build cache (spec section 5 R-BUILD).
+///
+/// A requirement lists [`BUILD_CACHE_CAPABILITY`] to ask for one cache
+/// directory, owned by the orchestrator and marked with an owner file, to be
+/// mounted at [`CONTAINER_BUILD_CACHE`]. Runtimes create the marker; the Pi
+/// harness and the pressure GC accept or delete a directory only when
+/// [`is_managed_build_cache_dir`] holds, so a directory without the marker is
+/// never trusted and never reclaimed.
+pub mod build_cache {
+    use std::path::Path;
+
+    /// Requirement capability that opts an execution into the shared cache.
+    pub const BUILD_CACHE_CAPABILITY: &str = "rust-build-cache";
+    /// Where the cache is mounted inside the agent container.
+    pub const CONTAINER_BUILD_CACHE: &str = "/sccache";
+    /// Owner file written once into each cache key directory.
+    pub const OWNER_FILE: &str = ".autospec-cache.json";
+
+    /// Whether `dir` is a real (non-symlink) directory holding a regular,
+    /// non-symlink owner file that declares `"managed": true`.
+    pub fn is_managed_build_cache_dir(dir: &Path) -> bool {
+        let is_real_dir = std::fs::symlink_metadata(dir)
+            .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_real_dir {
+            return false;
+        }
+        let owner = dir.join(OWNER_FILE);
+        let is_regular = std::fs::symlink_metadata(&owner)
+            .map(|meta| meta.is_file() && !meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_regular {
+            return false;
+        }
+        std::fs::read(&owner)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| value.get("managed") == Some(&serde_json::Value::Bool(true)))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn only_a_real_dir_with_a_managed_owner_file_qualifies() {
+            let root = std::env::temp_dir().join(format!("bc-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let ok = root.join("ok");
+            std::fs::create_dir(&ok).unwrap();
+            std::fs::write(ok.join(OWNER_FILE), br#"{"managed":true,"key":"k"}"#).unwrap();
+            assert!(is_managed_build_cache_dir(&ok));
+
+            let unmarked = root.join("unmarked");
+            std::fs::create_dir(&unmarked).unwrap();
+            assert!(!is_managed_build_cache_dir(&unmarked));
+
+            let falsy = root.join("falsy");
+            std::fs::create_dir(&falsy).unwrap();
+            std::fs::write(falsy.join(OWNER_FILE), br#"{"managed":false}"#).unwrap();
+            assert!(!is_managed_build_cache_dir(&falsy));
+
+            let garbage = root.join("garbage");
+            std::fs::create_dir(&garbage).unwrap();
+            std::fs::write(garbage.join(OWNER_FILE), b"not json").unwrap();
+            assert!(!is_managed_build_cache_dir(&garbage));
+
+            #[cfg(unix)]
+            {
+                let link = root.join("link");
+                std::os::unix::fs::symlink(&ok, &link).unwrap();
+                assert!(!is_managed_build_cache_dir(&link));
+                let owner_link = root.join("owner-link");
+                std::fs::create_dir(&owner_link).unwrap();
+                std::os::unix::fs::symlink(ok.join(OWNER_FILE), owner_link.join(OWNER_FILE))
+                    .unwrap();
+                assert!(!is_managed_build_cache_dir(&owner_link));
+            }
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
+}
