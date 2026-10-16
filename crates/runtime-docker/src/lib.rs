@@ -87,6 +87,58 @@ pub fn validate_agent_user(raw: &str) -> Result<(), RuntimeError> {
     }
 }
 
+/// The alias the inference relay answers to on the execution network, so the
+/// agent reaches it as `http://inferweave:<port>` (spec section 5 R-ORCH).
+pub const INFERENCE_RELAY_ALIAS: &str = "inferweave";
+
+/// A per-execution relay that forwards to exactly one InferWeave `host:port`.
+///
+/// The operator supplies `image`; the orchestrator hands it only the listen
+/// port and the upstream as its two arguments (`<listen_port> <upstream>`), so
+/// the relay cannot be told to forward anywhere else. Build one through
+/// [`DockerRuntime::with_inference_relay`], which validates `upstream`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceRelay {
+    pub image: String,
+    pub upstream: String,
+    pub listen_port: u16,
+}
+
+/// Accepts only `host:port` with a bare host name or address and a non-zero
+/// port. A scheme, path, credential, whitespace or a missing port is refused.
+fn validate_relay_upstream(upstream: &str) -> Result<(), RuntimeError> {
+    let invalid = || {
+        RuntimeError::ResourceLimit(format!(
+            "inference upstream {upstream:?} must be host:port, for example gateway.local:8080"
+        ))
+    };
+    let (host, port) = upstream.rsplit_once(':').ok_or_else(invalid)?;
+    let bracketed = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'));
+    let host_ok = match bracketed {
+        Some(inner) => {
+            !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_hexdigit() || b == b':')
+        }
+        None => {
+            !host.is_empty()
+                && host.len() <= 253
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+        }
+    };
+    let port_ok = !port.is_empty()
+        && port.len() <= 5
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|port| port != 0);
+    if host_ok && port_ok {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DockerRuntime {
     pub(crate) client: Docker,
@@ -100,6 +152,7 @@ pub struct DockerRuntime {
     pub(crate) build_cache: Option<BuildCacheConfig>,
     pub(crate) hardening: ContainerHardening,
     pub(crate) agent_user: String,
+    pub(crate) inference_relay: Option<InferenceRelay>,
 }
 
 /// Where the opt-in shared sccache lives and how large it may grow
@@ -150,6 +203,7 @@ impl DockerRuntime {
             build_cache: None,
             hardening: ContainerHardening::Enforced,
             agent_user: DEFAULT_AGENT_USER.to_owned(),
+            inference_relay: None,
         })
     }
 
@@ -163,6 +217,26 @@ impl DockerRuntime {
         validate_agent_user(uid_gid)?;
         self.agent_user = uid_gid.to_owned();
         Ok(self)
+    }
+
+    /// Configures the per-execution inference relay.
+    ///
+    /// Refuses an empty image, a zero listen port and an upstream that is not
+    /// a plain `host:port`. The relay forwards only to that upstream.
+    pub fn with_inference_relay(mut self, relay: InferenceRelay) -> Result<Self, RuntimeError> {
+        if relay.image.trim().is_empty() || relay.listen_port == 0 {
+            return Err(RuntimeError::ResourceLimit(
+                "inference relay needs an image and a non-zero listen port".to_owned(),
+            ));
+        }
+        validate_relay_upstream(&relay.upstream)?;
+        self.inference_relay = Some(relay);
+        Ok(self)
+    }
+
+    /// The configured inference relay, if any.
+    pub fn inference_relay(&self) -> Option<&InferenceRelay> {
+        self.inference_relay.as_ref()
     }
 
     /// The `uid:gid` the agent container runs as.
@@ -320,6 +394,11 @@ impl DockerRuntime {
         format!("autospec-{execution_id}-{service}")
     }
 
+    /// Name of an execution's inference relay container.
+    pub fn relay_container_name(execution_id: &ExecutionId) -> String {
+        format!("autospec-{execution_id}-inferweave-relay")
+    }
+
     pub fn volume_name(execution_id: &ExecutionId, purpose: &str) -> String {
         format!("autospec-{execution_id}-{purpose}")
     }
@@ -475,6 +554,66 @@ mod tests {
         assert_eq!(
             DockerRuntime::network_name(&ExecutionId::new("node-417-impl-01")),
             "autospec-node-417-impl-01"
+        );
+    }
+
+    #[test]
+    fn inference_relay_upstream_must_be_host_and_port() {
+        let relay = |upstream: &str| InferenceRelay {
+            image: "relay:1".to_owned(),
+            upstream: upstream.to_owned(),
+            listen_port: 8080,
+        };
+        let runtime = || DockerRuntime::connect_with_state_root(None, "/tmp").expect("client");
+        for good in [
+            "gateway.local:8080",
+            "10.0.0.5:443",
+            "[::1]:8080",
+            "a_b-c:1",
+        ] {
+            let configured = runtime()
+                .with_inference_relay(relay(good))
+                .unwrap_or_else(|error| panic!("{good}: {error}"));
+            assert_eq!(
+                configured.inference_relay().map(|r| r.upstream.as_str()),
+                Some(good)
+            );
+        }
+        for bad in [
+            "gateway.local",
+            "gateway.local:",
+            ":8080",
+            "gateway.local:0",
+            "gateway.local:65536",
+            "gateway.local:80a",
+            "http://gateway.local:8080",
+            "user@gateway.local:8080",
+            "gateway.local:8080/path",
+            "gate way:8080",
+            "",
+        ] {
+            assert!(
+                runtime().with_inference_relay(relay(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        let mut no_port = relay("gateway.local:8080");
+        no_port.listen_port = 0;
+        assert!(runtime().with_inference_relay(no_port).is_err());
+        let mut no_image = relay("gateway.local:8080");
+        no_image.image = " ".to_owned();
+        assert!(runtime().with_inference_relay(no_image).is_err());
+        assert!(
+            runtime().inference_relay().is_none(),
+            "off unless configured"
+        );
+    }
+
+    #[test]
+    fn relay_container_name_is_execution_scoped() {
+        assert_eq!(
+            DockerRuntime::relay_container_name(&ExecutionId::new("node-417-impl-01")),
+            "autospec-node-417-impl-01-inferweave-relay"
         );
     }
 
