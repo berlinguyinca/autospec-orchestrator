@@ -3765,7 +3765,9 @@ async fn internal_network_relays_inference_and_blocks_other_egress() {
         )
         .await;
         if out.contains("relayed-ok") {
-            return Err(format!("the agent reached the upstream directly: {exit} {out}"));
+            return Err(format!(
+                "the agent reached the upstream directly: {exit} {out}"
+            ));
         }
         Ok(())
     }

@@ -454,7 +454,10 @@ async fn provision_inner(
                 user: Some(runtime.agent_user.clone()),
                 env: Some(agent_env(
                     build_cache.as_ref().map(|plan| plan.max_gib),
-                    runtime.inference_relay.as_ref().map(|relay| relay.listen_port),
+                    runtime
+                        .inference_relay
+                        .as_ref()
+                        .map(|relay| relay.listen_port),
                 )),
                 labels: Some(labels.to_map().into_iter().collect()),
                 host_config: Some(limits),
