@@ -112,7 +112,8 @@ impl ReservationStore for PgReservationStore {
         let worker = decode_worker(&worker_row)?;
         let usage = sqlx::query(
             "SELECT COUNT(*) AS slots, COALESCE(SUM(cpu), 0)::BIGINT AS cpu, \
-             COALESCE(SUM(memory_mib), 0)::BIGINT AS memory_mib \
+             COALESCE(SUM(memory_mib), 0)::BIGINT AS memory_mib, \
+             COALESCE(SUM(disk_gib), 0)::BIGINT AS disk_gib \
              FROM reservations WHERE worker_id = $1",
         )
         .bind(worker_id.as_str())
@@ -124,6 +125,8 @@ impl ReservationStore for PgReservationStore {
             .map_err(|_| StoreError::Conflict("invalid reserved cpu".to_owned()))?;
         let used_memory = u64::try_from(usage.try_get::<i64, _>("memory_mib")?)
             .map_err(|_| StoreError::Conflict("invalid reserved memory".to_owned()))?;
+        let used_disk = u64::try_from(usage.try_get::<i64, _>("disk_gib")?)
+            .map_err(|_| StoreError::Conflict("invalid reserved disk".to_owned()))?;
         if worker.state != orchestrator_core::WorkerState::Ready
             || !worker
                 .capability_proof
@@ -156,7 +159,7 @@ impl ReservationStore for PgReservationStore {
                 && requirement.cpu <= worker.capabilities.cpu.saturating_sub(used_cpu)
                 && requirement.memory_mib
                     <= worker.capabilities.memory_mib.saturating_sub(used_memory)
-                && requirement.disk_gib <= worker.capabilities.disk_gib
+                && requirement.disk_gib <= worker.capabilities.disk_gib.saturating_sub(used_disk)
                 && requirement
                     .capabilities
                     .iter()
@@ -172,8 +175,8 @@ impl ReservationStore for PgReservationStore {
         };
         let attempt_id = AttemptId::new(format!("attempt-{}", uuid::Uuid::new_v4().simple()));
         sqlx::query(
-            "INSERT INTO reservations (execution_id, worker_id, attempt_id, cpu, memory_mib) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO reservations (execution_id, worker_id, attempt_id, cpu, memory_mib, disk_gib) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(execution.id.as_str())
         .bind(worker_id.as_str())
@@ -184,6 +187,11 @@ impl ReservationStore for PgReservationStore {
         .bind(
             i64::try_from(execution.manifest.runtime.memory_mib).map_err(|_| {
                 StoreError::Conflict("execution memory exceeds PostgreSQL BIGINT".to_owned())
+            })?,
+        )
+        .bind(
+            i64::try_from(execution.manifest.runtime.disk_gib).map_err(|_| {
+                StoreError::Conflict("execution disk exceeds PostgreSQL BIGINT".to_owned())
             })?,
         )
         .execute(&mut *transaction)
