@@ -23,7 +23,10 @@ use orchestrator_persistence::{
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 
-pub use auth::{ApiTokenValidator, StaticApiTokenValidator};
+pub use auth::{
+    ApiTokenValidator, PerWorkerTokens, SharedWorkerToken, StaticApiTokenValidator, WorkerIdentity,
+    WorkerTokenValidator,
+};
 pub use state::AppState;
 
 pub fn api_root() -> String {

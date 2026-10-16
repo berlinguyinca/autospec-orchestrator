@@ -1,4 +1,7 @@
-use crate::{ApiTokenValidator, StaticApiTokenValidator};
+use crate::{
+    auth::{PerWorkerTokens, SharedWorkerToken, WorkerTokenValidator},
+    ApiTokenValidator, StaticApiTokenValidator,
+};
 use orchestrator_core::ExecutionEvent;
 use orchestrator_persistence::{
     ArtifactStore, CleanupAuthorityStore, EventLog, ExecutionStore, ReservationStore, WorkerStore,
@@ -15,7 +18,7 @@ pub struct AppState {
     pub(crate) reservations: Arc<dyn ReservationStore>,
     pub(crate) artifacts: Arc<dyn ArtifactStore>,
     pub(crate) api_token_validator: Arc<dyn ApiTokenValidator>,
-    pub(crate) worker_token_validator: Arc<dyn ApiTokenValidator>,
+    pub(crate) worker_token_validator: Arc<dyn WorkerTokenValidator>,
     pub(crate) cleanup_authorities: Option<Arc<dyn CleanupAuthorityStore>>,
 }
 
@@ -39,9 +42,19 @@ impl AppState {
             reservations,
             artifacts,
             api_token_validator: Arc::new(StaticApiTokenValidator::new(api_token)),
-            worker_token_validator: Arc::new(StaticApiTokenValidator::new(worker_token)),
+            worker_token_validator: Arc::new(SharedWorkerToken::new(worker_token)),
             cleanup_authorities: None,
         }
+    }
+
+    /// Replaces the shared worker token with per-worker identities.
+    ///
+    /// The shared token stops working: it is not kept as a fallback, so a
+    /// leaked per-worker token speaks for one worker only.
+    #[must_use]
+    pub fn with_worker_tokens(mut self, tokens: PerWorkerTokens) -> Self {
+        self.worker_token_validator = Arc::new(tokens);
+        self
     }
 
     pub fn with_cleanup_authorities(
