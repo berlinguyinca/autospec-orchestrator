@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use disk_budget::{DiskPolicy, Sampler};
 use execution_storage::{
     ApfsBackend, DockerBindCapability, DockerBindProof, DockerBindVerifier, ExecutionStorage,
     ExecutionStorageManager, LvmBackend, ProcessCommandRunner, StorageBackend, StorageError,
@@ -29,6 +30,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+mod disk_budget;
 
 struct Secret(String);
 
@@ -96,6 +99,15 @@ struct Cli {
     database_url: String,
     #[arg(long, env = "AUTOSPEC_STATE_ROOT", default_value = "/var/lib/autospec")]
     state_root: PathBuf,
+    /// State-root usage (bytes or inodes) at which a warning is logged.
+    #[arg(long, default_value_t = 80)]
+    disk_warn_percent: u8,
+    /// State-root usage (bytes or inodes) at which new executions stop being admitted.
+    #[arg(long, default_value_t = 90)]
+    disk_stop_percent: u8,
+    /// Free state-root space below which new executions stop being admitted (0 disables).
+    #[arg(long, default_value_t = 0)]
+    disk_reserve_gib: u64,
     #[arg(long, default_value = "https://github.com")]
     clone_base: String,
     #[arg(long, env = "AUTOSPEC_DOCKER_SOCKET")]
@@ -132,13 +144,56 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    disk_policy(&cli)?;
     let prepared = prepare_execution_plane(&cli).await;
     let (worker, execution_plane) = advertisement_from_preparation(&cli, prepared)?;
     let token = Secret(cli.worker_token.clone());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
-    run_control_loop(&cli, worker, execution_plane, token, client).await
+    run_control_loop(
+        &cli,
+        worker,
+        execution_plane,
+        token,
+        client,
+        Arc::new(disk_budget::sample),
+    )
+    .await
+}
+
+fn disk_policy(cli: &Cli) -> Result<DiskPolicy> {
+    DiskPolicy::new(
+        cli.disk_warn_percent,
+        cli.disk_stop_percent,
+        cli.disk_reserve_gib,
+    )
+}
+
+/// The advertisement actually sent on a heartbeat: the base advertisement plus
+/// a freshly sampled disk-pressure health error (spec §5 R-BUILD). Sampling on
+/// every call lets admission resume when space returns.
+fn heartbeat_advertisement(
+    base: &WorkerAdvertisement,
+    state_root: &Path,
+    policy: &DiskPolicy,
+    sampler: &Sampler,
+) -> WorkerAdvertisement {
+    let mut advertised = base.clone();
+    if let Some(reason) = policy.health_error(state_root, sampler) {
+        if !advertised
+            .capabilities
+            .health_errors
+            .iter()
+            .any(|error| error == reason)
+        {
+            advertised
+                .capabilities
+                .health_errors
+                .push(reason.to_owned());
+        }
+    }
+    advertised
 }
 
 struct ExecutionPlane {
@@ -376,7 +431,9 @@ async fn run_control_loop(
     mut execution_plane: Option<ExecutionPlane>,
     token: Secret,
     client: reqwest::Client,
+    sampler: Sampler,
 ) -> Result<()> {
+    let policy = disk_policy(cli)?;
     tracing::info!(
         worker_id = %worker.id,
         controller = %cli.controller,
@@ -494,12 +551,13 @@ async fn run_control_loop(
             }
         }
         if tokio::time::Instant::now() >= heartbeat_due {
+            let advertised = heartbeat_advertisement(&worker, &cli.state_root, &policy, &sampler);
             let request = if registered {
                 client.post(&heartbeat_url)
             } else {
                 client.post(&workers_url)
             };
-            match request.bearer_auth(&token.0).json(&worker).send().await {
+            match request.bearer_auth(&token.0).json(&advertised).send().await {
                 Ok(response)
                     if control_disposition(registered, response.status())
                         == ControlDisposition::Registered =>
@@ -830,6 +888,9 @@ mod tests {
             pi_executable: "pi".into(),
             allow_untested_pi_version: false,
             allow_local_development_credentials: false,
+            disk_warn_percent: 80,
+            disk_stop_percent: 90,
+            disk_reserve_gib: 0,
         }
     }
 
@@ -1017,5 +1078,188 @@ mod tests {
             worker.capabilities.health_errors,
             vec!["docker-capability-unavailable"]
         );
+    }
+    fn sampler_with_used_percent(
+        used: &'static [u64],
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Sampler {
+        Arc::new(move |_| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let pct = used[call.min(used.len() - 1)];
+            Ok(disk_budget::DiskSample {
+                total_bytes: 1000,
+                free_bytes: 1000 - pct * 10,
+                total_inodes: 1000,
+                free_inodes: 1000,
+            })
+        })
+    }
+
+    #[test]
+    fn disk_flags_default_and_parse_through_cli_into_policy() {
+        let defaults = parse(&[]);
+        assert_eq!(
+            (
+                defaults.disk_warn_percent,
+                defaults.disk_stop_percent,
+                defaults.disk_reserve_gib
+            ),
+            (80, 90, 0)
+        );
+        assert_eq!(
+            disk_policy(&defaults).unwrap(),
+            DiskPolicy::new(80, 90, 0).unwrap()
+        );
+        let cli = parse(&[
+            "--disk-warn-percent",
+            "50",
+            "--disk-stop-percent",
+            "60",
+            "--disk-reserve-gib",
+            "3",
+        ]);
+        let policy = disk_policy(&cli).unwrap();
+        assert_eq!(policy.warn_percent, 50);
+        assert_eq!(policy.stop_percent, 60);
+        assert_eq!(policy.reserve_bytes, 3 * 1024 * 1024 * 1024);
+        assert!(disk_policy(&parse(&["--disk-warn-percent", "95"])).is_err());
+    }
+
+    #[test]
+    fn configured_stop_percent_and_reserve_reach_the_advertisement() {
+        let base = advertisement(&cli(), None, Vec::new()).unwrap();
+        let root = Path::new("/state");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sampler = sampler_with_used_percent(&[55], calls);
+        let strict = disk_policy(&parse(&[
+            "--disk-warn-percent",
+            "40",
+            "--disk-stop-percent",
+            "50",
+        ]))
+        .unwrap();
+        let lenient = disk_policy(&parse(&[])).unwrap();
+        assert_eq!(
+            heartbeat_advertisement(&base, root, &strict, &sampler)
+                .capabilities
+                .health_errors,
+            vec!["disk-pressure-bytes"]
+        );
+        assert!(heartbeat_advertisement(&base, root, &lenient, &sampler)
+            .capabilities
+            .health_errors
+            .is_empty());
+        // 1000 total bytes is far below a 1 GiB reserve, whatever the percent.
+        let reserve = disk_policy(&parse(&["--disk-reserve-gib", "1"])).unwrap();
+        assert_eq!(
+            heartbeat_advertisement(&base, root, &reserve, &sampler)
+                .capabilities
+                .health_errors,
+            vec!["disk-pressure-bytes"]
+        );
+    }
+
+    #[test]
+    fn heartbeat_resamples_each_call_and_keeps_preparation_errors_sanitized() {
+        let base =
+            advertisement(&cli(), None, vec!["storage-capability-unavailable".into()]).unwrap();
+        let policy = disk_policy(&parse(&[])).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sampler = sampler_with_used_percent(&[95, 10], calls.clone());
+        let root = Path::new("/state");
+        let full = heartbeat_advertisement(&base, root, &policy, &sampler);
+        assert_eq!(
+            full.capabilities.health_errors,
+            vec!["storage-capability-unavailable", "disk-pressure-bytes"]
+        );
+        assert!(full.capabilities.health_errors_are_sanitized());
+        let freed = heartbeat_advertisement(&base, root, &policy, &sampler);
+        assert_eq!(
+            freed.capabilities.health_errors,
+            vec!["storage-capability-unavailable"]
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // The base advertisement is never mutated by pressure.
+        assert_eq!(base.capabilities.health_errors.len(), 1);
+    }
+
+    /// Serves `500` to every request and forwards each request body.
+    async fn fake_controller(
+        listener: tokio::net::TcpListener,
+        bodies: tokio::sync::mpsc::UnboundedSender<String>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let body = loop {
+                let read = socket.read(&mut chunk).await.unwrap_or(0);
+                if read == 0 {
+                    break String::new();
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&buffer).into_owned();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break body.to_owned();
+                    }
+                }
+            };
+            let _ = bodies.send(body);
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn control_loop_heartbeats_advertise_disk_pressure_then_resume() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut bodies) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(fake_controller(listener, sender));
+        let state_root = tempfile::tempdir().unwrap();
+        let mut config = cli();
+        config.controller = format!("http://{address}");
+        config.state_root = state_root.path().to_owned();
+        let worker = advertisement(&config, None, Vec::new()).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // First heartbeat sees a full disk, later ones see space again.
+        let sampler = sampler_with_used_percent(&[95, 10], calls);
+        let client = reqwest::Client::new();
+        let control = tokio::spawn(async move {
+            run_control_loop(&config, worker, None, Secret("t".into()), client, sampler).await
+        });
+        let mut errors = Vec::new();
+        for _ in 0..2 {
+            let body = tokio::time::timeout(Duration::from_secs(30), bodies.recv())
+                .await
+                .expect("heartbeat arrives")
+                .expect("server alive");
+            let wire: serde_json::Value = serde_json::from_str(&body).unwrap();
+            errors.push(
+                wire["capabilities"]["healthErrors"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        control.abort();
+        server.abort();
+        assert!(errors[0].iter().any(|error| error == "disk-pressure-bytes"));
+        assert!(!errors[1].iter().any(|error| error == "disk-pressure-bytes"));
     }
 }

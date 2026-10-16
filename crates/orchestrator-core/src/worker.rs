@@ -52,6 +52,8 @@ impl WorkerCapabilities {
                         | "docker-capability-unavailable"
                         | "worker-configuration-invalid"
                         | "worker-preparation-unavailable"
+                        | "disk-pressure-bytes"
+                        | "disk-pressure-inodes"
                 )
             })
     }
@@ -180,6 +182,8 @@ mod tests {
             "worker-preparation-unavailable",
             "storage-capability-unavailable",
             "docker-capability-unavailable",
+            "disk-pressure-bytes",
+            "disk-pressure-inodes",
         ] {
             let mut advertised = capabilities.clone();
             advertised.health_errors = vec![code.to_owned()];
