@@ -986,7 +986,7 @@ async fn symlinked_live_event_file_cannot_escape_private_session() {
 }
 
 #[tokio::test]
-async fn docker_exec_uses_only_container_paths_and_carries_no_model_selection_flags() {
+async fn docker_exec_uses_only_container_paths_and_carries_the_model_policy_flags() {
     let Some(fixture) = DockerPi::create() else {
         return;
     };
@@ -1001,8 +1001,9 @@ async fn docker_exec_uses_only_container_paths_and_carries_no_model_selection_fl
     assert!(args.contains("--skill /workspace/role.md"));
     assert!(args.contains("@/workspace/.autospec/task-packet.json"));
     assert!(!args.contains(fixture.root.path().to_string_lossy().as_ref()));
-    assert!(!args.contains("--provider"));
-    assert!(!args.contains("--model"));
+    assert!(args.contains("--provider inferweave"));
+    assert!(args.contains("--model qwen/code"));
+    assert!(!args.contains("qwen/fallback"));
     assert!(!args.contains("--models"));
     let owner: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.session_dir().join("owner.json")).unwrap())

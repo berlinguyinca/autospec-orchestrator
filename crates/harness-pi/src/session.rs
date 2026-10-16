@@ -191,6 +191,7 @@ pub(crate) fn base_args(harness: &PiHarness) -> Result<Vec<String>, HarnessError
         "--no-themes".into(),
         "--approve".into(),
     ];
+    args.extend(model_args(harness.config.model_policy.as_ref()));
     if harness.config.tools.is_empty() {
         args.push("--no-tools".into());
     } else {
@@ -208,6 +209,22 @@ pub(crate) fn base_args(harness: &PiHarness) -> Result<Vec<String>, HarnessError
         ]);
     }
     Ok(args)
+}
+
+/// Projects AutoSpec's `ModelPolicy` onto Pi's argv so Pi runs the model AutoSpec
+/// chose (spec R-ORCH). Only `preferred[0]` is passed: alternatives and the
+/// fallback class belong to the caller, never to this harness. Pi rejects
+/// `--provider` without `--model`, so an empty `preferred` projects to nothing.
+pub(crate) fn model_args(policy: Option<&ModelPolicy>) -> Vec<String> {
+    match policy.and_then(|p| p.preferred.first().map(|model| (p, model))) {
+        Some((policy, model)) => vec![
+            "--provider".into(),
+            policy.provider.clone(),
+            "--model".into(),
+            model.clone(),
+        ],
+        None => Vec::new(),
+    }
 }
 
 fn packet_role_skill(worktree: &Path) -> Option<String> {
@@ -1573,5 +1590,76 @@ mod secret_tests {
             String::from_utf8(record).unwrap(),
             "before [REDACTED_CREDENTIAL] middle [REDACTED_CREDENTIAL] after\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod model_args_tests {
+    use super::{base_args, model_args};
+    use crate::{PiHarness, PiHarnessConfig};
+    use orchestrator_core::{ExecutionId, ModelPolicy, OwnershipLabels, WorkerId};
+
+    fn policy(preferred: &[&str]) -> ModelPolicy {
+        ModelPolicy {
+            provider: "inferweave".to_owned(),
+            preferred: preferred.iter().map(|m| (*m).to_owned()).collect(),
+            alternatives: vec!["qwen/fallback".to_owned()],
+            fallback_class: Some("coding".to_owned()),
+        }
+    }
+
+    #[test]
+    fn preferred_model_becomes_provider_and_model_flags() {
+        assert_eq!(
+            model_args(Some(&policy(&["qwen/code", "qwen/second"]))),
+            ["--provider", "inferweave", "--model", "qwen/code"]
+        );
+    }
+
+    #[test]
+    fn missing_policy_or_empty_preferred_projects_to_nothing() {
+        assert!(model_args(None).is_empty());
+        assert!(model_args(Some(&policy(&[]))).is_empty());
+    }
+
+    #[test]
+    fn alternatives_are_never_passed() {
+        let args = model_args(Some(&policy(&["qwen/code"])));
+        assert!(!args.iter().any(|a| a.contains("fallback")));
+    }
+
+    fn harness(model_policy: Option<ModelPolicy>) -> PiHarness {
+        let mut config = PiHarnessConfig::for_execution(
+            "/nonexistent/state".into(),
+            "/nonexistent/worktree".into(),
+            "agent".to_owned(),
+            OwnershipLabels {
+                execution_id: ExecutionId::new("exec-model-args"),
+                worker_id: WorkerId::new("worker"),
+                repository: "repo".to_owned(),
+                issue: None,
+            },
+        );
+        config.model_policy = model_policy;
+        PiHarness::new(config)
+    }
+
+    /// Wiring: `base_args` is the single argv builder behind start, resume and
+    /// fork, so the policy must reach Pi through it, not only through `owner.json`.
+    #[test]
+    fn base_args_carries_the_model_policy_before_tools() {
+        let args = base_args(&harness(Some(policy(&["qwen/code"])))).unwrap();
+        let at = args.iter().position(|a| a == "--provider").unwrap();
+        assert_eq!(
+            args[at..at + 4],
+            ["--provider", "inferweave", "--model", "qwen/code"]
+        );
+        assert!(at < args.iter().position(|a| a == "--tools").unwrap());
+    }
+
+    #[test]
+    fn base_args_without_a_policy_has_no_model_flags() {
+        let args = base_args(&harness(None)).unwrap();
+        assert!(!args.iter().any(|a| a == "--provider" || a == "--model"));
     }
 }
