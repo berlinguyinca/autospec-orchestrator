@@ -3212,3 +3212,323 @@ async fn unreachable_reaper_skips_already_fenced_attempt_with_retained_cleanup_r
         .await
         .unwrap());
 }
+
+// --- reservation disk budget (issue #66) -------------------------------------------------
+
+fn disk_worker(disk_gib: u64, slots: u32) -> orchestrator_core::WorkerRegistration {
+    let mut worker = registered_worker(
+        &format!("worker-disk-{}", uuid::Uuid::new_v4().simple()),
+        slots,
+    );
+    worker.capabilities.disk_gib = disk_gib;
+    worker
+}
+
+fn disk_execution(disk_gib: u64) -> Execution {
+    let mut queued = execution(ExecutionState::Queued);
+    queued.manifest.runtime.disk_gib = disk_gib;
+    queued
+}
+
+/// Queued executions left behind by other tests would be claimed first (oldest wins); the
+/// disposable database is ours alone while the test lock is held, so clear them.
+async fn clear_queued_executions() {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&std::env::var("AUTOSPEC_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM executions WHERE state = 'QUEUED'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn migration_0014_is_additive_and_existing_reservations_read_zero_disk() {
+    let _database_test = database_test_lock().lock().await;
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        return;
+    };
+    let schema = format!("reservation_disk_{}", uuid::Uuid::new_v4().simple());
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::raw_sql(&format!(
+        "CREATE SCHEMA {schema}; SET search_path TO {schema}"
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    let current = sqlx::migrate!();
+    let before = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            current
+                .migrations
+                .iter()
+                .filter(|migration| migration.version <= 13)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: false,
+        no_tx: false,
+    };
+    before.run(&mut connection).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO executions (id, role, state, manifest, labels, created_at, updated_at) \
+         VALUES ('legacy', 'implementation', 'WORKER_ASSIGNED', '{}'::jsonb, '{}'::jsonb, now(), now()); \
+         INSERT INTO workers (id, capabilities, capability_proof, state, last_heartbeat) \
+         VALUES ('legacy-worker', '{}'::jsonb, '{}'::jsonb, 'READY', now()); \
+         INSERT INTO reservations (execution_id, worker_id, attempt_id, cpu, memory_mib) \
+         VALUES ('legacy', 'legacy-worker', 'legacy-attempt', 2, 4096)",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    current.run(&mut connection).await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT disk_gib FROM reservations WHERE execution_id = 'legacy'"
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap(),
+        0,
+        "a pre-0014 reservation must read back zero reserved disk"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 14 AND success"
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(sqlx::query(
+        "INSERT INTO reservations (execution_id, worker_id, attempt_id, cpu, memory_mib, disk_gib) \
+         VALUES ('legacy', 'legacy-worker', 'negative', 1, 1, -1)"
+    )
+    .execute(&mut connection)
+    .await
+    .is_err());
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn claim_binds_the_requirements_disk_into_the_reservation_row() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    clear_queued_executions().await;
+    let worker = disk_worker(100, 2);
+    workers.register(&worker).await.unwrap();
+    let queued = disk_execution(37);
+    executions.insert(&queued).await.unwrap();
+
+    let reservation = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .expect("a 37 GiB execution fits a 100 GiB worker");
+    assert_eq!(reservation.execution.id, queued.id);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&std::env::var("AUTOSPEC_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let stored: i64 =
+        sqlx::query_scalar("SELECT disk_gib FROM reservations WHERE execution_id = $1")
+            .bind(queued.id.as_str())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 37);
+    pool.close().await;
+    reservations.release(&queued.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn claim_whose_disk_exceeds_unreserved_disk_is_refused_until_release() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    clear_queued_executions().await;
+    let worker = disk_worker(100, 4);
+    workers.register(&worker).await.unwrap();
+    let big = disk_execution(90);
+    executions.insert(&big).await.unwrap();
+    let held = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.execution.id, big.id);
+
+    let small = disk_execution(20);
+    executions.insert(&small).await.unwrap();
+    assert!(
+        reservations
+            .reserve_next(&worker.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "20 GiB must not be claimed with 90 of 100 GiB reserved"
+    );
+    assert_eq!(
+        executions.get(&small.id).await.unwrap().state,
+        ExecutionState::Queued
+    );
+
+    reservations.release(&big.id).await.unwrap();
+    let granted = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .expect("the same 20 GiB execution is claimed once the disk is released");
+    assert_eq!(granted.execution.id, small.id);
+    reservations.release(&small.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn reserved_disk_is_summed_across_reservations_and_a_fitting_claim_is_granted() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    clear_queued_executions().await;
+    let worker = disk_worker(100, 4);
+    workers.register(&worker).await.unwrap();
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let queued = disk_execution(30);
+        executions.insert(&queued).await.unwrap();
+        held.push(
+            reservations
+                .reserve_next(&worker.id)
+                .await
+                .unwrap()
+                .expect("30 GiB fits while the worker has free disk"),
+        );
+    }
+    // 60 GiB reserved across two rows: 41 does not fit (it stays queued), 40 does.
+    let too_big = disk_execution(41);
+    executions.insert(&too_big).await.unwrap();
+    assert!(reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .is_none());
+    let fits = disk_execution(40);
+    executions.insert(&fits).await.unwrap();
+    let granted = reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .expect("40 GiB exactly fills the remaining disk");
+    assert_eq!(granted.execution.id, fits.id);
+    held.push(granted);
+    for reservation in held {
+        reservations
+            .release(&reservation.execution.id)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn concurrent_claims_cannot_race_past_the_disk_capacity() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let reservations = Arc::new(reservations);
+    for _ in 0..8 {
+        clear_queued_executions().await;
+        let worker = disk_worker(100, 4);
+        workers.register(&worker).await.unwrap();
+        for _ in 0..2 {
+            executions.insert(&disk_execution(60)).await.unwrap();
+        }
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let reservations = Arc::clone(&reservations);
+            let worker_id = worker.id.clone();
+            tasks.push(tokio::spawn(async move {
+                reservations.reserve_next(&worker_id).await
+            }));
+        }
+        let mut granted = Vec::new();
+        for task in tasks {
+            if let Some(reservation) = task.await.unwrap().unwrap() {
+                granted.push(reservation);
+            }
+        }
+        assert_eq!(
+            granted.len(),
+            1,
+            "two 60 GiB claims on a 100 GiB worker must reserve exactly one"
+        );
+        reservations
+            .release(&granted[0].execution.id)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn disk_claim_serializes_behind_a_concurrent_reservation_through_the_worker_row_lock() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    clear_queued_executions().await;
+    let worker = disk_worker(100, 4);
+    workers.register(&worker).await.unwrap();
+    let rival = execution(ExecutionState::WorkerAssigned);
+    executions.insert(&rival).await.unwrap();
+    let queued = disk_execution(60);
+    executions.insert(&queued).await.unwrap();
+
+    // A concurrent claim holds the worker row and has reserved 60 GiB but not committed.
+    // Our claim must wait for that lock, then see the 60 GiB and refuse (60 > 100 - 60). A
+    // claim that read usage without the lock would see 0 and over-commit the disk.
+    let mut other = PgConnection::connect(&std::env::var("AUTOSPEC_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let mut held = Connection::begin(&mut other).await.unwrap();
+    sqlx::query("SELECT 1 FROM workers WHERE id = $1 FOR UPDATE")
+        .bind(worker.id.as_str())
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO reservations (execution_id, worker_id, attempt_id, cpu, memory_mib, disk_gib) \
+         VALUES ($1, $2, $3, 2, 4096, 60)",
+    )
+    .bind(rival.id.as_str())
+    .bind(worker.id.as_str())
+    .bind(format!("attempt-{}", uuid::Uuid::new_v4().simple()))
+    .execute(&mut *held)
+    .await
+    .unwrap();
+    let reservations = Arc::new(reservations);
+    let claimer = Arc::clone(&reservations);
+    let worker_id = worker.id.clone();
+    let claim = tokio::spawn(async move { claimer.reserve_next(&worker_id).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    held.commit().await.unwrap();
+    assert!(
+        claim.await.unwrap().unwrap().is_none(),
+        "the claim read disk usage without waiting for the worker row lock"
+    );
+    reservations.release(&rival.id).await.unwrap();
+}
