@@ -33,6 +33,30 @@ granting an unauthenticated ACL is not supported.
 APFS/LVM or Docker bind probe registers the worker Offline with a sanitized
 `healthErrors` reason and zero advertised runtime capacity.
 
+Worker credentials. The controller refuses to start unless exactly one worker
+credential source is configured:
+
+- Per-worker tokens (recommended): `AUTOSPEC_WORKER_TOKENS_FILE` (or
+  `--worker-tokens-file`) names a file with one `<worker_id> <sha256-hex-of-token>`
+  per line (`#` comments). Issue each worker its own random token, store only
+  the SHA-256 digest in the file (`printf %s "$TOKEN" | sha256sum`), give the
+  worker the token as its `AUTOSPEC_WORKER_TOKEN`, and `chmod 600` the file; a
+  file readable by group or other fails startup. A token is accepted for its own
+  worker only. Do not also set the controller's `AUTOSPEC_WORKER_TOKEN`.
+- One shared token (legacy): set `AUTOSPEC_WORKER_TOKEN` and
+  `AUTOSPEC_ALLOW_SHARED_WORKER_TOKEN=true` (`--allow-shared-worker-token`). The
+  shared token speaks for every worker, so a leak exposes all of them.
+
+Upgrading: a controller started with only `AUTOSPEC_WORKER_TOKEN` now exits at
+startup naming both options above instead of silently accepting the shared
+token. The bundled `docker-compose.yml` passes
+`AUTOSPEC_ALLOW_SHARED_WORKER_TOKEN` (default `true`, because that file already
+requires the shared `AUTOSPEC_WORKER_TOKEN`). To move off the shared token, edit
+the `controller` service: drop its `AUTOSPEC_WORKER_TOKEN` and
+`AUTOSPEC_ALLOW_SHARED_WORKER_TOKEN` lines, mount the tokens file read-only, and
+set `AUTOSPEC_WORKER_TOKENS_FILE` to its in-container path (the file must be
+mode 0600 and readable by the controller's user).
+
 Agents run as a non-root user by default (`AUTOSPEC_AGENT_USER`, default
 `1000:1000`). The execution directories are owner-only on the host, so a
 non-root agent works only where the Docker daemon maps that uid to the worker's

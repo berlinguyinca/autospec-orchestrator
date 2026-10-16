@@ -33,6 +33,9 @@ services:
       AUTOSPEC_DATABASE_URL: postgres://autospec_orchestrator:${AUTOSPEC_POSTGRES_PASSWORD}@postgres/autospec_orchestrator
       AUTOSPEC_API_TOKEN: ${AUTOSPEC_API_TOKEN:?set AUTOSPEC_API_TOKEN}
       AUTOSPEC_WORKER_TOKEN: ${AUTOSPEC_WORKER_TOKEN:?set AUTOSPEC_WORKER_TOKEN}
+      # The controller refuses the shared worker token unless this is explicit.
+      # See deploy/README.md for per-worker tokens (AUTOSPEC_WORKER_TOKENS_FILE).
+      AUTOSPEC_ALLOW_SHARED_WORKER_TOKEN: ${AUTOSPEC_ALLOW_SHARED_WORKER_TOKEN:-true}
       AUTOSPEC_STATE_ROOT: /var/lib/autospec
     depends_on:
       postgres:
