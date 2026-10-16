@@ -24,6 +24,7 @@ use runtime_docker::LocalCredentialBroker;
 use runtime_docker::TrustedVerifierImage;
 use runtime_traits::CredentialBroker;
 use std::{
+    collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
     process::Command,
@@ -108,6 +109,11 @@ struct Cli {
     /// Free state-root space below which new executions stop being admitted (0 disables).
     #[arg(long, default_value_t = 0)]
     disk_reserve_gib: u64,
+    /// Toolchain this host serves, as `name=version` (repeatable), e.g.
+    /// `--toolchain rust=1.86.0`. Advertised verbatim once the worker is ready;
+    /// the scheduler and the claim path match versions exactly (spec §5 R-PAR).
+    #[arg(long = "toolchain", value_name = "NAME=VERSION", value_parser = parse_toolchain)]
+    toolchains: Vec<(String, String)>,
     #[arg(long, default_value = "https://github.com")]
     clone_base: String,
     #[arg(long, env = "AUTOSPEC_DOCKER_SOCKET")]
@@ -144,7 +150,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    disk_policy(&cli)?;
+    validate_cli(&cli)?;
     let prepared = prepare_execution_plane(&cli).await;
     let (worker, execution_plane) = advertisement_from_preparation(&cli, prepared)?;
     let token = Secret(cli.worker_token.clone());
@@ -160,6 +166,40 @@ async fn main() -> Result<()> {
         Arc::new(disk_budget::sample),
     )
     .await
+}
+
+/// Startup checks that need no host access, so a bad flag fails before any
+/// storage, Docker or database work begins.
+fn validate_cli(cli: &Cli) -> Result<()> {
+    disk_policy(cli)?;
+    toolchain_map(&cli.toolchains)?;
+    Ok(())
+}
+
+/// Parses one `--toolchain name=version` value; both halves must be non-empty.
+fn parse_toolchain(raw: &str) -> Result<(String, String), String> {
+    let (name, version) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("toolchain `{raw}` must be NAME=VERSION"))?;
+    let (name, version) = (name.trim(), version.trim());
+    if name.is_empty() || version.is_empty() {
+        return Err(format!(
+            "toolchain `{raw}` must have a non-empty name and version"
+        ));
+    }
+    Ok((name.to_owned(), version.to_owned()))
+}
+
+/// The advertised toolchain map; a name declared twice is ambiguous and refused
+/// even when the versions agree.
+fn toolchain_map(list: &[(String, String)]) -> Result<BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    for (name, version) in list {
+        if map.insert(name.clone(), version.clone()).is_some() {
+            anyhow::bail!("toolchain `{name}` is declared more than once");
+        }
+    }
+    Ok(map)
 }
 
 fn disk_policy(cli: &Cli) -> Result<DiskPolicy> {
@@ -659,6 +699,7 @@ fn advertisement(
     let ready = proof
         .as_ref()
         .is_some_and(WorkerCapabilityProof::is_complete);
+    let toolchains = toolchain_map(&cli.toolchains)?;
     Ok(WorkerAdvertisement {
         id: WorkerId::new(&cli.worker_id),
         capabilities: WorkerCapabilities {
@@ -679,7 +720,7 @@ fn advertisement(
             } else {
                 Vec::new()
             },
-            toolchains: Default::default(),
+            toolchains: if ready { toolchains } else { BTreeMap::new() },
             max_concurrent_executions: cli.concurrency,
             health_errors,
         },
@@ -881,6 +922,7 @@ mod tests {
             docker_binary: "docker".into(),
             database_url: "postgres://test".into(),
             state_root: "/tmp".into(),
+            toolchains: Vec::new(),
             clone_base: "https://github.com".into(),
             docker_socket: None,
             docker_proxy_port: 2375,
@@ -1261,5 +1303,89 @@ mod tests {
         server.abort();
         assert!(errors[0].iter().any(|error| error == "disk-pressure-bytes"));
         assert!(!errors[1].iter().any(|error| error == "disk-pressure-bytes"));
+    }
+
+    fn ready_proof() -> WorkerCapabilityProof {
+        WorkerCapabilityProof {
+            storage_backend: "apfs".into(),
+            storage_pool_identity: "pool".into(),
+            docker_daemon_id: "daemon".into(),
+            docker_verifier: format!("sha256:{}", "a".repeat(64)),
+            docker_method_version: "v2".into(),
+        }
+    }
+
+    #[test]
+    fn parse_toolchain_accepts_name_equals_version_and_rejects_the_rest() {
+        assert_eq!(
+            parse_toolchain("rust=1.86.0").unwrap(),
+            ("rust".to_owned(), "1.86.0".to_owned())
+        );
+        for bad in ["rust=", "=1.86.0", "rust", "=", " =  "] {
+            assert!(parse_toolchain(bad).is_err(), "accepted `{bad}`");
+        }
+    }
+
+    #[test]
+    fn toolchain_map_rejects_a_repeated_name_even_with_the_same_version() {
+        let pair = |n: &str, v: &str| (n.to_owned(), v.to_owned());
+        assert!(toolchain_map(&[pair("rust", "1.86.0"), pair("rust", "1.85.0")]).is_err());
+        assert!(toolchain_map(&[pair("rust", "1.86.0"), pair("rust", "1.86.0")]).is_err());
+        let map = toolchain_map(&[pair("rust", "1.86.0"), pair("node", "22")]).unwrap();
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn toolchain_flags_flow_from_the_command_line_into_a_ready_advertisement() {
+        let cli = parse(&["--toolchain", "rust=1.86.0", "--toolchain", "node=22.1.0"]);
+        assert_eq!(cli.toolchains.len(), 2);
+        let worker = advertisement(&cli, Some(ready_proof()), Vec::new()).unwrap();
+        let wire = serde_json::to_value(&worker).unwrap();
+        assert_eq!(
+            wire["capabilities"]["toolchains"],
+            serde_json::json!({"node": "22.1.0", "rust": "1.86.0"})
+        );
+        // The heartbeat sends a clone of the base advertisement, so the
+        // toolchains survive the per-beat disk-pressure refresh.
+        let policy = disk_policy(&cli).unwrap();
+        let sampler =
+            sampler_with_used_percent(&[10], Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let beat = heartbeat_advertisement(&worker, Path::new("/tmp"), &policy, &sampler);
+        assert_eq!(beat.capabilities.toolchains["rust"], "1.86.0");
+    }
+
+    #[test]
+    fn an_unready_worker_advertises_no_toolchains() {
+        let cli = parse(&["--toolchain", "rust=1.86.0"]);
+        let worker =
+            advertisement(&cli, None, vec!["docker-capability-unavailable".into()]).unwrap();
+        assert!(worker.capabilities.toolchains.is_empty());
+        let wire = serde_json::to_value(&worker).unwrap();
+        assert!(wire["capabilities"].get("toolchains").is_none());
+    }
+
+    #[test]
+    fn startup_validation_rejects_malformed_and_duplicate_toolchain_flags() {
+        assert!(Cli::try_parse_from([
+            "autospec-worker",
+            "--worker-id",
+            "w",
+            "--worker-token",
+            "t",
+            "--storage-kind",
+            "apfs",
+            "--storage-pool",
+            "/tmp",
+            "--docker-verifier-image",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--database-url",
+            "postgres://test",
+            "--toolchain",
+            "rust=",
+        ])
+        .is_err());
+        let dup = parse(&["--toolchain", "rust=1.86.0", "--toolchain", "rust=1.85.0"]);
+        assert!(validate_cli(&dup).is_err());
+        assert!(validate_cli(&parse(&["--toolchain", "rust=1.86.0"])).is_ok());
     }
 }
