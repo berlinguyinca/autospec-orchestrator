@@ -2317,7 +2317,11 @@ mod tests {
         let runtime =
             || runtime_docker::DockerRuntime::connect_with_state_root(None, "/tmp").unwrap();
         assert!(factory().inference_relay().is_none());
-        assert!(factory().configure(runtime()).unwrap().inference_relay().is_none());
+        assert!(factory()
+            .configure(runtime())
+            .unwrap()
+            .inference_relay()
+            .is_none());
         let relay = runtime_docker::InferenceRelay {
             image: "relay:1".to_owned(),
             upstream: "gateway.local:8080".to_owned(),

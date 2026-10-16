@@ -269,9 +269,9 @@ fn resolve_relay(cli: &Cli) -> Result<Option<runtime_docker::InferenceRelay>> {
             "--allow-agent-egress contradicts --inference-upstream/--inference-relay-image; \
              pass the relay flags or --allow-agent-egress, not both"
         ),
-        (Some(_), None, _) | (None, Some(_), _) => anyhow::bail!(
-            "--inference-upstream and --inference-relay-image must be given together"
-        ),
+        (Some(_), None, _) | (None, Some(_), _) => {
+            anyhow::bail!("--inference-upstream and --inference-relay-image must be given together")
+        }
         (None, None, false) => anyhow::bail!(
             "no inference relay configured: executions would have unrestricted network egress. \
              Pass --inference-upstream <host:port> and --inference-relay-image <image> \
@@ -1911,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_refuses_to_run_without_a_relay_unless_egress_is_allowed() {
+    fn resolve_relay_refuses_without_a_relay_unless_egress_is_allowed() {
         // Neither relay flag nor the opt-out: refuse, naming all three flags.
         let bare = parse_raw(&[]);
         assert!(!bare.allow_agent_egress);
@@ -1923,7 +1923,10 @@ mod tests {
         ] {
             assert!(error.contains(flag), "{error}");
         }
-        assert!(resolve_relay(&bare).unwrap_err().to_string().contains("--inference-upstream"));
+        assert!(resolve_relay(&bare)
+            .unwrap_err()
+            .to_string()
+            .contains("--inference-upstream"));
         // The explicit opt-out starts, with no relay.
         let egress = parse_raw(&["--allow-agent-egress"]);
         assert!(validate_cli(&egress).is_ok());
@@ -1931,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn both_relay_flags_make_a_relay_with_the_default_or_a_given_port() {
+    fn resolve_relay_makes_a_relay_from_both_flags_with_the_default_or_a_given_port() {
         let both = parse_raw(&[
             "--inference-upstream",
             "gateway.local:8080",
@@ -1959,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn a_half_configured_contradictory_or_malformed_relay_is_refused_at_startup() {
+    fn resolve_relay_refuses_half_contradictory_or_malformed_relays_at_startup() {
         for extra in [
             vec!["--inference-upstream", "gateway.local:8080"],
             vec!["--inference-relay-image", "relay:1"],
@@ -2030,9 +2033,15 @@ mod tests {
             "9001",
         ]);
         let factory = build(&cli).unwrap();
-        let relay = factory.inference_relay().expect("relay reaches the factory");
+        let relay = factory
+            .inference_relay()
+            .expect("relay reaches the factory");
         assert_eq!(
-            (relay.image.as_str(), relay.upstream.as_str(), relay.listen_port),
+            (
+                relay.image.as_str(),
+                relay.upstream.as_str(),
+                relay.listen_port
+            ),
             ("relay:1", "gateway.local:8080", 9001)
         );
         // A configuration that would run without a relay cannot build a factory.
