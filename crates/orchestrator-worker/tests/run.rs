@@ -387,6 +387,7 @@ struct FakeLifecycle {
     poll_empty: bool,
     cleanup_fail: bool,
     hang_poll: bool,
+    empty_diff: bool,
 }
 
 impl FakeLifecycle {
@@ -514,6 +515,12 @@ impl ExecutionLifecycle for FakeLifecycle {
     }
     async fn capture(&self, _: &Worktree) -> Result<DiffCapture, LifecycleError> {
         self.step("git-capture")?;
+        if self.empty_diff {
+            return Ok(DiffCapture {
+                patch: String::new(),
+                changed_files: Vec::new(),
+            });
+        }
         Ok(DiffCapture {
             patch: "diff".into(),
             changed_files: vec!["src/lib.rs".into()],
@@ -624,6 +631,7 @@ async fn restart_adoption_reuses_attempt_session_and_skips_all_creation_steps() 
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: false,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
@@ -663,6 +671,7 @@ async fn failed_adoption_recovers_durable_authority_instead_of_releasing_live_la
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: false,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
@@ -712,6 +721,7 @@ async fn successful_run_uses_exact_order_and_persists_result_before_cleanup() {
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: false,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
@@ -796,6 +806,7 @@ async fn storage_ack_failure_keeps_finalized_authority_for_fresh_worker_retry() 
             poll_empty: false,
             cleanup_fail: false,
             hang_poll: false,
+            empty_diff: false,
         }),
         store.clone(),
         reservations.clone(),
@@ -825,6 +836,7 @@ async fn storage_ack_failure_keeps_finalized_authority_for_fresh_worker_retry() 
             poll_empty: false,
             cleanup_fail: false,
             hang_poll: false,
+            empty_diff: false,
         }),
         store,
         reservations,
@@ -846,6 +858,7 @@ async fn resumable_review_ready_retains_resources_but_releases_capacity() {
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: false,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
@@ -888,6 +901,7 @@ async fn cleanup_authority_conflict_immediately_releases_the_new_reservation() {
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: false,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
@@ -916,6 +930,7 @@ async fn provisioning_failure_runs_reverse_cleanup_and_returns_worker_lost_peer_
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: false,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
@@ -1025,6 +1040,7 @@ async fn every_creation_and_result_phase_failure_cleans_only_acquired_lower_laye
             poll_empty: false,
             cleanup_fail: false,
             hang_poll: false,
+            empty_diff: false,
         });
         let store = Arc::new(FakeStore::default());
         let reservations = Arc::new(FakeReservations::default());
@@ -1070,6 +1086,7 @@ async fn cancelling_one_execution_stops_only_its_task_and_persists_cancelled() {
         poll_empty: true,
         cleanup_fail: false,
         hang_poll: false,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
@@ -1096,6 +1113,7 @@ async fn execution_and_reverse_cleanup_failures_are_all_reported() {
         poll_empty: false,
         cleanup_fail: true,
         hang_poll: false,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let execution = execution();
@@ -1117,6 +1135,7 @@ async fn uncertain_pi_stop_retains_runtime_storage_and_reservation_authority() {
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: false,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
@@ -1141,6 +1160,7 @@ async fn cancellation_interrupts_a_hung_poll_and_still_runs_cleanup() {
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: true,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
@@ -1188,6 +1208,7 @@ async fn failing_oldest_taskless_cancellation_does_not_starve_active_peer_signal
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: true,
+        empty_diff: false,
     });
     let worker = Arc::new(worker(
         lifecycle,
@@ -1223,6 +1244,7 @@ async fn durable_pause_resume_and_conversation_fork_interrupt_poll_without_works
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: true,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let reservations = Arc::new(FakeReservations::default());
@@ -1337,6 +1359,7 @@ async fn running_conversation_fork_quiesces_source_and_resumes_exact_target() {
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: true,
+        empty_diff: false,
     });
     let store = Arc::new(FakeStore::default());
     let execution = execution();
@@ -1540,6 +1563,7 @@ async fn startup_keeps_a_failed_cancellation_lookup_and_recovers_later_authoriti
         poll_empty: false,
         cleanup_fail: false,
         hang_poll: false,
+        empty_diff: false,
     });
     let worker = Arc::new(Worker::new(
         lifecycle,
@@ -1627,6 +1651,7 @@ async fn startup_does_not_spawn_adoption_before_all_fallible_reconciliation_comp
             poll_empty: false,
             cleanup_fail: false,
             hang_poll: false,
+            empty_diff: false,
         }),
         store,
         reservations.clone(),
@@ -1685,5 +1710,80 @@ fn receipt(execution: &Execution) -> AllocationReceipt {
             source_path: "/allocation".into(),
             filesystem_id: "fs".into(),
         },
+    }
+}
+
+fn empty_diff_lifecycle(order: &Arc<Mutex<Vec<&'static str>>>) -> Arc<FakeLifecycle> {
+    Arc::new(FakeLifecycle {
+        order: Arc::clone(order),
+        fail_at: None,
+        poll_empty: false,
+        cleanup_fail: false,
+        hang_poll: false,
+        empty_diff: true,
+    })
+}
+
+/// Runs an execution of `role` whose Pi settles (ReviewReady event) but whose
+/// worktree capture is empty. Returns the run outcome, the step order and the store.
+async fn run_with_empty_diff(
+    role: Role,
+) -> (
+    Result<orchestrator_core::ExecutionResult, orchestrator_worker::WorkerError>,
+    Vec<&'static str>,
+    Arc<FakeStore>,
+) {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let store = Arc::new(FakeStore::default());
+    let mut execution = execution();
+    execution.role = role;
+    execution.manifest.role = role;
+    store.insert(&execution).await.unwrap();
+    let worker = worker(
+        empty_diff_lifecycle(&order),
+        store.clone(),
+        Arc::new(FakeReservations::default()),
+    );
+    let result = worker.run(&execution).await;
+    let steps = order.lock().unwrap().clone();
+    (result, steps, store)
+}
+
+#[tokio::test]
+async fn empty_diff_implementation_and_documentation_fail_with_task_failed_after_persisting_evidence(
+) {
+    for role in [Role::Implementation, Role::Documentation] {
+        let (result, steps, store) = run_with_empty_diff(role).await;
+        assert!(
+            result.is_err(),
+            "{role:?} with an empty diff must not succeed"
+        );
+        let capture = steps.iter().position(|s| *s == "git-capture").unwrap();
+        let persisted = steps.iter().position(|s| *s == "persist-evidence").unwrap();
+        assert!(
+            capture < persisted,
+            "{role:?}: evidence persisted after capture"
+        );
+        let stored = store.execution.lock().unwrap().clone().unwrap();
+        assert_eq!(stored.state, ExecutionState::Failed, "{role:?}");
+        assert_eq!(
+            stored.result.and_then(|r| r.failure),
+            Some(orchestrator_core::FailureClass::TaskFailed),
+            "{role:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_diff_review_roles_still_reach_review_ready() {
+    for role in [
+        Role::Review,
+        Role::UiReview,
+        Role::IntegrationTest,
+        Role::Interactive,
+    ] {
+        let (result, _, _) = run_with_empty_diff(role).await;
+        let result = result.unwrap_or_else(|e| panic!("{role:?} must keep REVIEW_READY: {e:?}"));
+        assert_eq!(result.state, ExecutionState::ReviewReady, "{role:?}");
     }
 }
