@@ -104,6 +104,17 @@ pub struct InferenceRelay {
     pub listen_port: u16,
 }
 
+/// The checks `with_inference_relay` applies, for callers (the worker's
+/// startup) that must refuse a bad relay before any execution exists.
+pub fn validate_inference_relay(relay: &InferenceRelay) -> Result<(), RuntimeError> {
+    if relay.image.trim().is_empty() || relay.listen_port == 0 {
+        return Err(RuntimeError::ResourceLimit(
+            "inference relay needs an image and a non-zero listen port".to_owned(),
+        ));
+    }
+    validate_relay_upstream(&relay.upstream)
+}
+
 /// Accepts only `host:port` with a bare host name or address and a non-zero
 /// port. A scheme, path, credential, whitespace or a missing port is refused.
 fn validate_relay_upstream(upstream: &str) -> Result<(), RuntimeError> {
@@ -224,12 +235,7 @@ impl DockerRuntime {
     /// Refuses an empty image, a zero listen port and an upstream that is not
     /// a plain `host:port`. The relay forwards only to that upstream.
     pub fn with_inference_relay(mut self, relay: InferenceRelay) -> Result<Self, RuntimeError> {
-        if relay.image.trim().is_empty() || relay.listen_port == 0 {
-            return Err(RuntimeError::ResourceLimit(
-                "inference relay needs an image and a non-zero listen port".to_owned(),
-            ));
-        }
-        validate_relay_upstream(&relay.upstream)?;
+        validate_inference_relay(&relay)?;
         self.inference_relay = Some(relay);
         Ok(self)
     }
