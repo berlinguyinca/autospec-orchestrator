@@ -1129,6 +1129,120 @@ async fn settle_without_an_assistant_turn_polls_as_harness_failed_not_review_rea
     harness.stop(&session).await.unwrap();
 }
 
+/// Polls until `poll_events` has produced an `ExecutionFailed`, within 5 seconds.
+async fn poll_until_failure(
+    harness: &PiHarness,
+    session: &SessionRef,
+) -> Vec<orchestrator_core::ExecutionEvent> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut seen = Vec::new();
+    while std::time::Instant::now() < deadline {
+        seen.extend(harness.poll_events(session).await.unwrap());
+        if seen
+            .iter()
+            .any(|event| matches!(event.kind, ExecutionEventKind::ExecutionFailed { .. }))
+        {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no ExecutionFailed within 5 seconds, saw {} events",
+        seen.len()
+    );
+}
+
+fn failure_classes(events: &[orchestrator_core::ExecutionEvent]) -> Vec<FailureClass> {
+    events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            ExecutionEventKind::ExecutionFailed { failure } => Some(*failure),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn pi_exited_without_a_terminal_record_exit_zero_fails_fast_and_only_once() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.worktree_dir().join("pi-exit-after-events"), "0").unwrap();
+    // agent_start and an assistant turn were written, then Pi exited 0 with no settle.
+    fixture.set_event_phases(
+        "{\"type\":\"session\",\"id\":\"e2e\"}\n{\"type\":\"agent_start\"}\n{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[],\"stopReason\":\"stop\"}}\n",
+        "",
+    );
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    let events = poll_until_failure(&harness, &session).await;
+    assert_eq!(failure_classes(&events), vec![FailureClass::HarnessFailed]);
+    // The record written before the exit is delivered ahead of the failure.
+    let started = events
+        .iter()
+        .position(|e| matches!(e.kind, ExecutionEventKind::AgentStarted { .. }))
+        .expect("agent_start delivered");
+    let failed = events
+        .iter()
+        .position(|e| matches!(e.kind, ExecutionEventKind::ExecutionFailed { .. }))
+        .unwrap();
+    assert!(started < failed);
+    assert!(events
+        .iter()
+        .all(|e| !matches!(e.kind, ExecutionEventKind::ReviewReady)));
+    // The failure is terminal: nothing more is emitted.
+    assert!(harness.poll_events(&session).await.unwrap().is_empty());
+    assert!(harness.poll_events(&session).await.unwrap().is_empty());
+    harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
+async fn pi_exited_without_a_session_file_exit_one_fails_fast_even_with_the_event_file_missing() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.worktree_dir().join("pi-exit-immediately"), "1").unwrap();
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    // No session file was ever created by the stub.
+    assert!(!fixture
+        .session_dir()
+        .join(format!("session_{}.jsonl", fixture.execution_id))
+        .exists());
+    // Also cover the branch where the live event file does not exist at all.
+    let events_path = fixture
+        .session_dir()
+        .join(format!("pi.events-{}.jsonl", fixture.execution_id));
+    let _ = fs::remove_file(&events_path);
+    let events = poll_until_failure(&harness, &session).await;
+    assert_eq!(failure_classes(&events), vec![FailureClass::HarnessFailed]);
+    assert!(harness.poll_events(&session).await.unwrap().is_empty());
+    harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_running_pi_is_not_reported_as_exited_without_a_terminal_record() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fixture.set_event_phases(
+        "{\"type\":\"session\",\"id\":\"e2e\"}\n{\"type\":\"agent_start\"}\n",
+        "",
+    );
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    let events_path = fixture
+        .session_dir()
+        .join(format!("pi.events-{}.jsonl", fixture.execution_id));
+    wait_for_content(&events_path, "agent_start").await;
+    for _ in 0..5 {
+        let events = harness.poll_events(&session).await.unwrap();
+        assert!(failure_classes(&events).is_empty());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    harness.stop(&session).await.unwrap();
+}
+
 #[tokio::test]
 async fn retrying_backend_error_emits_only_start_then_review_ready_across_restart() {
     let Some(fixture) = DockerPi::create() else {
@@ -1956,6 +2070,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 printf 'started\n' > /workspace/pi-body-started
+if [ -f /workspace/pi-exit-immediately ]; then exit "$(cat /workspace/pi-exit-immediately)"; fi
 stat=$(cat /proc/$$/stat)
 rest=${stat##*) }
 set -- $rest
@@ -1992,6 +2107,7 @@ fi
 if [ -f /workspace/hung-descendant ]; then
   (trap '' TERM; while :; do sleep 0.05; done) &
 fi
+if [ -f /workspace/pi-exit-after-events ]; then exit "$(cat /workspace/pi-exit-after-events)"; fi
 trap 'if [ -f "$session_dir/ignore-term" ]; then :; else exit 0; fi' TERM
 while :; do sleep 0.05; done
 "#;
