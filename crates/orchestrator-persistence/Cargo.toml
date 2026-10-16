@@ -13,6 +13,7 @@ workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 orchestrator-core.workspace = true
+orchestrator-scheduler.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

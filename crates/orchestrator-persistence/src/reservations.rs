@@ -8,6 +8,7 @@ use orchestrator_core::{
     event::ExecutionEventKind, AttemptId, Execution, ExecutionEvent, ExecutionId, ExecutionResult,
     ExecutionState, FailureClass, PersistenceMode, WorkerId,
 };
+use orchestrator_scheduler::{worker_fits_with_reservations, ReservedResources};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::collections::BTreeSet;
 
@@ -137,6 +138,12 @@ impl ReservationStore for PgReservationStore {
             transaction.commit().await?;
             return Ok(None);
         }
+        let reserved = ReservedResources {
+            slots,
+            cpu: used_cpu,
+            memory_mib: used_memory,
+            disk_gib: used_disk,
+        };
         let rows = sqlx::query(
             "SELECT * FROM executions WHERE state = 'QUEUED' \
              AND NOT EXISTS (SELECT 1 FROM execution_cancellation_requests r \
@@ -150,20 +157,10 @@ impl ReservationStore for PgReservationStore {
         let mut selected = None;
         for row in rows {
             let execution = decode_execution(&row)?;
-            let requirement = &execution.manifest.runtime;
-            let fits = requirement
-                .os
-                .as_ref()
-                .is_none_or(|os| os.eq_ignore_ascii_case(&worker.capabilities.os))
-                && worker.capabilities.runtimes.contains(&requirement.kind)
-                && requirement.cpu <= worker.capabilities.cpu.saturating_sub(used_cpu)
-                && requirement.memory_mib
-                    <= worker.capabilities.memory_mib.saturating_sub(used_memory)
-                && requirement.disk_gib <= worker.capabilities.disk_gib.saturating_sub(used_disk)
-                && requirement
-                    .capabilities
-                    .iter()
-                    .all(|capability| worker.capabilities.capabilities.contains(capability));
+            // One placement rule: the claim path asks the scheduler, so arch,
+            // toolchain, cpu, memory and disk can never drift between them.
+            let fits =
+                worker_fits_with_reservations(&worker, &execution.manifest.runtime, reserved);
             if fits {
                 selected = Some(execution);
                 break;
