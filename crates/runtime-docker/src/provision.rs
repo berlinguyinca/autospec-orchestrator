@@ -7,6 +7,7 @@ use bollard::{
         AttachContainerOptions, Config, CreateContainerOptions, ListContainersOptions, LogOutput,
         RemoveContainerOptions,
     },
+    exec::{CreateExecOptions, StartExecResults},
     image::CreateImageOptions,
     models::{ImageInspect, Mount, MountPoint, MountPointTypeEnum, MountTypeEnum},
     network::CreateNetworkOptions,
@@ -402,7 +403,7 @@ async fn provision_inner(
 
     let agent_container = DockerRuntime::agent_container_name(&labels.execution_id);
     let mut limits = host_limits(requirement);
-    harden_agent(&mut limits, runtime.hardening);
+    harden_agent(&mut limits, runtime.hardening, &runtime.agent_user);
     limits.network_mode = Some(network.clone());
     let mut mounts = agent_mounts;
     mounts.extend(execution_mounts);
@@ -422,7 +423,7 @@ async fn provision_inner(
             Config {
                 image: Some(image.to_owned()),
                 cmd: Some(vec!["sleep".to_owned(), "infinity".to_owned()]),
-                user: Some("0:0".to_owned()),
+                user: Some(runtime.agent_user.clone()),
                 env: Some(agent_env(build_cache.as_ref().map(|plan| plan.max_gib))),
                 labels: Some(labels.to_map().into_iter().collect()),
                 host_config: Some(limits),
@@ -467,6 +468,10 @@ async fn provision_inner(
         .map_err(|error| {
             RuntimeError::Provisioning(format!("start agent container {agent_container}: {error}"))
         })?;
+    if runtime.agent_user != crate::DEFAULT_AGENT_USER {
+        probe_agent_user_can_use_its_mounts(runtime, &agent_container_id, &runtime.agent_user)
+            .await?;
+    }
     let verified_agent_container =
         issue_agent_container_capability(runtime, &agent_container_id, labels, layout, &mounts)
             .await?;
@@ -483,6 +488,92 @@ async fn provision_inner(
             .as_ref()
             .map(|credentials| credentials.path.clone()),
     })
+}
+
+/// Fails closed when a non-root agent cannot traverse and write the repository
+/// and conversation binds.
+///
+/// Those directories are pinned owner-only (`0700`) by execution storage, so
+/// the configured uid can use them only when the daemon maps it to their owner
+/// (a rootful daemon whose worker runs as the same uid, for example). The host
+/// cannot widen the mode without breaking that pin, and whether the mapping
+/// holds depends on the daemon (rootless user namespaces differ), so the check
+/// runs inside the started container as the agent user instead of guessing from
+/// host uids. An agent that cannot write `/workspace` would otherwise fail on
+/// its first edit, long after provisioning reported success.
+async fn probe_agent_user_can_use_its_mounts(
+    runtime: &DockerRuntime,
+    container_id: &str,
+    agent_user: &str,
+) -> Result<(), RuntimeError> {
+    let fail = |detail: String| {
+        RuntimeError::ResourceLimit(format!(
+            "agent user {agent_user} cannot use its worktree and conversation mounts: {detail}"
+        ))
+    };
+    let exec = runtime
+        .client
+        .create_exec(
+            container_id,
+            CreateExecOptions {
+                cmd: Some(
+                    [
+                        "test",
+                        "-d",
+                        CONTAINER_WORKTREE,
+                        "-a",
+                        "-w",
+                        CONTAINER_WORKTREE,
+                        "-a",
+                        "-x",
+                    ]
+                    .into_iter()
+                    .chain([
+                        CONTAINER_WORKTREE,
+                        "-a",
+                        "-w",
+                        CONTAINER_SESSION,
+                        "-a",
+                        "-x",
+                    ])
+                    .chain([CONTAINER_SESSION])
+                    .map(str::to_owned)
+                    .collect(),
+                ),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| fail(format!("create probe: {error}")))?;
+    let run = async {
+        if let StartExecResults::Attached { mut output, .. } = runtime
+            .client
+            .start_exec(&exec.id, None)
+            .await
+            .map_err(|error| fail(format!("start probe: {error}")))?
+        {
+            while let Some(item) = output.next().await {
+                item.map_err(|error| fail(format!("read probe: {error}")))?;
+            }
+        }
+        runtime
+            .client
+            .inspect_exec(&exec.id)
+            .await
+            .map_err(|error| fail(format!("inspect probe: {error}")))
+    };
+    let inspect = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .map_err(|_| fail("probe timed out".to_owned()))??;
+    match inspect.exit_code {
+        Some(0) => Ok(()),
+        code => Err(fail(format!(
+            "probe exited with {code:?}; the mounts are owner-only on the host, so the agent \
+             uid must be the uid the daemon maps to the worker's owner"
+        ))),
+    }
 }
 
 async fn issue_agent_container_capability(

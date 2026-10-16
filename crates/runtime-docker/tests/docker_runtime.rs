@@ -3398,3 +3398,180 @@ async fn cargo_builds_a_crate_inside_the_hardened_agent() {
     assert!(out.contains("hardened-ok"), "{out}");
     assert_eq!(cap_drop, Some(vec!["ALL".to_owned()]));
 }
+
+#[tokio::test]
+async fn an_agent_without_the_builder_still_reports_user_root() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((_state, runtime)) = execution_runtime_with_disk_or_skip(
+        "an_agent_without_the_builder_still_reports_user_root",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let handle = runtime
+        .provision(&execution_labels, &hardening_requirement(), &[])
+        .await
+        .expect("provision default agent");
+    let inspect = docker
+        .inspect_container(&handle.agent_container, None)
+        .await
+        .expect("inspect default agent");
+    assert_eq!(inspect.config.and_then(|c| c.user).as_deref(), Some("0:0"));
+    scope.cleanup().await.expect("cleanup default-user test");
+}
+
+async fn daemon_is_rootless(docker: &Docker) -> bool {
+    docker
+        .info()
+        .await
+        .ok()
+        .and_then(|info| info.security_options)
+        .is_some_and(|options| options.iter().any(|option| option.contains("rootless")))
+}
+
+/// The agent runs as the uid that owns the host worktree (the daemon maps that
+/// uid to itself), so every mount, including edits to existing repository
+/// files, is writable without any capability. A rootless daemon maps the host
+/// uid to container root instead, so the check needs a rootful daemon.
+#[tokio::test]
+async fn a_configured_agent_user_is_the_container_user_and_can_write_its_mounts() {
+    use std::os::unix::fs::MetadataExt;
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((state, runtime)) = execution_runtime_with_disk_or_skip(
+        "a_configured_agent_user_is_the_container_user_and_can_write_its_mounts",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    if daemon_is_rootless(&docker).await {
+        eprintln!("SKIP: a rootless daemon does not map the worktree owner to a non-root uid");
+        return;
+    }
+    let owner = fs::metadata(state.worktree(&execution_labels)).expect("stat worktree");
+    let user = format!("{}:{}", owner.uid(), owner.gid());
+    let runtime = runtime
+        .with_agent_user(&user)
+        .expect("numeric uid:gid is accepted");
+    write_host_repository(&state.worktree(&execution_labels));
+    ensure_alpine_image(&docker).await;
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let handle = runtime
+        .provision(&execution_labels, &hardening_requirement(), &[])
+        .await
+        .expect("provision non-root agent");
+    let inspect = docker
+        .inspect_container(&handle.agent_container, None)
+        .await
+        .expect("inspect non-root agent");
+    assert_eq!(
+        inspect.config.and_then(|c| c.user).as_deref(),
+        Some(user.as_str())
+    );
+    let host = inspect.host_config.expect("host config");
+    assert_eq!(host.cap_drop, Some(vec!["ALL".to_owned()]));
+    assert!(
+        host.cap_add.as_ref().is_none_or(Vec::is_empty),
+        "a non-root agent keeps no capability: {:?}",
+        host.cap_add
+    );
+    let (exit, out, err) = exec_output(&docker, &handle.agent_container, "id -u; id -g").await;
+    assert_eq!(
+        (exit, out.trim().replace('\n', ":")),
+        (0, user.clone()),
+        "stderr: {err}"
+    );
+    for command in [
+        "touch /workspace/.probe",
+        "touch /home/autospec/.probe",
+        "touch /tmp/.probe /session/.probe /cargo-target/.probe",
+        "cd /workspace && echo 'pub fn b() {}' >> src/lib.rs && echo n > src/nested/new.rs && rm src/nested/mod.rs",
+    ] {
+        let (exit, out, err) = exec_output(&docker, &handle.agent_container, command).await;
+        assert_eq!(exit, 0, "{command}: stdout {out} stderr {err}");
+    }
+    scope.cleanup().await.expect("cleanup non-root test");
+}
+
+/// A uid the daemon does not map to the worktree owner cannot write the
+/// owner-only worktree. Provisioning must refuse it (on every daemon) and roll
+/// everything back, rather than hand over an agent that fails on its first edit.
+#[tokio::test]
+async fn an_agent_user_that_cannot_write_the_worktree_fails_provisioning_and_leaves_nothing() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((_state, runtime)) = execution_runtime_with_disk_or_skip(
+        "an_agent_user_that_cannot_write_the_worktree_fails_provisioning_and_leaves_nothing",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let runtime = runtime
+        .with_agent_user("54321:54321")
+        .expect("numeric uid:gid is accepted");
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let error = runtime
+        .provision(&execution_labels, &hardening_requirement(), &[])
+        .await
+        .expect_err("an agent that cannot write /workspace must not be handed over");
+    assert!(
+        error.to_string().contains("cannot use its worktree"),
+        "{error}"
+    );
+    assert!(docker
+        .list_containers(Some(bollard::container::ListContainersOptions {
+            all: true,
+            filters: HashMap::from([("label".to_owned(), execution_labels.selector())]),
+            ..Default::default()
+        }))
+        .await
+        .expect("list containers")
+        .is_empty());
+    assert!(docker
+        .inspect_network::<String>(
+            &DockerRuntime::network_name(&execution_labels.execution_id),
+            None
+        )
+        .await
+        .is_err());
+    scope.cleanup().await.expect("cleanup refused agent");
+}
+
+#[test]
+fn agent_user_builder_accepts_numeric_uid_gid_and_refuses_everything_else() {
+    let runtime = || DockerRuntime::connect_with_state_root(None, "/tmp").expect("client");
+    assert_eq!(runtime().agent_user(), "0:0");
+    assert_eq!(
+        runtime()
+            .with_agent_user("1000:1000")
+            .expect("numeric")
+            .agent_user(),
+        "1000:1000"
+    );
+    for bad in [
+        "root",
+        "",
+        "1000",
+        "1000:",
+        ":1000",
+        "root:root",
+        "-1:0",
+        " 1:1",
+        "1:1:1",
+    ] {
+        assert!(runtime().with_agent_user(bad).is_err(), "{bad:?}");
+    }
+}

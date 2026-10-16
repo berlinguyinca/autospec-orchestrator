@@ -88,19 +88,37 @@ pub fn drop_all_capabilities(limits: &mut HostConfigLimits) {
 }
 
 /// Applies `hardening` to an agent container's limits.
-pub(crate) fn harden_agent(limits: &mut HostConfigLimits, hardening: ContainerHardening) {
+///
+/// `agent_user` is the container's `uid:gid`: only a root agent keeps
+/// [`ROOT_AGENT_RETAINED_CAPABILITIES`]; a non-root agent gets a bare
+/// `cap_drop ALL` (it owns, or is mapped to the owner of, what it writes).
+pub(crate) fn harden_agent(
+    limits: &mut HostConfigLimits,
+    hardening: ContainerHardening,
+    agent_user: &str,
+) {
     match hardening {
         ContainerHardening::Enforced => {
             drop_all_capabilities(limits);
-            limits.cap_add = Some(
-                ROOT_AGENT_RETAINED_CAPABILITIES
-                    .iter()
-                    .map(|capability| (*capability).to_owned())
-                    .collect(),
-            );
+            if is_root_user(agent_user) {
+                limits.cap_add = Some(
+                    ROOT_AGENT_RETAINED_CAPABILITIES
+                        .iter()
+                        .map(|capability| (*capability).to_owned())
+                        .collect(),
+                );
+            }
         }
         ContainerHardening::Relaxed => limits.security_opt = None,
     }
+}
+
+fn is_root_user(agent_user: &str) -> bool {
+    agent_user
+        .split(':')
+        .next()
+        .and_then(|uid| uid.parse::<u32>().ok())
+        == Some(0)
 }
 
 /// Applies `hardening` to a service container's limits (default capabilities).
@@ -147,7 +165,7 @@ mod tests {
     #[test]
     fn enforced_hardening_drops_agent_capabilities_but_not_service_capabilities() {
         let mut agent = host_limits(&RuntimeRequirement::default());
-        harden_agent(&mut agent, ContainerHardening::Enforced);
+        harden_agent(&mut agent, ContainerHardening::Enforced, "0:0");
         assert_eq!(agent.cap_drop, Some(vec!["ALL".to_owned()]));
         assert_eq!(
             agent.cap_add,
@@ -160,9 +178,24 @@ mod tests {
     }
 
     #[test]
+    fn a_non_root_agent_gets_a_bare_cap_drop_all() {
+        for user in ["1000:1000", "1:0", "00001:5"] {
+            let mut agent = host_limits(&RuntimeRequirement::default());
+            harden_agent(&mut agent, ContainerHardening::Enforced, user);
+            assert_eq!(agent.cap_drop, Some(vec!["ALL".to_owned()]), "{user}");
+            assert_eq!(agent.cap_add, None, "{user}");
+        }
+        for user in ["0:0", "0:1000", "000:0"] {
+            let mut agent = host_limits(&RuntimeRequirement::default());
+            harden_agent(&mut agent, ContainerHardening::Enforced, user);
+            assert!(agent.cap_add.is_some(), "{user} is root");
+        }
+    }
+
+    #[test]
     fn relaxed_hardening_restores_the_previous_container_options() {
         let mut agent = host_limits(&RuntimeRequirement::default());
-        harden_agent(&mut agent, ContainerHardening::Relaxed);
+        harden_agent(&mut agent, ContainerHardening::Relaxed, "0:0");
         assert_eq!(
             (agent.cap_drop, agent.cap_add, agent.security_opt),
             (None, None, None)
