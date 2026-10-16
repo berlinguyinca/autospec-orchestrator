@@ -401,6 +401,10 @@ impl FakeLifecycle {
     }
 }
 
+/// Execution ids whose health probe went through `resource_sample`.
+static SAMPLED_EXECUTIONS: Mutex<std::collections::BTreeSet<String>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
 #[async_trait]
 impl ExecutionLifecycle for FakeLifecycle {
     async fn allocate(&self, execution: &Execution) -> Result<AllocationReceipt, LifecycleError> {
@@ -512,6 +516,19 @@ impl ExecutionLifecycle for FakeLifecycle {
     }
     async fn cpu_percent(&self, _: &Execution) -> Result<f64, LifecycleError> {
         Ok(0.0)
+    }
+    async fn resource_sample(
+        &self,
+        execution: &Execution,
+    ) -> Result<orchestrator_worker::ResourceSample, LifecycleError> {
+        SAMPLED_EXECUTIONS
+            .lock()
+            .unwrap()
+            .insert(execution.id.as_str().to_owned());
+        Ok(orchestrator_worker::ResourceSample {
+            io_bytes: Some(1),
+            ..Default::default()
+        })
     }
     async fn capture(&self, _: &Worktree) -> Result<DiffCapture, LifecycleError> {
         self.step("git-capture")?;
@@ -1860,4 +1877,77 @@ async fn the_runtime_factory_refuses_the_build_cache_for_non_implementation_role
         .await
         .err();
     assert!(error.is_none_or(|e| !e.to_string().contains("limited to implementation")));
+}
+
+#[tokio::test]
+async fn the_health_probe_in_a_running_execution_is_the_lifecycle_resource_sample() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let store = Arc::new(FakeStore::default());
+    let mut execution = execution();
+    execution.id = ExecutionId::new("resource-sample-wiring");
+    store.insert(&execution).await.unwrap();
+    let worker = worker(
+        empty_diff_lifecycle(&order),
+        store.clone(),
+        Arc::new(FakeReservations::default()),
+    );
+
+    let _ = worker.run(&execution).await;
+
+    assert!(
+        SAMPLED_EXECUTIONS
+            .lock()
+            .unwrap()
+            .contains("resource-sample-wiring"),
+        "drive_running must probe through ExecutionLifecycle::resource_sample"
+    );
+}
+
+/// Real-daemon check that `VerifiedDockerRuntimeFactory` overrides the default
+/// `resource_sample` (which would leave block I/O unknown). Returns early
+/// without Docker (GitHub Actions has no daemon).
+#[tokio::test]
+async fn docker_factory_resource_sample_measures_the_agent_container() {
+    use orchestrator_worker::RuntimeFactory;
+    let up = std::process::Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !up {
+        return;
+    }
+    let mut execution = execution();
+    execution.id = ExecutionId::new("factory-sample-live");
+    let name = runtime_docker::DockerRuntime::agent_container_name(&execution.id);
+    let started = std::process::Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "--label",
+            "autospec.test=resource-sample",
+            "alpine:latest",
+            "sleep",
+            "120",
+        ])
+        .output()
+        .unwrap();
+    if !started.status.success() {
+        return;
+    }
+    let sample = docker_factory().resource_sample(&execution).await;
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", &name])
+        .output();
+    let sample = sample.unwrap();
+    assert!(
+        sample.io_bytes.is_some(),
+        "Docker factory must report block I/O: {sample:?}"
+    );
+    assert!(sample.rss_bytes.is_some());
+    assert!(sample
+        .current_command
+        .as_deref()
+        .is_some_and(|c| c.contains("sleep")));
 }

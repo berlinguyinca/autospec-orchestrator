@@ -1,6 +1,6 @@
 use crate::{
     cleanup_guard::CleanupGuard, ControlCheckpoint, HealthAssessment, HealthMonitor,
-    LifecycleError, ResourceSample, Worker, WorkerError,
+    LifecycleError, Worker, WorkerError,
 };
 use chrono::Utc;
 use futures_util::FutureExt;
@@ -612,8 +612,8 @@ async fn drive_running(
         } else {
             health.record_event(Instant::now());
         }
-        let cpu_percent = tokio::select! {
-            cpu_percent = worker.lifecycle.cpu_percent(execution) => cpu_percent?,
+        let sample = tokio::select! {
+            sample = worker.lifecycle.resource_sample(execution) => sample?,
             control = controls.recv() => {
                 let control = control.ok_or_else(|| WorkerError::Invalid(
                     "interactive control channel closed during health probe".into()
@@ -622,10 +622,6 @@ async fn drive_running(
                 continue;
             }
             () = cancellation_signal(cancelled) => return Err(WorkerError::Cancelled),
-        };
-        let sample = ResourceSample {
-            cpu_percent,
-            ..Default::default()
         };
         match health.assess(Instant::now(), &sample) {
             HealthAssessment::Healthy => {}
