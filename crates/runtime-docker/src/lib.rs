@@ -74,6 +74,15 @@ pub struct DockerRuntime {
     pub(crate) trusted_verifier: Option<TrustedVerifierImage>,
     pub(crate) credentials: Option<ExecutionCredentials>,
     cleanup_labels: Option<OwnershipLabels>,
+    pub(crate) build_cache: Option<BuildCacheConfig>,
+}
+
+/// Where the opt-in shared sccache lives and how large it may grow
+/// (spec section 5 R-BUILD defaults: 40 GiB, LRU).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BuildCacheConfig {
+    pub(crate) root: PathBuf,
+    pub(crate) max_gib: u64,
 }
 
 impl DockerRuntime {
@@ -113,7 +122,21 @@ impl DockerRuntime {
             trusted_verifier: None,
             credentials: None,
             cleanup_labels: None,
+            build_cache: None,
         })
+    }
+
+    /// Enables the opt-in shared sccache under `root`, bounded to `max_gib`.
+    ///
+    /// Off by default. Only an agent whose requirement lists the
+    /// `rust-build-cache` capability mounts it; a requirement that lists the
+    /// capability on a runtime without this configuration fails provisioning.
+    /// Who may request the capability is the worker's decision, not this
+    /// adapter's (AGENTS.md invariant 3).
+    #[must_use]
+    pub fn with_build_cache(mut self, root: PathBuf, max_gib: u64) -> Self {
+        self.build_cache = Some(BuildCacheConfig { root, max_gib });
+        self
     }
 
     /// Connects a runtime to one exact durable Ready execution allocation.

@@ -12,7 +12,7 @@ use execution_storage::{
 };
 use harness_traits::{AgentHarness, HarnessError, SessionRef};
 use orchestrator_core::{ExecutionEvent, ModelPolicy, OwnershipLabels, TaskPacket};
-use runtime_traits::VerifiedAgentContainer;
+use runtime_traits::{build_cache, VerifiedAgentContainer, VerifiedBindMount};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -359,11 +359,27 @@ fn validate_container_capability(
             "agent container capability lacks exact writable execution binds".to_owned(),
         ));
     }
+    validate_mount_sources(&container.mounts, &root, &session_root, &conversation)
+}
+
+/// Every bind must sit inside the execution root, with two exceptions that are
+/// checked, not trusted: the harness never sees private session state, and the
+/// opt-in shared build cache (one writable `/sccache` bind) is accepted only
+/// when its source is a real directory holding a managed owner file.
+fn validate_mount_sources(
+    mounts: &[VerifiedBindMount],
+    root: &std::path::Path,
+    session_root: &std::path::Path,
+    conversation: &std::path::Path,
+) -> Result<(), HarnessError> {
     let mut targets = std::collections::BTreeSet::new();
-    for mount in &container.mounts {
-        if !mount.source.starts_with(&root)
+    for mount in mounts {
+        let shared_build_cache = mount.target == build_cache::CONTAINER_BUILD_CACHE
+            && mount.writable
+            && build_cache::is_managed_build_cache_dir(&mount.source);
+        if (!mount.source.starts_with(root) && !shared_build_cache)
             || !targets.insert(&mount.target)
-            || (mount.source.starts_with(&session_root) && mount.source != conversation)
+            || (mount.source.starts_with(session_root) && mount.source != conversation)
             || mount.target == "/var/run/docker.sock"
             || mount.source == std::path::Path::new("/var/run/docker.sock")
         {
@@ -436,5 +452,77 @@ impl AgentHarness for PiHarness {
 
     async fn stop(&self, session: &SessionRef) -> Result<(), HarnessError> {
         session::stop(self, session).await
+    }
+}
+
+#[cfg(test)]
+mod build_cache_mount_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        session: PathBuf,
+        conversation: PathBuf,
+        cache: PathBuf,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("exec");
+        let session = root.join("session");
+        let conversation = session.join("conversation");
+        let cache = base.join("cache/sccache/k");
+        std::fs::create_dir_all(&conversation).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join(build_cache::OWNER_FILE),
+            br#"{"managed":true,"key":"k"}"#,
+        )
+        .unwrap();
+        Fixture {
+            _dir: dir,
+            root,
+            session,
+            conversation,
+            cache,
+        }
+    }
+
+    fn bind(source: &std::path::Path, target: &str, writable: bool) -> VerifiedBindMount {
+        VerifiedBindMount {
+            source: source.to_path_buf(),
+            target: target.to_owned(),
+            writable,
+        }
+    }
+
+    fn check(f: &Fixture, mounts: &[VerifiedBindMount]) -> Result<(), HarnessError> {
+        validate_mount_sources(mounts, &f.root, &f.session, &f.conversation)
+    }
+
+    #[test]
+    fn a_managed_shared_cache_bind_outside_the_execution_root_is_accepted() {
+        let f = fixture();
+        let session = bind(&f.conversation, "/session", true);
+        assert!(check(&f, &[session.clone(), bind(&f.cache, "/sccache", true)]).is_ok());
+    }
+
+    #[test]
+    fn an_unmarked_read_only_or_misplaced_outside_bind_is_refused() {
+        let f = fixture();
+        let session = bind(&f.conversation, "/session", true);
+        std::fs::remove_file(f.cache.join(build_cache::OWNER_FILE)).unwrap();
+        assert!(check(&f, &[session.clone(), bind(&f.cache, "/sccache", true)]).is_err());
+        std::fs::write(
+            f.cache.join(build_cache::OWNER_FILE),
+            br#"{"managed":true}"#,
+        )
+        .unwrap();
+        assert!(check(&f, &[session.clone(), bind(&f.cache, "/sccache", false)]).is_err());
+        // A managed directory mounted anywhere but /sccache gets no exemption.
+        assert!(check(&f, &[session, bind(&f.cache, "/elsewhere", true)]).is_err());
     }
 }

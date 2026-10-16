@@ -1763,6 +1763,7 @@ dependencies = [
  "runtime-podman",
  "runtime-traits",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -1786,6 +1787,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "orchestrator-core",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

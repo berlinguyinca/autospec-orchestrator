@@ -58,7 +58,7 @@ pub(crate) async fn create_services(
                 container_create_error(format!("create service container {name}"), error, true)
             })?;
         storage.verify(all_mounts).await?;
-        verify_container_mount_sources(runtime, &name, execution_root, mounts).await?;
+        verify_container_mount_sources(runtime, &name, execution_root, mounts, None).await?;
         containers.push(name);
     }
     Ok(containers)
