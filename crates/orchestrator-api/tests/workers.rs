@@ -416,6 +416,75 @@ async fn worker_api_registers_every_preparation_failure_as_safe_offline_health()
     }
 }
 
+#[tokio::test]
+async fn disk_pressure_health_errors_take_a_worker_offline_and_clear_on_the_next_heartbeat() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
+        return;
+    };
+    let _database_lock = DisposableTestDatabaseLock::acquire(&database_url)
+        .await
+        .unwrap();
+    let store = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let token = format!("worker-token-{}", uuid::Uuid::new_v4());
+    let state = app_state(&database_url, store.clone(), reservations, token.clone()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://{address}/api/v1/workers");
+    let mut worker = registration(&format!("worker-api-{}", uuid::Uuid::new_v4().simple()));
+    for code in ["disk-pressure-bytes", "disk-pressure-inodes"] {
+        worker.capabilities.health_errors = vec![code.to_owned()];
+        let response = client
+            .post(format!("{base}/{}/heartbeat", worker.id))
+            .bearer_auth(&token)
+            .json(&worker)
+            .send()
+            .await
+            .unwrap();
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let created = client
+                .post(&base)
+                .bearer_auth(&token)
+                .json(&worker)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(created.status(), reqwest::StatusCode::CREATED, "{code}");
+            let created: WorkerRegistration = created.json().await.unwrap();
+            assert_eq!(created.state, WorkerState::Offline, "{code}");
+        } else {
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "{code}");
+            let beat: WorkerRegistration = response.json().await.unwrap();
+            assert_eq!(beat.state, WorkerState::Offline, "{code}");
+        }
+        assert_eq!(
+            store.get(&worker.id).await.unwrap().state,
+            WorkerState::Offline,
+            "{code}"
+        );
+    }
+    worker.capabilities.health_errors.clear();
+    let response = client
+        .post(format!("{base}/{}/heartbeat", worker.id))
+        .bearer_auth(&token)
+        .json(&worker)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let beat: WorkerRegistration = response.json().await.unwrap();
+    assert_eq!(beat.state, WorkerState::Ready);
+    assert_eq!(
+        store.get(&worker.id).await.unwrap().state,
+        WorkerState::Ready
+    );
+}
+
 fn registration(id: &str) -> WorkerRegistration {
     WorkerRegistration {
         id: WorkerId::new(id),

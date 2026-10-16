@@ -24,6 +24,7 @@ orchestrator-core.workspace = true
 orchestrator-persistence.workspace = true
 orchestrator-worker.workspace = true
 reqwest.workspace = true
+rustix.workspace = true
 runtime-docker.workspace = true
 runtime-traits.workspace = true
 serde_json.workspace = true
@@ -31,3 +32,6 @@ harness-pi.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
