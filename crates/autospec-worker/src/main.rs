@@ -22,6 +22,7 @@ use orchestrator_worker::{
 };
 use runtime_docker::LocalCredentialBroker;
 use runtime_docker::TrustedVerifierImage;
+use runtime_traits::build_cache::BUILD_CACHE_CAPABILITY;
 use runtime_traits::CredentialBroker;
 use std::{
     collections::BTreeMap,
@@ -114,6 +115,14 @@ struct Cli {
     /// the scheduler and the claim path match versions exactly (spec §5 R-PAR).
     #[arg(long = "toolchain", value_name = "NAME=VERSION", value_parser = parse_toolchain)]
     toolchains: Vec<(String, String)>,
+    /// Directory holding the shared sccache (`<root>/sccache/<key>`). When set the
+    /// worker advertises `rust-build-cache`; only Implementation executions that
+    /// request it get the mount. Unset: no cache, no advertisement.
+    #[arg(long, env = "AUTOSPEC_BUILD_CACHE_ROOT")]
+    build_cache_root: Option<PathBuf>,
+    /// Upper bound, in GiB, passed to sccache as `SCCACHE_CACHE_SIZE`.
+    #[arg(long, env = "AUTOSPEC_BUILD_CACHE_MAX_GIB", default_value_t = 40)]
+    build_cache_max_gib: u64,
     #[arg(long, default_value = "https://github.com")]
     clone_base: String,
     #[arg(long, env = "AUTOSPEC_DOCKER_SOCKET")]
@@ -173,6 +182,7 @@ async fn main() -> Result<()> {
 fn validate_cli(cli: &Cli) -> Result<()> {
     disk_policy(cli)?;
     toolchain_map(&cli.toolchains)?;
+    validate_build_cache(cli)?;
     Ok(())
 }
 
@@ -200,6 +210,49 @@ fn toolchain_map(list: &[(String, String)]) -> Result<BTreeMap<String, String>> 
         }
     }
     Ok(map)
+}
+
+
+/// The cache root must be absolute, must not sit inside the per-execution
+/// state (which cleanup removes), and needs a positive size bound.
+fn validate_build_cache(cli: &Cli) -> Result<()> {
+    let Some(root) = &cli.build_cache_root else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        root.is_absolute(),
+        "--build-cache-root must be an absolute path"
+    );
+    anyhow::ensure!(
+        !root.starts_with(cli.state_root.join("executions")),
+        "--build-cache-root must not be inside the per-execution state directory"
+    );
+    anyhow::ensure!(
+        cli.build_cache_max_gib > 0,
+        "--build-cache-max-gib must be greater than zero"
+    );
+    Ok(())
+}
+
+/// The Docker runtime factory, carrying the shared build cache only when the
+/// operator configured one (the same condition that advertises the capability).
+fn runtime_factory(
+    cli: &Cli,
+    verifier: Arc<dyn execution_storage::ReadyAllocationVerifier>,
+    trusted_verifier: TrustedVerifierImage,
+    credentials: Arc<dyn CredentialBroker>,
+) -> VerifiedDockerRuntimeFactory {
+    let factory = VerifiedDockerRuntimeFactory::new(
+        cli.docker_socket.clone(),
+        PathBuf::from(&cli.docker_binary),
+        verifier,
+        trusted_verifier,
+        credentials,
+    );
+    match &cli.build_cache_root {
+        Some(root) => factory.with_build_cache(root.clone(), cli.build_cache_max_gib),
+        None => factory,
+    }
 }
 
 fn disk_policy(cli: &Cli) -> Result<DiskPolicy> {
@@ -408,9 +461,8 @@ async fn prepare_execution_plane(
         LocalCredentialBroker::new(&cli.state_root, chrono::Duration::minutes(15))
             .map_err(PreparationFailure::configuration)?,
     );
-    let runtimes = Arc::new(VerifiedDockerRuntimeFactory::new(
-        cli.docker_socket.clone(),
-        PathBuf::from(&cli.docker_binary),
+    let runtimes = Arc::new(runtime_factory(
+        cli,
         verifier.clone(),
         trusted_verifier,
         credential_broker,
@@ -716,7 +768,11 @@ fn advertisement(
                 Vec::new()
             },
             capabilities: if ready {
-                vec!["docker".to_owned()]
+                let mut capabilities = vec!["docker".to_owned()];
+                if cli.build_cache_root.is_some() {
+                    capabilities.push(BUILD_CACHE_CAPABILITY.to_owned());
+                }
+                capabilities
             } else {
                 Vec::new()
             },
@@ -923,6 +979,8 @@ mod tests {
             database_url: "postgres://test".into(),
             state_root: "/tmp".into(),
             toolchains: Vec::new(),
+            build_cache_root: None,
+            build_cache_max_gib: 40,
             clone_base: "https://github.com".into(),
             docker_socket: None,
             docker_proxy_port: 2375,
@@ -1387,5 +1445,102 @@ mod tests {
         let dup = parse(&["--toolchain", "rust=1.86.0", "--toolchain", "rust=1.85.0"]);
         assert!(validate_cli(&dup).is_err());
         assert!(validate_cli(&parse(&["--toolchain", "rust=1.86.0"])).is_ok());
+    }
+
+    fn count(worker: &WorkerAdvertisement, capability: &str) -> usize {
+        worker
+            .capabilities
+            .capabilities
+            .iter()
+            .filter(|c| c.as_str() == capability)
+            .count()
+    }
+
+    #[test]
+    fn without_a_cache_root_the_worker_advertises_docker_and_no_build_cache() {
+        let cli = parse(&[]);
+        assert!(cli.build_cache_root.is_none());
+        assert_eq!(cli.build_cache_max_gib, 40);
+        let worker = advertisement(&cli, Some(ready_proof()), Vec::new()).unwrap();
+        assert_eq!(count(&worker, "docker"), 1);
+        assert_eq!(count(&worker, "rust-build-cache"), 0);
+    }
+
+    #[test]
+    fn a_cache_root_advertises_rust_build_cache_only_when_ready() {
+        let cli = parse(&[
+            "--build-cache-root",
+            "/var/cache/autospec",
+            "--build-cache-max-gib",
+            "12",
+        ]);
+        assert_eq!(cli.build_cache_max_gib, 12);
+        let ready = advertisement(&cli, Some(ready_proof()), Vec::new()).unwrap();
+        assert_eq!(count(&ready, "docker"), 1);
+        assert_eq!(count(&ready, "rust-build-cache"), 1);
+        let offline =
+            advertisement(&cli, None, vec!["docker-capability-unavailable".into()]).unwrap();
+        assert!(offline.capabilities.capabilities.is_empty());
+    }
+
+    #[test]
+    fn the_cache_flags_reach_the_runtime_factory() {
+        #[derive(Debug)]
+        struct NoStorage;
+        impl execution_storage::ReadyAllocationVerifier for NoStorage {
+            fn verify_ready(
+                &self,
+                _: &execution_storage::AllocationReceipt,
+            ) -> Result<
+                Box<dyn execution_storage::VerifiedExecutionStorage>,
+                execution_storage::StorageError,
+            > {
+                Err(execution_storage::StorageError::Unavailable("stub".into()))
+            }
+        }
+        let build = |cli: &Cli| {
+            runtime_factory(
+                cli,
+                Arc::new(NoStorage),
+                TrustedVerifierImage::new(format!("sha256:{}", "a".repeat(64)), "/usr/bin/stat")
+                    .unwrap(),
+                Arc::new(
+                    LocalCredentialBroker::new(std::env::temp_dir(), chrono::Duration::minutes(15))
+                        .unwrap(),
+                ),
+            )
+        };
+        assert!(build(&parse(&[])).build_cache().is_none());
+        let cli = parse(&[
+            "--build-cache-root",
+            "/var/cache/autospec",
+            "--build-cache-max-gib",
+            "12",
+        ]);
+        assert_eq!(
+            build(&cli).build_cache(),
+            Some((Path::new("/var/cache/autospec"), 12))
+        );
+    }
+
+    #[test]
+    fn startup_rejects_an_unsafe_cache_root_or_size() {
+        assert!(validate_cli(&parse(&["--build-cache-root", "relative/cache"])).is_err());
+        assert!(validate_cli(&parse(&[
+            "--state-root",
+            "/var/lib/autospec",
+            "--build-cache-root",
+            "/var/lib/autospec/executions/x/cache"
+        ]))
+        .is_err());
+        assert!(validate_cli(&parse(&[
+            "--build-cache-root",
+            "/var/cache/autospec",
+            "--build-cache-max-gib",
+            "0"
+        ]))
+        .is_err());
+        assert!(validate_cli(&parse(&["--build-cache-root", "/var/cache/autospec"])).is_ok());
+        assert!(validate_cli(&parse(&[])).is_ok());
     }
 }
