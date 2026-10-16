@@ -186,6 +186,10 @@ pub struct RuntimeRequirement {
     pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    /// Required CPU architecture. `x86_64`/`amd64` and `aarch64`/`arm64` are
+    /// aliases and compare case-insensitively. Absent means any architecture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
     #[serde(default = "default_cpu")]
     pub cpu: u32,
     #[serde(rename = "memoryMib", default = "default_memory")]
@@ -194,6 +198,10 @@ pub struct RuntimeRequirement {
     pub disk_gib: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// Required toolchain versions by name (e.g. `rust` -> `1.86.0`). Versions
+    /// are compared as exact strings. Absent means no toolchain constraint.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub toolchains: BTreeMap<String, String>,
 }
 
 fn default_cpu() -> u32 {
@@ -212,10 +220,12 @@ impl Default for RuntimeRequirement {
             kind: RuntimeKind::default(),
             image: None,
             os: None,
+            arch: None,
             cpu: default_cpu(),
             memory_mib: default_memory(),
             disk_gib: default_disk(),
             capabilities: Vec::new(),
+            toolchains: BTreeMap::new(),
         }
     }
 }
@@ -253,6 +263,31 @@ mod validation_tests {
     #[test]
     fn canonical_example_is_valid() {
         example_manifest().validate().expect("manifest is valid");
+    }
+
+    #[test]
+    fn v1alpha1_manifest_without_arch_or_toolchains_still_parses_and_validates() {
+        // The checked-in example predates the `arch` and `toolchains` fields.
+        let manifest = example_manifest();
+        assert_eq!(manifest.api_version, "autospec.dev/v1alpha1");
+        assert!(manifest.runtime.arch.is_none());
+        assert!(manifest.runtime.toolchains.is_empty());
+        manifest.validate().expect("manifest is valid");
+        // Unset fields are not emitted, so an older reader still accepts it.
+        let json = serde_json::to_value(&manifest.runtime).unwrap();
+        assert!(json.get("arch").is_none() && json.get("toolchains").is_none());
+    }
+
+    #[test]
+    fn v1alpha1_manifest_with_arch_and_toolchains_parses_and_validates() {
+        let yaml = include_str!("../../../examples/execution-manifest.yaml").replace(
+            "runtime:\n  type: docker\n",
+            "runtime:\n  type: docker\n  arch: arm64\n  toolchains:\n    rust: 1.86.0\n",
+        );
+        let manifest: ExecutionManifest = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(manifest.runtime.arch.as_deref(), Some("arm64"));
+        assert_eq!(manifest.runtime.toolchains["rust"], "1.86.0");
+        manifest.validate().expect("manifest is valid");
     }
 
     #[test]

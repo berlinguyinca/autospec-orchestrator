@@ -788,6 +788,7 @@ async fn paused_worker_is_adopted_across_a_separate_process_with_zero_live_pi_ho
             disk_gib: 1,
             runtimes: vec![RuntimeKind::Docker],
             capabilities: vec!["docker".into(), e2e_capability.clone()],
+            toolchains: Default::default(),
             max_concurrent_executions: 1,
             health_errors: Vec::new(),
         },
@@ -3706,6 +3707,7 @@ fn matrix_worker_registration(
             disk_gib: 1,
             runtimes: vec![RuntimeKind::Docker],
             capabilities: vec!["docker".into(), capability],
+            toolchains: Default::default(),
             max_concurrent_executions: 1,
             health_errors: Vec::new(),
         },
@@ -3922,6 +3924,7 @@ fn queued_execution(
                 memory_mib: 256,
                 disk_gib: 1,
                 capabilities: vec![capability],
+                ..RuntimeRequirement::default()
             },
             services: Vec::new(),
             persistence: PersistenceMode::Resumable,
