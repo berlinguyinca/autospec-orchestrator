@@ -68,6 +68,25 @@ impl TrustedVerifierImage {
     }
 }
 
+/// The agent container's default user: root, until the worker opts in.
+pub const DEFAULT_AGENT_USER: &str = "0:0";
+
+/// Accepts only a numeric `uid:gid` (each part a decimal `u32`).
+pub fn validate_agent_user(raw: &str) -> Result<(), RuntimeError> {
+    let numeric = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 10
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && part.parse::<u32>().is_ok()
+    };
+    match raw.split_once(':') {
+        Some((uid, gid)) if numeric(uid) && numeric(gid) => Ok(()),
+        _ => Err(RuntimeError::ResourceLimit(format!(
+            "agent user {raw:?} must be a numeric uid:gid such as 1000:1000"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DockerRuntime {
     pub(crate) client: Docker,
@@ -80,6 +99,7 @@ pub struct DockerRuntime {
     cleanup_labels: Option<OwnershipLabels>,
     pub(crate) build_cache: Option<BuildCacheConfig>,
     pub(crate) hardening: ContainerHardening,
+    pub(crate) agent_user: String,
 }
 
 /// Where the opt-in shared sccache lives and how large it may grow
@@ -129,7 +149,25 @@ impl DockerRuntime {
             cleanup_labels: None,
             build_cache: None,
             hardening: ContainerHardening::Enforced,
+            agent_user: DEFAULT_AGENT_USER.to_owned(),
         })
+    }
+
+    /// Runs the agent container as `uid_gid` (numeric `uid:gid`, for example
+    /// `1000:1000`) instead of root.
+    ///
+    /// The default stays `0:0`, so switching the agent off root is an explicit,
+    /// reversible step taken by the worker (spec section 5 R-ORCH). Names are
+    /// refused: a name would resolve through the image's `/etc/passwd`.
+    pub fn with_agent_user(mut self, uid_gid: &str) -> Result<Self, RuntimeError> {
+        validate_agent_user(uid_gid)?;
+        self.agent_user = uid_gid.to_owned();
+        Ok(self)
+    }
+
+    /// The `uid:gid` the agent container runs as.
+    pub fn agent_user(&self) -> &str {
+        &self.agent_user
     }
 
     /// Selects the container privilege limits (default `Enforced`: every
