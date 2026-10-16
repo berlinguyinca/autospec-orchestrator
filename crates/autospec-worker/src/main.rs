@@ -212,7 +212,6 @@ fn toolchain_map(list: &[(String, String)]) -> Result<BTreeMap<String, String>> 
     Ok(map)
 }
 
-
 /// The cache root must be absolute, must not sit inside the per-execution
 /// state (which cleanup removes), and needs a positive size bound.
 fn validate_build_cache(cli: &Cli) -> Result<()> {
