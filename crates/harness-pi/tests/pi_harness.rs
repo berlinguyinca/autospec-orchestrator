@@ -46,6 +46,8 @@ struct DockerPi {
     verifier: Arc<TestReadyVerifier>,
     capability: VerifiedAgentContainer,
     removed: bool,
+    /// Set for a hardened non-root container (`--user`, `--cap-drop ALL`).
+    agent_user: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -185,6 +187,12 @@ impl TestReadyVerifier {
 
 impl DockerPi {
     fn create() -> Option<Self> {
+        Self::create_as(None)
+    }
+
+    /// With `Some(uid:gid)` the agent container runs as that user with every
+    /// capability dropped and `no-new-privileges`, like the hardened runtime.
+    fn create_as(agent_user: Option<&str>) -> Option<Self> {
         if !Command::new("docker")
             .args(["version", "--format", "{{.Server.Version}}"])
             .output()
@@ -220,6 +228,12 @@ impl DockerPi {
         fs::create_dir_all(&conversation).unwrap();
         fs::create_dir_all(&layout.credentials).unwrap();
         fs::create_dir_all(&layout.runtime).unwrap();
+        if agent_user.is_some() {
+            // A uid that is not the owner needs world-writable bind roots.
+            for dir in [&worktree, &conversation, &worktree.join(".autospec")] {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o777)).unwrap();
+            }
+        }
         fs::write(worktree.join("AGENTS.md"), "Stay scoped.\n").unwrap();
         fs::write(worktree.join("role.md"), "Implement.\n").unwrap();
         fs::write(
@@ -240,8 +254,20 @@ impl DockerPi {
             .as_nanos();
         let container = format!("autospec-pi-test-{}-{nonce}-{sequence}", std::process::id());
         let labels = labels(&execution_id);
+        let hardening: Vec<&str> = match agent_user {
+            Some(user) => vec![
+                "--user",
+                user,
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+            ],
+            None => Vec::new(),
+        };
         let created = Command::new("docker")
             .args(["create", "--name", &container])
+            .args(&hardening)
             .args(
                 labels
                     .to_map()
@@ -358,6 +384,7 @@ impl DockerPi {
             verifier,
             capability,
             removed: false,
+            agent_user: agent_user.map(str::to_owned),
         })
     }
 
@@ -379,6 +406,9 @@ impl DockerPi {
         config.tools = vec!["read".to_owned(), "bash".to_owned(), "edit".to_owned()];
         config.skills = vec![];
         config.stop_timeout = Duration::from_millis(250);
+        if let Some(user) = &self.agent_user {
+            config = config.with_agent_user(user).unwrap();
+        }
         PiHarness::new(config)
     }
 
@@ -2211,3 +2241,27 @@ if [ -f /workspace/handshake-timeout ]; then
 fi
 exec /usr/bin/setsid "$@"
 "#;
+
+/// A non-root agent container with every capability dropped: the harness must
+/// probe and signal Pi as that user (root-by-name `docker exec --user root`
+/// would signal from another uid, which `cap_drop ALL` forbids), so `stop`
+/// still reaps the whole process group, including a descendant that ignores
+/// TERM.
+#[tokio::test]
+async fn non_root_capless_agent_is_stopped_and_its_process_group_reaped() {
+    let Some(fixture) = DockerPi::create_as(Some("1000:1000")) else {
+        return;
+    };
+    fs::write(fixture.worktree_dir().join("hung-descendant"), "").unwrap();
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    let pgid = wait_for_pi_pgid(&fixture).await;
+    wait_for_content(&fixture.conversation_dir().join("arguments"), "--mode json").await;
+    assert!(pi_is_alive(&fixture));
+    fs::write(fixture.conversation_dir().join("ignore-term"), "").unwrap();
+    let started = Instant::now();
+    harness.stop(&session).await.unwrap();
+    assert!(started.elapsed() <= Duration::from_secs(10));
+    assert!(!pi_is_alive(&fixture));
+    assert_zombie_only_group(&fixture, pgid);
+}

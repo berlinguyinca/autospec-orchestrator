@@ -48,7 +48,33 @@ pub struct PiHarnessConfig {
     /// Exact in-memory values removed before Pi output reaches durable JSONL.
     pub credential_redactions: Vec<Vec<u8>>,
     pub stop_timeout: Duration,
+    /// `uid:gid` the harness's process-group probes and signals run as inside
+    /// the agent container. It must be the user the container's processes run
+    /// as: a process may signal its own uid without `CAP_KILL`, which a
+    /// `cap_drop ALL` container no longer has. Default `0:0` matches the
+    /// default agent container user. Validated by [`validate_agent_user`].
+    pub agent_user: String,
     storage: Option<VerifiedAllocationConfig>,
+}
+
+/// Accepts only a numeric `uid:gid` (for example `1000:1000`).
+///
+/// User names are refused: a name resolves through the container's
+/// `/etc/passwd`, which the agent can influence, and an empty or malformed
+/// value would make `docker exec --user` fall back to the image default.
+pub fn validate_agent_user(raw: &str) -> Result<(), HarnessError> {
+    let numeric = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 10
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && part.parse::<u32>().is_ok()
+    };
+    match raw.split_once(':') {
+        Some((uid, gid)) if numeric(uid) && numeric(gid) => Ok(()),
+        _ => Err(HarnessError::Start(format!(
+            "agent user {raw:?} must be a numeric uid:gid such as 1000:1000"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,8 +115,16 @@ impl PiHarnessConfig {
             skills: Vec::new(),
             credential_redactions: Vec::new(),
             stop_timeout: Duration::from_secs(10),
+            agent_user: "0:0".to_owned(),
             storage: None,
         }
+    }
+
+    /// Sets the agent user after validating it (see [`validate_agent_user`]).
+    pub fn with_agent_user(mut self, user: &str) -> Result<Self, HarnessError> {
+        validate_agent_user(user)?;
+        self.agent_user = user.to_owned();
+        Ok(self)
     }
 
     /// Binds Pi to one exact Ready execution allocation.
@@ -136,6 +170,7 @@ impl PiHarnessConfig {
             skills: Vec::new(),
             credential_redactions: Vec::new(),
             stop_timeout: Duration::from_secs(10),
+            agent_user: "0:0".to_owned(),
             storage: Some(VerifiedAllocationConfig {
                 verifier,
                 receipt,
@@ -158,11 +193,21 @@ struct ProcessRegistry {
 pub(crate) struct DockerCli {
     binary: PathBuf,
     host: Option<String>,
+    agent_user: String,
 }
 
 impl DockerCli {
-    pub(crate) fn new(binary: PathBuf, host: Option<String>) -> Self {
-        Self { binary, host }
+    pub(crate) fn new(binary: PathBuf, host: Option<String>, agent_user: String) -> Self {
+        Self {
+            binary,
+            host,
+            agent_user,
+        }
+    }
+
+    /// The `uid:gid` every probe and signal runs as inside the agent container.
+    pub(crate) fn agent_user(&self) -> &str {
+        &self.agent_user
     }
 
     pub(crate) fn command(&self) -> Command {
@@ -221,7 +266,11 @@ pub struct PiHarness {
 
 impl PiHarness {
     pub fn new(config: PiHarnessConfig) -> Self {
-        let docker = DockerCli::new(config.docker_binary.clone(), config.docker_host.clone());
+        let docker = DockerCli::new(
+            config.docker_binary.clone(),
+            config.docker_host.clone(),
+            config.agent_user.clone(),
+        );
         let agent_container = config.agent_container.clone();
         let stop_timeout = config.stop_timeout;
         Self {
@@ -245,6 +294,7 @@ impl PiHarness {
     }
 
     pub(crate) fn acquire_ready_storage(&self) -> Result<ReadyPiStorage, HarnessError> {
+        validate_agent_user(&self.config.agent_user)?;
         let storage = self.config.storage.as_ref().ok_or_else(|| {
             HarnessError::Start(
                 "Pi execution requires an exact Ready execution-storage allocation".to_owned(),
@@ -524,5 +574,80 @@ mod build_cache_mount_tests {
         assert!(check(&f, &[session.clone(), bind(&f.cache, "/sccache", false)]).is_err());
         // A managed directory mounted anywhere but /sccache gets no exemption.
         assert!(check(&f, &[session, bind(&f.cache, "/elsewhere", true)]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod agent_user_tests {
+    use super::*;
+    use orchestrator_core::{ExecutionId, WorkerId};
+
+    #[test]
+    fn numeric_uid_gid_is_accepted() {
+        for ok in ["1000:1000", "0:0", "65534:65534", "4294967295:0"] {
+            assert!(validate_agent_user(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn names_and_malformed_values_are_refused() {
+        for bad in [
+            "root",
+            "",
+            "1000",
+            "1000:",
+            ":1000",
+            "1000:1000:1",
+            "root:root",
+            "1000:wheel",
+            " 1000:1000",
+            "1000:1000 ",
+            "-1:0",
+            "+1:0",
+            "4294967296:0",
+            "00000000000:0",
+            "1,0:1",
+        ] {
+            assert!(validate_agent_user(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    fn config() -> PiHarnessConfig {
+        PiHarnessConfig::for_execution(
+            "/nonexistent/state".into(),
+            "/nonexistent/worktree".into(),
+            "agent".to_owned(),
+            OwnershipLabels {
+                execution_id: ExecutionId::new("exec-agent-user"),
+                worker_id: WorkerId::new("worker"),
+                repository: "repo".to_owned(),
+                issue: None,
+            },
+        )
+    }
+
+    #[test]
+    fn default_is_root_so_behaviour_is_unchanged_until_the_runtime_switches() {
+        assert_eq!(config().agent_user, "0:0");
+        assert_eq!(
+            PiHarness::new(config()).processes.docker.agent_user(),
+            "0:0"
+        );
+    }
+
+    #[test]
+    fn builder_validates_and_the_value_reaches_the_docker_context() {
+        assert!(config().with_agent_user("root").is_err());
+        let harness = PiHarness::new(config().with_agent_user("1000:1000").unwrap());
+        assert_eq!(harness.config().agent_user, "1000:1000");
+        assert_eq!(harness.processes.docker.agent_user(), "1000:1000");
+    }
+
+    #[test]
+    fn an_unvalidated_field_is_still_refused_before_any_docker_work() {
+        let mut bad = config();
+        bad.agent_user = "root".to_owned();
+        let error = PiHarness::new(bad).acquire_ready_storage().err().unwrap();
+        assert!(error.to_string().contains("uid:gid"), "{error}");
     }
 }

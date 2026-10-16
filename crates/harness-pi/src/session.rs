@@ -929,7 +929,7 @@ fn container_group_alive_with(
         .args([
             "exec",
             "--user",
-            "root",
+            docker.agent_user(),
             container,
             "/bin/sh",
             "-c",
@@ -981,7 +981,7 @@ fn run_control_command(
         .args([
             "exec",
             "--user",
-            "root",
+            docker.agent_user(),
             container,
             "/bin/sh",
             "-c",
@@ -1232,7 +1232,7 @@ fn derive_token_pgids(
         .args([
             "exec",
             "--user",
-            "root",
+            docker.agent_user(),
             container,
             "/bin/sh",
             "-c",
@@ -1700,5 +1700,69 @@ mod model_args_tests {
     fn base_args_without_a_policy_has_no_model_flags() {
         let args = base_args(&harness(None)).unwrap();
         assert!(!args.iter().any(|a| a == "--provider" || a == "--model"));
+    }
+}
+
+#[cfg(test)]
+mod agent_user_probe_tests {
+    use super::{
+        container_group_alive_with, derive_token_pgids, run_control_command, signal_container_group,
+    };
+    use crate::DockerCli;
+    use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+
+    /// A `docker` stand-in that records its argv and prints nothing.
+    fn recording_docker(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let log = dir.join("argv.log");
+        let script = dir.join("docker");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s %s %s %s \\n' \"$1\" \"$2\" \"$3\" \"$4\" >> '{}'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        (script, log)
+    }
+
+    fn exec_lines(log: &Path) -> Vec<String> {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn every_probe_and_signal_runs_as_the_configured_agent_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, log) = recording_docker(dir.path());
+        let docker = DockerCli::new(script, None, "4242:4343".to_owned());
+
+        let _ = container_group_alive_with(&docker, "agent", 77);
+        let _ = run_control_command(&docker, "agent", 77, "TERM");
+        let _ = derive_token_pgids(&docker, "agent", "token");
+        let _ = signal_container_group(&docker, "agent", 77, "KILL");
+
+        let lines = exec_lines(&log);
+        assert!(lines.len() >= 4, "{lines:?}");
+        for line in &lines {
+            assert!(
+                line.starts_with("exec --user 4242:4343 agent "),
+                "must exec as the agent user, never root: {line}"
+            );
+            assert!(!line.contains("--user root"), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_default_agent_user_is_root_so_nothing_changes_until_the_runtime_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, log) = recording_docker(dir.path());
+        let docker = DockerCli::new(script, None, "0:0".to_owned());
+        let _ = run_control_command(&docker, "agent", 1, "TERM");
+        assert!(exec_lines(&log)[0].starts_with("exec --user 0:0 agent "));
     }
 }
