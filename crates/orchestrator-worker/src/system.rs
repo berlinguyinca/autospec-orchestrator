@@ -12,7 +12,7 @@ use orchestrator_core::{
     TaskPacket,
 };
 use orchestrator_persistence::{ArtifactStore, CleanupAuthority, CleanupDisposition};
-use runtime_docker::{ContainerHardening, DockerRuntime, TrustedVerifierImage};
+use runtime_docker::{ContainerHardening, DockerRuntime, InferenceRelay, TrustedVerifierImage};
 use runtime_traits::build_cache::BUILD_CACHE_CAPABILITY;
 use runtime_traits::{
     CredentialBroker, EnvironmentHandle, Runtime, VerifiedAgentContainer, VerifiedBindMount,
@@ -106,6 +106,7 @@ pub struct VerifiedDockerRuntimeFactory {
     build_cache: Option<(PathBuf, u64)>,
     hardening: ContainerHardening,
     agent_user: String,
+    inference_relay: Option<InferenceRelay>,
 }
 
 impl VerifiedDockerRuntimeFactory {
@@ -125,7 +126,23 @@ impl VerifiedDockerRuntimeFactory {
             build_cache: None,
             hardening: ContainerHardening::Enforced,
             agent_user: runtime_docker::DEFAULT_AGENT_USER.to_owned(),
+            inference_relay: None,
         }
+    }
+
+    /// Routes every execution's model traffic through a per-execution relay
+    /// and puts the execution on an internal network (spec section 5 R-ORCH).
+    /// `None` keeps the legacy network with unrestricted egress; the worker
+    /// passes `None` only when the operator chose `--allow-agent-egress`.
+    #[must_use]
+    pub fn with_inference_relay(mut self, relay: Option<InferenceRelay>) -> Self {
+        self.inference_relay = relay;
+        self
+    }
+
+    /// The inference relay this factory hands to runtimes.
+    pub fn inference_relay(&self) -> Option<&InferenceRelay> {
+        self.inference_relay.as_ref()
     }
 
     /// Runs every agent container as `uid_gid` (numeric `uid:gid`). Default
@@ -171,10 +188,16 @@ impl VerifiedDockerRuntimeFactory {
         &self,
         runtime: DockerRuntime,
     ) -> Result<DockerRuntime, LifecycleError> {
-        apply_build_cache(runtime, self.build_cache.as_ref())
+        let runtime = apply_build_cache(runtime, self.build_cache.as_ref())
             .with_hardening(self.hardening)
             .with_agent_user(&self.agent_user)
-            .map_err(|error| LifecycleError::Step(error.to_string()))
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        match &self.inference_relay {
+            Some(relay) => runtime
+                .with_inference_relay(relay.clone())
+                .map_err(|error| LifecycleError::Step(error.to_string())),
+            None => Ok(runtime),
+        }
     }
 }
 
@@ -2287,6 +2310,35 @@ mod tests {
         let relaxed = factory().with_container_hardening(Relaxed);
         assert_eq!(relaxed.container_hardening(), Relaxed);
         assert_eq!(relaxed.configure(runtime()).unwrap().hardening(), Relaxed);
+    }
+
+    #[test]
+    fn the_factory_inference_relay_reaches_every_runtime_it_configures() {
+        let runtime =
+            || runtime_docker::DockerRuntime::connect_with_state_root(None, "/tmp").unwrap();
+        assert!(factory().inference_relay().is_none());
+        assert!(factory()
+            .configure(runtime())
+            .unwrap()
+            .inference_relay()
+            .is_none());
+        let relay = runtime_docker::InferenceRelay {
+            image: "relay:1".to_owned(),
+            upstream: "gateway.local:8080".to_owned(),
+            listen_port: 8081,
+        };
+        let with_relay = factory().with_inference_relay(Some(relay.clone()));
+        assert_eq!(with_relay.inference_relay(), Some(&relay));
+        assert_eq!(
+            with_relay.configure(runtime()).unwrap().inference_relay(),
+            Some(&relay)
+        );
+        // A relay the runtime refuses cannot be configured silently.
+        let bad = factory().with_inference_relay(Some(runtime_docker::InferenceRelay {
+            upstream: "no-port".to_owned(),
+            ..relay
+        }));
+        assert!(bad.configure(runtime()).is_err());
     }
 
     #[test]

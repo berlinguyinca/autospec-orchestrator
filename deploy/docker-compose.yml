@@ -91,6 +91,9 @@ services:
       DOCKER_HOST: tcp://docker-api:2375
       AUTOSPEC_WORKER_HOST_DOCKER: ${AUTOSPEC_WORKER_HOST_DOCKER:-false}
       AUTOSPEC_ALLOW_LOCAL_DEVELOPMENT_CREDENTIALS: ${AUTOSPEC_ALLOW_LOCAL_DEVELOPMENT_CREDENTIALS:-false}
+      # The worker refuses to start without an inference relay unless egress is
+      # explicitly allowed. See deploy/README.md to adopt the relay instead.
+      AUTOSPEC_ALLOW_AGENT_EGRESS: ${AUTOSPEC_ALLOW_AGENT_EGRESS:-true}
     command:
       - --storage-kind
       - ${AUTOSPEC_STORAGE_KIND:?set AUTOSPEC_STORAGE_KIND}

@@ -57,6 +57,31 @@ the `controller` service: drop its `AUTOSPEC_WORKER_TOKEN` and
 set `AUTOSPEC_WORKER_TOKENS_FILE` to its in-container path (the file must be
 mode 0600 and readable by the controller's user).
 
+Agent network isolation. By default every execution runs on an internal Docker
+network with no route out. Model traffic goes through a per-execution relay
+container that forwards only to one InferWeave `host:port`, and the agent
+reaches it as `INFERWEAVE_RELAY_URL=http://inferweave:<port>` (point Pi's
+provider base URL at that URL in the agent image). The worker therefore refuses
+to start unless it is given the relay:
+
+- `AUTOSPEC_INFERENCE_UPSTREAM` (`--inference-upstream`): the InferWeave
+  `host:port`, for example `gateway.local:8080`.
+- `AUTOSPEC_INFERENCE_RELAY_IMAGE` (`--inference-relay-image`): an image you
+  supply (for example one carrying `socat`) whose entrypoint receives exactly
+  `<listen_port> <upstream>` and forwards to the upstream. It must be stateless
+  (no image volumes).
+- `AUTOSPEC_INFERENCE_RELAY_PORT` (`--inference-relay-port`, default 8080).
+
+To keep the previous behaviour (ordinary network, unrestricted agent egress) pass
+`--allow-agent-egress` / `AUTOSPEC_ALLOW_AGENT_EGRESS=true` instead; it is logged
+as a warning at startup and cannot be combined with the relay flags. Upgrading
+without either leaves the worker exiting at startup with a message naming all
+three flags. On an internal network, service containers (`postgres`, `redis`,
+...) also lose outbound access; they remain reachable by the agent. The bundled
+`docker-compose.yml` worker passes `AUTOSPEC_ALLOW_AGENT_EGRESS` (default `true`)
+so the example deployment keeps starting; set it to `false` and add the two relay
+variables to adopt the relay.
+
 Agents run as a non-root user by default (`AUTOSPEC_AGENT_USER`, default
 `1000:1000`). The execution directories are owner-only on the host, so a
 non-root agent works only where the Docker daemon maps that uid to the worker's

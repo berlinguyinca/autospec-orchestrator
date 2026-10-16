@@ -145,6 +145,24 @@ struct Cli {
     /// warning when used.
     #[arg(long, env = "AUTOSPEC_ALLOW_ROOT_AGENT", default_value_t = false)]
     allow_root_agent: bool,
+    /// InferWeave `host:port` the per-execution inference relay forwards to.
+    /// Needs `--inference-relay-image`. With a relay each execution runs on an
+    /// internal network and reaches only this upstream.
+    #[arg(long, env = "AUTOSPEC_INFERENCE_UPSTREAM")]
+    inference_upstream: Option<String>,
+    /// Operator-supplied relay image: its entrypoint receives
+    /// `<listen_port> <upstream>`. Needs `--inference-upstream`.
+    #[arg(long, env = "AUTOSPEC_INFERENCE_RELAY_IMAGE")]
+    inference_relay_image: Option<String>,
+    /// Port the relay listens on; agents reach it as `http://inferweave:<port>`.
+    #[arg(long, env = "AUTOSPEC_INFERENCE_RELAY_PORT", default_value_t = 8080)]
+    inference_relay_port: u16,
+    /// Starts WITHOUT an inference relay: executions keep an ordinary network
+    /// with unrestricted egress. Without this flag the worker refuses to start
+    /// unless both `--inference-upstream` and `--inference-relay-image` are set.
+    /// Logged as a warning at startup.
+    #[arg(long, env = "AUTOSPEC_ALLOW_AGENT_EGRESS", default_value_t = false)]
+    allow_agent_egress: bool,
     #[arg(long, default_value = "https://github.com")]
     clone_base: String,
     #[arg(long, env = "AUTOSPEC_DOCKER_SOCKET")]
@@ -187,6 +205,11 @@ async fn main() -> Result<()> {
             "container hardening is relaxed: no-new-privileges is not set and the agent keeps its default capabilities"
         );
     }
+    if cli.allow_agent_egress {
+        tracing::warn!(
+            "agent egress is allowed: executions run on an ordinary network with unrestricted outbound access"
+        );
+    }
     let prepared = prepare_execution_plane(&cli).await;
     let (worker, execution_plane) = advertisement_from_preparation(&cli, prepared)?;
     let token = Secret(cli.worker_token.clone());
@@ -212,7 +235,51 @@ fn validate_cli(cli: &Cli) -> Result<()> {
     toolchain_map(&cli.toolchains)?;
     validate_build_cache(cli)?;
     resolve_agent_user(&cli.agent_user, cli.allow_root_agent)?;
+    resolve_relay(cli)?;
     Ok(())
+}
+
+/// The inference relay every execution uses, or `None` when the operator
+/// explicitly allowed agent egress (spec section 5 R-ORCH: internal by default).
+///
+/// - both relay flags: `Some(relay)`;
+/// - neither, with `--allow-agent-egress`: `None`;
+/// - anything else is an error naming the flags, so an upgrade that sets
+///   neither is seen immediately rather than silently losing isolation. Relay
+///   flags together with `--allow-agent-egress` contradict each other and are
+///   refused too.
+fn resolve_relay(cli: &Cli) -> Result<Option<runtime_docker::InferenceRelay>> {
+    let upstream = cli.inference_upstream.as_deref().filter(|v| !v.is_empty());
+    let image = cli
+        .inference_relay_image
+        .as_deref()
+        .filter(|v| !v.is_empty());
+    match (upstream, image, cli.allow_agent_egress) {
+        (Some(upstream), Some(image), false) => {
+            let relay = runtime_docker::InferenceRelay {
+                image: image.to_owned(),
+                upstream: upstream.to_owned(),
+                listen_port: cli.inference_relay_port,
+            };
+            runtime_docker::validate_inference_relay(&relay)?;
+            Ok(Some(relay))
+        }
+        (None, None, true) => Ok(None),
+        (Some(_), Some(_), true) => anyhow::bail!(
+            "--allow-agent-egress contradicts --inference-upstream/--inference-relay-image; \
+             pass the relay flags or --allow-agent-egress, not both"
+        ),
+        (Some(_), None, _) | (None, Some(_), _) => {
+            anyhow::bail!("--inference-upstream and --inference-relay-image must be given together")
+        }
+        (None, None, false) => anyhow::bail!(
+            "no inference relay configured: executions would have unrestricted network egress. \
+             Pass --inference-upstream <host:port> and --inference-relay-image <image> \
+             (AUTOSPEC_INFERENCE_UPSTREAM, AUTOSPEC_INFERENCE_RELAY_IMAGE) to run agents on an \
+             internal network, or --allow-agent-egress (AUTOSPEC_ALLOW_AGENT_EGRESS) to keep \
+             unrestricted egress"
+        ),
+    }
 }
 
 /// The one agent `uid:gid` handed to both the runtime and the harness.
@@ -304,7 +371,9 @@ fn runtime_factory(
         credentials,
     )
     .with_agent_user(agent_user)?;
-    let factory = factory.with_container_hardening(container_hardening(cli));
+    let factory = factory
+        .with_container_hardening(container_hardening(cli))
+        .with_inference_relay(resolve_relay(cli)?);
     Ok(match &cli.build_cache_root {
         Some(root) => factory.with_build_cache(root.clone(), cli.build_cache_max_gib),
         None => factory,
@@ -1153,6 +1222,10 @@ mod tests {
             relax_container_hardening: false,
             agent_user: "1000:1000".into(),
             allow_root_agent: false,
+            inference_upstream: None,
+            inference_relay_image: None,
+            inference_relay_port: 8080,
+            allow_agent_egress: true,
             clone_base: "https://github.com".into(),
             docker_socket: None,
             docker_proxy_port: 2375,
@@ -1166,7 +1239,8 @@ mod tests {
         }
     }
 
-    fn parse(extra: &[&str]) -> Cli {
+    /// Parses the worker flags exactly as given (plus the required ones).
+    fn parse_raw(extra: &[&str]) -> Cli {
         let mut args = vec![
             "autospec-worker",
             "--worker-id",
@@ -1184,6 +1258,22 @@ mod tests {
         ];
         args.extend_from_slice(extra);
         Cli::try_parse_from(args).expect("worker CLI parses")
+    }
+
+    /// `parse_raw` plus `--allow-agent-egress` unless the test sets a relay
+    /// flag itself, so tests of unrelated flags pass the startup relay rule.
+    fn parse(extra: &[&str]) -> Cli {
+        let own = extra.iter().any(|arg| {
+            matches!(
+                *arg,
+                "--inference-upstream" | "--inference-relay-image" | "--allow-agent-egress"
+            )
+        });
+        let mut all = extra.to_vec();
+        if !own {
+            all.push("--allow-agent-egress");
+        }
+        parse_raw(&all)
     }
 
     #[test]
@@ -1818,6 +1908,162 @@ mod tests {
         assert_eq!(harness.agent_user(), Some("1234:5678"));
         // A user that does not validate cannot reach either factory.
         assert!(harness_factory(&cli, "root", Arc::new(NoStorage)).is_err());
+    }
+
+    #[test]
+    fn resolve_relay_refuses_without_a_relay_unless_egress_is_allowed() {
+        // Neither relay flag nor the opt-out: refuse, naming all three flags.
+        let bare = parse_raw(&[]);
+        assert!(!bare.allow_agent_egress);
+        let error = validate_cli(&bare).unwrap_err().to_string();
+        for flag in [
+            "--inference-upstream",
+            "--inference-relay-image",
+            "--allow-agent-egress",
+        ] {
+            assert!(error.contains(flag), "{error}");
+        }
+        assert!(resolve_relay(&bare)
+            .unwrap_err()
+            .to_string()
+            .contains("--inference-upstream"));
+        // The explicit opt-out starts, with no relay.
+        let egress = parse_raw(&["--allow-agent-egress"]);
+        assert!(validate_cli(&egress).is_ok());
+        assert_eq!(resolve_relay(&egress).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_relay_makes_a_relay_from_both_flags_with_the_default_or_a_given_port() {
+        let both = parse_raw(&[
+            "--inference-upstream",
+            "gateway.local:8080",
+            "--inference-relay-image",
+            "relay:1",
+        ]);
+        assert!(validate_cli(&both).is_ok());
+        assert_eq!(
+            resolve_relay(&both).unwrap(),
+            Some(runtime_docker::InferenceRelay {
+                image: "relay:1".into(),
+                upstream: "gateway.local:8080".into(),
+                listen_port: 8080,
+            })
+        );
+        let port = parse_raw(&[
+            "--inference-upstream",
+            "gateway.local:8080",
+            "--inference-relay-image",
+            "relay:1",
+            "--inference-relay-port",
+            "9000",
+        ]);
+        assert_eq!(resolve_relay(&port).unwrap().unwrap().listen_port, 9000);
+    }
+
+    #[test]
+    fn resolve_relay_refuses_half_contradictory_or_malformed_relays_at_startup() {
+        for extra in [
+            vec!["--inference-upstream", "gateway.local:8080"],
+            vec!["--inference-relay-image", "relay:1"],
+            vec![
+                "--inference-upstream",
+                "gateway.local:8080",
+                "--inference-relay-image",
+                "relay:1",
+                "--allow-agent-egress",
+            ],
+            vec![
+                "--inference-upstream",
+                "gateway.local",
+                "--inference-relay-image",
+                "relay:1",
+            ],
+            vec![
+                "--inference-upstream",
+                "http://gateway.local:8080",
+                "--inference-relay-image",
+                "relay:1",
+            ],
+        ] {
+            let cli = parse_raw(&extra);
+            assert!(resolve_relay(&cli).is_err(), "{extra:?}");
+            assert!(validate_cli(&cli).is_err(), "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn the_relay_flags_reach_the_runtime_factory() {
+        #[derive(Debug)]
+        struct NoStorage;
+        impl execution_storage::ReadyAllocationVerifier for NoStorage {
+            fn verify_ready(
+                &self,
+                _: &execution_storage::AllocationReceipt,
+            ) -> Result<
+                Box<dyn execution_storage::VerifiedExecutionStorage>,
+                execution_storage::StorageError,
+            > {
+                Err(execution_storage::StorageError::Unavailable("stub".into()))
+            }
+        }
+        let build = |cli: &Cli| {
+            runtime_factory(
+                cli,
+                &cli.agent_user,
+                Arc::new(NoStorage),
+                TrustedVerifierImage::new(format!("sha256:{}", "a".repeat(64)), "/usr/bin/stat")
+                    .unwrap(),
+                Arc::new(
+                    LocalCredentialBroker::new(std::env::temp_dir(), chrono::Duration::minutes(15))
+                        .unwrap(),
+                ),
+            )
+        };
+        assert!(build(&parse_raw(&["--allow-agent-egress"]))
+            .unwrap()
+            .inference_relay()
+            .is_none());
+        let cli = parse_raw(&[
+            "--inference-upstream",
+            "gateway.local:8080",
+            "--inference-relay-image",
+            "relay:1",
+            "--inference-relay-port",
+            "9001",
+        ]);
+        let factory = build(&cli).unwrap();
+        let relay = factory
+            .inference_relay()
+            .expect("relay reaches the factory");
+        assert_eq!(
+            (
+                relay.image.as_str(),
+                relay.upstream.as_str(),
+                relay.listen_port
+            ),
+            ("relay:1", "gateway.local:8080", 9001)
+        );
+        // A configuration that would run without a relay cannot build a factory.
+        assert!(build(&parse_raw(&[])).is_err());
+    }
+
+    #[test]
+    fn the_relay_flags_have_environment_twins() {
+        // clap reads these from the environment when the flag is absent.
+        let cmd = <Cli as clap::CommandFactory>::command();
+        for (long, env) in [
+            ("inference-upstream", "AUTOSPEC_INFERENCE_UPSTREAM"),
+            ("inference-relay-image", "AUTOSPEC_INFERENCE_RELAY_IMAGE"),
+            ("inference-relay-port", "AUTOSPEC_INFERENCE_RELAY_PORT"),
+            ("allow-agent-egress", "AUTOSPEC_ALLOW_AGENT_EGRESS"),
+        ] {
+            let arg = cmd
+                .get_arguments()
+                .find(|arg| arg.get_long() == Some(long))
+                .unwrap_or_else(|| panic!("--{long} exists"));
+            assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some(env), "{long}");
+        }
     }
 
     #[test]
