@@ -22,7 +22,8 @@ use orchestrator_core::{
     labels, ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement, WorkerId,
 };
 use runtime_docker::{
-    host_limits, ContainerHardening, DockerRuntime, TrustedVerifierImage, DEFAULT_PIDS_LIMIT,
+    host_limits, ContainerHardening, DockerRuntime, InferenceRelay, TrustedVerifierImage,
+    DEFAULT_PIDS_LIMIT,
 };
 use runtime_traits::Runtime;
 use std::{
@@ -3574,4 +3575,246 @@ fn agent_user_builder_accepts_numeric_uid_gid_and_refuses_everything_else() {
     ] {
         assert!(runtime().with_agent_user(bad).is_err(), "{bad:?}");
     }
+}
+
+/// Builds a throwaway relay image from the local Alpine image: busybox `nc`
+/// forwarding `$1` to `$2`, plus a small upstream that reads the request before
+/// answering `relayed-ok`.
+fn build_relay_test_image(tag: &str) -> bool {
+    let Some(docker) = docker_cli() else {
+        return false;
+    };
+    let dir = tempfile::tempdir().expect("build context");
+    for (name, body) in [
+        (
+            "relay.sh",
+            "#!/bin/sh\nhost=${2%:*}\nport=${2##*:}\nwhile true; do nc -l -p \"$1\" -e nc \"$host\" \"$port\"; done\n",
+        ),
+        (
+            "upstream.sh",
+            "#!/bin/sh\nwhile true; do nc -l -p 8000 -e /respond.sh; done\n",
+        ),
+        (
+            "respond.sh",
+            "#!/bin/sh\nwhile read -r line; do case \"$line\" in \"$(printf '\\r')\"|\"\") break;; esac; done\nprintf 'HTTP/1.0 200 OK\\r\\n\\r\\nrelayed-ok\\n'\n",
+        ),
+    ] {
+        fs::write(dir.path().join(name), body).expect("write script");
+    }
+    fs::write(
+        dir.path().join("Dockerfile"),
+        "FROM alpine:3.20\nCOPY relay.sh upstream.sh respond.sh /\nRUN chmod 755 /relay.sh /upstream.sh /respond.sh\nENTRYPOINT [\"/relay.sh\"]\n",
+    )
+    .expect("write Dockerfile");
+    Command::new(docker)
+        .args(["build", "-q", "-t", tag])
+        .arg(dir.path())
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Starts the test upstream on the default bridge; returns its `ip:8000`.
+async fn start_relay_test_upstream(docker: &Docker, tag: &str, name: &str) -> String {
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: name.to_owned(),
+                platform: None,
+            }),
+            Config {
+                image: Some(tag.to_owned()),
+                entrypoint: Some(vec![]),
+                cmd: Some(vec!["/upstream.sh".to_owned()]),
+                host_config: Some(HostConfig {
+                    network_mode: Some("bridge".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create relay test upstream");
+    docker
+        .start_container::<String>(name, None)
+        .await
+        .expect("start relay test upstream");
+    let ip = docker
+        .inspect_container(name, None)
+        .await
+        .expect("inspect upstream")
+        .network_settings
+        .and_then(|settings| settings.networks)
+        .and_then(|networks| networks.get("bridge").and_then(|e| e.ip_address.clone()))
+        .expect("upstream bridge address");
+    format!("{ip}:8000")
+}
+
+async fn remove_relay_test_resources(docker: &Docker, upstream: &str, tag: &str) {
+    let _ = docker
+        .remove_container(
+            upstream,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker
+        .remove_image(
+            tag,
+            Some(RemoveImageOptions {
+                force: true,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+}
+
+/// With a relay the execution network is internal: the agent reaches the
+/// upstream through `http://inferweave:<port>` and nothing else.
+#[tokio::test]
+async fn internal_network_relays_inference_and_blocks_other_egress() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((_state, runtime)) = execution_runtime_with_disk_or_skip(
+        "internal_network_relays_inference_and_blocks_other_egress",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let pid = std::process::id();
+    let tag = format!("autospec-relay-int-test:{pid}");
+    let upstream_name = format!("autospec-relay-int-upstream-{pid}");
+    if !build_relay_test_image(&tag) {
+        println!("SKIP: cannot build the throwaway relay image");
+        return;
+    }
+    let upstream = start_relay_test_upstream(&docker, &tag, &upstream_name).await;
+    let runtime = runtime
+        .with_inference_relay(InferenceRelay {
+            image: tag.clone(),
+            upstream,
+            listen_port: 8080,
+        })
+        .expect("valid relay");
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let outcome = async {
+        let handle = runtime
+            .provision(&execution_labels, &hardening_requirement(), &[])
+            .await
+            .map_err(|error| format!("provision with relay: {error}"))?;
+        let network = docker
+            .inspect_network::<String>(&handle.network, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        if network.internal != Some(true) {
+            return Err(format!("network not internal: {:?}", network.internal));
+        }
+        let env = docker
+            .inspect_container(&handle.agent_container, None)
+            .await
+            .map_err(|error| error.to_string())?
+            .config
+            .and_then(|config| config.env)
+            .unwrap_or_default();
+        if !env.contains(&"INFERWEAVE_RELAY_URL=http://inferweave:8080".to_owned()) {
+            return Err(format!("agent env lacks the relay URL: {env:?}"));
+        }
+        let mut reached = String::new();
+        for _ in 0..90 {
+            let (_, out, err) = exec_output(
+                &docker,
+                &handle.agent_container,
+                "wget -T 5 -qO- http://inferweave:8080/ 2>&1",
+            )
+            .await;
+            if out.contains("relayed-ok") {
+                reached = out;
+                break;
+            }
+            let _ = err;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        if !reached.contains("relayed-ok") {
+            return Err("the agent could not reach the upstream through the relay".to_owned());
+        }
+        // The same network has no route to anything else.
+        let (exit, out, _) = exec_output(
+            &docker,
+            &handle.agent_container,
+            "wget -T 5 -qO- http://1.1.1.1/ 2>&1",
+        )
+        .await;
+        if exit == 0 || out.contains("<html") || out.contains("HTTP/") {
+            return Err(format!("the internal network allowed egress: {exit} {out}"));
+        }
+        // And not to the upstream directly: only the relay may reach it.
+        let direct = runtime
+            .inference_relay()
+            .map(|relay| relay.upstream.clone())
+            .expect("relay configured");
+        let (exit, out, _) = exec_output(
+            &docker,
+            &handle.agent_container,
+            &format!("wget -T 5 -qO- http://{direct}/ 2>&1"),
+        )
+        .await;
+        if out.contains("relayed-ok") {
+            return Err(format!(
+                "the agent reached the upstream directly: {exit} {out}"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+    let cleaned = scope.cleanup().await;
+    remove_relay_test_resources(&docker, &upstream_name, &tag).await;
+    outcome.expect("internal network behaviour");
+    cleaned.expect("cleanup relay execution");
+}
+
+/// Without a relay the network is today's non-internal one, and the agent is
+/// not told about any relay.
+#[tokio::test]
+async fn without_a_relay_the_network_is_not_internal_and_no_relay_url_is_set() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((_state, runtime)) = execution_runtime_with_disk_or_skip(
+        "without_a_relay_the_network_is_not_internal_and_no_relay_url_is_set",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let handle = runtime
+        .provision(&execution_labels, &hardening_requirement(), &[])
+        .await
+        .expect("provision without a relay");
+    let network = docker
+        .inspect_network::<String>(&handle.network, None)
+        .await
+        .expect("inspect network");
+    assert_eq!(network.internal, Some(false));
+    let env = docker
+        .inspect_container(&handle.agent_container, None)
+        .await
+        .expect("inspect agent")
+        .config
+        .and_then(|config| config.env)
+        .unwrap_or_default();
+    assert!(
+        !env.iter()
+            .any(|entry| entry.starts_with("INFERWEAVE_RELAY_URL")),
+        "{env:?}"
+    );
+    scope.cleanup().await.expect("cleanup no-relay execution");
 }
