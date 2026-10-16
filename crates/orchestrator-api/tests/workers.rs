@@ -322,6 +322,269 @@ async fn authenticated_execution_cleanup_requests_durable_reconciliation() {
     );
 }
 
+async fn retained_execution(cleanup: &PgCleanupAuthorityStore, label: &str) -> ExecutionId {
+    let execution_id = ExecutionId::new(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
+    cleanup
+        .begin(
+            &execution_id,
+            &orchestrator_core::AttemptId::new(format!(
+                "attempt-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &WorkerId::new(format!("worker-{}", uuid::Uuid::new_v4().simple())),
+        )
+        .await
+        .unwrap();
+    let handles = serde_json::json!({"session": "durable"});
+    let path = [
+        CleanupDisposition::Active(CleanupStage::Reserved),
+        CleanupDisposition::Active(CleanupStage::Storage),
+        CleanupDisposition::Active(CleanupStage::Worktree),
+        CleanupDisposition::Active(CleanupStage::Runtime),
+        CleanupDisposition::Active(CleanupStage::PiStarted),
+        CleanupDisposition::Active(CleanupStage::Running),
+        CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent),
+        CleanupDisposition::RetainRequested,
+        CleanupDisposition::Retained,
+    ];
+    for pair in path.windows(2) {
+        cleanup
+            .transition(&execution_id, pair[0], pair[1], &handles)
+            .await
+            .unwrap();
+    }
+    execution_id
+}
+
+#[tokio::test]
+async fn post_merge_cleanup_accepts_the_api_token_and_is_idempotent() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
+        return;
+    };
+    let _database_lock = DisposableTestDatabaseLock::acquire(&database_url)
+        .await
+        .unwrap();
+    let workers = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+    let retained = retained_execution(&cleanup, "merge-retained").await;
+    let state = app_state(&database_url, workers, reservations, "worker-secret".into())
+        .await
+        .with_cleanup_authorities(cleanup.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/api/v1/executions/{retained}/cleanup");
+
+    // No token, or a token that is neither credential: 401, nothing moves.
+    assert_eq!(
+        client.post(&url).send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("not-a-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        cleanup.get(&retained).await.unwrap().disposition().unwrap(),
+        CleanupDisposition::Retained
+    );
+
+    // The API token moves Retained to CleanupPending.
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("api-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::ACCEPTED
+    );
+    let first = cleanup.get(&retained).await.unwrap();
+    assert_eq!(
+        first.disposition().unwrap(),
+        CleanupDisposition::CleanupPending
+    );
+
+    // Replays (either credential) are 202 and write nothing.
+    for token in ["api-secret", "worker-secret"] {
+        assert_eq!(
+            client
+                .post(&url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::ACCEPTED
+        );
+        let again = cleanup.get(&retained).await.unwrap();
+        assert_eq!(again.phase, first.phase);
+        assert_eq!(again.updated_at, first.updated_at, "replay wrote a row");
+    }
+
+    // A later phase is also a no-op 202 and is not dragged back.
+    cleanup
+        .transition(
+            &retained,
+            CleanupDisposition::CleanupPending,
+            CleanupDisposition::RuntimeStopped,
+            &first.handles,
+        )
+        .await
+        .unwrap();
+    let advanced = cleanup.get(&retained).await.unwrap();
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("api-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::ACCEPTED
+    );
+    let after = cleanup.get(&retained).await.unwrap();
+    assert_eq!(after.phase, advanced.phase);
+    assert_eq!(after.updated_at, advanced.updated_at);
+
+    // Concurrent identical requests on a fresh retained execution all succeed.
+    let racing = retained_execution(&cleanup, "merge-racing").await;
+    let racing_url = format!("http://{address}/api/v1/executions/{racing}/cleanup");
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        let racing_url = racing_url.clone();
+        tasks.push(tokio::spawn(async move {
+            client
+                .post(racing_url)
+                .bearer_auth("api-secret")
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), reqwest::StatusCode::ACCEPTED);
+    }
+}
+
+#[tokio::test]
+async fn post_merge_cleanup_refuses_active_and_unknown_executions_untouched() {
+    let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
+        return;
+    };
+    let _database_lock = DisposableTestDatabaseLock::acquire(&database_url)
+        .await
+        .unwrap();
+    let workers = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+    let state = app_state(&database_url, workers, reservations, "worker-secret".into())
+        .await
+        .with_cleanup_authorities(cleanup.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let post = |id: &ExecutionId, token: &'static str| {
+        let request = client
+            .post(format!("http://{address}/api/v1/executions/{id}/cleanup"))
+            .bearer_auth(token);
+        async move { request.send().await.unwrap() }
+    };
+
+    let active = ExecutionId::new(format!("merge-active-{}", uuid::Uuid::new_v4().simple()));
+    cleanup
+        .begin(
+            &active,
+            &orchestrator_core::AttemptId::new("active-attempt"),
+            &WorkerId::new("active-worker"),
+        )
+        .await
+        .unwrap();
+    let before = cleanup.get(&active).await.unwrap();
+    for token in ["api-secret", "worker-secret"] {
+        let response = post(&active, token).await;
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("CLEANUP_EXECUTION_ACTIVE"), "{body}");
+    }
+    let after = cleanup.get(&active).await.unwrap();
+    assert_eq!(after.phase, before.phase);
+    assert_eq!(after.updated_at, before.updated_at);
+
+    // An execution that only asked to be retained is not yet cleanable.
+    let requested = ExecutionId::new(format!("merge-req-{}", uuid::Uuid::new_v4().simple()));
+    cleanup
+        .begin(
+            &requested,
+            &orchestrator_core::AttemptId::new("req-attempt"),
+            &WorkerId::new("req-worker"),
+        )
+        .await
+        .unwrap();
+    let handles = serde_json::json!({});
+    let steps = [
+        CleanupDisposition::Active(CleanupStage::Reserved),
+        CleanupDisposition::Active(CleanupStage::Storage),
+        CleanupDisposition::Active(CleanupStage::Worktree),
+        CleanupDisposition::Active(CleanupStage::Runtime),
+        CleanupDisposition::Active(CleanupStage::PiStarted),
+        CleanupDisposition::Active(CleanupStage::Running),
+        CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent),
+        CleanupDisposition::RetainRequested,
+    ];
+    for pair in steps.windows(2) {
+        cleanup
+            .transition(&requested, pair[0], pair[1], &handles)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        post(&requested, "api-secret").await.status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        cleanup
+            .get(&requested)
+            .await
+            .unwrap()
+            .disposition()
+            .unwrap(),
+        CleanupDisposition::RetainRequested
+    );
+
+    let unknown = ExecutionId::new("merge-never-existed");
+    assert_eq!(
+        post(&unknown, "api-secret").await.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+}
+
 #[tokio::test]
 async fn worker_routes_reject_invalid_and_oversized_bodies() {
     let Some(database_url) = std::env::var("AUTOSPEC_DATABASE_URL").ok() else {

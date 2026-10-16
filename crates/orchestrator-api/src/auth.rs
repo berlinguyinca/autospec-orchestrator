@@ -58,6 +58,25 @@ pub(crate) fn authorize_worker(state: &AppState, headers: &HeaderMap) -> Result<
     )
 }
 
+/// Either credential may request post-merge cleanup: the API token (an
+/// external client that decided a PR merged) or the worker token. Both
+/// validators always run, so the answer's timing does not reveal which
+/// credential was supplied.
+pub(crate) fn authorize_api_or_worker(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let api = authorize_bearer(headers, state.api_token_validator.as_ref());
+    let worker = authorize_bearer(headers, state.worker_token_validator.as_ref());
+    if api | worker {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized(
+            "missing or invalid API or worker bearer token",
+        ))
+    }
+}
+
 fn authorize(
     headers: &HeaderMap,
     validator: &dyn ApiTokenValidator,

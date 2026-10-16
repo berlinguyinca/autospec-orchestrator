@@ -12,7 +12,7 @@ use orchestrator_persistence::{CleanupDisposition, StoreError};
 use serde::Deserialize;
 
 use crate::{
-    auth::{authorize_api, authorize_worker},
+    auth::{authorize_api, authorize_api_or_worker, authorize_worker},
     error::ApiError,
     state::AppState,
 };
@@ -62,12 +62,20 @@ pub fn routes() -> Router<AppState> {
         .layer(DefaultBodyLimit::max(WORKER_BODY_LIMIT))
 }
 
+/// Requests teardown of a retained execution (spec §7 item 12). The caller
+/// (the API client that decided the PR merged, or a worker) never reaches GitHub
+/// through us: the orchestrator only moves the durable cleanup authority.
+///
+/// Idempotent: `Retained` becomes `CleanupPending`; `CleanupPending` and every
+/// later phase is a no-op 202; an execution that is still active (or only
+/// asked to be retained) is refused with 409 and left untouched. The physical
+/// teardown stays in the worker's owned-only `cleanup_phases`.
 async fn request_cleanup(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    authorize_worker(&state, &headers)?;
+    authorize_api_or_worker(&state, &headers)?;
     let cleanup = state.cleanup_authorities.as_ref().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -77,23 +85,45 @@ async fn request_cleanup(
     })?;
     let execution_id = ExecutionId::new(id);
     let authority = cleanup.get(&execution_id).await.map_err(ApiError::store)?;
-    if authority.disposition().map_err(ApiError::store)? != CleanupDisposition::Retained {
-        return Err(ApiError::new(
+    match authority.disposition().map_err(ApiError::store)? {
+        CleanupDisposition::Active(_) | CleanupDisposition::RetainRequested => Err(ApiError::new(
             StatusCode::CONFLICT,
-            "CLEANUP_NOT_RETAINED",
-            "only a retained execution can be explicitly cleaned",
-        ));
+            "CLEANUP_EXECUTION_ACTIVE",
+            "an active execution cannot be cleaned up",
+        )),
+        CleanupDisposition::Retained => {
+            let moved = cleanup
+                .transition(
+                    &execution_id,
+                    CleanupDisposition::Retained,
+                    CleanupDisposition::CleanupPending,
+                    &authority.handles,
+                )
+                .await;
+            if let Err(error) = moved {
+                // A concurrent identical request may have won the transition;
+                // that is success, anything else is the original error.
+                let now = cleanup.get(&execution_id).await.map_err(ApiError::store)?;
+                let advanced = !matches!(
+                    now.disposition().map_err(ApiError::store)?,
+                    CleanupDisposition::Active(_)
+                        | CleanupDisposition::RetainRequested
+                        | CleanupDisposition::Retained
+                );
+                if !advanced {
+                    return Err(ApiError::store(error));
+                }
+            }
+            Ok(StatusCode::ACCEPTED)
+        }
+        CleanupDisposition::CleanupPending
+        | CleanupDisposition::RuntimeStopped
+        | CleanupDisposition::RuntimeDestroyed
+        | CleanupDisposition::GitRecoveredCleaned
+        | CleanupDisposition::StorageReleased
+        | CleanupDisposition::ReservationReleased
+        | CleanupDisposition::Resolved => Ok(StatusCode::ACCEPTED),
     }
-    cleanup
-        .transition(
-            &execution_id,
-            CleanupDisposition::Retained,
-            CleanupDisposition::CleanupPending,
-            &authority.handles,
-        )
-        .await
-        .map_err(ApiError::store)?;
-    Ok(StatusCode::ACCEPTED)
 }
 
 async fn register(
