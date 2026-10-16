@@ -12,7 +12,7 @@ use execution_storage::{disk_gib_to_bytes, ExecutionLayout, ReadyLease, Verified
 use futures_util::StreamExt;
 use orchestrator_core::{OwnershipLabels, RuntimeRequirement, ServiceRequirement};
 use runtime_traits::build_cache::{
-    is_managed_build_cache_dir, BUILD_CACHE_CAPABILITY, CONTAINER_BUILD_CACHE, OWNER_FILE,
+    is_managed_build_cache_dir, BUILD_CACHE_CAPABILITY, CONTAINER_BUILD_CACHE, OWNER_FILE, REFS_DIR,
 };
 use runtime_traits::{EnvironmentHandle, RuntimeError, VerifiedAgentContainer, VerifiedBindMount};
 use std::{
@@ -353,6 +353,7 @@ async fn provision_inner(
         requirement,
         image_inspect.id.as_deref().unwrap_or(image),
         read_lockfile(&layout.repository).as_deref(),
+        &labels.execution_id,
     )?;
     let service_mounts = service_requirements
         .iter()
@@ -1141,6 +1142,7 @@ fn plan_build_cache(
     requirement: &RuntimeRequirement,
     image: &str,
     lockfile: Option<&[u8]>,
+    execution_id: &orchestrator_core::ExecutionId,
 ) -> Result<Option<BuildCachePlan>, RuntimeError> {
     if !requirement
         .capabilities
@@ -1160,6 +1162,7 @@ fn plan_build_cache(
         fs::canonicalize(mount.source.as_deref().unwrap_or_default()).map_err(|error| {
             RuntimeError::Provisioning(format!("canonicalize build cache: {error}"))
         })?;
+    mark_cache_in_use(&source, execution_id)?;
     Ok(Some(BuildCachePlan {
         mount,
         source,
@@ -1186,6 +1189,35 @@ fn build_cache_mount(root: &Path, key: &str) -> Result<Mount, RuntimeError> {
     write_owner_file_once(&dir, key)?;
     make_container_writable(&dir)?;
     bind_mount(&dir, CONTAINER_BUILD_CACHE)
+}
+
+/// Records that `execution_id` is about to use this cache directory by writing
+/// `refs/<execution_id>`. The pressure GC treats a directory as in use while a
+/// container labelled with a referenced execution exists, or while the ref is
+/// younger than [`runtime_traits::build_cache::REF_GRACE`] (the window before
+/// that container exists). The directory is re-checked afterwards so a GC that
+/// removed it in between surfaces as a provisioning error, never as a mount of
+/// a vanished path.
+fn mark_cache_in_use(
+    dir: &Path,
+    execution_id: &orchestrator_core::ExecutionId,
+) -> Result<(), RuntimeError> {
+    validate_safe_component(execution_id.as_str(), "execution id")?;
+    let refs = dir.join(REFS_DIR);
+    ensure_real_directory(&refs, true, "build cache refs directory")?;
+    let marker = refs.join(execution_id.as_str());
+    fs::write(&marker, chrono::Utc::now().to_rfc3339()).map_err(|error| {
+        RuntimeError::Provisioning(format!(
+            "write build cache ref {}: {error}",
+            marker.display()
+        ))
+    })?;
+    if !is_managed_build_cache_dir(dir) {
+        return Err(RuntimeError::Provisioning(
+            "build cache directory vanished while being claimed; retry".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn write_owner_file_once(dir: &Path, key: &str) -> Result<(), RuntimeError> {
@@ -1694,6 +1726,21 @@ mod tests {
             .all(|source| !layout.credentials.starts_with(source)));
     }
 
+    fn plan_build_cache(
+        config: Option<&crate::BuildCacheConfig>,
+        requirement: &RuntimeRequirement,
+        image: &str,
+        lockfile: Option<&[u8]>,
+    ) -> Result<Option<BuildCachePlan>, RuntimeError> {
+        super::plan_build_cache(
+            config,
+            requirement,
+            image,
+            lockfile,
+            &orchestrator_core::ExecutionId::new("exec-test"),
+        )
+    }
+
     fn cache_config(root: &Path, max_gib: u64) -> crate::BuildCacheConfig {
         crate::BuildCacheConfig {
             root: root.to_path_buf(),
@@ -1774,6 +1821,17 @@ mod tests {
         ] {
             assert!(env.iter().any(|e| e == expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn the_plan_records_a_ref_for_the_execution_that_will_use_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let config = cache_config(&root.path().join("cache"), 40);
+        let plan = plan_build_cache(Some(&config), &wants_cache(), "img", None)
+            .unwrap()
+            .unwrap();
+        assert!(plan.source.join("refs/exec-test").is_file());
+        assert!(is_managed_build_cache_dir(&plan.source));
     }
 
     #[test]
