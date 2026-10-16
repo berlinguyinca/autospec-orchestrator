@@ -4126,3 +4126,189 @@ fn run(command: &mut Command) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn docker_is_rootless() -> bool {
+    Command::new("docker")
+        .args(["info", "--format", "{{.SecurityOptions}}"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains("rootless"))
+        .unwrap_or(false)
+}
+
+/// The system lifecycle built with one agent user for the runtime *and* the
+/// harness, exactly as the worker binary wires it.
+fn build_system_lifecycle_for_agent_user(
+    root: &Path,
+    remote_root: &Path,
+    daemon_id: &str,
+    image_id: &str,
+    agent_user: &str,
+) -> Arc<SystemExecutionLifecycle> {
+    let trusted = TrustedVerifierImage::new(image_id, "/bin/stat").unwrap();
+    let storage = Arc::new(
+        ExecutionStorage::new(
+            root,
+            Box::new(FixedFilesystemBackend),
+            Box::new(TestDockerBindVerifier {
+                daemon_id: daemon_id.into(),
+                image_id: image_id.into(),
+                command: "/bin/stat".into(),
+                method: trusted.proof_method(),
+            }),
+        )
+        .unwrap(),
+    );
+    let verifier: Arc<dyn execution_storage::ReadyAllocationVerifier> = storage.clone();
+    let lifecycle = SystemExecutionLifecycle::new(
+        SystemRecoveryConfig {
+            state_root: root.into(),
+            verifier: verifier.clone(),
+            docker_binary: PathBuf::from("docker"),
+            docker_socket: None,
+        },
+        storage,
+        Arc::new(GitWorktreeManager::with_clone_base_and_verifier(
+            root,
+            format!("file://{}", remote_root.display()),
+            verifier.clone(),
+        )),
+        Arc::new(
+            VerifiedDockerRuntimeFactory::new(
+                None,
+                PathBuf::from("docker"),
+                verifier.clone(),
+                trusted,
+                Arc::new(LocalCredentialBroker::new(root, chrono::Duration::minutes(15)).unwrap())
+                    as Arc<dyn CredentialBroker>,
+            )
+            .with_agent_user(agent_user)
+            .unwrap(),
+        ),
+        Arc::new(
+            VerifiedPiHarnessFactory::new(
+                verifier,
+                None,
+                PathBuf::from("docker"),
+                "/workspace/pi".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_agent_user(agent_user)
+            .unwrap(),
+        ),
+        Arc::new(FilesystemEvidenceStore::new(root)),
+    );
+    lifecycle
+        .ensure_consistent_agent_user()
+        .expect("runtime and harness share one agent user");
+    Arc::new(lifecycle)
+}
+
+/// A non-root agent runs the repository's stub Pi to REVIEW_READY through the
+/// real system lifecycle: the agent container's `Config.User` is the configured
+/// user, Pi starts and is signalled as that user, and cleanup is exact. Needs a
+/// rootful daemon (a rootless one does not map the worktree owner to a non-root
+/// uid) and no database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_root_agent_user_reaches_review_ready_with_the_configured_container_user() {
+    use std::os::unix::fs::MetadataExt;
+    let Some((daemon_id, image_id)) = docker_capability() else {
+        eprintln!("skipping non-root agent e2e: Docker is unavailable");
+        return;
+    };
+    if docker_is_rootless() {
+        eprintln!("skipping non-root agent e2e: rootless daemon");
+        return;
+    }
+    let suffix = format!(
+        "nonroot-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    let root = std::env::temp_dir().join(format!("autospec-{suffix}"));
+    initialize_state_root(&root);
+    let root = root.canonicalize().unwrap();
+    let owner = fs::metadata(&root).unwrap();
+    let agent_user = format!("{}:{}", owner.uid(), owner.gid());
+    let remote = root.join("remotes");
+    create_completing_stub_repository(&remote);
+    let execution_id = ExecutionId::new(format!("execution-{suffix}"));
+    let labels = OwnershipLabels {
+        execution_id: execution_id.clone(),
+        worker_id: WorkerId::new(format!("worker-{suffix}")),
+        repository: "owner/repo".into(),
+        issue: Some("non-root-agent".into()),
+    };
+    let execution = queued_execution(
+        execution_id.clone(),
+        labels,
+        image_id.clone(),
+        format!("capability-{suffix}"),
+    );
+    let lifecycle =
+        build_system_lifecycle_for_agent_user(&root, &remote, &daemon_id, &image_id, &agent_user);
+
+    let receipt = lifecycle.allocate(&execution).await.unwrap();
+    let worktree = lifecycle
+        .create_worktree(&execution, &receipt)
+        .await
+        .unwrap();
+    let environment = lifecycle
+        .provision(&execution, &receipt, &worktree)
+        .await
+        .unwrap();
+    let inspected = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.Config.User}} {{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}}",
+            &environment.agent_container,
+        ])
+        .output()
+        .unwrap();
+    let inspected = String::from_utf8(inspected.stdout).unwrap();
+    assert_eq!(
+        inspected.trim(),
+        format!("{agent_user} [\"ALL\"] [\"no-new-privileges:true\"]")
+    );
+
+    let packet = execution
+        .manifest
+        .task_packet
+        .clone()
+        .expect("queued execution carries a task packet");
+    let session = lifecycle
+        .start(&execution, &receipt, &environment, &worktree, &packet)
+        .await
+        .unwrap();
+    let mut review_ready = false;
+    for _ in 0..200 {
+        let events = lifecycle.poll(&execution, &session).await.unwrap();
+        if events
+            .iter()
+            .any(|event| matches!(event.kind, ExecutionEventKind::ReviewReady))
+        {
+            review_ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    lifecycle.stop(&execution, &session).await.unwrap();
+    let capture = lifecycle.capture(&worktree).await.unwrap();
+    lifecycle.destroy_runtime(&execution).await.unwrap();
+    lifecycle.destroy_worktree(&worktree).await.unwrap();
+    lifecycle.release_storage(&receipt).await.unwrap();
+    assert!(review_ready, "the non-root agent must reach REVIEW_READY");
+    assert!(
+        capture.patch.contains("result.txt"),
+        "the non-root agent wrote result.txt into the worktree: {}",
+        capture.patch
+    );
+    assert!(!docker_resource_exists(
+        "container",
+        &environment.agent_container
+    ));
+    if root.exists() {
+        let _ = fs::remove_dir_all(root);
+    }
+}

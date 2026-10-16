@@ -133,6 +133,18 @@ struct Cli {
         default_value_t = false
     )]
     relax_container_hardening: bool,
+    /// `uid:gid` every agent container and every Pi probe/signal runs as. One
+    /// value feeds the runtime and the harness. Must be numeric. Default
+    /// `1000:1000`: a non-root agent can use its owner-only worktree only where
+    /// the daemon maps this uid to the worker's own (for example a rootful
+    /// daemon and a worker running as uid 1000); otherwise provisioning is
+    /// refused with an explanation. Root needs `--allow-root-agent`.
+    #[arg(long, env = "AUTOSPEC_AGENT_USER", default_value = "1000:1000")]
+    agent_user: String,
+    /// Permits `--agent-user 0:0` (root agents). Off by default; logged as a
+    /// warning when used.
+    #[arg(long, env = "AUTOSPEC_ALLOW_ROOT_AGENT", default_value_t = false)]
+    allow_root_agent: bool,
     #[arg(long, default_value = "https://github.com")]
     clone_base: String,
     #[arg(long, env = "AUTOSPEC_DOCKER_SOCKET")]
@@ -199,7 +211,33 @@ fn validate_cli(cli: &Cli) -> Result<()> {
     disk_policy(cli)?;
     toolchain_map(&cli.toolchains)?;
     validate_build_cache(cli)?;
+    resolve_agent_user(&cli.agent_user, cli.allow_root_agent)?;
     Ok(())
+}
+
+/// The one agent `uid:gid` handed to both the runtime and the harness.
+///
+/// Numeric `uid:gid` only. A root user (uid 0, any gid) is refused unless the
+/// operator also passed `--allow-root-agent`, and then logged: running agents
+/// as root must be a visible, deliberate choice.
+fn resolve_agent_user(user: &str, allow_root: bool) -> Result<String> {
+    runtime_docker::validate_agent_user(user)?;
+    let uid = user
+        .split(':')
+        .next()
+        .and_then(|uid| uid.parse::<u32>().ok())
+        .unwrap_or(0);
+    if uid == 0 {
+        anyhow::ensure!(
+            allow_root,
+            "--agent-user {user} runs agents as root; pass --allow-root-agent to confirm"
+        );
+        tracing::warn!(
+            agent_user = user,
+            "agents run as root by explicit operator choice"
+        );
+    }
+    Ok(user.to_owned())
 }
 
 /// Parses one `--toolchain name=version` value; both halves must be non-empty.
@@ -253,22 +291,43 @@ fn validate_build_cache(cli: &Cli) -> Result<()> {
 /// operator configured one (the same condition that advertises the capability).
 fn runtime_factory(
     cli: &Cli,
+    agent_user: &str,
     verifier: Arc<dyn execution_storage::ReadyAllocationVerifier>,
     trusted_verifier: TrustedVerifierImage,
     credentials: Arc<dyn CredentialBroker>,
-) -> VerifiedDockerRuntimeFactory {
+) -> Result<VerifiedDockerRuntimeFactory> {
     let factory = VerifiedDockerRuntimeFactory::new(
         cli.docker_socket.clone(),
         PathBuf::from(&cli.docker_binary),
         verifier,
         trusted_verifier,
         credentials,
-    );
+    )
+    .with_agent_user(agent_user)?;
     let factory = factory.with_container_hardening(container_hardening(cli));
-    match &cli.build_cache_root {
+    Ok(match &cli.build_cache_root {
         Some(root) => factory.with_build_cache(root.clone(), cli.build_cache_max_gib),
         None => factory,
-    }
+    })
+}
+
+/// The Pi harness factory; takes the same resolved `agent_user` as
+/// [`runtime_factory`] so the container user and the probe user cannot differ.
+fn harness_factory(
+    cli: &Cli,
+    agent_user: &str,
+    verifier: Arc<dyn execution_storage::ReadyAllocationVerifier>,
+) -> Result<VerifiedPiHarnessFactory> {
+    Ok(VerifiedPiHarnessFactory::new(
+        verifier,
+        cli.docker_socket.clone(),
+        PathBuf::from(&cli.docker_binary),
+        cli.pi_executable.clone(),
+        vec!["read".into(), "bash".into(), "edit".into(), "write".into()],
+        Vec::new(),
+    )
+    .with_allow_untested_pi_version(cli.allow_untested_pi_version)
+    .with_agent_user(agent_user)?)
 }
 
 fn container_hardening(cli: &Cli) -> runtime_docker::ContainerHardening {
@@ -564,22 +623,21 @@ async fn prepare_execution_plane(
         LocalCredentialBroker::new(&cli.state_root, chrono::Duration::minutes(15))
             .map_err(PreparationFailure::configuration)?,
     );
-    let runtimes = Arc::new(runtime_factory(
-        cli,
-        verifier.clone(),
-        trusted_verifier,
-        credential_broker,
-    ));
-    let harnesses = Arc::new(
-        VerifiedPiHarnessFactory::new(
+    let agent_user = resolve_agent_user(&cli.agent_user, cli.allow_root_agent)
+        .map_err(PreparationFailure::configuration)?;
+    let runtimes = Arc::new(
+        runtime_factory(
+            cli,
+            &agent_user,
             verifier.clone(),
-            cli.docker_socket.clone(),
-            PathBuf::from(&cli.docker_binary),
-            cli.pi_executable.clone(),
-            vec!["read".into(), "bash".into(), "edit".into(), "write".into()],
-            Vec::new(),
+            trusted_verifier,
+            credential_broker,
         )
-        .with_allow_untested_pi_version(cli.allow_untested_pi_version),
+        .map_err(PreparationFailure::configuration)?,
+    );
+    let harnesses = Arc::new(
+        harness_factory(cli, &agent_user, verifier.clone())
+            .map_err(PreparationFailure::configuration)?,
     );
     let lifecycle = Arc::new(SystemExecutionLifecycle::new(
         SystemRecoveryConfig {
@@ -594,6 +652,9 @@ async fn prepare_execution_plane(
         harnesses,
         Arc::new(ContentAddressedEvidenceStore::new(artifacts)),
     ));
+    lifecycle
+        .ensure_consistent_agent_user()
+        .map_err(PreparationFailure::configuration)?;
     let execution_worker = Arc::new(Worker::new(
         lifecycle,
         executions.clone(),
@@ -1090,6 +1151,8 @@ mod tests {
             build_cache_root: None,
             build_cache_max_gib: 40,
             relax_container_hardening: false,
+            agent_user: "1000:1000".into(),
+            allow_root_agent: false,
             clone_base: "https://github.com".into(),
             docker_socket: None,
             docker_proxy_port: 2375,
@@ -1619,6 +1682,7 @@ mod tests {
         let build = |cli: &Cli| {
             runtime_factory(
                 cli,
+                &cli.agent_user,
                 Arc::new(NoStorage),
                 TrustedVerifierImage::new(format!("sha256:{}", "a".repeat(64)), "/usr/bin/stat")
                     .unwrap(),
@@ -1627,6 +1691,7 @@ mod tests {
                         .unwrap(),
                 ),
             )
+            .unwrap()
         };
         assert!(build(&parse(&[])).build_cache().is_none());
         let cli = parse(&[
@@ -1660,6 +1725,7 @@ mod tests {
         let build = |cli: &Cli| {
             runtime_factory(
                 cli,
+                &cli.agent_user,
                 Arc::new(NoStorage),
                 TrustedVerifierImage::new(format!("sha256:{}", "a".repeat(64)), "/usr/bin/stat")
                     .unwrap(),
@@ -1668,12 +1734,90 @@ mod tests {
                         .unwrap(),
                 ),
             )
+            .unwrap()
         };
         assert!(!parse(&[]).relax_container_hardening);
         assert_eq!(build(&parse(&[])).container_hardening(), Enforced);
         let cli = parse(&["--relax-container-hardening"]);
         assert!(cli.relax_container_hardening);
         assert_eq!(build(&cli).container_hardening(), Relaxed);
+    }
+
+    #[test]
+    fn resolve_agent_user_refuses_root_unless_explicitly_allowed() {
+        assert!(resolve_agent_user("0:0", false).is_err());
+        assert_eq!(resolve_agent_user("0:0", true).unwrap(), "0:0");
+        assert_eq!(resolve_agent_user("1000:1000", false).unwrap(), "1000:1000");
+        assert_eq!(resolve_agent_user("1000:1000", true).unwrap(), "1000:1000");
+        // Root by uid alone is still root, whatever the gid.
+        assert!(resolve_agent_user("0:1000", false).is_err());
+        assert!(resolve_agent_user("00:5", false).is_err());
+        for bad in [
+            "root",
+            "",
+            "1000",
+            "1000:",
+            "ubuntu:ubuntu",
+            "-1:-1",
+            " 1:1",
+        ] {
+            assert!(resolve_agent_user(bad, true).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_agent_user_flags_default_to_non_root_and_gate_root() {
+        let cli = parse(&[]);
+        assert_eq!(
+            (cli.agent_user.as_str(), cli.allow_root_agent),
+            ("1000:1000", false)
+        );
+        assert!(validate_cli(&cli).is_ok());
+        let root = parse(&["--agent-user", "0:0"]);
+        assert!(
+            validate_cli(&root).is_err(),
+            "root without the extra flag fails at startup"
+        );
+        let allowed = parse(&["--agent-user", "0:0", "--allow-root-agent"]);
+        assert!(validate_cli(&allowed).is_ok());
+        assert!(validate_cli(&parse(&["--agent-user", "ubuntu"])).is_err());
+    }
+
+    #[test]
+    fn one_agent_user_reaches_both_the_runtime_and_the_harness_factory() {
+        use orchestrator_worker::{HarnessFactory, RuntimeFactory};
+        #[derive(Debug)]
+        struct NoStorage;
+        impl execution_storage::ReadyAllocationVerifier for NoStorage {
+            fn verify_ready(
+                &self,
+                _: &execution_storage::AllocationReceipt,
+            ) -> Result<
+                Box<dyn execution_storage::VerifiedExecutionStorage>,
+                execution_storage::StorageError,
+            > {
+                Err(execution_storage::StorageError::Unavailable("stub".into()))
+            }
+        }
+        let cli = parse(&["--agent-user", "1234:5678"]);
+        let user = resolve_agent_user(&cli.agent_user, cli.allow_root_agent).unwrap();
+        let runtime = runtime_factory(
+            &cli,
+            &user,
+            Arc::new(NoStorage),
+            TrustedVerifierImage::new(format!("sha256:{}", "a".repeat(64)), "/usr/bin/stat")
+                .unwrap(),
+            Arc::new(
+                LocalCredentialBroker::new(std::env::temp_dir(), chrono::Duration::minutes(15))
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        let harness = harness_factory(&cli, &user, Arc::new(NoStorage)).unwrap();
+        assert_eq!(runtime.agent_user(), Some("1234:5678"));
+        assert_eq!(harness.agent_user(), Some("1234:5678"));
+        // A user that does not validate cannot reach either factory.
+        assert!(harness_factory(&cli, "root", Arc::new(NoStorage)).is_err());
     }
 
     #[test]

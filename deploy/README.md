@@ -33,6 +33,14 @@ granting an unauthenticated ACL is not supported.
 APFS/LVM or Docker bind probe registers the worker Offline with a sanitized
 `healthErrors` reason and zero advertised runtime capacity.
 
+Agents run as a non-root user by default (`AUTOSPEC_AGENT_USER`, default
+`1000:1000`). The execution directories are owner-only on the host, so a
+non-root agent works only where the Docker daemon maps that uid to the worker's
+owner (a rootful daemon running the worker as the same uid). Where it does not
+(for example a rootless daemon), provisioning fails closed with a message
+naming the mounts. Run as root there only by explicit choice: set
+`AUTOSPEC_AGENT_USER=0:0` and `AUTOSPEC_ALLOW_ROOT_AGENT=true`.
+
 The proxy alone also joins `host-publish`, which lets Docker Desktop realize
 the loopback publication. The worker is not attached to that network; its
 container example reaches the proxy only through the internal `runtime-api`
