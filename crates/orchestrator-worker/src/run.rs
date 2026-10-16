@@ -6,7 +6,7 @@ use chrono::Utc;
 use futures_util::FutureExt;
 use orchestrator_core::{
     event::ExecutionEventKind, Execution, ExecutionControlAction, ExecutionEvent, ExecutionResult,
-    ExecutionState, FailureClass, PersistenceMode,
+    ExecutionState, FailureClass, PersistenceMode, Role,
 };
 use orchestrator_persistence::{CleanupDisposition, CleanupStage, PendingExecutionControl};
 use std::{
@@ -663,6 +663,12 @@ async fn drive_running(
         .lifecycle
         .persist_evidence(execution, &capture)
         .await?;
+    // An empty diff is still persisted above as evidence, but it is not work
+    // product: a code-producing role that changed nothing did not complete
+    // (issue #39 s1, spec s3: exit status and a settle record are not evidence).
+    if requires_diff(execution.manifest.role) && capture.changed_files.is_empty() {
+        return fail(worker, execution, FailureClass::TaskFailed).await;
+    }
     execution
         .transition(ExecutionState::ReviewReady)
         .map_err(|error| WorkerError::Invalid(error.to_string()))?;
@@ -712,6 +718,12 @@ async fn drive_running(
             .map_err(|error| WorkerError::Persistence(error.to_string()))?;
     }
     Ok(result)
+}
+
+/// Roles whose deliverable is a change to the repository. Review, UI review,
+/// integration test and interactive executions may legitimately change nothing.
+fn requires_diff(role: Role) -> bool {
+    matches!(role, Role::Implementation | Role::Documentation)
 }
 
 async fn cancellation_signal(cancelled: &AtomicBool) {
