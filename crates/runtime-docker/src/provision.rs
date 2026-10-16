@@ -340,7 +340,8 @@ async fn provision_inner(
             .as_ref()
             .map(|credentials| credentials.path.as_path()),
     )?;
-    let agent_mounts = writable_container_mounts(&layout.runtime, "agent", &image_inspect)?;
+    let mut agent_mounts = writable_container_mounts(&layout.runtime, "agent", &image_inspect)?;
+    agent_mounts.push(cargo_target_mount(&layout.runtime)?);
     let service_mounts = service_requirements
         .iter()
         .zip(&service_images)
@@ -404,6 +405,7 @@ async fn provision_inner(
                 env: Some(vec![
                     "HOME=/home/autospec".to_owned(),
                     "TMPDIR=/tmp".to_owned(),
+                    format!("CARGO_TARGET_DIR={CONTAINER_CARGO_TARGET}"),
                     format!("INFERWEAVE_CREDENTIAL_FILE={CONTAINER_CREDENTIAL}"),
                 ]),
                 labels: Some(labels.to_map().into_iter().collect()),
@@ -1047,6 +1049,22 @@ pub(crate) async fn verify_container_mount_sources(
     Ok(())
 }
 
+/// Container path of the agent's per-execution Rust build output directory.
+pub(crate) const CONTAINER_CARGO_TARGET: &str = "/cargo-target";
+
+/// Agent-only bind mount for `CARGO_TARGET_DIR`, kept under the execution's
+/// runtime root (outside the worktree, inside the execution's storage quota).
+/// Never shared with service containers or other executions.
+pub(crate) fn cargo_target_mount(runtime_root: &Path) -> Result<Mount, RuntimeError> {
+    ensure_real_directory(runtime_root, false, "execution runtime root")?;
+    let scope_root = runtime_root.join("agent");
+    ensure_real_directory(&scope_root, true, "container storage root")?;
+    let source = scope_root.join("cargo-target");
+    ensure_real_directory(&source, true, "cargo target directory")?;
+    make_container_writable(&source)?;
+    bind_mount(&source, CONTAINER_CARGO_TARGET)
+}
+
 pub(crate) fn writable_container_mounts(
     runtime_root: &Path,
     scope: &str,
@@ -1181,8 +1199,11 @@ fn validate_reserved_image_volumes(images: &[&ImageInspect]) -> Result<(), Runti
                 component => components.push(component),
             }
         }
-        let shadows_reserved_mount =
-            components.is_empty() || matches!(components.first(), Some(&"workspace" | &"session"));
+        let shadows_reserved_mount = components.is_empty()
+            || matches!(
+                components.first(),
+                Some(&"workspace" | &"session" | &"cargo-target")
+            );
         if shadows_reserved_mount {
             return Err(RuntimeError::ResourceLimit(format!(
                 "image volume target collides with reserved agent mount: {target}"
@@ -1214,6 +1235,35 @@ mod tests {
     use super::*;
     use bollard::models::{ContainerSummary, ImageConfig, MountPoint, MountPointTypeEnum};
     use std::collections::HashMap;
+
+    #[test]
+    fn cargo_target_mount_is_a_writable_bind_under_the_agent_runtime_dir() {
+        let state = tempfile::tempdir().expect("state");
+        let runtime_root = state.path().join("runtime");
+        std::fs::create_dir(&runtime_root).expect("runtime root");
+        let runtime_root = std::fs::canonicalize(runtime_root).expect("canonical runtime root");
+        let mount = cargo_target_mount(&runtime_root).expect("cargo target mount");
+        assert_eq!(mount.target.as_deref(), Some("/cargo-target"));
+        assert_eq!(mount.typ, Some(MountTypeEnum::BIND));
+        assert_ne!(mount.read_only, Some(true));
+        assert_eq!(
+            Path::new(mount.source.as_deref().unwrap()),
+            runtime_root.join("agent/cargo-target")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_target_mount_rejects_a_symlinked_directory() {
+        let state = tempfile::tempdir().expect("state");
+        let runtime_root = state.path().join("runtime");
+        std::fs::create_dir_all(runtime_root.join("agent")).expect("agent root");
+        let elsewhere = state.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, runtime_root.join("agent/cargo-target"))
+            .expect("symlink");
+        assert!(cargo_target_mount(&runtime_root).is_err());
+    }
 
     #[test]
     fn writable_image_paths_are_bind_mapped_beneath_execution_runtime() {
@@ -1310,6 +1360,8 @@ mod tests {
             "/workspace/cache",
             "/session",
             "/session/history",
+            "/cargo-target",
+            "/cargo-target/debug",
             "/",
             "/workspace/../session",
         ] {

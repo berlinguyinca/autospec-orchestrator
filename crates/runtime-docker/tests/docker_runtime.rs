@@ -1827,6 +1827,87 @@ async fn agent_mounts_only_writable_worktree_and_durable_conversation() {
 }
 
 #[tokio::test]
+async fn cargo_target_is_agent_only_and_under_the_execution_runtime() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((state, runtime)) = execution_runtime_with_disk_or_skip(
+        "cargo_target_is_agent_only_and_under_the_execution_runtime",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let requirement = RuntimeRequirement {
+        image: Some("alpine:3.20".to_owned()),
+        cpu: 1,
+        memory_mib: 2048,
+        disk_gib: 1,
+        ..RuntimeRequirement::default()
+    };
+    let service = ServiceRequirement {
+        name: "cache".to_owned(),
+        image: "redis:7-alpine".to_owned(),
+        env: BTreeMap::new(),
+    };
+    let handle = runtime
+        .provision(&execution_labels, &requirement, &[service])
+        .await
+        .expect("provision agent with service");
+    let agent = docker
+        .inspect_container(&handle.agent_container, None)
+        .await
+        .expect("inspect agent");
+    let service = docker
+        .inspect_container(&handle.service_containers[0], None)
+        .await
+        .expect("inspect service");
+
+    let env = agent.config.expect("agent config").env.expect("agent env");
+    assert!(env
+        .iter()
+        .any(|entry| entry == "CARGO_TARGET_DIR=/cargo-target"));
+    let agent_runtime_dir = fs::canonicalize(
+        state
+            .path
+            .join("executions")
+            .join(execution_labels.execution_id.as_str())
+            .join("runtime/agent"),
+    )
+    .expect("agent runtime dir");
+    let agent_mounts = agent.host_config.unwrap().mounts.unwrap();
+    let cargo_mounts = agent_mounts
+        .iter()
+        .filter(|mount| mount.target.as_deref() == Some("/cargo-target"))
+        .collect::<Vec<_>>();
+    assert_eq!(cargo_mounts.len(), 1);
+    assert_eq!(cargo_mounts[0].typ, Some(MountTypeEnum::BIND));
+    assert_ne!(cargo_mounts[0].read_only, Some(true));
+    assert!(Path::new(cargo_mounts[0].source.as_deref().unwrap()).starts_with(&agent_runtime_dir));
+    assert!(!Path::new(cargo_mounts[0].source.as_deref().unwrap())
+        .starts_with(fs::canonicalize(state.worktree(&execution_labels)).unwrap()));
+
+    let service_mounts = service.host_config.unwrap().mounts.unwrap_or_default();
+    assert!(!service_mounts.is_empty());
+    assert_eq!(
+        service_mounts
+            .iter()
+            .filter(|mount| mount.target.as_deref() == Some("/cargo-target"))
+            .count(),
+        0
+    );
+    let service_env = service.config.and_then(|c| c.env).unwrap_or_default();
+    assert!(!service_env
+        .iter()
+        .any(|e| e.starts_with("CARGO_TARGET_DIR=")));
+
+    scope.cleanup().await.expect("cleanup cargo target test");
+}
+
+#[tokio::test]
 async fn panicking_test_scope_removes_only_its_execution_resources() {
     let Some(runtime) =
         runtime_or_skip("panicking_test_scope_removes_only_its_execution_resources").await
