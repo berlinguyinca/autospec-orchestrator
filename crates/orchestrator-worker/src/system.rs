@@ -51,6 +51,12 @@ pub trait RuntimeFactory: Send + Sync {
         execution: &Execution,
         receipt: &AllocationReceipt,
     ) -> Result<Arc<dyn Runtime>, LifecycleError>;
+    /// The `uid:gid` this factory runs agent containers as, when it decides one.
+    /// `SystemExecutionLifecycle::ensure_consistent_agent_user` compares it with
+    /// the harness factory's (default: unknown).
+    fn agent_user(&self) -> Option<&str> {
+        None
+    }
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError>;
     /// Default wraps `cpu_percent`; the Docker factory measures the rest.
     async fn resource_sample(
@@ -67,6 +73,11 @@ pub trait RuntimeFactory: Send + Sync {
 
 #[async_trait]
 pub trait HarnessFactory: Send + Sync {
+    /// The `uid:gid` this factory probes and signals the agent as, when it
+    /// decides one (default: unknown).
+    fn agent_user(&self) -> Option<&str> {
+        None
+    }
     async fn build(
         &self,
         execution: &Execution,
@@ -94,6 +105,7 @@ pub struct VerifiedDockerRuntimeFactory {
     credentials: Arc<dyn CredentialBroker>,
     build_cache: Option<(PathBuf, u64)>,
     hardening: ContainerHardening,
+    agent_user: String,
 }
 
 impl VerifiedDockerRuntimeFactory {
@@ -112,7 +124,17 @@ impl VerifiedDockerRuntimeFactory {
             credentials,
             build_cache: None,
             hardening: ContainerHardening::Enforced,
+            agent_user: runtime_docker::DEFAULT_AGENT_USER.to_owned(),
         }
+    }
+
+    /// Runs every agent container as `uid_gid` (numeric `uid:gid`). Default
+    /// `0:0`; the worker passes the one value it also gives the harness factory.
+    pub fn with_agent_user(mut self, uid_gid: &str) -> Result<Self, LifecycleError> {
+        runtime_docker::validate_agent_user(uid_gid)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        self.agent_user = uid_gid.to_owned();
+        Ok(self)
     }
 
     /// Selects the container privilege limits handed to every runtime this
@@ -145,8 +167,14 @@ impl VerifiedDockerRuntimeFactory {
             .map(|(root, max_gib)| (root.as_path(), *max_gib))
     }
 
-    pub(crate) fn configure(&self, runtime: DockerRuntime) -> DockerRuntime {
-        apply_build_cache(runtime, self.build_cache.as_ref()).with_hardening(self.hardening)
+    pub(crate) fn configure(
+        &self,
+        runtime: DockerRuntime,
+    ) -> Result<DockerRuntime, LifecycleError> {
+        apply_build_cache(runtime, self.build_cache.as_ref())
+            .with_hardening(self.hardening)
+            .with_agent_user(&self.agent_user)
+            .map_err(|error| LifecycleError::Step(error.to_string()))
     }
 }
 
@@ -179,6 +207,10 @@ pub fn check_build_cache_role(
 
 #[async_trait]
 impl RuntimeFactory for VerifiedDockerRuntimeFactory {
+    fn agent_user(&self) -> Option<&str> {
+        Some(&self.agent_user)
+    }
+
     async fn build(
         &self,
         execution: &Execution,
@@ -205,15 +237,16 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
                 ),
             }));
         }
-        match DockerRuntime::connect_with_verified_execution_storage(
+        let built = DockerRuntime::connect_with_verified_execution_storage(
             self.socket.as_deref(),
             Arc::clone(&self.verifier),
             receipt.clone(),
             self.trusted_verifier.clone(),
         )
-        .map(|runtime| {
-            Arc::new(self.configure(runtime).with_credentials(credentials)) as Arc<dyn Runtime>
-        }) {
+        .map_err(|error| error.to_string())
+        .and_then(|runtime| self.configure(runtime).map_err(|error| error.to_string()))
+        .map(|runtime| Arc::new(runtime.with_credentials(credentials)) as Arc<dyn Runtime>);
+        match built {
             Ok(runtime) => Ok(runtime),
             Err(error) => {
                 let revocation = self.credentials.revoke(&execution.id).await;
@@ -326,6 +359,7 @@ pub struct VerifiedPiHarnessFactory {
     allow_untested_pi_version: bool,
     tools: Vec<String>,
     skills: Vec<PathBuf>,
+    agent_user: String,
 }
 
 impl VerifiedPiHarnessFactory {
@@ -345,7 +379,33 @@ impl VerifiedPiHarnessFactory {
             allow_untested_pi_version: false,
             tools,
             skills,
+            agent_user: runtime_docker::DEFAULT_AGENT_USER.to_owned(),
         }
+    }
+
+    /// Probes and signals Pi as `uid_gid` (numeric `uid:gid`), which must be the
+    /// user the agent container runs as. Default `0:0`.
+    pub fn with_agent_user(mut self, uid_gid: &str) -> Result<Self, LifecycleError> {
+        harness_pi::validate_agent_user(uid_gid)
+            .map_err(|error| LifecycleError::Step(error.to_string()))?;
+        self.agent_user = uid_gid.to_owned();
+        Ok(self)
+    }
+
+    /// Applies this factory's settings to a harness configuration.
+    pub(crate) fn configure(
+        &self,
+        mut config: PiHarnessConfig,
+    ) -> Result<PiHarnessConfig, LifecycleError> {
+        config.docker_binary = self.docker_binary.clone();
+        config.docker_host = self.docker_socket.clone();
+        config.pi_executable = self.pi_executable.clone();
+        config.allow_untested_pi_version = self.allow_untested_pi_version;
+        config.tools = self.tools.clone();
+        config.skills = self.skills.clone();
+        config
+            .with_agent_user(&self.agent_user)
+            .map_err(|error| LifecycleError::Step(error.to_string()))
     }
 
     /// Permits Pi releases outside the tested matrix (logged as a warning).
@@ -357,6 +417,10 @@ impl VerifiedPiHarnessFactory {
 
 #[async_trait]
 impl HarnessFactory for VerifiedPiHarnessFactory {
+    fn agent_user(&self) -> Option<&str> {
+        Some(&self.agent_user)
+    }
+
     async fn build(
         &self,
         execution: &Execution,
@@ -364,18 +428,14 @@ impl HarnessFactory for VerifiedPiHarnessFactory {
         environment: &EnvironmentHandle,
         _: &Worktree,
     ) -> Result<Arc<dyn AgentHarness>, LifecycleError> {
-        let mut config = PiHarnessConfig::for_ready_allocation(
-            Arc::clone(&self.verifier),
-            receipt.clone(),
-            environment.verified_agent_container.clone(),
-        )
-        .map_err(|error| LifecycleError::Step(error.to_string()))?;
-        config.docker_binary = self.docker_binary.clone();
-        config.docker_host = self.docker_socket.clone();
-        config.pi_executable = self.pi_executable.clone();
-        config.allow_untested_pi_version = self.allow_untested_pi_version;
-        config.tools = self.tools.clone();
-        config.skills = self.skills.clone();
+        let mut config = self.configure(
+            PiHarnessConfig::for_ready_allocation(
+                Arc::clone(&self.verifier),
+                receipt.clone(),
+                environment.verified_agent_container.clone(),
+            )
+            .map_err(|error| LifecycleError::Step(error.to_string()))?,
+        )?;
         let credential_path = environment
             .credentials_path
             .as_ref()
@@ -552,6 +612,21 @@ pub struct SystemRecoveryConfig {
 }
 
 impl SystemExecutionLifecycle {
+    /// Fails when the runtime and harness factories were given different agent
+    /// users: the agent container would run as one uid while Pi is probed and
+    /// signalled as another, and `cap_drop ALL` leaves no capability to bridge
+    /// them. Unknown (`None`) on either side is not a disagreement.
+    pub fn ensure_consistent_agent_user(&self) -> Result<(), LifecycleError> {
+        match (self.runtimes.agent_user(), self.harnesses.agent_user()) {
+            (Some(runtime), Some(harness)) if runtime != harness => Err(LifecycleError::Step(
+                format!(
+                    "runtime runs agents as {runtime} but the harness probes as {harness}; they must be the same user"
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub fn new(
         recovery: SystemRecoveryConfig,
         storage: Arc<dyn ExecutionStorageManager>,
@@ -2205,10 +2280,196 @@ mod tests {
         let runtime =
             || runtime_docker::DockerRuntime::connect_with_state_root(None, "/tmp").unwrap();
         assert_eq!(factory().container_hardening(), Enforced);
-        assert_eq!(factory().configure(runtime()).hardening(), Enforced);
+        assert_eq!(
+            factory().configure(runtime()).unwrap().hardening(),
+            Enforced
+        );
         let relaxed = factory().with_container_hardening(Relaxed);
         assert_eq!(relaxed.container_hardening(), Relaxed);
-        assert_eq!(relaxed.configure(runtime()).hardening(), Relaxed);
+        assert_eq!(relaxed.configure(runtime()).unwrap().hardening(), Relaxed);
+    }
+
+    #[test]
+    fn the_runtime_factory_agent_user_reaches_every_runtime_it_configures() {
+        use crate::RuntimeFactory;
+        let runtime =
+            || runtime_docker::DockerRuntime::connect_with_state_root(None, "/tmp").unwrap();
+        assert_eq!(factory().configure(runtime()).unwrap().agent_user(), "0:0");
+        let factory = factory().with_agent_user("1000:1000").unwrap();
+        assert_eq!(factory.agent_user(), Some("1000:1000"));
+        assert_eq!(
+            factory.configure(runtime()).unwrap().agent_user(),
+            "1000:1000"
+        );
+        assert!(
+            super::VerifiedDockerRuntimeFactory::with_agent_user(self::factory(), "root").is_err()
+        );
+    }
+
+    fn pi_factory() -> super::VerifiedPiHarnessFactory {
+        super::VerifiedPiHarnessFactory::new(
+            std::sync::Arc::new(StubVerifier),
+            None,
+            std::path::PathBuf::from("docker"),
+            "pi".to_owned(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn pi_config() -> harness_pi::PiHarnessConfig {
+        harness_pi::PiHarnessConfig::for_execution(
+            "/nonexistent/state".into(),
+            "/nonexistent/worktree".into(),
+            "agent".to_owned(),
+            orchestrator_core::OwnershipLabels {
+                execution_id: orchestrator_core::ExecutionId::new("exec-pi-user"),
+                worker_id: orchestrator_core::WorkerId::new("worker"),
+                repository: "repo".to_owned(),
+                issue: None,
+            },
+        )
+    }
+
+    #[test]
+    fn the_harness_factory_agent_user_reaches_the_pi_configuration() {
+        use crate::HarnessFactory;
+        assert_eq!(
+            pi_factory().configure(pi_config()).unwrap().agent_user,
+            "0:0"
+        );
+        let factory = pi_factory().with_agent_user("1000:1000").unwrap();
+        assert_eq!(factory.agent_user(), Some("1000:1000"));
+        assert_eq!(
+            factory.configure(pi_config()).unwrap().agent_user,
+            "1000:1000"
+        );
+        assert!(pi_factory().with_agent_user("root").is_err());
+        assert!(pi_factory().with_agent_user("").is_err());
+    }
+
+    #[test]
+    fn runtime_and_harness_must_agree_on_the_agent_user() {
+        let lifecycle = |runtime: &str, harness: &str| {
+            super::SystemExecutionLifecycle::new(
+                super::SystemRecoveryConfig {
+                    state_root: "/tmp".into(),
+                    verifier: std::sync::Arc::new(StubVerifier),
+                    docker_binary: "docker".into(),
+                    docker_socket: None,
+                },
+                std::sync::Arc::new(NoStorage),
+                std::sync::Arc::new(NoWorktrees),
+                std::sync::Arc::new(factory().with_agent_user(runtime).unwrap()),
+                std::sync::Arc::new(pi_factory().with_agent_user(harness).unwrap()),
+                std::sync::Arc::new(NoEvidence),
+            )
+        };
+        assert!(lifecycle("1000:1000", "1000:1000")
+            .ensure_consistent_agent_user()
+            .is_ok());
+        let error = lifecycle("1000:1000", "0:0")
+            .ensure_consistent_agent_user()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("1000:1000") && error.contains("0:0"),
+            "{error}"
+        );
+    }
+
+    struct NoStorage;
+    impl execution_storage::ExecutionStorageManager for NoStorage {
+        fn probe(
+            &self,
+            _: u64,
+        ) -> Result<execution_storage::StorageCapability, execution_storage::StorageError> {
+            unimplemented!()
+        }
+        fn allocate(
+            &self,
+            _: &execution_storage::AllocationRequest,
+        ) -> Result<execution_storage::AllocationReceipt, execution_storage::StorageError> {
+            unimplemented!()
+        }
+        fn release(
+            &self,
+            _: &execution_storage::AllocationReceipt,
+        ) -> Result<(), execution_storage::StorageError> {
+            unimplemented!()
+        }
+        fn reconcile(
+            &self,
+            _: &[orchestrator_core::ExecutionId],
+        ) -> Result<Vec<execution_storage::PhaseJournal>, execution_storage::StorageError> {
+            unimplemented!()
+        }
+    }
+
+    struct NoWorktrees;
+    impl git_worktree::WorktreeManager for NoWorktrees {
+        fn ensure_mirror(&self, _: &str) -> Result<String, git_worktree::WorktreeError> {
+            unimplemented!()
+        }
+        fn create(
+            &self,
+            _: &orchestrator_core::OwnershipLabels,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<git_worktree::Worktree, git_worktree::WorktreeError> {
+            unimplemented!()
+        }
+        fn create_in(
+            &self,
+            _: &orchestrator_core::OwnershipLabels,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &execution_storage::AllocationReceipt,
+        ) -> Result<git_worktree::Worktree, git_worktree::WorktreeError> {
+            unimplemented!()
+        }
+        fn capture_diff(
+            &self,
+            _: &git_worktree::Worktree,
+        ) -> Result<git_worktree::DiffCapture, git_worktree::WorktreeError> {
+            unimplemented!()
+        }
+        fn destroy(&self, _: &git_worktree::Worktree) -> Result<(), git_worktree::WorktreeError> {
+            unimplemented!()
+        }
+        fn ack_destroy(
+            &self,
+            _: &git_worktree::Worktree,
+        ) -> Result<(), git_worktree::WorktreeError> {
+            unimplemented!()
+        }
+        fn recover_interrupted_create(
+            &self,
+            _: &orchestrator_core::OwnershipLabels,
+            _: &std::path::Path,
+        ) -> Result<(), git_worktree::WorktreeError> {
+            unimplemented!()
+        }
+        fn find_stale(
+            &self,
+            _: &[orchestrator_core::ExecutionId],
+        ) -> Result<Vec<git_worktree::Worktree>, git_worktree::WorktreeError> {
+            unimplemented!()
+        }
+    }
+
+    struct NoEvidence;
+    #[async_trait::async_trait]
+    impl super::EvidenceStore for NoEvidence {
+        async fn persist(
+            &self,
+            _: &orchestrator_core::Execution,
+            _: &git_worktree::DiffCapture,
+        ) -> Result<String, crate::LifecycleError> {
+            unimplemented!()
+        }
     }
 
     #[test]
