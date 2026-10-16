@@ -228,6 +228,7 @@ pub struct VerifiedPiHarnessFactory {
     docker_socket: Option<String>,
     docker_binary: PathBuf,
     pi_executable: String,
+    allow_untested_pi_version: bool,
     tools: Vec<String>,
     skills: Vec<PathBuf>,
 }
@@ -246,9 +247,16 @@ impl VerifiedPiHarnessFactory {
             docker_socket,
             docker_binary,
             pi_executable,
+            allow_untested_pi_version: false,
             tools,
             skills,
         }
+    }
+
+    /// Permits Pi releases outside the tested matrix (logged as a warning).
+    pub fn with_allow_untested_pi_version(mut self, allow: bool) -> Self {
+        self.allow_untested_pi_version = allow;
+        self
     }
 }
 
@@ -270,6 +278,7 @@ impl HarnessFactory for VerifiedPiHarnessFactory {
         config.docker_binary = self.docker_binary.clone();
         config.docker_host = self.docker_socket.clone();
         config.pi_executable = self.pi_executable.clone();
+        config.allow_untested_pi_version = self.allow_untested_pi_version;
         config.tools = self.tools.clone();
         config.skills = self.skills.clone();
         let credential_path = environment

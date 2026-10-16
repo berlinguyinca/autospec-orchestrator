@@ -3,6 +3,7 @@
 mod events;
 mod resume;
 mod session;
+mod version;
 
 use async_trait::async_trait;
 use execution_storage::{
@@ -22,6 +23,7 @@ use std::{
     },
     time::Duration,
 };
+pub use version::{check_pi_version, parse_pi_version, TESTED_PI_VERSIONS};
 
 #[derive(Debug, Clone)]
 pub struct PiHarnessConfig {
@@ -33,6 +35,9 @@ pub struct PiHarnessConfig {
     pub docker_host: Option<String>,
     pub agent_container: String,
     pub pi_executable: String,
+    /// Permits a Pi release outside [`TESTED_PI_VERSIONS`] (logged as a warning).
+    /// Off by default; an unparseable `pi --version` is refused regardless.
+    pub allow_untested_pi_version: bool,
     pub labels: OwnershipLabels,
     /// AutoSpec's model policy, carried into Pi without choosing an alternative.
     pub model_policy: Option<ModelPolicy>,
@@ -72,6 +77,7 @@ impl PiHarnessConfig {
             docker_host: None,
             agent_container,
             pi_executable: "pi".to_owned(),
+            allow_untested_pi_version: false,
             labels,
             model_policy: None,
             tools: vec![
@@ -118,6 +124,7 @@ impl PiHarnessConfig {
             docker_host: None,
             agent_container,
             pi_executable: "pi".to_owned(),
+            allow_untested_pi_version: false,
             labels,
             model_policy: None,
             tools: vec![

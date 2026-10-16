@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+if test "$#" -ge 1 && test "$1" = "--version"; then echo "pi 0.84.3"; exit 0; fi
+
 session_id=
 source_session=
 task_packet=
