@@ -6,7 +6,7 @@ mod recovery;
 mod run;
 mod system;
 
-pub use health::{HealthAssessment, HealthMonitor};
+pub use health::{HealthAssessment, HealthMonitor, ResourceSample};
 pub use recovery::{RecoveryAuthority, RecoveryCoordinator, RecoveryDisposition};
 pub use system::{
     ContentAddressedEvidenceStore, EvidenceStore, FilesystemEvidenceStore, HarnessFactory,

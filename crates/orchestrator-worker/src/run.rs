@@ -1,6 +1,6 @@
 use crate::{
     cleanup_guard::CleanupGuard, ControlCheckpoint, HealthAssessment, HealthMonitor,
-    LifecycleError, Worker, WorkerError,
+    LifecycleError, ResourceSample, Worker, WorkerError,
 };
 use chrono::Utc;
 use futures_util::FutureExt;
@@ -623,8 +623,19 @@ async fn drive_running(
             }
             () = cancellation_signal(cancelled) => return Err(WorkerError::Cancelled),
         };
-        match health.assess(Instant::now(), cpu_percent) {
+        let sample = ResourceSample {
+            cpu_percent,
+            ..Default::default()
+        };
+        match health.assess(Instant::now(), &sample) {
             HealthAssessment::Healthy => {}
+            HealthAssessment::QuietHealthy { quiet_seconds } => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    quiet_seconds,
+                    "execution is quiet but its I/O counter advances"
+                );
+            }
             HealthAssessment::InactiveWarning { seconds } => {
                 record(
                     worker,
