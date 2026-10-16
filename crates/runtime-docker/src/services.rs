@@ -286,17 +286,30 @@ mod tests {
     }
 
     /// Builds a throwaway relay image from the local Alpine image: busybox
-    /// `nc` listening on `$1` and forwarding each connection to `$2`.
+    /// `nc` listening on `$1` and forwarding each connection to `$2`, plus a
+    /// tiny upstream that reads the request before answering (answering first
+    /// resets the connection and loses the response when a hop is added).
     fn build_test_relay_image(tag: &str) -> bool {
         let dir = tempfile::tempdir().expect("build context");
-        std::fs::write(
-            dir.path().join("relay.sh"),
-            "#!/bin/sh\nhost=${2%:*}\nport=${2##*:}\nwhile true; do nc -l -p \"$1\" -e nc \"$host\" \"$port\"; done\n",
-        )
-        .expect("write relay script");
+        for (name, body) in [
+            (
+                "relay.sh",
+                "#!/bin/sh\nhost=${2%:*}\nport=${2##*:}\nwhile true; do nc -l -p \"$1\" -e nc \"$host\" \"$port\"; done\n",
+            ),
+            (
+                "upstream.sh",
+                "#!/bin/sh\nwhile true; do nc -l -p 8000 -e /respond.sh; done\n",
+            ),
+            (
+                "respond.sh",
+                "#!/bin/sh\nwhile read -r line; do case \"$line\" in \"$(printf '\\r')\"|\"\") break;; esac; done\nprintf 'HTTP/1.0 200 OK\\r\\n\\r\\nrelayed-ok\\n'\n",
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), body).expect("write script");
+        }
         std::fs::write(
             dir.path().join("Dockerfile"),
-            "FROM alpine:3.20\nCOPY relay.sh /relay.sh\nRUN chmod 755 /relay.sh\nENTRYPOINT [\"/relay.sh\"]\n",
+            "FROM alpine:3.20\nCOPY relay.sh upstream.sh respond.sh /\nRUN chmod 755 /relay.sh /upstream.sh /respond.sh\nENTRYPOINT [\"/relay.sh\"]\n",
         )
         .expect("write Dockerfile");
         Command::new("docker")
@@ -307,7 +320,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon and builds an image; run: cargo test -p runtime-docker --lib a_created_relay -- --ignored"]
     async fn a_created_relay_is_labelled_unprivileged_forwards_and_is_removed_by_destroy() {
         let Ok(docker) = Docker::connect_with_local_defaults() else {
             return;
@@ -331,9 +343,10 @@ mod tests {
             // An upstream on the default bridge serving a fixed page.
             let mut upstream_labels = labels.to_map().into_iter().collect::<HashMap<_, _>>();
             upstream_labels.insert("autospec.test".to_owned(), "relay".to_owned());
-            let create = |name: &str, cmd: Vec<&str>, network: &str, labels| {
+            let create = |name: &str, image: &str, cmd: Vec<&str>, network: &str, labels| {
                 let config = Config {
-                    image: Some("alpine:3.20".to_owned()),
+                    image: Some(image.to_owned()),
+                    entrypoint: Some(vec![]),
                     cmd: Some(cmd.into_iter().map(str::to_owned).collect()),
                     labels: Some(labels),
                     host_config: Some(bollard::models::HostConfig {
@@ -359,11 +372,8 @@ mod tests {
             };
             create(
                 &upstream_name,
-                vec![
-                    "sh",
-                    "-c",
-                    "while true; do printf 'HTTP/1.0 200 OK\\r\\n\\r\\nrelayed-ok\\n' | nc -l -p 8000; done",
-                ],
+                &tag,
+                vec!["/upstream.sh"],
                 "bridge",
                 upstream_labels.clone(),
             )
@@ -400,8 +410,13 @@ mod tests {
             )
             .await
             .map_err(|e| e.to_string())?;
-            assert_eq!(name, DockerRuntime::relay_container_name(&labels.execution_id));
-            start_relay(&runtime, &name).await.map_err(|e| e.to_string())?;
+            assert_eq!(
+                name,
+                DockerRuntime::relay_container_name(&labels.execution_id)
+            );
+            start_relay(&runtime, &name)
+                .await
+                .map_err(|e| e.to_string())?;
 
             let inspect = docker
                 .inspect_container(&name, None)
@@ -413,19 +428,25 @@ mod tests {
                 Some("true")
             );
             assert_eq!(
-                container_labels.get("autospec.execution_id").map(String::as_str),
+                container_labels
+                    .get("autospec.execution_id")
+                    .map(String::as_str),
                 Some(id.as_str())
             );
             assert_eq!(
                 inspect.host_config.and_then(|h| h.cap_drop),
                 Some(vec!["ALL".to_owned()])
             );
-            let networks = inspect.network_settings.and_then(|n| n.networks).unwrap_or_default();
+            let networks = inspect
+                .network_settings
+                .and_then(|n| n.networks)
+                .unwrap_or_default();
             assert!(networks.contains_key("bridge") && networks.contains_key(&network));
 
             // A probe on the execution network reaches the upstream only through the relay.
             create(
                 &probe_name,
+                "alpine:3.20",
                 vec!["sleep", "600"],
                 &network,
                 labels.to_map().into_iter().collect(),
@@ -437,15 +458,45 @@ mod tests {
                 .await
                 .map_err(|e| e.to_string())?;
             let mut body = String::new();
-            for _ in 0..20 {
-                let (code, out) = exec(&docker, &probe_name, "wget -T 3 -qO- http://inferweave:8080/").await;
-                if code == 0 {
+            for _ in 0..90 {
+                let (code, out) = exec(
+                    &docker,
+                    &probe_name,
+                    "wget -T 3 -qO- http://inferweave:8080/ 2>&1",
+                )
+                .await;
+                // busybox wget may exit non-zero after the body when the peer
+                // closes with a reset, so the body decides, not the exit code.
+                let _ = code;
+                if out.contains("relayed-ok") {
                     body = out;
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
-            assert_eq!(body.trim(), "relayed-ok", "the relay forwards to its upstream");
+            if !body.contains("relayed-ok") {
+                for container in [&name, &upstream_name] {
+                    let logs = Command::new("docker").args(["logs", container]).output();
+                    eprintln!(
+                        "--- logs {container}: {:?}",
+                        logs.map(|o| (
+                            String::from_utf8_lossy(&o.stdout).into_owned(),
+                            String::from_utf8_lossy(&o.stderr).into_owned()
+                        ))
+                    );
+                }
+                let (code, out) = exec(
+                    &docker,
+                    &probe_name,
+                    "wget -T 3 -O- http://inferweave:8080/ 2>&1; getent hosts inferweave",
+                )
+                .await;
+                eprintln!("--- last probe: {code} {out}");
+            }
+            assert!(
+                body.contains("relayed-ok"),
+                "the relay forwards to its upstream, got {body:?}"
+            );
             Ok::<_, String>(name)
         }
         .await;
