@@ -12,7 +12,7 @@ use orchestrator_core::{
     TaskPacket,
 };
 use orchestrator_persistence::{ArtifactStore, CleanupAuthority, CleanupDisposition};
-use runtime_docker::{DockerRuntime, TrustedVerifierImage};
+use runtime_docker::{ContainerHardening, DockerRuntime, TrustedVerifierImage};
 use runtime_traits::build_cache::BUILD_CACHE_CAPABILITY;
 use runtime_traits::{
     CredentialBroker, EnvironmentHandle, Runtime, VerifiedAgentContainer, VerifiedBindMount,
@@ -93,6 +93,7 @@ pub struct VerifiedDockerRuntimeFactory {
     trusted_verifier: TrustedVerifierImage,
     credentials: Arc<dyn CredentialBroker>,
     build_cache: Option<(PathBuf, u64)>,
+    hardening: ContainerHardening,
 }
 
 impl VerifiedDockerRuntimeFactory {
@@ -110,7 +111,23 @@ impl VerifiedDockerRuntimeFactory {
             trusted_verifier,
             credentials,
             build_cache: None,
+            hardening: ContainerHardening::Enforced,
         }
+    }
+
+    /// Selects the container privilege limits handed to every runtime this
+    /// factory builds. The default `Enforced` sets `no-new-privileges` on every
+    /// container and drops the agent's capabilities; `Relaxed` is the operator
+    /// opt-out for images that need setuid helpers or capabilities.
+    #[must_use]
+    pub fn with_container_hardening(mut self, hardening: ContainerHardening) -> Self {
+        self.hardening = hardening;
+        self
+    }
+
+    /// The container privilege limits this factory hands to runtimes.
+    pub fn container_hardening(&self) -> ContainerHardening {
+        self.hardening
     }
 
     /// Lets Implementation executions that request `rust-build-cache` mount the
@@ -128,8 +145,8 @@ impl VerifiedDockerRuntimeFactory {
             .map(|(root, max_gib)| (root.as_path(), *max_gib))
     }
 
-    fn configure(&self, runtime: DockerRuntime) -> DockerRuntime {
-        apply_build_cache(runtime, self.build_cache.as_ref())
+    pub(crate) fn configure(&self, runtime: DockerRuntime) -> DockerRuntime {
+        apply_build_cache(runtime, self.build_cache.as_ref()).with_hardening(self.hardening)
     }
 }
 
@@ -2145,6 +2162,53 @@ mod tests {
             );
             assert!(check_build_cache_role(role, &requirement(&["docker"])).is_ok());
         }
+    }
+
+    #[derive(Debug)]
+    struct StubVerifier;
+
+    impl execution_storage::ReadyAllocationVerifier for StubVerifier {
+        fn verify_ready(
+            &self,
+            _: &execution_storage::AllocationReceipt,
+        ) -> Result<
+            Box<dyn execution_storage::VerifiedExecutionStorage>,
+            execution_storage::StorageError,
+        > {
+            Err(execution_storage::StorageError::Unavailable("stub".into()))
+        }
+    }
+
+    fn factory() -> super::VerifiedDockerRuntimeFactory {
+        super::VerifiedDockerRuntimeFactory::new(
+            None,
+            std::path::PathBuf::from("docker"),
+            std::sync::Arc::new(StubVerifier),
+            runtime_docker::TrustedVerifierImage::new(
+                format!("sha256:{}", "a".repeat(64)),
+                "/usr/bin/stat",
+            )
+            .unwrap(),
+            std::sync::Arc::new(
+                runtime_docker::LocalCredentialBroker::new(
+                    std::env::temp_dir(),
+                    chrono::Duration::minutes(15),
+                )
+                .unwrap(),
+            ),
+        )
+    }
+
+    #[test]
+    fn the_factory_hardening_setting_reaches_every_runtime_it_configures() {
+        use runtime_docker::ContainerHardening::{Enforced, Relaxed};
+        let runtime =
+            || runtime_docker::DockerRuntime::connect_with_state_root(None, "/tmp").unwrap();
+        assert_eq!(factory().container_hardening(), Enforced);
+        assert_eq!(factory().configure(runtime()).hardening(), Enforced);
+        let relaxed = factory().with_container_hardening(Relaxed);
+        assert_eq!(relaxed.container_hardening(), Relaxed);
+        assert_eq!(relaxed.configure(runtime()).hardening(), Relaxed);
     }
 
     #[test]

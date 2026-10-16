@@ -21,7 +21,9 @@ use futures_util::StreamExt;
 use orchestrator_core::{
     labels, ExecutionId, OwnershipLabels, RuntimeRequirement, ServiceRequirement, WorkerId,
 };
-use runtime_docker::{host_limits, DockerRuntime, TrustedVerifierImage, DEFAULT_PIDS_LIMIT};
+use runtime_docker::{
+    host_limits, ContainerHardening, DockerRuntime, TrustedVerifierImage, DEFAULT_PIDS_LIMIT,
+};
 use runtime_traits::Runtime;
 use std::{
     any::Any,
@@ -3109,4 +3111,290 @@ async fn provisioning_failure_removes_exact_attempt_anonymous_volumes() {
         .cleanup()
         .await
         .expect("cleanup attempt-scoped images");
+}
+
+fn hardening_requirement() -> RuntimeRequirement {
+    RuntimeRequirement {
+        image: Some("alpine:3.20".to_owned()),
+        cpu: 1,
+        memory_mib: 2048,
+        disk_gib: 1,
+        ..RuntimeRequirement::default()
+    }
+}
+
+/// Creates a source tree the way the host worker does: owned by the
+/// orchestrator uid, ordinary modes, nested directories.
+fn write_host_repository(worktree: &Path) {
+    fs::create_dir_all(worktree.join("src/nested")).expect("create repository tree");
+    fs::write(worktree.join("Cargo.toml"), "[package]\n").expect("write manifest");
+    fs::write(worktree.join("src/lib.rs"), "pub fn a() {}\n").expect("write source");
+    fs::write(worktree.join("src/nested/mod.rs"), "// m\n").expect("write nested source");
+}
+
+async fn wait_until_running(docker: &Docker, container: &str) -> bool {
+    for _ in 0..60 {
+        let running = docker
+            .inspect_container(container, None)
+            .await
+            .ok()
+            .and_then(|inspect| inspect.state)
+            .and_then(|state| state.running)
+            == Some(true);
+        if running {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn container_hardening_reaches_the_inspected_agent_and_service_containers() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((_state, runtime)) = execution_runtime_with_disk_or_skip(
+        "container_hardening_reaches_the_inspected_agent_and_service_containers",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let service = ServiceRequirement {
+        name: "cache".to_owned(),
+        image: "redis:7-alpine".to_owned(),
+        env: BTreeMap::new(),
+    };
+    let handle = runtime
+        .provision(&execution_labels, &hardening_requirement(), &[service])
+        .await
+        .expect("provision hardened agent with a service that starts as root and drops privileges");
+
+    let agent = docker
+        .inspect_container(&handle.agent_container, None)
+        .await
+        .expect("inspect agent")
+        .host_config
+        .expect("agent host config");
+    assert_eq!(agent.cap_drop, Some(vec!["ALL".to_owned()]));
+    assert_eq!(
+        agent.cap_add,
+        Some(vec!["DAC_OVERRIDE".to_owned(), "FOWNER".to_owned()]),
+        "root agent keeps only file-access capabilities"
+    );
+    assert!(agent
+        .security_opt
+        .as_ref()
+        .is_some_and(|opts| opts.iter().any(|opt| opt == "no-new-privileges:true")));
+
+    let service_name = &handle.service_containers[0];
+    let service = docker
+        .inspect_container(service_name, None)
+        .await
+        .expect("inspect service")
+        .host_config
+        .expect("service host config");
+    assert!(service
+        .security_opt
+        .as_ref()
+        .is_some_and(|opts| opts.iter().any(|opt| opt == "no-new-privileges:true")));
+    assert!(
+        service.cap_drop.as_ref().is_none_or(Vec::is_empty),
+        "services keep default capabilities so entrypoints can chown and switch user: {:?}",
+        service.cap_drop
+    );
+    assert!(
+        wait_until_running(&docker, service_name).await,
+        "redis (root entrypoint that drops to the redis user) must start under no-new-privileges"
+    );
+    let (exit, out, err) = exec_output(&docker, service_name, "redis-cli ping").await;
+    assert_eq!((exit, out.trim()), (0, "PONG"), "stderr: {err}");
+
+    // Capability-less root can still create files and signal its own uid.
+    let (exit, _, err) = exec_output(
+        &docker,
+        &handle.agent_container,
+        "touch /workspace/.probe && sleep 30 & kill $! && echo signalled",
+    )
+    .await;
+    assert_eq!(exit, 0, "stderr: {err}");
+
+    scope.cleanup().await.expect("cleanup hardening test");
+}
+
+#[tokio::test]
+async fn relaxed_hardening_restores_the_previous_container_options() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((_state, runtime)) = execution_runtime_with_disk_or_skip(
+        "relaxed_hardening_restores_the_previous_container_options",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let runtime = runtime.with_hardening(ContainerHardening::Relaxed);
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let service = ServiceRequirement {
+        name: "cache".to_owned(),
+        image: "redis:7-alpine".to_owned(),
+        env: BTreeMap::new(),
+    };
+    let handle = runtime
+        .provision(&execution_labels, &hardening_requirement(), &[service])
+        .await
+        .expect("provision relaxed agent");
+    for container in [&handle.agent_container, &handle.service_containers[0]] {
+        let host = docker
+            .inspect_container(container, None)
+            .await
+            .expect("inspect relaxed container")
+            .host_config
+            .expect("host config");
+        assert!(
+            host.cap_drop.as_ref().is_none_or(Vec::is_empty),
+            "{container}"
+        );
+        assert!(
+            host.security_opt.as_ref().is_none_or(Vec::is_empty),
+            "{container}: {:?}",
+            host.security_opt
+        );
+    }
+    scope.cleanup().await.expect("cleanup relaxed test");
+}
+
+/// The agent edits files the host worker created (ordinary owner and modes,
+/// nested directories). With every capability dropped there is no
+/// `CAP_DAC_OVERRIDE` or `CAP_FOWNER` to bypass those permissions.
+#[tokio::test]
+async fn dropped_capabilities_agent_can_still_edit_a_host_created_repository() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((state, runtime)) = execution_runtime_with_disk_or_skip(
+        "dropped_capabilities_agent_can_still_edit_a_host_created_repository",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    write_host_repository(&state.worktree(&execution_labels));
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let handle = runtime
+        .provision(&execution_labels, &hardening_requirement(), &[])
+        .await
+        .expect("provision hardened agent");
+    let (exit, out, err) = exec_output(
+        &docker,
+        &handle.agent_container,
+        "cd /workspace && echo 'pub fn b() {}' >> src/lib.rs && echo ok-append && \
+         echo new > src/nested/new.rs && echo ok-create-nested && \
+         mv src/lib.rs src/lib2.rs && echo ok-rename && rm src/nested/mod.rs && echo ok-remove",
+    )
+    .await;
+    assert_eq!(exit, 0, "stdout: {out} stderr: {err}");
+    scope.cleanup().await.expect("cleanup repository edit test");
+}
+
+/// A label-free copy of `source`: the runtime requires an agent container's
+/// labels to equal the execution's exactly, and the upstream Rust image carries
+/// an `org.opencontainers` label. Built with `docker export | docker import`,
+/// which keeps the filesystem and re-applies the environment.
+fn unlabelled_copy(source: &str, tag: &str) -> bool {
+    let script = format!(
+        "set -e; c=$(docker create {source}); trap 'docker rm -f $c >/dev/null' EXIT; \
+         docker export $c | docker import \
+           --change 'ENV PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+           --change 'ENV CARGO_HOME=/usr/local/cargo' --change 'ENV RUSTUP_HOME=/usr/local/rustup' \
+           - {tag} >/dev/null"
+    );
+    std::process::Command::new("sh")
+        .args(["-c", &script])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Cargo builds a crate inside the hardened (no-new-privileges, capabilities
+/// dropped) agent, writing its artifacts to the `/cargo-target` bind. Skipped
+/// when the Rust image is not already present locally.
+#[tokio::test]
+async fn cargo_builds_a_crate_inside_the_hardened_agent() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((state, runtime)) = execution_runtime_with_disk_or_skip(
+        "cargo_builds_a_crate_inside_the_hardened_agent",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    if docker.inspect_image("rust:1.96-slim").await.is_err() {
+        return;
+    }
+    let tag = format!("autospec-test-rust-{}", execution_labels.execution_id);
+    assert!(
+        unlabelled_copy("rust:1.96-slim", &tag),
+        "build label-free Rust image"
+    );
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let requirement = RuntimeRequirement {
+        image: Some(tag.clone()),
+        cpu: 2,
+        memory_mib: 4096,
+        disk_gib: 1,
+        ..RuntimeRequirement::default()
+    };
+    let worktree = state.worktree(&execution_labels);
+    fs::create_dir_all(worktree.join("src")).expect("create crate src");
+    fs::write(
+        worktree.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write manifest");
+    fs::write(
+        worktree.join("src/main.rs"),
+        "fn main() { println!(\"hardened-ok\"); }\n",
+    )
+    .expect("write main");
+    let outcome = async {
+        let handle = runtime
+            .provision(&execution_labels, &requirement, &[])
+            .await
+            .map_err(|error| format!("provision hardened rust agent: {error}"))?;
+        let (exit, out, err) = exec_output(
+            &docker,
+            &handle.agent_container,
+            "cd /workspace && cargo build --offline 2>&1 | tail -3 && /cargo-target/debug/probe",
+        )
+        .await;
+        let host = docker
+            .inspect_container(&handle.agent_container, None)
+            .await
+            .map_err(|error| error.to_string())?
+            .host_config
+            .ok_or("no host config")?;
+        Ok::<_, String>((exit, out, err, host.cap_drop))
+    }
+    .await;
+    let cleanup = scope.cleanup().await;
+    let _ = docker
+        .remove_image(&tag, None::<RemoveImageOptions>, None)
+        .await;
+    let (exit, out, err, cap_drop) = outcome.expect("hardened agent ran");
+    cleanup.expect("cleanup cargo test");
+    assert_eq!(exit, 0, "stdout: {out} stderr: {err}");
+    assert!(out.contains("hardened-ok"), "{out}");
+    assert_eq!(cap_drop, Some(vec!["ALL".to_owned()]));
 }

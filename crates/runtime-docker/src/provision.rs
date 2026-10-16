@@ -1,4 +1,7 @@
-use crate::{limits::host_limits, services, DockerRuntime};
+use crate::{
+    limits::{drop_all_capabilities, harden_agent, host_limits},
+    services, DockerRuntime,
+};
 use bollard::{
     container::{
         AttachContainerOptions, Config, CreateContainerOptions, ListContainersOptions, LogOutput,
@@ -399,6 +402,7 @@ async fn provision_inner(
 
     let agent_container = DockerRuntime::agent_container_name(&labels.execution_id);
     let mut limits = host_limits(requirement);
+    harden_agent(&mut limits, runtime.hardening);
     limits.network_mode = Some(network.clone());
     let mut mounts = agent_mounts;
     mounts.extend(execution_mounts);
@@ -801,8 +805,7 @@ async fn verify_with_trusted_container(
         .map(|index| format!("/autospec-proof/{index}"))
         .collect::<Vec<_>>();
     let name = format!("autospec-{}-mount-verifier", labels.execution_id);
-    let mut limits = host_limits(requirement);
-    limits.network_mode = Some("none".to_owned());
+    let mut limits = verifier_limits(requirement);
     limits.mounts = Some(proof_mounts.clone());
     let mut command = vec!["-c".to_owned(), "%d:%i".to_owned()];
     command.extend(proof_targets);
@@ -1445,8 +1448,30 @@ pub(crate) fn container_create_error(
     }
 }
 
+/// Limits of the trusted mount-verifier container: it only runs `stat` on
+/// read-only proof mounts, so it never gets network access or any capability
+/// regardless of the operator's hardening choice.
+fn verifier_limits(requirement: &RuntimeRequirement) -> crate::limits::HostConfigLimits {
+    let mut limits = host_limits(requirement);
+    drop_all_capabilities(&mut limits);
+    limits.network_mode = Some("none".to_owned());
+    limits
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_trusted_verifier_is_always_hardened_and_offline() {
+        let limits = super::verifier_limits(&RuntimeRequirement::default());
+        assert_eq!(limits.cap_drop, Some(vec!["ALL".to_owned()]));
+        assert_eq!(limits.cap_add, None);
+        assert_eq!(
+            limits.security_opt,
+            Some(vec!["no-new-privileges:true".to_owned()])
+        );
+        assert_eq!(limits.network_mode.as_deref(), Some("none"));
+    }
+
     use super::*;
     use bollard::models::{ContainerSummary, ImageConfig, MountPoint, MountPointTypeEnum};
     use std::collections::HashMap;
