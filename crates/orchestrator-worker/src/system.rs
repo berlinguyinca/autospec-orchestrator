@@ -1104,6 +1104,7 @@ fn parse_stats(json: &str) -> Result<ResourceSample, LifecycleError> {
         cpu_percent,
         io_bytes: Some(io_bytes),
         rss_bytes,
+        disk_bytes: None,
         current_command: None,
     })
 }
@@ -1144,6 +1145,35 @@ fn parse_top_command(output: &str) -> Option<String> {
         .filter(|(_, args)| !args.is_empty())
         .max_by_key(|(pid, _)| *pid)
         .map(|(_, args)| args.chars().take(CURRENT_COMMAND_MAX_CHARS).collect())
+}
+
+/// Used bytes of the volume mounted at `root` (spec section 5 R-WATCH (a)).
+///
+/// Each execution gets a dedicated volume, so a `root` on its own device is
+/// that execution's usage. When `root` shares a device with `state_root` the
+/// filesystem figure would be host-wide, so it is withheld (`None`); so is any
+/// error, with a debug log. A number is never invented.
+fn execution_disk_bytes(root: &Path, state_root: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let root_device = std::fs::metadata(root).map(|m| m.dev());
+    let state_device = std::fs::metadata(state_root).map(|m| m.dev());
+    let (Ok(root_device), Ok(state_device)) = (root_device, state_device) else {
+        tracing::debug!(root = %root.display(), "execution disk probe: cannot stat");
+        return None;
+    };
+    if root_device == state_device {
+        return None;
+    }
+    match rustix::fs::statvfs(root) {
+        Ok(stat) => stat
+            .f_blocks
+            .saturating_sub(stat.f_bfree)
+            .checked_mul(stat.f_frsize),
+        Err(error) => {
+            tracing::debug!(root = %root.display(), %error, "execution disk probe: statvfs failed");
+            None
+        }
+    }
 }
 
 /// Drops a sampled command line that `is_secret` flags; the numeric counters
@@ -1360,6 +1390,9 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
         scrub_current_command(&mut sample, |bytes| {
             self.reject_secret(&execution.id, bytes).is_err()
         });
+        sample.disk_bytes = ExecutionLayout::new(&self.state_root, &execution.id)
+            .ok()
+            .and_then(|layout| execution_disk_bytes(&layout.root, &self.state_root));
         Ok(sample)
     }
 
@@ -2061,8 +2094,8 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_build_cache_role, parse_size, parse_stats, parse_top_command, persist_evidence_file,
-        probe_resource_sample, scrub_current_command,
+        check_build_cache_role, execution_disk_bytes, parse_size, parse_stats, parse_top_command,
+        persist_evidence_file, probe_resource_sample, scrub_current_command,
     };
     use orchestrator_core::{Role, RuntimeRequirement};
     use runtime_traits::build_cache::BUILD_CACHE_CAPABILITY;
@@ -2147,6 +2180,52 @@ mod tests {
             super::contains_bytes(bytes, b"SECRET-TOKEN-VALUE")
         });
         assert_eq!(clean.current_command.as_deref(), Some("cargo test"));
+    }
+
+    fn scratch(base: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let dir = base.join(format!("autospec-disk-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn execution_disk_bytes_is_none_when_the_root_shares_the_state_root_device() {
+        let dir = scratch(&std::env::temp_dir(), "same");
+        assert_eq!(execution_disk_bytes(&dir, &dir), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn execution_disk_bytes_on_a_missing_root_is_none_without_panicking() {
+        let state = scratch(&std::env::temp_dir(), "state");
+        let missing = state.join("no-such-execution-root");
+        assert_eq!(execution_disk_bytes(&missing, &state), None);
+        assert_eq!(execution_disk_bytes(&state, &missing), None);
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    /// A tmpfs under /dev/shm is its own device, like a per-execution volume.
+    #[test]
+    fn execution_disk_bytes_reports_used_bytes_of_a_distinct_volume() {
+        use std::os::unix::fs::MetadataExt;
+        let shm = std::path::Path::new("/dev/shm");
+        let state = scratch(&std::env::temp_dir(), "state2");
+        if !shm.is_dir()
+            || std::fs::metadata(shm).unwrap().dev() == std::fs::metadata(&state).unwrap().dev()
+        {
+            std::fs::remove_dir_all(state).unwrap();
+            return;
+        }
+        let root = scratch(shm, "volume");
+        let before = execution_disk_bytes(&root, &state).expect("distinct device yields a value");
+        std::fs::write(root.join("blob"), vec![7u8; 8 * 1024 * 1024]).unwrap();
+        let after = execution_disk_bytes(&root, &state).unwrap();
+        assert!(
+            after >= before + 8 * 1024 * 1024,
+            "used bytes must grow by the file size: {before} -> {after}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(state).unwrap();
     }
 
     const STATS_LINE: &str = r#"{"BlockIO":"1.5MB / 500kB","CPUPerc":"12.50%","Container":"c","ID":"x","MemPerc":"0.5%","MemUsage":"10.5MiB / 1.9GiB","Name":"c","NetIO":"0B / 0B","PIDs":"3"}"#;

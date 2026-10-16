@@ -1357,6 +1357,7 @@ dependencies = [
  "reqwest",
  "runtime-docker",
  "runtime-traits",
+ "rustix",
  "serde",
  "serde_json",
  "sqlx",

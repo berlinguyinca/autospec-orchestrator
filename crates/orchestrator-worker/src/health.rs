@@ -15,6 +15,9 @@ pub struct ResourceSample {
     /// Cumulative block-I/O bytes (read plus write) of the execution.
     pub io_bytes: Option<u64>,
     pub rss_bytes: Option<u64>,
+    /// Bytes used on the execution's own storage volume; `None` when that is
+    /// not a distinct mount or cannot be read (never a host-wide number).
+    pub disk_bytes: Option<u64>,
     pub current_command: Option<String>,
 }
 
