@@ -1951,3 +1951,213 @@ async fn docker_factory_resource_sample_measures_the_agent_container() {
         .as_deref()
         .is_some_and(|c| c.contains("sleep")));
 }
+
+mod system_lifecycle_sample {
+    use super::{execution, ExecutionLifecycle, LifecycleError};
+    use async_trait::async_trait;
+    use execution_storage::{
+        AllocationReceipt, AllocationRequest, ExecutionStorageManager, PhaseJournal,
+        ReadyAllocationVerifier, StorageCapability, StorageError, VerifiedExecutionStorage,
+    };
+    use git_worktree::{DiffCapture, Worktree, WorktreeError, WorktreeManager};
+    use harness_traits::AgentHarness;
+    use orchestrator_core::{Execution, ExecutionId, OwnershipLabels};
+    use orchestrator_worker::{
+        EvidenceStore, HarnessFactory, ResourceSample, RuntimeFactory, SystemExecutionLifecycle,
+        SystemRecoveryConfig,
+    };
+    use runtime_traits::{EnvironmentHandle, Runtime};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    #[derive(Debug)]
+    struct NoVerifier;
+    impl ReadyAllocationVerifier for NoVerifier {
+        fn verify_ready(
+            &self,
+            _: &AllocationReceipt,
+        ) -> Result<Box<dyn VerifiedExecutionStorage>, StorageError> {
+            unimplemented!("resource sampling never verifies storage")
+        }
+    }
+
+    struct NoStorage;
+    impl ExecutionStorageManager for NoStorage {
+        fn probe(&self, _: u64) -> Result<StorageCapability, StorageError> {
+            unimplemented!()
+        }
+        fn allocate(&self, _: &AllocationRequest) -> Result<AllocationReceipt, StorageError> {
+            unimplemented!()
+        }
+        fn release(&self, _: &AllocationReceipt) -> Result<(), StorageError> {
+            unimplemented!()
+        }
+        fn reconcile(&self, _: &[ExecutionId]) -> Result<Vec<PhaseJournal>, StorageError> {
+            unimplemented!()
+        }
+    }
+
+    struct NoWorktrees;
+    impl WorktreeManager for NoWorktrees {
+        fn ensure_mirror(&self, _: &str) -> Result<String, WorktreeError> {
+            unimplemented!()
+        }
+        fn create(
+            &self,
+            _: &OwnershipLabels,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Worktree, WorktreeError> {
+            unimplemented!()
+        }
+        fn create_in(
+            &self,
+            _: &OwnershipLabels,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &AllocationReceipt,
+        ) -> Result<Worktree, WorktreeError> {
+            unimplemented!()
+        }
+        fn capture_diff(&self, _: &Worktree) -> Result<DiffCapture, WorktreeError> {
+            unimplemented!()
+        }
+        fn destroy(&self, _: &Worktree) -> Result<(), WorktreeError> {
+            unimplemented!()
+        }
+        fn ack_destroy(&self, _: &Worktree) -> Result<(), WorktreeError> {
+            unimplemented!()
+        }
+        fn recover_interrupted_create(
+            &self,
+            _: &OwnershipLabels,
+            _: &Path,
+        ) -> Result<(), WorktreeError> {
+            unimplemented!()
+        }
+        fn find_stale(&self, _: &[ExecutionId]) -> Result<Vec<Worktree>, WorktreeError> {
+            unimplemented!()
+        }
+    }
+
+    struct NoHarnesses;
+    #[async_trait]
+    impl HarnessFactory for NoHarnesses {
+        async fn build(
+            &self,
+            _: &Execution,
+            _: &AllocationReceipt,
+            _: &EnvironmentHandle,
+            _: &Worktree,
+        ) -> Result<Arc<dyn AgentHarness>, LifecycleError> {
+            unimplemented!()
+        }
+    }
+
+    struct NoEvidence;
+    #[async_trait]
+    impl EvidenceStore for NoEvidence {
+        async fn persist(&self, _: &Execution, _: &DiffCapture) -> Result<String, LifecycleError> {
+            unimplemented!()
+        }
+    }
+
+    /// Reports a fixed sample, as the Docker factory would for a live container.
+    struct FixedSampleRuntimes;
+    #[async_trait]
+    impl RuntimeFactory for FixedSampleRuntimes {
+        async fn build(
+            &self,
+            _: &Execution,
+            _: &AllocationReceipt,
+        ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+            unimplemented!()
+        }
+        async fn build_for_cleanup(
+            &self,
+            _: &Execution,
+            _: &AllocationReceipt,
+        ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+            unimplemented!()
+        }
+        async fn cpu_percent(&self, _: &Execution) -> Result<f64, LifecycleError> {
+            Ok(0.0)
+        }
+        async fn resource_sample(&self, _: &Execution) -> Result<ResourceSample, LifecycleError> {
+            Ok(ResourceSample {
+                cpu_percent: 1.5,
+                io_bytes: Some(10),
+                rss_bytes: Some(20),
+                current_command: Some("cargo test".into()),
+                disk_bytes: None,
+            })
+        }
+        async fn revoke_credentials(&self, _: &ExecutionId) -> Result<(), LifecycleError> {
+            unimplemented!()
+        }
+    }
+
+    fn lifecycle(state_root: &Path) -> SystemExecutionLifecycle {
+        SystemExecutionLifecycle::new(
+            SystemRecoveryConfig {
+                state_root: state_root.to_path_buf(),
+                verifier: Arc::new(NoVerifier),
+                docker_binary: PathBuf::from("docker"),
+                docker_socket: None,
+            },
+            Arc::new(NoStorage),
+            Arc::new(NoWorktrees),
+            Arc::new(FixedSampleRuntimes),
+            Arc::new(NoHarnesses),
+            Arc::new(NoEvidence),
+        )
+    }
+
+    /// `state_root/executions` points at a tmpfs, so each execution root is a
+    /// distinct device, as a dedicated per-execution volume is.
+    #[tokio::test]
+    async fn the_system_lifecycle_sample_carries_the_execution_volume_usage() {
+        use std::os::unix::fs::MetadataExt;
+        let shm = Path::new("/dev/shm");
+        let state =
+            std::env::temp_dir().join(format!("autospec-lifecycle-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&state).unwrap();
+        if !shm.is_dir()
+            || std::fs::metadata(shm).unwrap().dev() == std::fs::metadata(&state).unwrap().dev()
+        {
+            std::fs::remove_dir_all(&state).unwrap();
+            return;
+        }
+        let execution = execution();
+        let volume = shm.join(format!("autospec-lifecycle-volume-{}", std::process::id()));
+        std::fs::create_dir_all(volume.join(execution.id.as_str())).unwrap();
+        std::os::unix::fs::symlink(&volume, state.join("executions")).unwrap();
+
+        let lifecycle = lifecycle(&state);
+        let sample = lifecycle.resource_sample(&execution).await.unwrap();
+
+        assert_eq!(
+            sample.io_bytes,
+            Some(10),
+            "factory measurements pass through"
+        );
+        assert_eq!(sample.current_command.as_deref(), Some("cargo test"));
+        assert!(
+            sample.disk_bytes.is_some(),
+            "own volume must report used bytes: {sample:?}"
+        );
+
+        // Same device as the state root: withheld, never a host-wide number.
+        std::fs::remove_file(state.join("executions")).unwrap();
+        std::fs::create_dir_all(state.join("executions").join(execution.id.as_str())).unwrap();
+        let sample = lifecycle.resource_sample(&execution).await.unwrap();
+        assert_eq!(sample.disk_bytes, None);
+
+        std::fs::remove_dir_all(&volume).unwrap();
+        std::fs::remove_dir_all(&state).unwrap();
+    }
+}
