@@ -3532,3 +3532,105 @@ async fn disk_claim_serializes_behind_a_concurrent_reservation_through_the_worke
     );
     reservations.release(&rival.id).await.unwrap();
 }
+
+fn worker_with(
+    id: &str,
+    arch: &str,
+    toolchains: &[(&str, &str)],
+) -> orchestrator_core::WorkerRegistration {
+    let mut worker = registered_worker(id, 4);
+    worker.capabilities.arch = arch.to_owned();
+    worker.capabilities.toolchains = toolchains
+        .iter()
+        .map(|(name, version)| ((*name).to_owned(), (*version).to_owned()))
+        .collect();
+    worker
+}
+
+fn queued_requiring(arch: Option<&str>, toolchains: &[(&str, &str)]) -> Execution {
+    let mut execution = execution(ExecutionState::Queued);
+    execution.manifest.runtime.arch = arch.map(str::to_owned);
+    execution.manifest.runtime.toolchains = toolchains
+        .iter()
+        .map(|(name, version)| ((*name).to_owned(), (*version).to_owned()))
+        .collect();
+    execution
+}
+
+#[tokio::test]
+async fn claim_path_applies_the_scheduler_arch_rule() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let x86 = worker_with("worker-x86", "x86_64", &[]);
+    let arm = worker_with("worker-arm", "arm64", &[]);
+    workers.register(&x86).await.unwrap();
+    workers.register(&arm).await.unwrap();
+    let queued = queued_requiring(Some("aarch64"), &[]);
+    executions.insert(&queued).await.unwrap();
+
+    assert!(
+        reservations.reserve_next(&x86.id).await.unwrap().is_none(),
+        "an x86_64 worker must not claim an aarch64 execution"
+    );
+    let claimed = reservations
+        .reserve_next(&arm.id)
+        .await
+        .unwrap()
+        .expect("arm64 is the scheduler's alias of aarch64");
+    assert_eq!(claimed.execution.id, queued.id);
+}
+
+#[tokio::test]
+async fn claim_path_applies_the_scheduler_toolchain_rule() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let none = worker_with("worker-no-rust", "x86_64", &[]);
+    let old = worker_with("worker-rust-185", "x86_64", &[("rust", "1.85.0")]);
+    let exact = worker_with("worker-rust-186", "x86_64", &[("rust", "1.86.0")]);
+    for worker in [&none, &old, &exact] {
+        workers.register(worker).await.unwrap();
+    }
+    let queued = queued_requiring(None, &[("rust", "1.86.0")]);
+    executions.insert(&queued).await.unwrap();
+
+    assert!(reservations.reserve_next(&none.id).await.unwrap().is_none());
+    assert!(reservations.reserve_next(&old.id).await.unwrap().is_none());
+    let claimed = reservations
+        .reserve_next(&exact.id)
+        .await
+        .unwrap()
+        .expect("a worker advertising rust 1.86.0 claims it");
+    assert_eq!(claimed.execution.id, queued.id);
+}
+
+#[tokio::test]
+async fn claim_path_counts_reserved_disk_against_the_next_claim() {
+    let _database_test = database_test_lock().lock().await;
+    let Some((executions, workers, reservations)) = worker_stores().await else {
+        return;
+    };
+    let worker = worker_with("worker-disk", "x86_64", &[]); // 500 GiB
+    workers.register(&worker).await.unwrap();
+    for _ in 0..2 {
+        let mut queued = queued_requiring(None, &[]);
+        queued.manifest.runtime.disk_gib = 300;
+        executions.insert(&queued).await.unwrap();
+    }
+    assert!(reservations
+        .reserve_next(&worker.id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(
+        reservations
+            .reserve_next(&worker.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "300 GiB already reserved leaves 200 GiB, below the second 300 GiB request"
+    );
+}

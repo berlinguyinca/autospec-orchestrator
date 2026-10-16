@@ -1317,6 +1317,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "orchestrator-core",
+ "orchestrator-scheduler",
  "serde",
  "serde_json",
  "sqlx",
