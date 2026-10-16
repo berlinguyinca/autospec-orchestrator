@@ -123,6 +123,16 @@ struct Cli {
     /// Upper bound, in GiB, passed to sccache as `SCCACHE_CACHE_SIZE`.
     #[arg(long, env = "AUTOSPEC_BUILD_CACHE_MAX_GIB", default_value_t = 40)]
     build_cache_max_gib: u64,
+    /// Opt-out of container privilege hardening. By default every container runs
+    /// with `no-new-privileges` and the agent drops all capabilities except the
+    /// two file-access ones; this restores the previous defaults for images that
+    /// need setuid helpers or capabilities. Logged as a warning at startup.
+    #[arg(
+        long,
+        env = "AUTOSPEC_RELAX_CONTAINER_HARDENING",
+        default_value_t = false
+    )]
+    relax_container_hardening: bool,
     #[arg(long, default_value = "https://github.com")]
     clone_base: String,
     #[arg(long, env = "AUTOSPEC_DOCKER_SOCKET")]
@@ -160,6 +170,11 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    if cli.relax_container_hardening {
+        tracing::warn!(
+            "container hardening is relaxed: no-new-privileges is not set and the agent keeps its default capabilities"
+        );
+    }
     let prepared = prepare_execution_plane(&cli).await;
     let (worker, execution_plane) = advertisement_from_preparation(&cli, prepared)?;
     let token = Secret(cli.worker_token.clone());
@@ -249,9 +264,18 @@ fn runtime_factory(
         trusted_verifier,
         credentials,
     );
+    let factory = factory.with_container_hardening(container_hardening(cli));
     match &cli.build_cache_root {
         Some(root) => factory.with_build_cache(root.clone(), cli.build_cache_max_gib),
         None => factory,
+    }
+}
+
+fn container_hardening(cli: &Cli) -> runtime_docker::ContainerHardening {
+    if cli.relax_container_hardening {
+        runtime_docker::ContainerHardening::Relaxed
+    } else {
+        runtime_docker::ContainerHardening::Enforced
     }
 }
 
@@ -1065,6 +1089,7 @@ mod tests {
             toolchains: Vec::new(),
             build_cache_root: None,
             build_cache_max_gib: 40,
+            relax_container_hardening: false,
             clone_base: "https://github.com".into(),
             docker_socket: None,
             docker_proxy_port: 2375,
@@ -1614,6 +1639,41 @@ mod tests {
             build(&cli).build_cache(),
             Some((Path::new("/var/cache/autospec"), 12))
         );
+    }
+
+    #[test]
+    fn container_hardening_is_enforced_unless_the_operator_opts_out() {
+        use runtime_docker::ContainerHardening::{Enforced, Relaxed};
+        #[derive(Debug)]
+        struct NoStorage;
+        impl execution_storage::ReadyAllocationVerifier for NoStorage {
+            fn verify_ready(
+                &self,
+                _: &execution_storage::AllocationReceipt,
+            ) -> Result<
+                Box<dyn execution_storage::VerifiedExecutionStorage>,
+                execution_storage::StorageError,
+            > {
+                Err(execution_storage::StorageError::Unavailable("stub".into()))
+            }
+        }
+        let build = |cli: &Cli| {
+            runtime_factory(
+                cli,
+                Arc::new(NoStorage),
+                TrustedVerifierImage::new(format!("sha256:{}", "a".repeat(64)), "/usr/bin/stat")
+                    .unwrap(),
+                Arc::new(
+                    LocalCredentialBroker::new(std::env::temp_dir(), chrono::Duration::minutes(15))
+                        .unwrap(),
+                ),
+            )
+        };
+        assert!(!parse(&[]).relax_container_hardening);
+        assert_eq!(build(&parse(&[])).container_hardening(), Enforced);
+        let cli = parse(&["--relax-container-hardening"]);
+        assert!(cli.relax_container_hardening);
+        assert_eq!(build(&cli).container_hardening(), Relaxed);
     }
 
     #[test]

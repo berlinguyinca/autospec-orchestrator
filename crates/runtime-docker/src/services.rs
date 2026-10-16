@@ -1,5 +1,5 @@
 use crate::{
-    limits::host_limits,
+    limits::{harden_service, host_limits},
     provision::{container_create_error, verify_container_mount_sources, ReadyStorageGuard},
     DockerRuntime,
 };
@@ -25,6 +25,7 @@ pub(crate) async fn create_services(
     for (service, mounts) in services.iter().zip(service_mounts) {
         let name = DockerRuntime::service_container_name(&labels.execution_id, &service.name);
         let mut limits = host_limits(requirement);
+        harden_service(&mut limits, runtime.hardening);
         limits.network_mode = Some(network.to_owned());
         limits.mounts = Some(mounts.clone());
         let mut environment = service

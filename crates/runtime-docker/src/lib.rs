@@ -21,7 +21,10 @@ use std::{env, path::PathBuf, sync::Arc};
 
 pub use cleanup::{gc_build_cache, select_evictions, CacheEntry, GcReport};
 pub use credentials::LocalCredentialBroker;
-pub use limits::{host_limits, HostConfigLimits, DEFAULT_PIDS_LIMIT};
+pub use limits::{
+    drop_all_capabilities, host_limits, ContainerHardening, HostConfigLimits, DEFAULT_PIDS_LIMIT,
+    NO_NEW_PRIVILEGES,
+};
 
 const DEFAULT_MIN_API_VERSION: &str = "1.41";
 pub const CONFORMANCE_METADATA: RuntimeConformanceMetadata =
@@ -76,6 +79,7 @@ pub struct DockerRuntime {
     pub(crate) credentials: Option<ExecutionCredentials>,
     cleanup_labels: Option<OwnershipLabels>,
     pub(crate) build_cache: Option<BuildCacheConfig>,
+    pub(crate) hardening: ContainerHardening,
 }
 
 /// Where the opt-in shared sccache lives and how large it may grow
@@ -124,7 +128,21 @@ impl DockerRuntime {
             credentials: None,
             cleanup_labels: None,
             build_cache: None,
+            hardening: ContainerHardening::Enforced,
         })
+    }
+
+    /// Selects the container privilege limits (default `Enforced`: every
+    /// container `no-new-privileges`, agent capabilities all dropped).
+    #[must_use]
+    pub fn with_hardening(mut self, hardening: ContainerHardening) -> Self {
+        self.hardening = hardening;
+        self
+    }
+
+    /// The container privilege limits this runtime applies.
+    pub fn hardening(&self) -> ContainerHardening {
+        self.hardening
     }
 
     /// Enables the opt-in shared sccache under `root`, bounded to `max_gib`.
