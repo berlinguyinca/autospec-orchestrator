@@ -116,7 +116,7 @@ impl ServerConfig {
 /// failing line only, never a digest.
 fn load_worker_tokens(path: &std::path::Path) -> Result<PerWorkerTokens> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)
+    let file = std::fs::File::open(path)
         .map_err(|error| anyhow::anyhow!("open worker tokens file {}: {error}", path.display()))?;
     check_tokens_file_handle(&file, path)?;
     let mut text = String::new();
