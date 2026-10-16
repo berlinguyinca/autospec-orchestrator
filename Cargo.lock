@@ -124,6 +124,8 @@ dependencies = [
  "orchestrator-core",
  "reqwest",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
