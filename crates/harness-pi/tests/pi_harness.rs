@@ -909,7 +909,7 @@ async fn credential_echo_is_scrubbed_from_stdout_and_stderr_before_terminal_poll
     let secret = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     fixture.set_event_phases(
         &format!(
-            "{{\"type\":\"session\",\"id\":\"e2e\"}}\n{{\"type\":\"agent_start\"}}\n{{\"type\":\"message_update\",\"text\":\"{}\"}}\n{{\"type\":\"agent_settled\"}}\n",
+            "{{\"type\":\"session\",\"id\":\"e2e\"}}\n{{\"type\":\"agent_start\"}}\n{{\"type\":\"message_update\",\"text\":\"{}\"}}\n{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[],\"stopReason\":\"stop\"}}}}\n{{\"type\":\"agent_settled\"}}\n",
             String::from_utf8_lossy(secret)
         ),
         "",
@@ -1094,6 +1094,39 @@ async fn cursor_rejects_any_nonempty_path_other_than_the_exact_live_event_file()
         harness.poll_events(&session).await,
         Err(HarnessError::InvalidSession(_))
     ));
+}
+
+#[tokio::test]
+async fn settle_without_an_assistant_turn_polls_as_harness_failed_not_review_ready() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fixture.set_event_phases(
+        "{\"type\":\"session\",\"id\":\"e2e\"}\n{\"type\":\"agent_start\"}\n{\"type\":\"agent_settled\"}\n",
+        "",
+    );
+    let harness = fixture.harness();
+    let session = harness.start(&packet()).await.unwrap();
+    let events_path = fixture
+        .session_dir()
+        .join(format!("pi.events-{}.jsonl", fixture.execution_id));
+    wait_for_content(&events_path, "agent_settled").await;
+    let events = harness.poll_events(&session).await.unwrap();
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event.kind, ExecutionEventKind::ReviewReady)));
+    let failures: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            ExecutionEventKind::ExecutionFailed { failure } => Some(*failure),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        failures,
+        vec![orchestrator_core::FailureClass::HarnessFailed]
+    );
+    harness.stop(&session).await.unwrap();
 }
 
 #[tokio::test]

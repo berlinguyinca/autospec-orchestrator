@@ -37,6 +37,12 @@ struct ReducerState {
     pending_model_error: bool,
     retrying: bool,
     terminal: TerminalState,
+    /// Assistant `message_end` records that are not model errors. A settle
+    /// record with none of these is not evidence that the agent ran (spec s3:
+    /// exit status and settle records are not proof of work). Cursors written
+    /// before this field existed deserialize to 0.
+    #[serde(default)]
+    assistant_turns: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +52,8 @@ enum TerminalState {
     Active,
     ReviewReady,
     ModelFailed,
+    /// Pi settled without a single assistant turn.
+    HarnessFailed,
 }
 
 pub(crate) fn poll_events(
@@ -159,6 +167,9 @@ fn normalize(session: &SessionRef, record: &Value, reducer: &mut ReducerState) -
         "message_end" => {
             if is_assistant_message(record) {
                 reducer.pending_model_error = is_model_error(record);
+                if !reducer.pending_model_error {
+                    reducer.assistant_turns += 1;
+                }
             }
             return Normalized::KnownIgnored;
         }
@@ -220,11 +231,17 @@ fn normalize(session: &SessionRef, record: &Value, reducer: &mut ReducerState) -
 }
 
 fn settle(session: &SessionRef, reducer: &mut ReducerState) -> Normalized {
-    if reducer.terminal == TerminalState::ModelFailed {
+    if matches!(
+        reducer.terminal,
+        TerminalState::ModelFailed | TerminalState::HarnessFailed
+    ) {
         return Normalized::KnownIgnored;
     }
     if reducer.pending_model_error || reducer.retrying {
         return model_failed(session, reducer);
+    }
+    if reducer.assistant_turns == 0 {
+        return harness_failed(session, reducer);
     }
     if reducer.terminal == TerminalState::ReviewReady {
         return Normalized::KnownIgnored;
@@ -237,8 +254,24 @@ fn settle(session: &SessionRef, reducer: &mut ReducerState) -> Normalized {
     ))
 }
 
+/// Pi reached a terminal record without ever producing an assistant turn.
+/// Until AutoSpec T04 defines `AGENT-NEVER-STARTED` this maps to `HarnessFailed`.
+fn harness_failed(session: &SessionRef, reducer: &mut ReducerState) -> Normalized {
+    reducer.terminal = TerminalState::HarnessFailed;
+    Normalized::Event(event(
+        session,
+        ExecutionState::Failed,
+        ExecutionEventKind::ExecutionFailed {
+            failure: FailureClass::HarnessFailed,
+        },
+    ))
+}
+
 fn model_failed(session: &SessionRef, reducer: &mut ReducerState) -> Normalized {
-    if reducer.terminal == TerminalState::ModelFailed {
+    if matches!(
+        reducer.terminal,
+        TerminalState::ModelFailed | TerminalState::HarnessFailed
+    ) {
         return Normalized::KnownIgnored;
     }
     reducer.pending_model_error = false;
@@ -347,4 +380,134 @@ pub(crate) fn find_session_file(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestrator_core::ExecutionId;
+    use serde_json::json;
+
+    fn session() -> SessionRef {
+        SessionRef {
+            id: SessionId::new("s"),
+            path: "/session".into(),
+            execution_id: ExecutionId::new("e"),
+            worktree_path: "/workspace".into(),
+        }
+    }
+
+    /// Feeds records through `normalize` and returns the produced events.
+    fn feed(reducer: &mut ReducerState, records: &[Value]) -> Vec<ExecutionEventKind> {
+        let session = session();
+        records
+            .iter()
+            .filter_map(|record| match normalize(&session, record, reducer) {
+                Normalized::Event(event) => Some(event.kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assistant_ok() -> Value {
+        json!({"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"stop"}})
+    }
+
+    fn assistant_error() -> Value {
+        json!({"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"x"}})
+    }
+
+    fn failed_with(kinds: &[ExecutionEventKind], class: FailureClass) -> bool {
+        kinds.iter().any(
+            |kind| matches!(kind, ExecutionEventKind::ExecutionFailed { failure } if *failure == class),
+        )
+    }
+
+    fn review_ready_count(kinds: &[ExecutionEventKind]) -> usize {
+        kinds
+            .iter()
+            .filter(|kind| matches!(kind, ExecutionEventKind::ReviewReady))
+            .count()
+    }
+
+    #[test]
+    fn settle_without_an_assistant_turn_is_harness_failed_not_review_ready() {
+        for terminal in ["agent_settled", "done"] {
+            let mut reducer = ReducerState::default();
+            let kinds = feed(
+                &mut reducer,
+                &[json!({"type":"agent_start"}), json!({"type": terminal})],
+            );
+            assert!(
+                failed_with(&kinds, FailureClass::HarnessFailed),
+                "{terminal}"
+            );
+            assert_eq!(review_ready_count(&kinds), 0, "{terminal}");
+        }
+    }
+
+    #[test]
+    fn one_assistant_turn_before_settle_yields_exactly_one_review_ready() {
+        let mut reducer = ReducerState::default();
+        let kinds = feed(
+            &mut reducer,
+            &[
+                json!({"type":"agent_start"}),
+                assistant_ok(),
+                json!({"type":"agent_settled"}),
+                json!({"type":"done"}),
+            ],
+        );
+        assert_eq!(review_ready_count(&kinds), 1);
+        assert!(!failed_with(&kinds, FailureClass::HarnessFailed));
+    }
+
+    #[test]
+    fn an_error_only_assistant_turn_does_not_count() {
+        let mut reducer = ReducerState::default();
+        feed(
+            &mut reducer,
+            &[json!({"type":"agent_start"}), assistant_error()],
+        );
+        assert_eq!(reducer.assistant_turns, 0);
+    }
+
+    #[test]
+    fn failure_is_terminal_so_a_repeated_settle_stays_ignored() {
+        let mut reducer = ReducerState::default();
+        let kinds = feed(
+            &mut reducer,
+            &[
+                json!({"type":"agent_start"}),
+                json!({"type":"agent_settled"}),
+                json!({"type":"agent_settled"}),
+                json!({"type":"done"}),
+            ],
+        );
+        assert_eq!(kinds.len(), 2); // AgentStarted + one ExecutionFailed
+        assert_eq!(reducer.terminal, TerminalState::HarnessFailed);
+    }
+
+    #[test]
+    fn agent_start_resets_the_turn_counter() {
+        let mut reducer = ReducerState::default();
+        feed(
+            &mut reducer,
+            &[json!({"type":"agent_start"}), assistant_ok()],
+        );
+        assert_eq!(reducer.assistant_turns, 1);
+        feed(&mut reducer, &[json!({"type":"agent_start"})]);
+        assert_eq!(reducer.assistant_turns, 0);
+    }
+
+    #[test]
+    fn a_cursor_without_assistant_turns_deserializes_to_zero() {
+        let cursor: JsonlCursor = serde_json::from_str(
+            r#"{"path":"/session/pi.events.jsonl","offset":7,"reducer":{"pending_model_error":false,"retrying":false,"terminal":"active"}}"#,
+        )
+        .unwrap();
+        assert_eq!(cursor.reducer.assistant_turns, 0);
+        let legacy: JsonlCursor = serde_json::from_str(r#"{"path":"/p","offset":0}"#).unwrap();
+        assert_eq!(legacy.reducer.assistant_turns, 0);
+    }
 }
