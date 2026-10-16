@@ -1197,6 +1197,34 @@ async fn pi_exited_without_a_terminal_record_exit_zero_fails_fast_and_only_once(
 }
 
 #[tokio::test]
+async fn an_untested_pi_version_is_refused_before_pi_starts() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.worktree_dir().join("pi-version"), "pi 0.86.0\n").unwrap();
+    let result = fixture.harness().start(&packet()).await;
+    match result {
+        Err(HarnessError::Start(message)) => assert!(message.contains("0.86.0"), "{message}"),
+        other => panic!("expected a Start error naming 0.86.0, got {other:?}"),
+    }
+    assert!(!fixture.worktree_dir().join("pi-body-started").exists());
+}
+
+#[tokio::test]
+async fn an_untested_pi_version_runs_only_with_the_explicit_allowance() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.worktree_dir().join("pi-version"), "pi 0.86.0\n").unwrap();
+    let mut config = fixture.harness().config().clone();
+    config.allow_untested_pi_version = true;
+    let harness = PiHarness::new(config);
+    let session = harness.start(&packet()).await.unwrap();
+    wait_for_content(&fixture.worktree_dir().join("pi-body-started"), "started").await;
+    harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
 async fn pi_exited_without_a_session_file_exit_one_fails_fast_even_with_the_event_file_missing() {
     let Some(fixture) = DockerPi::create() else {
         return;
@@ -1241,6 +1269,19 @@ async fn a_running_pi_is_not_reported_as_exited_without_a_terminal_record() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     harness.stop(&session).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unparseable_pi_version_is_refused_even_with_the_allowance() {
+    let Some(fixture) = DockerPi::create() else {
+        return;
+    };
+    fs::write(fixture.worktree_dir().join("pi-version"), "garbage\n").unwrap();
+    let mut config = fixture.harness().config().clone();
+    config.allow_untested_pi_version = true;
+    let result = PiHarness::new(config).start(&packet()).await;
+    assert!(matches!(result, Err(HarnessError::Start(_))), "{result:?}");
+    assert!(!fixture.worktree_dir().join("pi-body-started").exists());
 }
 
 #[tokio::test]
@@ -2057,6 +2098,12 @@ async fn missing_pi_inside_the_agent_container_is_not_installed() {
 }
 
 const STUB_PI: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  version=0.84.3
+  if [ -f /workspace/pi-version ]; then version=$(cat /workspace/pi-version); fi
+  echo "$version"
+  exit 0
+fi
 session_dir=
 session_id=
 source_session=

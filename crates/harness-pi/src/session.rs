@@ -747,14 +747,29 @@ fn ensure_docker_and_pi(harness: &PiHarness) -> Result<(), HarnessError> {
                 HarnessError::Start(error.to_string())
             }
         })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(HarnessError::NotInstalled(format!(
+    if !output.status.success() {
+        return Err(HarnessError::NotInstalled(format!(
             "{} in container {}",
             harness.config.pi_executable, harness.config.agent_container
-        )))
+        )));
     }
+    let version = harness
+        .processes
+        .docker
+        .command()
+        .args(["exec", &harness.config.agent_container])
+        .arg(&harness.config.pi_executable)
+        .arg("--version")
+        .output()
+        .map_err(|error| HarnessError::Start(error.to_string()))?;
+    let stdout = String::from_utf8_lossy(&version.stdout);
+    // A failing `--version` has no trustworthy output; treat it as unparseable.
+    let found = version
+        .status
+        .success()
+        .then(|| crate::version::parse_pi_version(&stdout))
+        .flatten();
+    crate::version::check_pi_version(found.as_deref(), harness.config.allow_untested_pi_version)
 }
 
 #[derive(Deserialize)]

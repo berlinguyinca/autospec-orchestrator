@@ -108,6 +108,13 @@ struct Cli {
     host_docker: bool,
     #[arg(long, default_value = "pi")]
     pi_executable: String,
+    /// Runs Pi releases outside the tested version matrix (logged as a warning).
+    #[arg(
+        long,
+        env = "AUTOSPEC_ALLOW_UNTESTED_PI_VERSION",
+        default_value_t = false
+    )]
+    allow_untested_pi_version: bool,
     /// Explicitly permits the local development-only credential issuer.
     #[arg(
         long,
@@ -313,14 +320,17 @@ async fn prepare_execution_plane(
         trusted_verifier,
         credential_broker,
     ));
-    let harnesses = Arc::new(VerifiedPiHarnessFactory::new(
-        verifier.clone(),
-        cli.docker_socket.clone(),
-        PathBuf::from(&cli.docker_binary),
-        cli.pi_executable.clone(),
-        vec!["read".into(), "bash".into(), "edit".into(), "write".into()],
-        Vec::new(),
-    ));
+    let harnesses = Arc::new(
+        VerifiedPiHarnessFactory::new(
+            verifier.clone(),
+            cli.docker_socket.clone(),
+            PathBuf::from(&cli.docker_binary),
+            cli.pi_executable.clone(),
+            vec!["read".into(), "bash".into(), "edit".into(), "write".into()],
+            Vec::new(),
+        )
+        .with_allow_untested_pi_version(cli.allow_untested_pi_version),
+    );
     let lifecycle = Arc::new(SystemExecutionLifecycle::new(
         SystemRecoveryConfig {
             state_root: cli.state_root.clone(),
@@ -817,8 +827,35 @@ mod tests {
             docker_proxy_port: 2375,
             host_docker: false,
             pi_executable: "pi".into(),
+            allow_untested_pi_version: false,
             allow_local_development_credentials: false,
         }
+    }
+
+    fn parse(extra: &[&str]) -> Cli {
+        let mut args = vec![
+            "autospec-worker",
+            "--worker-id",
+            "w",
+            "--worker-token",
+            "t",
+            "--storage-kind",
+            "apfs",
+            "--storage-pool",
+            "/tmp",
+            "--docker-verifier-image",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--database-url",
+            "postgres://test",
+        ];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).expect("worker CLI parses")
+    }
+
+    #[test]
+    fn untested_pi_versions_are_refused_unless_the_flag_is_given() {
+        assert!(!parse(&[]).allow_untested_pi_version);
+        assert!(parse(&["--allow-untested-pi-version"]).allow_untested_pi_version);
     }
 
     #[test]
