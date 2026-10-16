@@ -19,6 +19,7 @@ use runtime_traits::{
 };
 use std::{env, path::PathBuf, sync::Arc};
 
+pub use cleanup::{gc_build_cache, select_evictions, CacheEntry, GcReport};
 pub use credentials::LocalCredentialBroker;
 pub use limits::{host_limits, HostConfigLimits, DEFAULT_PIDS_LIMIT};
 

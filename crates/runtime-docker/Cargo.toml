@@ -19,10 +19,10 @@ orchestrator-core.workspace = true
 runtime-traits.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 runtime-apptainer.workspace = true
 runtime-podman.workspace = true
 tempfile.workspace = true
-tokio.workspace = true

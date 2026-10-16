@@ -2014,6 +2014,64 @@ async fn shared_sccache_is_opt_in_per_requirement_and_keyed_outside_the_executio
 }
 
 #[tokio::test]
+async fn build_cache_gc_keeps_a_cache_in_use_and_never_touches_foreign_directories() {
+    let execution_labels = labels_for(unique_execution_id());
+    let Some((_state, runtime)) = execution_runtime_with_disk_or_skip(
+        "build_cache_gc_keeps_a_cache_in_use_and_never_touches_foreign_directories",
+        &execution_labels,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let docker = raw_client().expect("connect to probed daemon");
+    ensure_alpine_image(&docker).await;
+    let cache_root = tempfile::tempdir().expect("cache root");
+    // Budget 0 GiB: everything evictable would be evicted.
+    let runtime = runtime.with_build_cache(cache_root.path().to_path_buf(), 0);
+    let mut scope = DockerTestScope::new(&runtime, &execution_labels);
+    let requirement = RuntimeRequirement {
+        image: Some("alpine:3.20".to_owned()),
+        cpu: 1,
+        memory_mib: 2048,
+        disk_gib: 1,
+        capabilities: vec!["rust-build-cache".to_owned()],
+        ..RuntimeRequirement::default()
+    };
+    runtime
+        .provision(&execution_labels, &requirement, &[])
+        .await
+        .expect("provision agent with shared cache");
+
+    let sccache = cache_root.path().join("sccache");
+    let foreign = sccache.join("not-ours");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("precious"), b"keep").unwrap();
+    let keys = fs::read_dir(&sccache)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "not-ours")
+        .collect::<Vec<_>>();
+    assert_eq!(keys.len(), 1);
+
+    let report = runtime_docker::gc_build_cache(&runtime)
+        .await
+        .expect("gc while the execution is running");
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(report.kept_live, keys);
+    assert_eq!(report.foreign, vec!["not-ours".to_owned()]);
+    assert!(sccache
+        .join(&keys[0])
+        .join(".autospec-cache.json")
+        .is_file());
+    assert_eq!(fs::read(foreign.join("precious")).unwrap(), b"keep");
+
+    scope.cleanup().await.expect("cleanup cache execution");
+}
+
+#[tokio::test]
 async fn panicking_test_scope_removes_only_its_execution_resources() {
     let Some(runtime) =
         runtime_or_skip("panicking_test_scope_removes_only_its_execution_resources").await

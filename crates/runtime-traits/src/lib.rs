@@ -231,6 +231,12 @@ pub mod build_cache {
     pub const CONTAINER_BUILD_CACHE: &str = "/sccache";
     /// Owner file written once into each cache key directory.
     pub const OWNER_FILE: &str = ".autospec-cache.json";
+    /// Directory inside a key directory holding one `<execution_id>` file per
+    /// execution that mounted it.
+    pub const REFS_DIR: &str = "refs";
+    /// A ref younger than this counts as live even before its container exists
+    /// (provisioning writes the ref, then creates the container).
+    pub const REF_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
     /// Whether `dir` is a real (non-symlink) directory holding a regular,
     /// non-symlink owner file that declares `"managed": true`.

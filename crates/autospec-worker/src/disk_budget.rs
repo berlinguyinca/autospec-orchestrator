@@ -98,31 +98,31 @@ impl DiskPolicy {
         })
     }
 
-    /// Samples `root` and returns the health code to advertise, if any.
-    /// A failed sample is logged and treated as no pressure signal.
-    pub fn health_error(&self, root: &Path, sampler: &Sampler) -> Option<&'static str> {
+    /// Samples `root` once and judges it. A failed sample is logged and is no
+    /// pressure signal (`Ok`).
+    pub fn assess(&self, root: &Path, sampler: &Sampler) -> DiskVerdict {
         match sampler(root) {
             Ok(sample) => {
-                match judge(
+                let verdict = judge(
                     &sample,
                     self.warn_percent,
                     self.stop_percent,
                     self.reserve_bytes,
-                ) {
-                    DiskVerdict::Ok => None,
+                );
+                match verdict {
+                    DiskVerdict::Ok => {}
                     DiskVerdict::Warn => {
                         tracing::warn!(root = %root.display(), "state root disk usage above warn threshold");
-                        None
                     }
                     DiskVerdict::Stop(reason) => {
                         tracing::warn!(root = %root.display(), reason, "state root under disk pressure; refusing new executions");
-                        Some(reason)
                     }
                 }
+                verdict
             }
             Err(error) => {
                 tracing::warn!(root = %root.display(), %error, "disk sample failed");
-                None
+                DiskVerdict::Ok
             }
         }
     }
@@ -222,8 +222,11 @@ mod tests {
         let free: Sampler = Arc::new(|_| Ok(sample_with(10, 10)));
         let broken: Sampler = Arc::new(|_| Err(io::Error::other("boom")));
         let root = Path::new("/x");
-        assert_eq!(policy.health_error(root, &full), Some(DISK_PRESSURE_BYTES));
-        assert_eq!(policy.health_error(root, &free), None);
-        assert_eq!(policy.health_error(root, &broken), None);
+        assert_eq!(
+            policy.assess(root, &full),
+            DiskVerdict::Stop(DISK_PRESSURE_BYTES)
+        );
+        assert_eq!(policy.assess(root, &free), DiskVerdict::Ok);
+        assert_eq!(policy.assess(root, &broken), DiskVerdict::Ok);
     }
 }

@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use disk_budget::{DiskPolicy, Sampler};
+use disk_budget::{DiskPolicy, DiskVerdict, Sampler};
 use execution_storage::{
     ApfsBackend, DockerBindCapability, DockerBindProof, DockerBindVerifier, ExecutionStorage,
     ExecutionStorageManager, LvmBackend, ProcessCommandRunner, StorageBackend, StorageError,
@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
         token,
         client,
         Arc::new(disk_budget::sample),
+        cache_collector(&cli),
     )
     .await
 }
@@ -265,14 +266,27 @@ fn disk_policy(cli: &Cli) -> Result<DiskPolicy> {
 /// The advertisement actually sent on a heartbeat: the base advertisement plus
 /// a freshly sampled disk-pressure health error (spec §5 R-BUILD). Sampling on
 /// every call lets admission resume when space returns.
+#[cfg(test)]
 fn heartbeat_advertisement(
     base: &WorkerAdvertisement,
     state_root: &Path,
     policy: &DiskPolicy,
     sampler: &Sampler,
 ) -> WorkerAdvertisement {
+    heartbeat_assessed(base, state_root, policy, sampler).0
+}
+
+/// [`heartbeat_advertisement`] plus the verdict it was built from, so the
+/// caller can react to `Warn` (which is not advertised) with one sample per beat.
+fn heartbeat_assessed(
+    base: &WorkerAdvertisement,
+    state_root: &Path,
+    policy: &DiskPolicy,
+    sampler: &Sampler,
+) -> (WorkerAdvertisement, DiskVerdict) {
     let mut advertised = base.clone();
-    if let Some(reason) = policy.health_error(state_root, sampler) {
+    let verdict = policy.assess(state_root, sampler);
+    if let DiskVerdict::Stop(reason) = verdict {
         if !advertised
             .capabilities
             .health_errors
@@ -285,7 +299,73 @@ fn heartbeat_advertisement(
                 .push(reason.to_owned());
         }
     }
-    advertised
+    (advertised, verdict)
+}
+
+/// Starts one background build-cache GC pass at a time. A pass is spawned, not
+/// awaited, so a large cache never delays a heartbeat; a pass still running when
+/// the next pressured heartbeat arrives is not duplicated.
+struct CacheCollector {
+    start: Arc<dyn Fn() -> tokio::task::JoinHandle<()> + Send + Sync>,
+    running: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl CacheCollector {
+    fn new(start: Arc<dyn Fn() -> tokio::task::JoinHandle<()> + Send + Sync>) -> Self {
+        Self {
+            start,
+            running: None,
+        }
+    }
+
+    /// Runs a pass when the disk is under `Warn` or `Stop` pressure.
+    fn on_verdict(&mut self, verdict: DiskVerdict) {
+        if verdict == DiskVerdict::Ok {
+            return;
+        }
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        self.running = Some((self.start)());
+    }
+}
+
+/// The real collector: present only when the operator configured a cache root.
+fn cache_collector(cli: &Cli) -> Option<CacheCollector> {
+    let root = cli.build_cache_root.clone()?;
+    let max_gib = cli.build_cache_max_gib;
+    let socket = cli.docker_socket.clone();
+    let state_root = cli.state_root.clone();
+    Some(CacheCollector::new(Arc::new(move || {
+        let (root, socket, state_root) = (root.clone(), socket.clone(), state_root.clone());
+        tokio::spawn(async move {
+            let runtime = match runtime_docker::DockerRuntime::connect_with_state_root(
+                socket.as_deref(),
+                state_root,
+            ) {
+                Ok(runtime) => runtime.with_build_cache(root, max_gib),
+                Err(error) => {
+                    tracing::warn!(%error, "build cache gc could not reach Docker");
+                    return;
+                }
+            };
+            match runtime_docker::gc_build_cache(&runtime).await {
+                Ok(report) => tracing::info!(
+                    evicted = report.evicted.len(),
+                    freed_bytes = report.freed_bytes,
+                    kept_live = report.kept_live.len(),
+                    foreign = report.foreign.len(),
+                    pruned_refs = report.pruned_refs,
+                    "build cache gc finished"
+                ),
+                Err(error) => tracing::warn!(%error, "build cache gc failed"),
+            }
+        })
+    })))
 }
 
 struct ExecutionPlane {
@@ -523,6 +603,7 @@ async fn run_control_loop(
     token: Secret,
     client: reqwest::Client,
     sampler: Sampler,
+    mut collector: Option<CacheCollector>,
 ) -> Result<()> {
     let policy = disk_policy(cli)?;
     tracing::info!(
@@ -642,7 +723,11 @@ async fn run_control_loop(
             }
         }
         if tokio::time::Instant::now() >= heartbeat_due {
-            let advertised = heartbeat_advertisement(&worker, &cli.state_root, &policy, &sampler);
+            let (advertised, verdict) =
+                heartbeat_assessed(&worker, &cli.state_root, &policy, &sampler);
+            if let Some(collector) = collector.as_mut() {
+                collector.on_verdict(verdict);
+            }
             let request = if registered {
                 client.post(&heartbeat_url)
             } else {
@@ -1340,7 +1425,16 @@ mod tests {
         let sampler = sampler_with_used_percent(&[95, 10], calls);
         let client = reqwest::Client::new();
         let control = tokio::spawn(async move {
-            run_control_loop(&config, worker, None, Secret("t".into()), client, sampler).await
+            run_control_loop(
+                &config,
+                worker,
+                None,
+                Secret("t".into()),
+                client,
+                sampler,
+                None,
+            )
+            .await
         });
         let mut errors = Vec::new();
         for _ in 0..2 {
@@ -1541,5 +1635,102 @@ mod tests {
         .is_err());
         assert!(validate_cli(&parse(&["--build-cache-root", "/var/cache/autospec"])).is_ok());
         assert!(validate_cli(&parse(&[])).is_ok());
+    }
+
+    fn counting_collector(
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        hold: Option<Arc<tokio::sync::Notify>>,
+    ) -> CacheCollector {
+        CacheCollector::new(Arc::new(move || {
+            started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let hold = hold.clone();
+            tokio::spawn(async move {
+                if let Some(hold) = hold {
+                    hold.notified().await;
+                }
+            })
+        }))
+    }
+
+    #[tokio::test]
+    async fn the_collector_runs_on_warn_and_stop_but_not_ok_and_never_overlaps() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let mut collector = counting_collector(started.clone(), Some(hold.clone()));
+        let runs = || started.load(std::sync::atomic::Ordering::SeqCst);
+        collector.on_verdict(DiskVerdict::Ok);
+        assert_eq!(runs(), 0);
+        collector.on_verdict(DiskVerdict::Warn);
+        assert_eq!(runs(), 1);
+        collector.on_verdict(DiskVerdict::Stop("disk-pressure-bytes"));
+        assert_eq!(runs(), 1, "a pass is still running");
+        hold.notify_one();
+        for _ in 0..100 {
+            if collector.running.as_ref().is_some_and(|t| t.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        collector.on_verdict(DiskVerdict::Stop("disk-pressure-bytes"));
+        assert_eq!(runs(), 2);
+    }
+
+    #[test]
+    fn a_real_collector_exists_only_with_a_configured_cache_root() {
+        let none = parse(&[]);
+        assert!(cache_collector(&none).is_none());
+        let some = parse(&["--build-cache-root", "/var/cache/autospec"]);
+        // Constructing it must not spawn anything (it only captures the config).
+        assert!(cache_collector(&some).is_some());
+    }
+
+    async fn heartbeats_with_pressure(used: &'static [u64], beats: usize) -> usize {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut bodies) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(fake_controller(listener, sender));
+        let state_root = tempfile::tempdir().unwrap();
+        let mut config = cli();
+        config.controller = format!("http://{address}");
+        config.state_root = state_root.path().to_owned();
+        let worker = advertisement(&config, None, Vec::new()).unwrap();
+        let sampler = sampler_with_used_percent(used, Arc::new(Default::default()));
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let collector = counting_collector(started.clone(), None);
+        let client = reqwest::Client::new();
+        let control = tokio::spawn(async move {
+            run_control_loop(
+                &config,
+                worker,
+                None,
+                Secret("t".into()),
+                client,
+                sampler,
+                Some(collector),
+            )
+            .await
+        });
+        for _ in 0..beats {
+            tokio::time::timeout(Duration::from_secs(30), bodies.recv())
+                .await
+                .expect("heartbeat arrives")
+                .expect("server alive");
+        }
+        control.abort();
+        server.abort();
+        started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn the_control_loop_triggers_cache_gc_on_warn_and_stop_heartbeats() {
+        // 85 % is Warn (not advertised as an error) and must still collect.
+        assert!(heartbeats_with_pressure(&[85], 1).await >= 1);
+        // 95 % is Stop.
+        assert!(heartbeats_with_pressure(&[95], 1).await >= 1);
+    }
+
+    #[tokio::test]
+    async fn the_control_loop_does_not_collect_without_pressure() {
+        assert_eq!(heartbeats_with_pressure(&[10], 1).await, 0);
     }
 }
