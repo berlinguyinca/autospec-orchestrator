@@ -427,6 +427,7 @@ fn registration(id: &str) -> WorkerRegistration {
             disk_gib: 40,
             runtimes: vec![RuntimeKind::Docker],
             capabilities: vec!["docker".into()],
+            toolchains: Default::default(),
             max_concurrent_executions: 2,
             health_errors: Vec::new(),
         },

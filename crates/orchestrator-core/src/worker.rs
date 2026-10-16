@@ -6,6 +6,7 @@
 use crate::{ids::WorkerId, manifest::RuntimeKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerCapabilities {
@@ -21,6 +22,10 @@ pub struct WorkerCapabilities {
     /// Free-form execution capabilities, e.g. `docker`, `playwright`, `browser`.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Installed toolchain versions by name (e.g. `rust` -> `1.86.0`). Absent in
+    /// advertisements from older workers, which then match no toolchain.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub toolchains: BTreeMap<String, String>,
     #[serde(rename = "maxConcurrentExecutions", default = "default_concurrency")]
     pub max_concurrent_executions: u32,
     /// Sanitized, operator-actionable reasons this worker cannot advertise
@@ -166,6 +171,7 @@ mod tests {
             disk_gib: 40,
             runtimes: Vec::new(),
             capabilities: Vec::new(),
+            toolchains: BTreeMap::new(),
             max_concurrent_executions: 2,
             health_errors: Vec::new(),
         };

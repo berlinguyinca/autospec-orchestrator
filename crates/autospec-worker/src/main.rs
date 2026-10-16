@@ -621,6 +621,7 @@ fn advertisement(
             } else {
                 Vec::new()
             },
+            toolchains: Default::default(),
             max_concurrent_executions: cli.concurrency,
             health_errors,
         },
