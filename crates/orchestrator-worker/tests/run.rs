@@ -1787,3 +1787,77 @@ async fn empty_diff_review_roles_still_reach_review_ready() {
         assert_eq!(result.state, ExecutionState::ReviewReady, "{role:?}");
     }
 }
+
+#[derive(Debug)]
+struct RefusingVerifier;
+
+impl execution_storage::ReadyAllocationVerifier for RefusingVerifier {
+    fn verify_ready(
+        &self,
+        _: &AllocationReceipt,
+    ) -> Result<Box<dyn execution_storage::VerifiedExecutionStorage>, execution_storage::StorageError>
+    {
+        Err(execution_storage::StorageError::Unavailable("stub".into()))
+    }
+}
+
+fn docker_factory() -> orchestrator_worker::VerifiedDockerRuntimeFactory {
+    orchestrator_worker::VerifiedDockerRuntimeFactory::new(
+        None,
+        std::path::PathBuf::from("docker"),
+        Arc::new(RefusingVerifier),
+        runtime_docker::TrustedVerifierImage::new(
+            format!("sha256:{}", "a".repeat(64)),
+            "/usr/bin/stat",
+        )
+        .unwrap(),
+        Arc::new(
+            runtime_docker::LocalCredentialBroker::new(
+                std::env::temp_dir(),
+                chrono::Duration::minutes(15),
+            )
+            .unwrap(),
+        ),
+    )
+}
+
+#[tokio::test]
+async fn the_runtime_factory_refuses_the_build_cache_for_non_implementation_roles() {
+    use orchestrator_worker::RuntimeFactory;
+    let factory = docker_factory().with_build_cache("/var/cache/autospec".into(), 40);
+    assert_eq!(
+        factory.build_cache(),
+        Some((std::path::Path::new("/var/cache/autospec"), 40))
+    );
+    for role in [Role::Review, Role::UiReview, Role::Interactive] {
+        let mut execution = execution();
+        execution.role = role;
+        execution
+            .manifest
+            .runtime
+            .capabilities
+            .push("rust-build-cache".into());
+        let error = factory
+            .build(&execution, &receipt(&execution))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{role:?} was allowed the shared cache"));
+        assert!(
+            error.to_string().contains("rust-build-cache"),
+            "unexpected error for {role:?}: {error}"
+        );
+    }
+    // Implementation passes the role gate (it then fails later on credentials,
+    // which is a different error).
+    let mut implementation = execution();
+    implementation
+        .manifest
+        .runtime
+        .capabilities
+        .push("rust-build-cache".into());
+    let error = factory
+        .build(&implementation, &receipt(&implementation))
+        .await
+        .err();
+    assert!(error.is_none_or(|e| !e.to_string().contains("limited to implementation")));
+}

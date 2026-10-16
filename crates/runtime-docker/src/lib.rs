@@ -139,6 +139,13 @@ impl DockerRuntime {
         self
     }
 
+    /// The configured shared build cache `(root, max_gib)`, if any.
+    pub fn build_cache(&self) -> Option<(&std::path::Path, u64)> {
+        self.build_cache
+            .as_ref()
+            .map(|cache| (cache.root.as_path(), cache.max_gib))
+    }
+
     /// Connects a runtime to one exact durable Ready execution allocation.
     ///
     /// The verifier is invoked immediately before provisioning; its receipt

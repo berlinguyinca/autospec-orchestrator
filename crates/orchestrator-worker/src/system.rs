@@ -8,10 +8,12 @@ use git_worktree::{DiffCapture, Worktree, WorktreeManager};
 use harness_pi::{PiHarness, PiHarnessConfig};
 use harness_traits::{AgentHarness, SessionRef};
 use orchestrator_core::{
-    Execution, ExecutionEvent, ExecutionId, OwnershipLabels, SessionId, TaskPacket,
+    Execution, ExecutionEvent, ExecutionId, OwnershipLabels, Role, RuntimeRequirement, SessionId,
+    TaskPacket,
 };
 use orchestrator_persistence::{ArtifactStore, CleanupAuthority, CleanupDisposition};
 use runtime_docker::{DockerRuntime, TrustedVerifierImage};
+use runtime_traits::build_cache::BUILD_CACHE_CAPABILITY;
 use runtime_traits::{
     CredentialBroker, EnvironmentHandle, Runtime, VerifiedAgentContainer, VerifiedBindMount,
 };
@@ -80,6 +82,7 @@ pub struct VerifiedDockerRuntimeFactory {
     verifier: Arc<dyn ReadyAllocationVerifier>,
     trusted_verifier: TrustedVerifierImage,
     credentials: Arc<dyn CredentialBroker>,
+    build_cache: Option<(PathBuf, u64)>,
 }
 
 impl VerifiedDockerRuntimeFactory {
@@ -96,8 +99,55 @@ impl VerifiedDockerRuntimeFactory {
             verifier,
             trusted_verifier,
             credentials,
+            build_cache: None,
         }
     }
+
+    /// Lets Implementation executions that request `rust-build-cache` mount the
+    /// shared sccache under `root` (bounded to `max_gib`). Off by default.
+    #[must_use]
+    pub fn with_build_cache(mut self, root: PathBuf, max_gib: u64) -> Self {
+        self.build_cache = Some((root, max_gib));
+        self
+    }
+
+    /// The shared build cache `(root, max_gib)` this factory hands to runtimes.
+    pub fn build_cache(&self) -> Option<(&Path, u64)> {
+        self.build_cache
+            .as_ref()
+            .map(|(root, max_gib)| (root.as_path(), *max_gib))
+    }
+
+    fn configure(&self, runtime: DockerRuntime) -> DockerRuntime {
+        apply_build_cache(runtime, self.build_cache.as_ref())
+    }
+}
+
+fn apply_build_cache(runtime: DockerRuntime, cache: Option<&(PathBuf, u64)>) -> DockerRuntime {
+    match cache {
+        Some((root, max_gib)) => runtime.with_build_cache(root.clone(), *max_gib),
+        None => runtime,
+    }
+}
+
+/// The shared build cache is mutable state; independent review must never
+/// share mutable state with implementation (AGENTS.md invariant 3), so only an
+/// `Implementation` execution may ask for it. Checked before any container
+/// exists.
+pub fn check_build_cache_role(
+    role: Role,
+    requirement: &RuntimeRequirement,
+) -> Result<(), LifecycleError> {
+    let wants_cache = requirement
+        .capabilities
+        .iter()
+        .any(|capability| capability == BUILD_CACHE_CAPABILITY);
+    if wants_cache && role != Role::Implementation {
+        return Err(LifecycleError::Step(format!(
+            "capability {BUILD_CACHE_CAPABILITY} is limited to implementation executions, not {role:?}"
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -107,6 +157,9 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
         execution: &Execution,
         receipt: &AllocationReceipt,
     ) -> Result<Arc<dyn Runtime>, LifecycleError> {
+        // Before credentials exist and before any container: a role that may not
+        // share the build cache never gets a runtime that requests it.
+        check_build_cache_role(execution.role, &execution.manifest.runtime)?;
         let credentials = self
             .credentials
             .mint(execution)
@@ -131,8 +184,9 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
             receipt.clone(),
             self.trusted_verifier.clone(),
         )
-        .map(|runtime| Arc::new(runtime.with_credentials(credentials)) as Arc<dyn Runtime>)
-        {
+        .map(|runtime| {
+            Arc::new(self.configure(runtime).with_credentials(credentials)) as Arc<dyn Runtime>
+        }) {
             Ok(runtime) => Ok(runtime),
             Err(error) => {
                 let revocation = self.credentials.revoke(&execution.id).await;
@@ -1836,7 +1890,9 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
 
 #[cfg(test)]
 mod tests {
-    use super::persist_evidence_file;
+    use super::{check_build_cache_role, persist_evidence_file};
+    use orchestrator_core::{Role, RuntimeRequirement};
+    use runtime_traits::build_cache::BUILD_CACHE_CAPABILITY;
 
     #[test]
     fn evidence_rejects_path_escape_and_existing_artifacts() {
@@ -1857,5 +1913,43 @@ mod tests {
         assert_eq!(std::fs::read(&artifact).unwrap(), b"first");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn requirement(capabilities: &[&str]) -> RuntimeRequirement {
+        RuntimeRequirement {
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            ..RuntimeRequirement::default()
+        }
+    }
+
+    #[test]
+    fn only_implementation_may_request_the_shared_build_cache() {
+        let with_cache = requirement(&["docker", BUILD_CACHE_CAPABILITY]);
+        assert!(check_build_cache_role(Role::Implementation, &with_cache).is_ok());
+        for role in [
+            Role::Review,
+            Role::Documentation,
+            Role::UiReview,
+            Role::IntegrationTest,
+            Role::Interactive,
+        ] {
+            assert!(
+                check_build_cache_role(role, &with_cache).is_err(),
+                "{role:?} must not get the cache"
+            );
+            assert!(check_build_cache_role(role, &requirement(&["docker"])).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_runtime_factory_build_cache_setting_reaches_the_docker_runtime() {
+        let root = std::path::PathBuf::from("/var/cache/autospec-build");
+        let plain = runtime_docker::DockerRuntime::connect_with_state_root(None, "/tmp").unwrap();
+        assert!(super::apply_build_cache(plain, None)
+            .build_cache()
+            .is_none());
+        let plain = runtime_docker::DockerRuntime::connect_with_state_root(None, "/tmp").unwrap();
+        let configured = super::apply_build_cache(plain, Some(&(root.clone(), 40)));
+        assert_eq!(configured.build_cache(), Some((root.as_path(), 40)));
     }
 }
