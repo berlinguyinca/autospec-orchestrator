@@ -12,7 +12,7 @@ use orchestrator_persistence::{CleanupDisposition, StoreError};
 use serde::Deserialize;
 
 use crate::{
-    auth::{authorize_api, authorize_api_or_worker, authorize_worker},
+    auth::{authorize_api, authorize_api_or_worker, authorize_worker, Caller, WorkerIdentity},
     error::ApiError,
     state::AppState,
 };
@@ -54,6 +54,19 @@ impl AppState {
     }
 }
 
+/// A per-worker token speaks for its own worker only (spec section 5 R-ORCH).
+/// The legacy shared token (`Any`) and the API token keep their old reach.
+fn require_identity(identity: &WorkerIdentity, id: &WorkerId) -> Result<(), ApiError> {
+    match identity {
+        WorkerIdentity::Worker(own) if own != id => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "WORKER_IDENTITY_MISMATCH",
+            "the worker token was not issued to this worker",
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/workers", get(list).post(register))
@@ -75,7 +88,7 @@ async fn request_cleanup(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    authorize_api_or_worker(&state, &headers)?;
+    let caller = authorize_api_or_worker(&state, &headers)?;
     let cleanup = state.cleanup_authorities.as_ref().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -85,6 +98,9 @@ async fn request_cleanup(
     })?;
     let execution_id = ExecutionId::new(id);
     let authority = cleanup.get(&execution_id).await.map_err(ApiError::store)?;
+    if let Caller::Worker(identity) = &caller {
+        require_identity(identity, &authority.worker_id)?;
+    }
     match authority.disposition().map_err(ApiError::store)? {
         CleanupDisposition::Active(_) | CleanupDisposition::RetainRequested => Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -131,8 +147,9 @@ async fn register(
     headers: HeaderMap,
     payload: Result<Json<WorkerAdvertisement>, JsonRejection>,
 ) -> Result<(StatusCode, Json<WorkerRegistration>), ApiError> {
-    authorize_worker(&state, &headers)?;
+    let identity = authorize_worker(&state, &headers)?;
     let Json(advertisement) = decode_payload(payload)?;
+    require_identity(&identity, &advertisement.id)?;
     let mut worker = WorkerRegistration {
         id: advertisement.id,
         capabilities: advertisement.capabilities,
@@ -174,8 +191,9 @@ async fn heartbeat(
     headers: HeaderMap,
     payload: Result<Json<WorkerAdvertisement>, JsonRejection>,
 ) -> Result<Json<WorkerRegistration>, ApiError> {
-    authorize_worker(&state, &headers)?;
+    let identity = authorize_worker(&state, &headers)?;
     let Json(advertisement) = decode_payload(payload)?;
+    require_identity(&identity, &advertisement.id)?;
     if advertisement.id.as_str() != id {
         return Err(ApiError::validation(
             "worker id does not match heartbeat path",

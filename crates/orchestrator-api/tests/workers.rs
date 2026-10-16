@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use orchestrator_api::{router, AppState};
+use orchestrator_api::{router, AppState, PerWorkerTokens};
 use orchestrator_core::{
     ExecutionId, RuntimeKind, WorkerCapabilities, WorkerCapabilityProof, WorkerId,
     WorkerRegistration, WorkerState,
@@ -10,6 +10,7 @@ use orchestrator_persistence::{
     PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore, PgWorkerStore,
     WorkerStore,
 };
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -795,4 +796,295 @@ async fn app_state(
         "api-secret".into(),
         worker_token,
     )
+}
+
+fn digest_hex(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+struct IdentityFixture {
+    base: String,
+    client: reqwest::Client,
+    w1: String,
+    w2: String,
+    t1: String,
+    t2: String,
+    shared: String,
+    cleanup: Arc<PgCleanupAuthorityStore>,
+}
+
+/// A real router whose worker auth is per-worker tokens only.
+async fn identity_fixture(
+    per_worker: bool,
+) -> Option<(IdentityFixture, DisposableTestDatabaseLock)> {
+    let database_url = std::env::var("AUTOSPEC_DATABASE_URL").ok()?;
+    let lock = DisposableTestDatabaseLock::acquire(&database_url)
+        .await
+        .unwrap();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let (w1, w2) = (format!("ident-w1-{nonce}"), format!("ident-w2-{nonce}"));
+    let (t1, t2) = (format!("tok1-{nonce}"), format!("tok2-{nonce}"));
+    let shared = format!("shared-{nonce}");
+    let workers = Arc::new(PgWorkerStore::connect(&database_url).await.unwrap());
+    let reservations = Arc::new(PgReservationStore::connect(&database_url).await.unwrap());
+    let cleanup = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
+    let mut state = app_state(&database_url, workers, reservations, shared.clone())
+        .await
+        .with_cleanup_authorities(cleanup.clone());
+    if per_worker {
+        let file = format!(
+            "# test identities\n{w1} {}\n{w2} {}\n",
+            digest_hex(&t1),
+            digest_hex(&t2)
+        );
+        state = state.with_worker_tokens(PerWorkerTokens::parse(&file).unwrap());
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+    Some((
+        IdentityFixture {
+            base: format!("http://{address}/api/v1"),
+            client: reqwest::Client::new(),
+            w1,
+            w2,
+            t1,
+            t2,
+            shared,
+            cleanup,
+        },
+        lock,
+    ))
+}
+
+async fn retained_execution_owned_by(
+    cleanup: &PgCleanupAuthorityStore,
+    owner: &str,
+) -> ExecutionId {
+    let execution_id = ExecutionId::new(format!("ident-exec-{}", uuid::Uuid::new_v4().simple()));
+    cleanup
+        .begin(
+            &execution_id,
+            &orchestrator_core::AttemptId::new(format!(
+                "attempt-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &WorkerId::new(owner),
+        )
+        .await
+        .unwrap();
+    let handles = serde_json::json!({"session": "durable"});
+    let path = [
+        CleanupDisposition::Active(CleanupStage::Reserved),
+        CleanupDisposition::Active(CleanupStage::Storage),
+        CleanupDisposition::Active(CleanupStage::Worktree),
+        CleanupDisposition::Active(CleanupStage::Runtime),
+        CleanupDisposition::Active(CleanupStage::PiStarted),
+        CleanupDisposition::Active(CleanupStage::Running),
+        CleanupDisposition::Active(CleanupStage::PostPiBeforeEvent),
+        CleanupDisposition::RetainRequested,
+        CleanupDisposition::Retained,
+    ];
+    for pair in path.windows(2) {
+        cleanup
+            .transition(&execution_id, pair[0], pair[1], &handles)
+            .await
+            .unwrap();
+    }
+    execution_id
+}
+
+#[tokio::test]
+async fn identity_a_worker_token_cannot_register_or_heartbeat_for_another_worker() {
+    let Some((f, _lock)) = identity_fixture(true).await else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
+        return;
+    };
+    let register = |token: &str, id: &str| {
+        f.client
+            .post(format!("{}/workers", f.base))
+            .bearer_auth(token)
+            .json(&registration(id))
+            .send()
+    };
+    let heartbeat = |token: &str, path_id: &str, body_id: &str| {
+        f.client
+            .post(format!("{}/workers/{path_id}/heartbeat", f.base))
+            .bearer_auth(token)
+            .json(&registration(body_id))
+            .send()
+    };
+
+    // w1's token cannot register w2, and nothing is written for w2.
+    let denied = register(&f.t1, &f.w2).await.unwrap();
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = denied.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "WORKER_IDENTITY_MISMATCH", "{body}");
+    assert!(!body.to_string().contains(&f.t1));
+    let listed: serde_json::Value = f
+        .client
+        .get(format!("{}/workers", f.base))
+        .bearer_auth("api-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !listed.to_string().contains(&f.w2),
+        "w2 was never registered"
+    );
+
+    // Each token registers and heartbeats its own worker.
+    assert_eq!(
+        register(&f.t1, &f.w1).await.unwrap().status(),
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(
+        register(&f.t2, &f.w2).await.unwrap().status(),
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(
+        heartbeat(&f.t1, &f.w1, &f.w1).await.unwrap().status(),
+        reqwest::StatusCode::OK
+    );
+
+    // A worker token on another worker's heartbeat route is refused, however the ids line up.
+    for (path_id, body_id, expected) in [
+        (&f.w2, &f.w2, reqwest::StatusCode::FORBIDDEN),
+        (&f.w1, &f.w2, reqwest::StatusCode::FORBIDDEN),
+        (&f.w2, &f.w1, reqwest::StatusCode::BAD_REQUEST),
+    ] {
+        let status = heartbeat(&f.t1, path_id, body_id).await.unwrap().status();
+        assert_eq!(status, expected, "path {path_id} body {body_id}");
+    }
+    assert_eq!(
+        heartbeat(&f.t1, &f.w2, &f.w2).await.unwrap().status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    // The shared token no longer works at all once per-worker tokens are loaded.
+    assert_eq!(
+        register(&f.shared, &f.w1).await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        register("not-a-token", &f.w1).await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn identity_a_worker_token_cannot_clean_up_another_workers_execution() {
+    let Some((f, _lock)) = identity_fixture(true).await else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
+        return;
+    };
+    let owned_by_w2 = retained_execution_owned_by(&f.cleanup, &f.w2).await;
+    let url = |id: &ExecutionId| format!("{}/executions/{id}/cleanup", f.base);
+
+    let denied = f
+        .client
+        .post(url(&owned_by_w2))
+        .bearer_auth(&f.t1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = denied.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "WORKER_IDENTITY_MISMATCH", "{body}");
+    assert_eq!(
+        f.cleanup
+            .get(&owned_by_w2)
+            .await
+            .unwrap()
+            .disposition()
+            .unwrap(),
+        CleanupDisposition::Retained,
+        "a refused request leaves the authority untouched"
+    );
+
+    // The owner's own token, and the API token, still request cleanup.
+    let owned_by_w1 = retained_execution_owned_by(&f.cleanup, &f.w1).await;
+    assert_eq!(
+        f.client
+            .post(url(&owned_by_w1))
+            .bearer_auth(&f.t1)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        f.client
+            .post(url(&owned_by_w2))
+            .bearer_auth("api-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        f.cleanup
+            .get(&owned_by_w2)
+            .await
+            .unwrap()
+            .disposition()
+            .unwrap(),
+        CleanupDisposition::CleanupPending
+    );
+}
+
+#[tokio::test]
+async fn identity_the_legacy_shared_token_still_speaks_for_every_worker() {
+    let Some((f, _lock)) = identity_fixture(false).await else {
+        eprintln!("SKIP: AUTOSPEC_DATABASE_URL is required for real worker API test");
+        return;
+    };
+    for id in [&f.w2, &f.w1] {
+        let response = f
+            .client
+            .post(format!("{}/workers", f.base))
+            .bearer_auth(&f.shared)
+            .json(&registration(id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    }
+    let owned_by_w2 = retained_execution_owned_by(&f.cleanup, &f.w2).await;
+    assert_eq!(
+        f.client
+            .post(format!("{}/executions/{owned_by_w2}/cleanup", f.base))
+            .bearer_auth(&f.shared)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::ACCEPTED
+    );
+    // Per-worker tokens are not in play: they do not authenticate.
+    assert_eq!(
+        f.client
+            .post(format!("{}/workers", f.base))
+            .bearer_auth(&f.t1)
+            .json(&registration(&f.w1))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 }
