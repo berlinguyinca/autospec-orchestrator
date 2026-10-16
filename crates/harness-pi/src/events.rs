@@ -1,6 +1,7 @@
 use crate::{
     session::{
-        atomic_write, events_path, io_error, open_real_file_read, read_real_file, CURSOR_FILE,
+        atomic_write, events_path, io_error, open_real_file_read, read_real_file,
+        session_process_exited, CURSOR_FILE,
     },
     PiHarness,
 };
@@ -74,25 +75,32 @@ pub(crate) fn poll_events(
             "cursor path does not exactly match the session live-event file".to_owned(),
         ));
     }
-    if !cursor.path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut file = open_real_file_read(&cursor.path)?;
-    let length = file.metadata().map_err(io_error)?.len();
-    if cursor.offset > length {
-        return Err(HarnessError::InvalidSession(format!(
-            "cursor {} exceeds JSONL length {length}",
-            cursor.offset
-        )));
-    }
-    file.seek(SeekFrom::Start(cursor.offset))
-        .map_err(io_error)?;
+    // Sample liveness BEFORE reading: a process seen exited here has written
+    // everything it ever will, so the read below cannot miss a final record
+    // that lands between the two steps.
+    let exited = session_process_exited(harness, session)?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(io_error)?;
-    let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
-        return Ok(Vec::new());
+    if cursor.path.exists() {
+        let mut file = open_real_file_read(&cursor.path)?;
+        let length = file.metadata().map_err(io_error)?.len();
+        if cursor.offset > length {
+            return Err(HarnessError::InvalidSession(format!(
+                "cursor {} exceeds JSONL length {length}",
+                cursor.offset
+            )));
+        }
+        file.seek(SeekFrom::Start(cursor.offset))
+            .map_err(io_error)?;
+        file.read_to_end(&mut bytes).map_err(io_error)?;
+    }
+    let complete: &[u8] = match bytes.iter().rposition(|byte| *byte == b'\n') {
+        Some(last_newline) => &bytes[..=last_newline],
+        None => &[],
     };
-    let complete = &bytes[..=last_newline];
+    let process_gone = exited && cursor.reducer.terminal == TerminalState::Active;
+    if complete.is_empty() && !process_gone {
+        return Ok(Vec::new());
+    }
     let mut events = Vec::new();
     let mut unknown = 0_u64;
     for line in complete
@@ -116,6 +124,13 @@ pub(crate) fn poll_events(
         }
     }
     cursor.offset += complete.len() as u64;
+    if process_gone && cursor.reducer.terminal == TerminalState::Active {
+        // Pi is gone and never wrote a terminal record: free the slot now
+        // instead of waiting for the inactivity timer.
+        if let Normalized::Event(event) = harness_failed(session, &mut cursor.reducer) {
+            events.push(event);
+        }
+    }
     let serialized =
         serde_json::to_vec(&cursors).map_err(|error| HarnessError::Io(error.to_string()))?;
     atomic_write(&cursor_path, &serialized)?;

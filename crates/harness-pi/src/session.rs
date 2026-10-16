@@ -650,6 +650,30 @@ pub(crate) async fn stop(harness: &PiHarness, session: &SessionRef) -> Result<()
     )))
 }
 
+/// Whether the Pi process registered for `session` has exited and left no live
+/// process in its container group. The exit status is never consulted: Pi exits
+/// 0 after a provider failure and exits 1 before writing any session file, so
+/// the code is not evidence of success or failure (spec s3, R-WATCH).
+///
+/// `false` when this harness instance holds no process for the session (for
+/// example after a worker restart); the caller then falls back to its timers.
+pub(crate) fn session_process_exited(
+    harness: &PiHarness,
+    session: &SessionRef,
+) -> Result<bool, HarnessError> {
+    let process = harness
+        .processes
+        .children
+        .lock()
+        .map_err(|_| HarnessError::Crashed("process registry lock poisoned".to_owned()))?
+        .get(session.id.as_str())
+        .cloned();
+    match process {
+        Some(process) => process_reaped(harness, &process),
+        None => Ok(false),
+    }
+}
+
 fn process_reaped(harness: &PiHarness, process: &ManagedProcess) -> Result<bool, HarnessError> {
     let child_exited = process
         .child
