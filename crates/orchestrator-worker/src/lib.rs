@@ -111,6 +111,18 @@ pub trait ExecutionLifecycle: Send + Sync {
         session: &SessionRef,
     ) -> Result<Vec<ExecutionEvent>, LifecycleError>;
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError>;
+    /// One watchdog probe (spec section 5 R-WATCH (a)). The default wraps
+    /// `cpu_percent` with every other measurement unknown, so lifecycles that
+    /// only know CPU keep working; the Docker lifecycle overrides it.
+    async fn resource_sample(
+        &self,
+        execution: &Execution,
+    ) -> Result<ResourceSample, LifecycleError> {
+        Ok(ResourceSample {
+            cpu_percent: self.cpu_percent(execution).await?,
+            ..ResourceSample::default()
+        })
+    }
     async fn stop(&self, execution: &Execution, session: &SessionRef)
         -> Result<(), LifecycleError>;
     async fn capture(&self, worktree: &Worktree) -> Result<DiffCapture, LifecycleError>;

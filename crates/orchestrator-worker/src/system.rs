@@ -1,4 +1,4 @@
-use crate::{AdoptedExecution, ExecutionLifecycle, LifecycleError};
+use crate::{AdoptedExecution, ExecutionLifecycle, LifecycleError, ResourceSample};
 use async_trait::async_trait;
 use execution_storage::{
     AllocationPhase, AllocationReceipt, AllocationRequest, ExecutionLayout,
@@ -52,6 +52,16 @@ pub trait RuntimeFactory: Send + Sync {
         receipt: &AllocationReceipt,
     ) -> Result<Arc<dyn Runtime>, LifecycleError>;
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError>;
+    /// Default wraps `cpu_percent`; the Docker factory measures the rest.
+    async fn resource_sample(
+        &self,
+        execution: &Execution,
+    ) -> Result<ResourceSample, LifecycleError> {
+        Ok(ResourceSample {
+            cpu_percent: self.cpu_percent(execution).await?,
+            ..ResourceSample::default()
+        })
+    }
     async fn revoke_credentials(&self, execution_id: &ExecutionId) -> Result<(), LifecycleError>;
 }
 
@@ -263,6 +273,20 @@ impl RuntimeFactory for VerifiedDockerRuntimeFactory {
                 .trim_end_matches('%')
                 .parse::<f64>()
                 .map_err(|error| LifecycleError::Step(error.to_string()))
+        })
+        .await
+        .map_err(|error| LifecycleError::Step(error.to_string()))?
+    }
+
+    async fn resource_sample(
+        &self,
+        execution: &Execution,
+    ) -> Result<ResourceSample, LifecycleError> {
+        let docker = self.docker_binary.clone();
+        let socket = self.socket.clone();
+        let container = DockerRuntime::agent_container_name(&execution.id);
+        tokio::task::spawn_blocking(move || {
+            probe_resource_sample(&docker, socket.as_deref(), &container)
         })
         .await
         .map_err(|error| LifecycleError::Step(error.to_string()))?
@@ -1002,6 +1026,138 @@ fn docker_container_id(
     Ok(id)
 }
 
+const CURRENT_COMMAND_MAX_CHARS: usize = 200;
+
+/// One blocking probe of the agent container: `docker stats` for CPU, RSS and
+/// block I/O (a failure is an error, never a zero counter) and `docker top`
+/// for the current command (best effort: `None` when it cannot be read).
+fn probe_resource_sample(
+    docker: &Path,
+    socket: Option<&str>,
+    container: &str,
+) -> Result<ResourceSample, LifecycleError> {
+    let output = docker_command(docker, socket)
+        .args(["stats", "--no-stream", "--format", "{{json .}}", container])
+        .output()
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    if !output.status.success() {
+        return Err(LifecycleError::Step(format!(
+            "Docker stats probe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let line = String::from_utf8(output.stdout)
+        .map_err(|error| LifecycleError::Step(error.to_string()))?;
+    let mut sample = parse_stats(line.trim())?;
+    sample.current_command = docker_command(docker, socket)
+        .args(["top", container, "-eo", "pid,args"])
+        .output()
+        .ok()
+        .filter(|top| top.status.success())
+        .and_then(|top| parse_top_command(&String::from_utf8_lossy(&top.stdout)));
+    Ok(sample)
+}
+
+#[derive(Deserialize)]
+struct DockerStatsLine {
+    #[serde(rename = "CPUPerc")]
+    cpu_perc: Option<String>,
+    #[serde(rename = "MemUsage")]
+    mem_usage: Option<String>,
+    #[serde(rename = "BlockIO")]
+    block_io: Option<String>,
+}
+
+/// Parses one `docker stats --no-stream --format '{{json .}}'` line. Any
+/// missing or malformed CPU or block-I/O field is an error: a probe failure
+/// must never look like a flat counter.
+fn parse_stats(json: &str) -> Result<ResourceSample, LifecycleError> {
+    let invalid = |what: String| LifecycleError::Step(format!("Docker stats: {what}"));
+    let line: DockerStatsLine =
+        serde_json::from_str(json).map_err(|error| invalid(format!("invalid JSON: {error}")))?;
+    let cpu = line
+        .cpu_perc
+        .ok_or_else(|| invalid("missing CPUPerc".into()))?;
+    let cpu_percent = cpu
+        .trim()
+        .trim_end_matches('%')
+        .parse::<f64>()
+        .map_err(|error| invalid(format!("CPUPerc {cpu:?}: {error}")))?;
+    let block_io = line
+        .block_io
+        .ok_or_else(|| invalid("missing BlockIO".into()))?;
+    let io_bytes = block_io
+        .split('/')
+        .map(|part| parse_size(part).ok_or_else(|| invalid(format!("BlockIO {block_io:?}"))))
+        .sum::<Result<u64, _>>()?;
+    if block_io.split('/').count() != 2 {
+        return Err(invalid(format!("BlockIO {block_io:?}")));
+    }
+    let rss_bytes = match line.mem_usage {
+        None => None,
+        Some(usage) => {
+            let used = usage.split('/').next().unwrap_or_default();
+            Some(parse_size(used).ok_or_else(|| invalid(format!("MemUsage {usage:?}")))?)
+        }
+    };
+    Ok(ResourceSample {
+        cpu_percent,
+        io_bytes: Some(io_bytes),
+        rss_bytes,
+        current_command: None,
+    })
+}
+
+/// Docker prints sizes as `12.3MB` (decimal, block I/O) or `10.5MiB`
+/// (binary, memory).
+fn parse_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let split = text.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+    let (number, unit) = text.split_at(split);
+    let multiplier: f64 = match unit {
+        "B" => 1.0,
+        "kB" | "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    let value = number.parse::<f64>().ok()?;
+    (value.is_finite() && value >= 0.0).then(|| (value * multiplier).round() as u64)
+}
+
+/// The newest process (highest pid) of `docker top ... -eo pid,args`,
+/// truncated to 200 characters.
+fn parse_top_command(output: &str) -> Option<String> {
+    output
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid, args) = line.split_once(char::is_whitespace)?;
+            Some((pid.parse::<u64>().ok()?, args.trim()))
+        })
+        .filter(|(_, args)| !args.is_empty())
+        .max_by_key(|(pid, _)| *pid)
+        .map(|(_, args)| args.chars().take(CURRENT_COMMAND_MAX_CHARS).collect())
+}
+
+/// Drops a sampled command line that `is_secret` flags; the numeric counters
+/// carry no secret and stay.
+fn scrub_current_command(sample: &mut ResourceSample, is_secret: impl Fn(&[u8]) -> bool) {
+    if sample
+        .current_command
+        .as_ref()
+        .is_some_and(|command| is_secret(command.as_bytes()))
+    {
+        sample.current_command = None;
+    }
+}
+
 fn docker_command(binary: &Path, socket: Option<&str>) -> Command {
     let mut command = Command::new(binary);
     if let Some(socket) = socket {
@@ -1191,6 +1347,20 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
 
     async fn cpu_percent(&self, execution: &Execution) -> Result<f64, LifecycleError> {
         self.runtimes.cpu_percent(execution).await
+    }
+
+    /// The sampled command line is observed output of the agent: one that
+    /// contains the execution's credential is dropped, not reported (the
+    /// numeric counters carry no secret and stay).
+    async fn resource_sample(
+        &self,
+        execution: &Execution,
+    ) -> Result<ResourceSample, LifecycleError> {
+        let mut sample = self.runtimes.resource_sample(execution).await?;
+        scrub_current_command(&mut sample, |bytes| {
+            self.reject_secret(&execution.id, bytes).is_err()
+        });
+        Ok(sample)
     }
 
     async fn stop(
@@ -1890,7 +2060,10 @@ impl ExecutionLifecycle for SystemExecutionLifecycle {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_build_cache_role, persist_evidence_file};
+    use super::{
+        check_build_cache_role, parse_size, parse_stats, parse_top_command, persist_evidence_file,
+        probe_resource_sample, scrub_current_command,
+    };
     use orchestrator_core::{Role, RuntimeRequirement};
     use runtime_traits::build_cache::BUILD_CACHE_CAPABILITY;
 
@@ -1951,5 +2124,172 @@ mod tests {
         let plain = runtime_docker::DockerRuntime::connect_with_state_root(None, "/tmp").unwrap();
         let configured = super::apply_build_cache(plain, Some(&(root.clone(), 40)));
         assert_eq!(configured.build_cache(), Some((root.as_path(), 40)));
+    }
+
+    #[test]
+    fn a_command_containing_the_credential_is_dropped_but_counters_stay() {
+        let mut sample = crate::ResourceSample {
+            cpu_percent: 3.0,
+            io_bytes: Some(9),
+            current_command: Some("curl -H token=SECRET-TOKEN-VALUE".into()),
+            ..Default::default()
+        };
+        scrub_current_command(&mut sample, |bytes| {
+            super::contains_bytes(bytes, b"SECRET-TOKEN-VALUE")
+        });
+        assert_eq!(sample.current_command, None);
+        assert_eq!(sample.io_bytes, Some(9));
+        let mut clean = crate::ResourceSample {
+            current_command: Some("cargo test".into()),
+            ..Default::default()
+        };
+        scrub_current_command(&mut clean, |bytes| {
+            super::contains_bytes(bytes, b"SECRET-TOKEN-VALUE")
+        });
+        assert_eq!(clean.current_command.as_deref(), Some("cargo test"));
+    }
+
+    const STATS_LINE: &str = r#"{"BlockIO":"1.5MB / 500kB","CPUPerc":"12.50%","Container":"c","ID":"x","MemPerc":"0.5%","MemUsage":"10.5MiB / 1.9GiB","Name":"c","NetIO":"0B / 0B","PIDs":"3"}"#;
+
+    #[test]
+    fn parse_stats_sums_block_io_read_and_write() {
+        assert_eq!(parse_stats(STATS_LINE).unwrap().io_bytes, Some(2_000_000));
+    }
+
+    #[test]
+    fn parse_stats_reads_cpu_percent_and_the_first_memory_term() {
+        let sample = parse_stats(STATS_LINE).unwrap();
+        assert_eq!(sample.cpu_percent, 12.5);
+        assert_eq!(sample.rss_bytes, Some(11_010_048));
+        assert_eq!(sample.current_command, None);
+    }
+
+    #[test]
+    fn parse_stats_without_block_io_is_an_error_not_a_zero_counter() {
+        let line = r#"{"CPUPerc":"1.00%","MemUsage":"1MiB / 2GiB"}"#;
+        assert!(parse_stats(line).is_err());
+    }
+
+    #[test]
+    fn parse_stats_rejects_malformed_fields() {
+        for line in [
+            "not json",
+            r#"{"CPUPerc":"abc","BlockIO":"0B / 0B"}"#,
+            r#"{"CPUPerc":"1%","BlockIO":"12 / 0B"}"#,
+            r#"{"CPUPerc":"1%","BlockIO":"1MB"}"#,
+            r#"{"CPUPerc":"1%","BlockIO":"1QB / 0B"}"#,
+            r#"{"BlockIO":"0B / 0B"}"#,
+            r#"{"CPUPerc":"1%","BlockIO":"0B / 0B","MemUsage":"x / y"}"#,
+        ] {
+            assert!(parse_stats(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn parse_size_knows_decimal_and_binary_units() {
+        assert_eq!(parse_size("0B"), Some(0));
+        assert_eq!(parse_size("500kB"), Some(500_000));
+        assert_eq!(parse_size("12.3MB"), Some(12_300_000));
+        assert_eq!(parse_size("2GiB"), Some(2_147_483_648));
+        assert_eq!(parse_size("5"), None);
+    }
+
+    #[test]
+    fn current_command_is_the_newest_process_truncated_to_200_chars() {
+        let long = "x".repeat(300);
+        let top = format!("PID   COMMAND\n10    sh -c loop\n  42    {long}\n7     init\n");
+        let command = parse_top_command(&top).unwrap();
+        assert_eq!(command.chars().count(), 200);
+        assert!(command.starts_with("xxx"));
+        assert_eq!(parse_top_command("PID COMMAND\n"), None);
+    }
+
+    fn docker_available() -> bool {
+        std::process::Command::new("docker")
+            .args(["version", "--format", "{{.Server.Version}}"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    struct TestContainer(String);
+
+    impl Drop for TestContainer {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
+
+    /// Real-daemon check of the actual probe. Returns early without Docker
+    /// (GitHub Actions has no daemon); the operator runs it on a Docker host.
+    #[test]
+    fn live_probe_sees_block_io_advance_and_the_current_command() {
+        if !docker_available() {
+            return;
+        }
+        let name = format!("autospec-resource-sample-test-{}", std::process::id());
+        let started = std::process::Command::new("docker")
+            .args([
+                "run", "-d", "--name", &name, "--label", "autospec.test=resource-sample",
+                "alpine:latest", "sh", "-c",
+                "while true; do dd if=/dev/zero of=/tmp/f bs=1M count=64 oflag=direct conv=fsync 2>/dev/null; sleep 1; done",
+            ])
+            .output()
+            .unwrap();
+        if !started.status.success() {
+            // Image not present and no network: nothing to probe.
+            return;
+        }
+        let _guard = TestContainer(name.clone());
+        let docker = std::path::Path::new("docker");
+        let first = probe_resource_sample(docker, None, &name).unwrap();
+        assert!(first.io_bytes.is_some(), "stats must report block I/O");
+        // The cgroup block-I/O counter does not move for filesystem writes on
+        // the ZFS or fuse-overlayfs storage drivers or under rootless Docker
+        // (observed), so the advance is only asserted on a rootful block-device
+        // driver.
+        if docker_block_io_is_accounted() {
+            let mut second = first.clone();
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                second = probe_resource_sample(docker, None, &name).unwrap();
+                if second.io_bytes > first.io_bytes {
+                    break;
+                }
+            }
+            assert!(
+                second.io_bytes > first.io_bytes,
+                "block I/O must advance: {first:?} -> {second:?}"
+            );
+        }
+        let last = probe_resource_sample(docker, None, &name).unwrap();
+        assert!(last.rss_bytes.is_some_and(|rss| rss > 0));
+        assert!(last.cpu_percent >= 0.0);
+        assert!(last
+            .current_command
+            .is_some_and(|command| !command.is_empty()));
+    }
+
+    fn docker_block_io_is_accounted() -> bool {
+        let info = std::process::Command::new("docker")
+            .args(["info", "--format", "{{.Driver}} {{.SecurityOptions}}"])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        info.starts_with("overlay2") && !info.contains("rootless")
+    }
+
+    #[test]
+    fn probing_a_missing_container_is_an_error_not_a_flat_counter() {
+        if !docker_available() {
+            return;
+        }
+        let result = probe_resource_sample(
+            std::path::Path::new("docker"),
+            None,
+            "autospec-no-such-container-for-resource-sample",
+        );
+        assert!(result.is_err());
     }
 }
