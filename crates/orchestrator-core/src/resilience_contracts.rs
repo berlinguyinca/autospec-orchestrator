@@ -241,6 +241,7 @@ pub fn resilience_lifecycle(kind: &ExecutionEventKind) -> Option<ResilienceLifec
         TestsStarted => None,
         TestsFailed => None,
         ConversationForked { .. } => None,
+        WatchdogSample { .. } => None,
     }
 }
 

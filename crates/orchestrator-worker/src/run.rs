@@ -5,8 +5,9 @@ use crate::{
 use chrono::Utc;
 use futures_util::FutureExt;
 use orchestrator_core::{
-    event::ExecutionEventKind, Execution, ExecutionControlAction, ExecutionEvent, ExecutionResult,
-    ExecutionState, FailureClass, PersistenceMode, Role,
+    event::{ExecutionEventKind, WatchdogVerdict},
+    Execution, ExecutionControlAction, ExecutionEvent, ExecutionResult, ExecutionState,
+    FailureClass, PersistenceMode, Role,
 };
 use orchestrator_persistence::{CleanupDisposition, CleanupStage, PendingExecutionControl};
 use std::{
@@ -565,6 +566,7 @@ async fn drive_running(
 ) -> Result<ExecutionResult, WorkerError> {
     let started_at = Instant::now();
     let mut health = HealthMonitor::default_at(started_at);
+    let mut throttle = SampleThrottle::default();
     if execution.state == ExecutionState::PausedForHuman {
         // An adopted human pause begins paused at the monitor's epoch; no wall
         // or inactivity time may accrue between process start and adoption.
@@ -623,7 +625,36 @@ async fn drive_running(
             }
             () = cancellation_signal(cancelled) => return Err(WorkerError::Cancelled),
         };
-        match health.assess(Instant::now(), &sample) {
+        let assessment = health.assess(Instant::now(), &sample);
+        let verdict = verdict_of(&assessment);
+        let now = Instant::now();
+        if throttle.is_due(now, verdict) {
+            // The monitor tracks progress on the monotonic clock; render the
+            // last progress as a wall-clock instant relative to now.
+            let last_progress_at = Some(
+                Utc::now()
+                    - chrono::Duration::from_std(
+                        now.saturating_duration_since(health.last_progress_at()),
+                    )
+                    .unwrap_or_default(),
+            );
+            record(
+                worker,
+                execution,
+                ExecutionEventKind::WatchdogSample {
+                    verdict,
+                    current_command: sample.current_command.clone(),
+                    last_progress_at,
+                    cpu_percent: Some(sample.cpu_percent),
+                    rss_bytes: sample.rss_bytes,
+                    io_bytes: sample.io_bytes,
+                    disk_bytes: sample.disk_bytes,
+                },
+            )
+            .await?;
+            throttle.mark_emitted(now, verdict);
+        }
+        match assessment {
             HealthAssessment::Healthy => {}
             HealthAssessment::QuietHealthy { quiet_seconds } => {
                 tracing::debug!(
@@ -1032,6 +1063,43 @@ async fn persist_failure(
     Ok(())
 }
 
+/// The watchdog verdict for an assessment: a quiet-but-advancing execution is
+/// `quiet_healthy`, an inactivity warning is still `healthy` (not yet stalled),
+/// and a failed assessment is `stalled`.
+fn verdict_of(assessment: &HealthAssessment) -> WatchdogVerdict {
+    match assessment {
+        HealthAssessment::Healthy => WatchdogVerdict::Healthy,
+        HealthAssessment::QuietHealthy { .. } => WatchdogVerdict::QuietHealthy,
+        HealthAssessment::InactiveWarning { .. } => WatchdogVerdict::Healthy,
+        HealthAssessment::Failed(_) => WatchdogVerdict::Stalled,
+    }
+}
+
+/// Throttles watchdog sample emission (spec section 95): at most one per 60s,
+/// but always immediately when the verdict changes.
+#[derive(Debug, Default)]
+struct SampleThrottle {
+    last_emitted_at: Option<Instant>,
+    last_verdict: Option<WatchdogVerdict>,
+}
+
+impl SampleThrottle {
+    /// A sample is due when none has been emitted yet, the verdict changed
+    /// since the last one, or at least 60s have elapsed since the last.
+    fn is_due(&self, now: Instant, verdict: WatchdogVerdict) -> bool {
+        self.last_emitted_at.is_none()
+            || self.last_verdict != Some(verdict)
+            || self
+                .last_emitted_at
+                .is_some_and(|last| now >= last + Duration::from_secs(60))
+    }
+
+    fn mark_emitted(&mut self, now: Instant, verdict: WatchdogVerdict) {
+        self.last_emitted_at = Some(now);
+        self.last_verdict = Some(verdict);
+    }
+}
+
 async fn record(
     worker: &Worker,
     execution: &Execution,
@@ -1062,5 +1130,59 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
         message.clone()
     } else {
         "non-string panic".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    #[test]
+    fn first_sample_is_due_and_not_repeated_within_60s() {
+        let mut throttle = SampleThrottle::default();
+        let t0 = Instant::now();
+        // Never emitted → due.
+        assert!(throttle.is_due(t0, WatchdogVerdict::Healthy));
+        throttle.mark_emitted(t0, WatchdogVerdict::Healthy);
+        // Same verdict within 60s → not due.
+        assert!(!throttle.is_due(t0 + Duration::from_secs(59), WatchdogVerdict::Healthy));
+    }
+
+    #[test]
+    fn sample_is_due_again_after_60s() {
+        let mut throttle = SampleThrottle::default();
+        let t0 = Instant::now();
+        throttle.mark_emitted(t0, WatchdogVerdict::Healthy);
+        // 60s elapsed with the same verdict → due.
+        assert!(throttle.is_due(t0 + Duration::from_secs(60), WatchdogVerdict::Healthy));
+    }
+
+    #[test]
+    fn sample_is_due_immediately_when_the_verdict_changes() {
+        let mut throttle = SampleThrottle::default();
+        let t0 = Instant::now();
+        throttle.mark_emitted(t0, WatchdogVerdict::Healthy);
+        // A verdict change is due immediately, even well within 60s.
+        assert!(throttle.is_due(t0 + Duration::from_secs(1), WatchdogVerdict::Stalled));
+    }
+
+    #[test]
+    fn verdict_of_maps_assessments_to_watchdog_verdicts() {
+        assert_eq!(
+            verdict_of(&HealthAssessment::Healthy),
+            WatchdogVerdict::Healthy
+        );
+        assert_eq!(
+            verdict_of(&HealthAssessment::QuietHealthy { quiet_seconds: 10 }),
+            WatchdogVerdict::QuietHealthy
+        );
+        assert_eq!(
+            verdict_of(&HealthAssessment::InactiveWarning { seconds: 450 }),
+            WatchdogVerdict::Healthy
+        );
+        assert_eq!(
+            verdict_of(&HealthAssessment::Failed(FailureClass::Inactivity)),
+            WatchdogVerdict::Stalled
+        );
     }
 }

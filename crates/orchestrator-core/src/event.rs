@@ -35,6 +35,33 @@ pub enum ExecutionEventKind {
     ConversationForked {
         session_id: SessionId,
     },
+    /// A periodic watchdog sample for a running execution (spec section 95).
+    /// Optional fields are absent when the probe could not measure them; an
+    /// unknown value is omitted, never a zero or empty placeholder.
+    WatchdogSample {
+        verdict: WatchdogVerdict,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_progress_at: Option<DateTime<Utc>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cpu_percent: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rss_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        io_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disk_bytes: Option<u64>,
+    },
+}
+
+/// Watchdog verdict for a running execution (spec section 95).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchdogVerdict {
+    Healthy,
+    QuietHealthy,
+    Stalled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

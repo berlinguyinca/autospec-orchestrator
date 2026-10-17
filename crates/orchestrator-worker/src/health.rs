@@ -92,6 +92,12 @@ impl HealthMonitor {
         self.warned_for_event_window = false;
     }
 
+    /// Monotonic time of the last observed progress (I/O counter rising). The
+    /// caller converts it to a wall-clock instant relative to `now`.
+    pub fn last_progress_at(&self) -> Instant {
+        self.last_progress_at
+    }
+
     pub fn pause(&mut self, at: Instant) {
         if self.paused_at.is_none() {
             self.paused_at = Some(at);
