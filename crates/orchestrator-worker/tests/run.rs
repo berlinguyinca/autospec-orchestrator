@@ -1952,6 +1952,60 @@ async fn docker_factory_resource_sample_measures_the_agent_container() {
         .is_some_and(|c| c.contains("sleep")));
 }
 
+/// The worker emits a throttled watchdog sample while an execution runs, and
+/// the serialized sample carries exactly the T08 watchdog field set: `verdict`,
+/// `current_command`, `last_progress_at`, `cpu_percent`, `rss_bytes`,
+/// `io_bytes`, `disk_bytes`. Unmeasured fields are omitted, never a zero or
+/// empty placeholder.
+#[tokio::test]
+async fn watchdog_sample_is_emitted_with_the_t08_field_set() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(FakeLifecycle {
+        order: Arc::clone(&order),
+        fail_at: None,
+        poll_empty: false,
+        cleanup_fail: false,
+        hang_poll: false,
+        empty_diff: false,
+    });
+    let store = Arc::new(FakeStore::default());
+    let reservations = Arc::new(FakeReservations::default());
+    let cleanup = Arc::new(FakeCleanupAuthorities::default());
+    let execution = execution();
+    store.insert(&execution).await.unwrap();
+    let worker = worker_with_cleanup(
+        lifecycle,
+        store.clone(),
+        reservations.clone(),
+        cleanup.clone(),
+    );
+
+    let result = worker.run(&execution).await.unwrap();
+    assert_eq!(result.state, ExecutionState::ReviewReady);
+
+    let events = store.events.lock().unwrap();
+    let watchdog = events
+        .iter()
+        .find(|event| matches!(event.kind, ExecutionEventKind::WatchdogSample { .. }))
+        .expect("a watchdog sample is emitted while the execution runs");
+    let json = serde_json::to_value(watchdog).unwrap();
+
+    // The event is tagged WatchdogSample.
+    assert_eq!(json["type"], "WatchdogSample");
+    // Present fields match the fake sample (io_bytes Some(1), cpu 0.0, healthy).
+    assert_eq!(json["verdict"], "healthy");
+    assert_eq!(json["cpu_percent"], serde_json::json!(0.0));
+    assert_eq!(json["io_bytes"], serde_json::json!(1));
+    assert!(
+        json.get("last_progress_at").is_some(),
+        "last_progress_at is known"
+    );
+    // Unmeasured fields are omitted, never a zero or empty placeholder.
+    assert!(json.get("current_command").is_none());
+    assert!(json.get("rss_bytes").is_none());
+    assert!(json.get("disk_bytes").is_none());
+}
+
 mod system_lifecycle_sample {
     use super::{execution, ExecutionLifecycle, LifecycleError};
     use async_trait::async_trait;
