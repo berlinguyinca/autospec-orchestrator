@@ -5,8 +5,8 @@ use orchestrator_core::{
 };
 use orchestrator_persistence::test_support::DisposableTestDatabaseLock;
 use orchestrator_persistence::{
-    ArtifactStore, EventLog, ExecutionStore, PgArtifactStore, PgEventLog, PgExecutionStore,
-    PgReservationStore, PgWorkerStore,
+    ArtifactStore, CleanupAuthorityStore, EventLog, ExecutionStore, PgArtifactStore,
+    PgCleanupAuthorityStore, PgEventLog, PgExecutionStore, PgReservationStore, PgWorkerStore,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -17,6 +17,7 @@ struct TestApi {
     events: Arc<PgEventLog>,
     executions: Arc<PgExecutionStore>,
     artifacts: Arc<PgArtifactStore>,
+    cleanup_authorities: Arc<PgCleanupAuthorityStore>,
     event_tx: tokio::sync::broadcast::Sender<ExecutionEvent>,
     _database_lock: DisposableTestDatabaseLock,
     _root: tempfile::TempDir,
@@ -41,6 +42,11 @@ async fn test_api() -> Option<TestApi> {
             .unwrap(),
     );
     let token = format!("api-token-{}", uuid::Uuid::new_v4());
+    let cleanup_authorities = Arc::new(
+        PgCleanupAuthorityStore::connect(&database_url)
+            .await
+            .unwrap(),
+    );
     let state = AppState::new(
         executions.clone(),
         events.clone(),
@@ -49,7 +55,8 @@ async fn test_api() -> Option<TestApi> {
         artifacts.clone(),
         token.clone(),
         "worker-secret".into(),
-    );
+    )
+    .with_cleanup_authorities(cleanup_authorities.clone());
     let event_tx = state.event_tx.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -60,6 +67,7 @@ async fn test_api() -> Option<TestApi> {
         events,
         executions,
         artifacts,
+        cleanup_authorities,
         event_tx,
         _database_lock: database_lock,
         _root: root,
@@ -88,6 +96,103 @@ async fn cancel_execution(client: &reqwest::Client, api: &TestApi, execution_id:
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn resources_route_requires_bearer_token() {
+    let Some(api) = test_api().await else { return };
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{}/executions/anything/resources", api.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn resources_route_returns_not_found_for_unknown_execution() {
+    let Some(api) = test_api().await else { return };
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "{}/executions/unknown-{}/resources",
+            api.base,
+            uuid::Uuid::new_v4().simple()
+        ))
+        .bearer_auth(&api.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn resources_route_projects_cleanup_handles() {
+    let Some(api) = test_api().await else { return };
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/executions", api.base))
+        .bearer_auth(&api.token)
+        .header(
+            "Idempotency-Key",
+            format!("resources-{}", uuid::Uuid::new_v4()),
+        )
+        .json(&manifest())
+        .send()
+        .await
+        .unwrap()
+        .json::<orchestrator_core::Execution>()
+        .await
+        .unwrap();
+    let attempt = orchestrator_core::AttemptId::new("attempt-resources");
+    let worker = orchestrator_core::WorkerId::new("worker-resources");
+    api.cleanup_authorities
+        .begin(&created.id, &attempt, &worker)
+        .await
+        .unwrap();
+    api.cleanup_authorities
+        .checkpoint(
+            &created.id,
+            "ACTIVE:STORAGE",
+            &serde_json::json!({
+                "worktree": {
+                    "execution_id": created.id.to_string(),
+                    "path": "/tmp/wt-resources",
+                    "branch": "main"
+                },
+                "runtime": { "execution_id": created.id.to_string(), "container_id": "abc" }
+            }),
+        )
+        .await
+        .unwrap();
+    let response = client
+        .get(format!("{}/executions/{}/resources", api.base, created.id))
+        .bearer_auth(&api.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let records = response.json::<Vec<serde_json::Value>>().await.unwrap();
+    let kinds: Vec<&str> = records
+        .iter()
+        .map(|record| record["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["worktree", "container"]);
+    for record in &records {
+        assert_eq!(
+            record["schema"].as_str().unwrap(),
+            "autospec.protocol.resource-record.v1"
+        );
+        assert_eq!(record["protocol_version"].as_u64().unwrap(), 1);
+        assert_eq!(
+            record["owner"]["execution_id"].as_str().unwrap(),
+            created.id.to_string()
+        );
+        assert!(record.get("mission_id").is_none());
+    }
+    assert_eq!(records[0]["path"].as_str().unwrap(), "/tmp/wt-resources");
+    cancel_execution(&client, &api, &created.id).await;
 }
 
 #[tokio::test]

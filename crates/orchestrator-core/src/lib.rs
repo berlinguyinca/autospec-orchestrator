@@ -15,6 +15,7 @@ pub mod ids;
 pub mod labels;
 pub mod manifest;
 pub mod resilience_contracts;
+pub mod resource_record;
 pub mod task_packet;
 pub mod telemetry;
 pub mod worker;
@@ -32,6 +33,7 @@ pub use manifest::{
     AgentAssignment, ExecutionManifest, HarnessKind, ModelPolicy, PersistenceMode,
     RepositoryReference, RuntimeKind, RuntimeRequirement, ServiceRequirement, TaskReference,
 };
+pub use resource_record::{project, ResourceKind, ResourceOwner, ResourceRecord, ResourceState};
 pub use task_packet::TaskPacket;
 pub use telemetry::{execution_span, init_tracing};
 pub use worker::{
