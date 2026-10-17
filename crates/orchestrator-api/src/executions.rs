@@ -6,8 +6,8 @@ use axum::{
 };
 use chrono::Utc;
 use orchestrator_core::{
-    event::ExecutionEventKind, Execution, ExecutionEvent, ExecutionId, ExecutionManifest,
-    ExecutionState, OwnershipLabels, Role, WorkerId,
+    event::ExecutionEventKind, project, Execution, ExecutionEvent, ExecutionId, ExecutionManifest,
+    ExecutionState, OwnershipLabels, ResourceRecord, Role, WorkerId,
 };
 use orchestrator_persistence::StoreError;
 
@@ -20,6 +20,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/executions", post(create))
         .route("/executions/{id}", get(read))
+        .route("/executions/{id}/resources", get(read_resources))
         .route("/executions/{id}/cancel", post(cancel))
         .route("/executions/{id}/retry", post(retry))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -51,6 +52,33 @@ async fn read(
         .await
         .map(Json)
         .map_err(|error| ApiError::store_for(error, &id))
+}
+
+async fn read_resources(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ResourceRecord>>, ApiError> {
+    authorize_api(&state, &headers)?;
+    let execution_id = ExecutionId::new(&id);
+    let Some(store) = state.cleanup_authorities.as_ref() else {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CLEANUP_UNAVAILABLE",
+            "cleanup authority store is not configured",
+        ));
+    };
+    let authority = store
+        .get(&execution_id)
+        .await
+        .map_err(|error| ApiError::store_for(error, &id))?;
+    let records = project(
+        &execution_id,
+        &authority.created_at,
+        &authority.phase,
+        &authority.handles,
+    );
+    Ok(Json(records))
 }
 
 async fn cancel(
